@@ -1,0 +1,236 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: vk_router_scroll.mac
+// @author  : 2013-08-26 zip_z. 
+// @desc    : скроллинг настройки маршрутизатора на шаг валютного контроля
+// @changes : none
+// -------------------------------------------------------------------------------------------------
+import vk_router;
+/*SDA 24.04.2014 R-368231-2  CHAR_SET и CHAR_UNSET в vk_router объявлены приватно, 
+                             из за чего не определены при импорте  */
+private const CHAR_UNSET = strfor (0);
+private const CHAR_SET   = strfor (88);
+
+// @desc: класс для хранения параметров текущей записи в скроллинге - #166620 (fxd 2030.48)
+private class TCurrentRecord ()
+    var id; // PKey в usr_vk_route_parm
+    
+    macro Save (rs:RsdRecordSet) 
+        // заполнить свойства класса согласно полям текущего RecordSet
+        this.id = rs.value ("id", null, V_INTEGER);
+    end;
+    
+    macro Compare (rs:RsdRecordSet) 
+        // сравнить ранее сохраненные свойства класса с текущей записью в RecordSet
+        return (this.id == rs.value ("id", null, V_INTEGER));
+    end;
+    
+    macro IsNull () 
+        // свойства класса не бывают заполнены, если листалка инициализируется при первом запуске
+        return ( this.id == null );
+    end;
+end;
+
+// @desc: циклический переключатель значений Y -> N -> 0 -> Y ...
+private macro getNextCycleSwitch (value:string):string
+    var ret = CHAR_YES;
+    if   (value == CHAR_YES   ) ret = CHAR_NO;
+    elif (value == CHAR_NO    ) ret = CHAR_UNKNOWN;
+    end;
+    return ret;
+end;
+
+// @desc: класс скроллинга для настройки параметров маршрута
+ class (TRecHandler) VK_RouteScroll ()
+    var isRunning = true; // флаг "скроллинг запущен и работает"
+    var isNew     = true; // флаг "ввод новой записи"
+    var rs        :RsdRecordSet   = null; // RsdRecordSet для построения скроллинга
+    var cr        :TCurrentRecord = null; // текущая запись скроллинга
+    
+    
+    private var accountForeign = RSL_GetRegistryValue("PS/REQOPENACC/173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ/ДЛЯ ВК");
+    private var accountBank    = RSL_GetRegistryValue("PS/REQOPENACC/СЧЕТА БАНКА");
+    
+    initTRecHandler ("p_route", RSL_GetLbrPath ("zResLib.lbr"), true);
+    
+    // @desc: функция используется для инициализации значений в панельке. Для новой панели используется
+    // значение valueIfNewOrNullRS, для имеющихся данных берётся строковое значение из поля RsdRecordSet
+    // с именем rsFieldName. Если оно нулевое (valtype == 26), используется valueIfNewOrNullRS.
+    private macro setStringValue (valueIfNewOrNullRS:string, rsFieldName:string)
+        return iif (isNew, valueIfNewOrNullRS, nvl_ex (rs.value (rsFieldName, null, V_STRING), valueIfNewOrNullRS ));
+    end;
+    
+    // @desc: обработчик событий панели
+    macro handlePanelEvents ( dlg, cmd, id, key )
+        var sql, ret, parm = TArray ();
+        if ( cmd == DLG_INIT )
+            this.("f_accountPayer")     = setStringValue (CHAR_ANY,     "accountPayer"    );
+            this.("f_accountReceiver")  = setStringValue (CHAR_ANY,     "accountReceiver" );
+            this.("f_baseFiidISO")      = setStringValue (CHAR_ANY,     "baseFiidISO"     );
+            this.("f_codeBankPayer")    = setStringValue (CHAR_ANY,     "codeBankPayer"   );
+            this.("f_codeBankReceiver") = setStringValue (CHAR_ANY,     "codeBankReceiver");
+            this.("f_docKind")          = setStringValue (CHAR_ANY,     "docKind"         );
+            this.("f_docOrigin")        = setStringValue (CHAR_ANY,     "docOrigin"       );
+            this.("f_paymentGround")    = setStringValue (CHAR_ANY,     "paymentGround"   );
+            this.("f_isExternal")       = setStringValue (CHAR_UNKNOWN, "isExternal"      );
+            this.("f_isTransit")        = setStringValue (CHAR_UNKNOWN, "isTransit"       );
+            this.("f_isUnknown")        = setStringValue (CHAR_UNKNOWN, "isUnknown"       );
+            this.("f_isActive")         = setStringValue (CHAR_SET,     "rule_isactive"   );
+            this.("f_description")      = setStringValue (CHAR_EMPTY,   "rule_description");
+            
+            if (isNew)
+                this.("f_rule_kind") = VK_ACTION_ALLOW;
+            else
+                this.("f_rule_kind") = iif (rs.value ("rule_kind", null, V_INTEGER) == VK_ROUTE_KIND_ALLOW, VK_ACTION_ALLOW, VK_ACTION_DENY);
+            end;
+            
+            message ("ESC - выход; F9 - ввод записи; Alt+B - подставить счета банка; Alt + N - подставить счета нерезидентов");
+            UpdateFields (dlg);
+            
+        elif ( cmd == DLG_KEY )
+            if   (key == KEY_ESC)
+                return iif ((GetTRUE (false, "Выйти без сохранения изменений?")), CM_DEFAULT, CM_IGNORE);
+            elif (key == KEY_SPACE)
+                // обработка нажатия пробела в переключателях "Внешний платёж", "Транзитный платёж", "Невыясненный платёж"
+                if (inList (FldName (id), "f_isExternal", "f_isTransit", "f_isUnknown" ))
+                    this.(FldName (id)) = getNextCycleSwitch (this.(FldName (id)));
+                    UpdateFields (dlg);
+                // обработка нажатия пробела в переключателе "Правило активно"
+                elif (FldName (id) == "f_isActive") 
+                    this.(FldName (id)) = iif (this.(FldName (id)) == CHAR_UNSET, CHAR_SET, CHAR_UNSET);
+                    UpdateFields (dlg);
+                // обработка нажатия пробела в переключателе "Тип правила"
+                elif (FldName (id) == "f_rule_kind")
+                    this.(FldName (id)) = iif (this.(FldName (id)) == VK_ACTION_ALLOW, VK_ACTION_DENY, VK_ACTION_ALLOW);
+                    UpdateFields (dlg);
+                end;
+            elif (key == KEY_ALT_B) 
+                // подставить счета банка в счет платедьщика или получателя
+                if (inList (FldName (id), "f_accountPayer", "f_accountReceiver"))
+                    this.(FldName (id)) = accountBank;
+                    UpdateFields (dlg);
+                end;
+            elif (key == KEY_ALT_N) 
+                // подставить счета нерезидентов в счет платедьщика или получателя
+                if (inList (FldName (id), "f_accountPayer", "f_accountReceiver"))
+                    this.(FldName (id)) = accountForeign;
+                    UpdateFields (dlg);
+                end;
+            elif (key == KEY_F9)
+                if (StrLen (this.("f_description")) < 10)
+                    msgbox ("Описание правила маршрутизации должно быть осмысленно заполнено (> 10 символов)");
+                    return CM_IGNORE;
+                end;
+                // сохранение параметров: для новой записи - insert, для старой - update
+                // merge не используется из-за громоздкости параметров. Мало кода - мало ошибок.
+                if (isNew)
+                    sql  = " insert into usr_vk_route_parm   ( "
+                         + "\n" + " accountpayer, accountreceiver, basefiidiso  , codebankpayer, codebankreceiver,"
+                         + "\n" + " dockind     , docorigin      , paymentground, isexternal   , istransit,"
+                         + "\n" + " isunknown   , rule_isactive  , rule_kind    , rule_description  ) "
+                         + "\n" + " values ("
+                         + "\n" + " :m_accountpayer, :m_accountreceiver, :m_basefiidiso  , :m_codebankpayer, :m_codebankreceiver,"
+                         + "\n" + " :m_dockind     , :m_docorigin      , :m_paymentground, :m_isexternal   , :m_istransit,"
+                         + "\n" + " :m_isunknown   , :m_rule_isactive  , :m_rule_kind    , :m_rule_description  )";
+                else
+                    sql = "     UPDATE usr_vk_route_parm "
+                        + "\n" + " SET accountpayer =       :m_accountpayer "
+                        + "\n" + "   , accountreceiver =    :m_accountreceiver"
+                        + "\n" + "   , basefiidiso =        :m_basefiidiso"
+                        + "\n" + "   , codebankpayer =      :m_codebankpayer"
+                        + "\n" + "   , codebankreceiver =   :m_codebankreceiver"
+                        + "\n" + "   , dockind =            :m_dockind"
+                        + "\n" + "   , docorigin =          :m_docorigin"
+                        + "\n" + "   , paymentground =      :m_paymentground"
+                        + "\n" + "   , isexternal =         :m_isexternal"
+                        + "\n" + "   , istransit =          :m_istransit"
+                        + "\n" + "   , isunknown =          :m_isunknown"
+                        + "\n" + "   , rule_isactive =      :m_rule_isactive"
+                        + "\n" + "   , rule_kind =          :m_rule_kind"
+                        + "\n" + "   , rule_description =   :m_rule_description"
+                        + "\n" + " WHERE id = :m_id"
+                end;
+                parm = TArray ();
+                parm [parm.size ()] = SqlParam ("m_accountpayer"    , this.("f_accountPayer"    ));
+                parm [parm.size ()] = SqlParam ("m_accountreceiver" , this.("f_accountReceiver" ));
+                parm [parm.size ()] = SqlParam ("m_basefiidiso"     , this.("f_baseFiidISO"     ));
+                parm [parm.size ()] = SqlParam ("m_codebankpayer"   , this.("f_codeBankPayer"   ));
+                parm [parm.size ()] = SqlParam ("m_codebankreceiver", this.("f_codeBankReceiver"));
+                parm [parm.size ()] = SqlParam ("m_dockind"         , this.("f_docKind"         ));
+                parm [parm.size ()] = SqlParam ("m_docorigin"       , this.("f_docOrigin"       ));
+                parm [parm.size ()] = SqlParam ("m_paymentground"   , this.("f_paymentGround"   ));
+                parm [parm.size ()] = SqlParam ("m_isexternal"      , this.("f_isExternal"      ));
+                parm [parm.size ()] = SqlParam ("m_istransit"       , this.("f_isTransit"       ));
+                parm [parm.size ()] = SqlParam ("m_isunknown"       , this.("f_isUnknown"       ));
+                parm [parm.size ()] = SqlParam ("m_rule_isactive"   , this.("f_isActive"        ));
+                parm [parm.size ()] = SqlParam ("m_rule_kind"       , iif (this.("f_rule_kind") == VK_ACTION_ALLOW, VK_ROUTE_KIND_ALLOW, VK_ROUTE_KIND_DENY ));
+                parm [parm.size ()] = SqlParam ("m_rule_description", this.("f_description"     ));
+                // в SQL UPDATE есть WHERE и соответственно на один параметр больше
+                if (not isNew)
+                    parm [parm.size ()] = SqlParam ("m_id", rs.value ("id", null, V_INTEGER));
+                end;
+                execSql (sql, parm, true);
+            end;
+        end;
+        return CM_DEFAULT;
+    end;
+    
+    // @desc: показать панель
+    macro showPanel ()
+        return RunDialog (this, R2M (this, "handlePanelEvents"));
+    end;
+    
+    // @desc: обработчик событий скроллинга
+    macro handleScrollEvents ( rs, command, id, key )
+        var retVal = CM_DEFAULT;
+        if (command == DLG_INIT) 
+            // перебрасываемся на нужную запись скроллинга при инициализации
+            if (not cr.IsNull ())
+                var flag = false;
+                while(rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            message ("ENTER - просмотр; ESC - выход; F9 - ввод записи; F8 - удаление записи");
+        elif (command == DLG_KEY) 
+            if (key == KEY_ENTER) 
+                isNew = false;
+                cr.Save (rs);
+                showPanel ();
+                retVal = CM_SELECT;
+            elif (key == KEY_ESC) 
+                isRunning = false;
+                retVal = CM_SELECT;
+            elif (key == KEY_F8)  
+                if (GetTRUE (false, "Вы действительно хотите удалить запись ?"))
+                    execSql ("delete from usr_vk_route_parm where id = :m_rule_id", makeArray (SQLParam ("m_rule_id", rs.value ("id", null, V_INTEGER))), false);
+                end;
+                retVal = CM_SELECT;
+            elif (key == KEY_F9)
+                isNew = true;
+                cr.Save (rs);
+                showPanel ();
+                retVal = CM_SELECT;
+            end;
+        end;
+        return retVal;
+    end;
+    
+    // @desc: показать скроллинг
+    macro showScroll ()
+        var sql = "SELECT id, accountpayer, accountreceiver, basefiidiso, codebankpayer, codebankreceiver, dockind, docorigin, paymentground, isexternal, "  + "\n"
+                "       istransit, isunknown, rule_isactive, rule_kind, decode ( rule_kind, 1, 'ВК', 2, 'Исключить ВК', 'Неизвестно' ) rule_kind_text, rule_description" + "\n"
+                "  FROM usr_vk_route_parm ORDER BY decode ( rule_isactive, chr ( 88 ), 1, 0 ) DESC, rule_kind ASC";
+        var col = makeArray ("rule_isactive"   , "ВКЛ",         3,  0, -1, 0,
+                             "rule_kind_text"  , "Вид правила", 10, 0, -1, 0,
+                             "rule_description", "Описание",    60, 0, -1, 0);
+        while (isRunning)
+            rs = RsdRecordSet (RsdCommand (sql), RSDVAL_CLIENT, RSDVAL_STATIC);
+            runScroll (rs, col.size () / 6, col, null, r2m (this, "handleScrollEvents"), "Параметры маршрутизации на шаг валютного контроля", "~ENTER~ - изменить ~ESC~ - выход");
+        end;
+        return true;
+    end;
+end;
+
+// -------------------------------------------------------------------------------------------------
+VK_RouteScroll ().ShowScroll ();

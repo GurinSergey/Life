@@ -1,0 +1,539 @@
+//------------------------------------------------------------------------------
+//                                                        )               (
+// @filename: fssp_accountquery.mac                      / \  .-"""""-.  / \
+// @author  : Golovkin                                  (   \/ __   __ \/   )
+// @desc    : Обработка сообщений AccountQuery           )  ; / _\ /_ \ ;  (
+// @changes :                                           (   |  / \ / \  |   )
+//                                                       \ (,  \0/_\0/  ,) /
+//                                                        \_|   /   \   |_/
+//                                                          | (_\___/_) |
+//                                                          .\ \ -.- / /.
+//                                                         {  \ `===' /  }
+//                                                        {    `.___.'    }
+//                                                         {             }
+//                                                          `"="="="="="`
+//------------------------------------------------------------------------------
+import rsd,Reporting,PTInter,RsbDataSet,FIInter,RsExts;
+import "globals.mac","likepy.mac","keycodes.mac","fssp_xml_lib.mac","lib_registry.mac","fssp_lib.mac";
+
+private var fssp_dir_export = RSL_GetRegistryValue("PRBB/FSSPPATH/OUT");
+
+private const EXEC_MODE_SINGLE = 1;
+private const EXEC_MODE_MASS   = 2;
+
+private const TRANSACTION_TYPE_INCOME   = 1; // приход
+private const TRANSACTION_TYPE_OUTCOME  = 2; // расход
+private const TRANSACTION_TYPE_IN_REST  = 3; // остаток на начало
+private const TRANSACTION_TYPE_OUT_REST = 4; // остаток на конец
+
+private const AQ_EXISTS_DATA        = 1;
+private const AQ_NO_EXISTS_DATA     = 2;
+private const AQ_NO_MANDATORY_FIELD = 5;
+
+private const ACTION_MODE_SINGLE = 1;
+private const ACTION_MODE_MULTI  = 2;
+
+class TFSSP_AccountQuery( mes_id )
+    var id        = -1,
+        clientId  = -1,
+        InternalKey   ,
+        IpInternalKey ,
+        DebtorINN     ,
+        DebtorKPP     ,
+        DebtorName    ,
+        DocDate       ,
+        SPI           ,
+        SPIFio        ,
+        IPNum         ,
+        IPDate        ,
+        ExtractBegin  ,
+        ExtractEnd    ;
+    var answerKey = -1,  
+        error     = 0,
+        mass_mode, 
+        doNotProcess;
+
+    var answer       = getTxtFileName ("accountQuery"),
+        answerError  = getTxtFileName ("accountQueryError"); // временный файл для ошибок
+
+    private macro move_file( in, out )
+        if( copyfile( in, out ) and removefile( in ) ) 
+            return true;
+        end;
+        return false;
+    end;
+
+    macro getAccountAnswerFileName
+//        return fssp_dir_export + "/" + answerKey + "_AccountAnswer.xml";
+        return fssp_dir_export + "/" + getMesName( int( id ) );
+    end;
+
+    // проверка полей сообщения
+    private macro checkFields
+        if(    ( InternalKey   == nullVal )
+            or ( IpInternalKey == nullVal )
+            or ( DebtorINN     == nullVal )
+            or ( DebtorName    == nullVal )
+            or ( ExtractBegin  == nullVal )
+            or ( DocDate       == nullVal )
+            or ( SPI           == nullVal )
+            or ( SPIFio        == nullVal )
+            or ( IPNum         == nullVal )
+            or ( IPDate        == nullVal ) )
+
+            error = AQ_NO_MANDATORY_FIELD;
+        end;
+
+        if( DebtorKPP == nullVal )
+            DebtorKPP = null;
+        end;
+
+        if( ExtractEnd == nullVal )
+            ExtractEnd = {curdate};
+        end;
+    end;
+
+    // сравнение наименований клиентов
+    private macro compareName( name, namersb )
+        const OOO = "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ";
+        const ZAO = "ЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+        const OAO = "ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+
+        namersb = strupr( namersb ); 
+        namersb = strsubst( namersb, "ООО", OOO );
+        namersb = strsubst( namersb, "ЗАО", ZAO );
+        namersb = strsubst( namersb, "ОАО", OAO );
+        namersb = strsubst( namersb, "Ё"  , "Е" );
+        namersb = strsubst( namersb, "\"" , ""  );
+        namersb = strsubst( namersb, "  " , " " );
+
+        name = strupr( name ); 
+        name = strsubst( name, "ООО", OOO );
+        name = strsubst( name, "ЗАО", ZAO );
+        name = strsubst( name, "ОАО", OAO );
+        name = strsubst( name, "Ё"  , "Е" );
+        name = strsubst( name, "\"" , ""  );
+        name = strsubst( name, "  " , " " );
+
+        return ( name == namersb );
+    end;  
+
+    // установить статус сообщению
+    private macro setMessageStatus( state )
+        private var cmd = RsdCommand( " UPDATE   USR_FSSP_MES SET T_MES_STATE = :state WHERE T_ID = :mes_id " );
+        cmd.addparam( "state" , RSDBP_IN, state );
+        cmd.addparam( "mes_id", RSDBP_IN, id    );
+        cmd.execute;
+    end;
+
+    // если счет закрыт, то isArchive == True 
+    private macro isArchive( open_close:string )
+        return string( open_close == "З" );
+    end;
+
+    // определение типа операции
+    private macro transType( account:string, kind_account:string, payeraccount:string, receiveraccount:string )
+        if  ( (     kind_account == "А"             ) // "приход"
+                and account      == payeraccount    )
+            return TRANSACTION_TYPE_INCOME;
+        elif( (     kind_account == "А"             ) // "расход"
+                and account      == receiveraccount )
+            return TRANSACTION_TYPE_OUTCOME;
+        elif( (     kind_account == "П"             ) // "приход"
+                and account      == receiveraccount )
+            return TRANSACTION_TYPE_INCOME;
+        elif( (     kind_account == "П"             ) // "расход"
+                and account      == payeraccount    )
+            return TRANSACTION_TYPE_OUTCOME;
+        end;
+
+        return -1; // хз 
+    end;
+
+    // конвертируем сумму операции в рубли
+    private macro convAmount( doc_amount, doc_fiid )
+        private var cAmount;
+        if( doc_fiid != 0 )
+            if( ConvSum( cAmount, money( doc_amount ), {curdate}, doc_fiid, 0, 7 ) == 0 )    
+                return cAmount;
+            end;
+        end;
+        return doc_amount;
+    end;
+
+    // представление даты в формате ФССП
+    private macro fsspDate( doc_date:date )
+        private var yyyy,mm,dd;
+        DateSplit( date( doc_date ), dd, mm, yyyy );
+        if( strLen( string( mm ) ) == 1 ) mm = "0" + mm; end; // ;)
+        if( strLen( string( dd ) ) == 1 ) dd = "0" + dd; end;
+        return yyyy + "-" + mm + "-" + dd;
+    end;
+
+    // остаток на дату
+    private macro accountRest( acc:rsdrecordset, restDate:date )
+        if( acc.value( "kind_account" ) == "А" )
+            return -restA( acc.value( "account" ), restDate );
+        else
+            return  restA( acc.value( "account" ), restDate );
+        end;
+        return $0;
+    end;
+
+    // генерация ExternalKey
+    private macro getAnswerKey
+        var rs;
+        rs = RsdRecordSet( " SELECT   USR_FSSP_ANSWER_MES_SEQ.NEXTVAL FROM DUAL " );
+
+        if( rs.movenext )
+            return rs.value(0);
+        end;
+
+        return -1;
+    end;
+
+    // получить ответ с ошибкой
+    private macro getAccountAnswerErrorText
+        var accountAnswer = XMLElement( "AccountAnswer" );
+            accountAnswer.addChild( XMLElement( "ExternalKey"     , answerKey        ) );
+            accountAnswer.addChild( XMLElement( "QueryInternalKey", InternalKey      ) );
+            accountAnswer.addChild( XMLElement( "IpInternalKey"   , IpInternalKey    ) );
+            accountAnswer.addChild( XMLElement( "answerDate"      , fsspDate( date ) ) );
+            accountAnswer.addChild( XMLElement( "AnswerType"      , error            ) );
+        return accountAnswer.toString;
+    end;
+
+    // определение клиента
+    private macro get_client_id
+        var cmd, rs, col = TArray();
+
+        macro EvProc ( rs, cmd, id, key )
+            if( cmd == DLG_KEY ) 
+                if( key == KEY_ENTER ) return CM_SELECT; end;
+            end;
+        end;
+
+        cmd = Rsdcommand( " WITH inn_kpp AS (SELECT   :inn inn, :kpp kpp, :name name FROM DUAL) "
+                          " SELECT   party.t_partyid, party.t_name, obj.t_code, COUNT (*) OVER (PARTITION BY NULL) cnt, "
+                          "          NVL2(inn_kpp.kpp,inn_kpp.inn || '/' || inn_kpp.kpp,inn_kpp.inn) mes_inn, "
+                          "          inn_kpp.name mes_name "
+                          "   FROM   dobjcode_dbt obj, dparty_dbt party, inn_kpp "
+                          "  WHERE   obj.t_code like "
+                          "             NVL2 (inn_kpp.kpp, "
+                          "                   inn_kpp.inn || '/' || inn_kpp.kpp, "
+                          "                   inn_kpp.inn || '%') "
+                          "          AND obj.t_codekind = 16 "
+                          "          AND obj.t_state = 0 "
+                          "          AND obj.t_objecttype = 3 "
+                          "          AND obj.t_objectid = party.t_partyid " );
+
+        cmd.addparam( "inn" , RSDBP_IN, DebtorINN  );
+        cmd.addparam( "kpp" , RSDBP_IN, DebtorKPP  );
+        cmd.addparam( "name", RSDBP_IN, DebtorName );
+
+        rs = RsdRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+
+        if( rs.movenext )
+            if( rs.value( "cnt" ) > 1 ) 
+
+                col = makeArray( "t_code"   , "Код"                     , 22, 0, 0, 0, 
+                                 "t_name"   , "Наименование"            , 40, 0, 0, 0, 
+                                 "t_partyid", "ИД субъекта"             , 10, 0, 0, 0,
+                                 "mes_inn"  , "Код в сообщении"         , 22, 0, 0, 0,
+                                 "mes_name" , "Наименование в сообщении", 40, 0, 0, 0 );
+
+                if( RunScroll ( rs, col.size/6, col, null, "EvProc", "Выберите клиента", "~Enter~ выбор" ) )
+                    return int( rs.value( "t_partyid" ) );
+                else
+                    doNotProcess = true;
+                end;
+            elif( rs.value( "cnt" ) == 1 ) 
+                if( compareName( rs.value( "mes_name" ), rs.value( "t_name" ) ) ) 
+                    return int( rs.value( "t_partyid" ) );
+                else
+                   if( mass_mode )
+                       doNotProcess = true;
+                   else
+                       if( getTrue( true, "Наименование должника в запросе:" + DebtorName + "|| наименование в БД:" + rs.value( "t_name" ) + "||Формировать выписку?" ) )
+                           return int( rs.value( "t_partyid" ) );
+                       end;
+                   end;
+                end;
+            end
+        end;
+        
+        return -1;
+    end;
+
+    // получить счета клиента
+    private macro get_accounts
+        var cmd,rs;
+
+        cmd = Rsdcommand( "  SELECT   ACCOUNT.T_OPEN_CLOSE    OPEN_CLOSE  , "
+                          "           ACCOUNT.T_CODE_CURRENCY FIID        , "
+                          "           ACCOUNT.T_ACCOUNT       ACCOUNT     , "
+                          "           ACCOUNT.T_NAMEACCOUNT   NAME_ACCOUNT, "
+                          "           ACCOUNT.T_OPEN_DATE     OPEN_DATE   , "
+                          "           ACCOUNT.T_CLOSE_DATE    CLOSE_DATE  , " 
+                          "           ACCOUNT.T_KIND_ACCOUNT KIND_ACCOUNT   "
+                          "    FROM   DACCOUNTS_VIEW  ACCOUNT " 
+                          "   WHERE       ACCOUNT.T_CLIENT = :PARTYID "
+                          "           AND     ACCOUNT.T_OPEN_DATE  < :END_DATE "
+                          "           AND (   ACCOUNT.T_CLOSE_DATE > :BEGIN_DATE "
+                          "                OR ACCOUNT.T_CLOSE_DATE = '01.01.0001') "
+                          "           AND INSTR (ACCOUNT.T_TYPE_ACCOUNT, 'П') = 0 "
+                          "           AND REGEXP_LIKE(ACCOUNT.T_TYPE_ACCOUNT,'Ч|Х|Я|Q|K|Y') " );
+
+        cmd.addparam( "PARTYID"   , RSDBP_IN, ClientId     );
+        cmd.addparam( "BEGIN_DATE", RSDBP_IN, ExtractEnd   );
+        cmd.addparam( "END_DATE"  , RSDBP_IN, ExtractBegin );
+
+        return RsdRecordset( cmd );
+    end;
+
+    // получить проводки
+    private macro get_documents( acc, fiid )
+        var docInfoServer;
+        var tableName, rs, ds, cacheQueryText, str; 
+     
+        docInfoServer = RepDocInfoServer( PTCK_ALL, 0 );
+
+        if( fiid == 0 )
+            tablename = "darhdoc_dbt" ;
+        else
+            tablename = "darhdoc$_dbt";
+        end;
+
+        cacheQueryText = " SELECT " + docInfoServer.getFieldListasString ()                                           + "\n" +
+                         "   FROM " + tableName                                                                       + "\n" +
+                         "  WHERE   (t_account_payer = '" + acc + "' OR t_account_receiver = '" + acc + "') "         + "\n" +
+                         "          AND t_date_carry BETWEEN TO_DATE ('" + date( ExtractBegin ) + "', 'dd.mm.yyyy') " + "\n" +
+                         "                               AND TO_DATE ('" + date( ExtractEnd   ) + "', 'dd.mm.yyyy') "        ;
+
+        docInfoServer.cacheInformation( cacheQueryText );
+
+        str = " SELECT docs.* " +
+              "   FROM "        + docInfoServer.getCacheTableName() + " docs  order by t_date_carry, t_payeraccount, t_amount ";
+
+        rs = TRsbDataSet ( str );
+
+        return rs;
+    end;
+
+    // процедура инициализации
+    macro init( mes_id )
+        private var cmd,rs;
+
+        cmd = RsdCommand( " SELECT   EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/InternalKey/text()'    ) INTERNAL_KEY,    "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/DocDate/text()'        ) DOC_DATE,        "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/SPI/text()'            ) SPI,             "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/SPIFio/text()'         ) SPIFIO,          "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IPNum/text()'       ) IP_NUM,          "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IPDate/text()'      ) IP_DATE,         "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/InternalKey/text()' ) IP_INTERNAL_KEY, "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorINN/text()'   ) INN,             "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorKPP/text()'   ) KPP,             "
+                          "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorName/text()'  ) NAME,            "
+                          "          to_date(EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/ExtractBegin/text()'), 'yyyy-mm-dd') BEGIN, "
+                          "          to_date(EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/ExtractEnd/text()'  ), 'yyyy-mm-dd') END,   "
+                          "          MES.T_PARTY_ID CLIENT "
+                          "   FROM   USR_FSSP_MES MES      "
+                          "  WHERE   MES.T_ID = :mes_id    " );
+        cmd.addparam( "mes_id", RSDBP_IN, mes_id );
+
+        rs = RsdRecordset( cmd );
+
+        if( rs.movenext )
+            DebtorINN     = rs.value( "INN"             );
+            DebtorKPP     = rs.value( "KPP"             );
+            DebtorName    = rs.value( "NAME"            );
+            ExtractBegin  = rs.value( "BEGIN"           );
+            ExtractEnd    = rs.value( "END"             );
+            InternalKey   = rs.value( "INTERNAL_KEY"    );
+            IpInternalKey = rs.value( "IP_INTERNAL_KEY" );
+            DocDate       = rs.value( "DOC_DATE"        );
+            SPI           = rs.value( "SPI"             );
+            SPIFio        = rs.value( "SPIFIO"          );
+            IPNum         = rs.value( "IP_NUM"          );
+            IPDate        = rs.value( "IP_DATE"         );
+            ClientId      = int( rs.value( "CLIENT" )   );
+        else
+            error = AQ_NO_MANDATORY_FIELD;                
+        end;
+
+        id        = mes_id;
+        answerKey = int( getAnswerKey );
+    end;
+
+    // откат сообщения
+    macro rollback
+        private var cmd;
+
+        cmd = RsdCommand( "DELETE FROM USR_FSSP_ANSWER WHERE T_MES_ID = :MES_ID" );
+        cmd.addparam( "MES_ID", RSDBP_IN, id ); 
+        cmd.execute;
+
+        RollBackDataScroll( id );
+
+        return 0;
+    end;
+
+    // формирование ответа
+    macro create( actionMode )
+        var cmd,clientAccounts,documents,dataElement,progress,indent;
+
+        indent = "   ";
+
+        if( actionMode == ACTION_MODE_SINGLE )
+            mass_mode = false;
+        else
+            mass_mode = true;
+        end;
+
+        checkFields;
+
+        if( ( ClientId == -1 ) and ( error == 0 ) ) 
+
+            ClientId = get_client_id( DebtorINN, DebtorKPP ); 
+
+            if( ClientId == -1 ) 
+                error = AQ_NO_EXISTS_DATA;
+            else
+                cmd = RsdCommand( " UPDATE   USR_FSSP_MES "
+                                  "    SET   T_PARTY_ID = :CLIENT_ID "
+                                  "  WHERE   T_ID = :MES_ID " );
+                cmd.addparam( "CLIENT_ID", RSDBP_IN, ClientId );
+                cmd.addparam( "MES_ID"   , RSDBP_IN, id       );
+                cmd.execute();
+            end;
+
+        end;      
+
+        if( ( error == 0 ) and ( not doNotProcess ) ) 
+
+            setOutput( answer, false );
+
+            println( simpleXMLOpenTag( "AccountAnswer" ) );
+        
+            println( indent + simpleXMLElement( "ExternalKey"     , answerKey        ) );
+            println( indent + simpleXMLElement( "QueryInternalKey", InternalKey      ) );
+            println( indent + simpleXMLElement( "IpInternalKey"   , IpInternalKey    ) );
+            println( indent + simpleXMLElement( "answerDate"      , fsspDate( date ) ) );
+            println( indent + simpleXMLElement( "AnswerType"      , AQ_EXISTS_DATA   ) ); // здесь успешно, сообщение с ошибкой формируется отдельно
+
+            clientAccounts = get_accounts;
+
+            while( clientAccounts.movenext )
+
+                println( indent + simpleXMLOpenTag( "Data" ) );
+
+                // остаток по счету на начало периода
+                dataElement = XMLElement( "AccountTransactionDatum" );
+                dataElement.addChild( XMLElement( "IsArchive"        , isArchive( clientAccounts.value( "OPEN_CLOSE" ) ) ) );
+                dataElement.addChild( XMLElement( "TransactionType"  , TRANSACTION_TYPE_IN_REST                          ) );
+                dataElement.addChild( XMLElement( "BIK"              , {MFO_Bank}                                        ) );
+                dataElement.addChild( XMLElement( "AccountNumber"    , clientAccounts.value( "ACCOUNT" )                 ) );
+                dataElement.addChild( XMLElement( "TransactionDate"  , fsspDate( ExtractBegin )                          ) );
+                dataElement.addChild( XMLElement( "Amount"           , accountRest( clientAccounts, ExtractBegin )       ) );
+                dataElement.addChild( XMLElement( "ContragentName"   , DebtorName                                        ) );
+                dataElement.addChild( XMLElement( "CorrBIK"          , {MFO_Bank}                                        ) );
+                dataElement.addChild( XMLElement( "CorrAccountNumber", {CORAC_Bank}                                      ) );
+                dataElement.addChild( XMLElement( "Grounds"          , "Остаток на начало периода"                       ) ); // ?
+
+                print( dataElement.toString( indent + indent ) );
+
+                documents = get_documents( clientAccounts.value( "ACCOUNT" ), clientAccounts.value( "FIID" ) );
+
+                initprogress( -1, "Идет обработка...", clientAccounts.value( "ACCOUNT" ) );
+
+                progress = 0;
+
+                while( documents and documents.movenext )
+
+                    progress = progress + 1;
+
+                    // данные по операции
+                    dataElement = XMLElement( "AccountTransactionDatum" );
+                    dataElement.addChild( XMLElement( "IsArchive"        , isArchive( clientAccounts.value( "OPEN_CLOSE"   ) ) ) );
+                    dataElement.addChild( XMLElement( "TransactionType"  , transType( clientAccounts.value( "ACCOUNT"      ), 
+                                                                                      clientAccounts.value( "KIND_ACCOUNT" ),
+                                                                                      documents.payeraccount,  
+                                                                                      documents.receiveraccount              ) ) );
+                    dataElement.addChild( XMLElement( "BIK"              , {MFO_Bank}                                          ) );
+                    dataElement.addChild( XMLElement( "AccountNumber"    , clientAccounts.value( "ACCOUNT" )                   ) );
+                    dataElement.addChild( XMLElement( "TransactionDate"  , fsspDate( date( documents.date_carry ) )            ) );
+                    dataElement.addChild( XMLElement( "Amount"           , convAmount( documents.amount, documents.fiid )      ) );
+                    dataElement.addChild( XMLElement( "ContragentName"   , DebtorName                                          ) );
+                    dataElement.addChild( XMLElement( "CorrBIK"          , {MFO_Bank}                                          ) );
+                    dataElement.addChild( XMLElement( "CorrAccountNumber", {CORAC_Bank}                                        ) );
+                    dataElement.addChild( XMLElement( "Grounds"          , documents.ground                                    ) );
+
+                    print( dataElement.toString( indent + indent ) );
+
+                    useprogress( progress );
+
+                end;
+
+                remprogress;
+
+                // остаток по счету на конец периода
+                dataElement = XMLElement( "AccountTransactionDatum" );
+                dataElement.addChild( XMLElement( "IsArchive"        , isArchive( clientAccounts.value( "OPEN_CLOSE" ) ) ) );
+                dataElement.addChild( XMLElement( "TransactionType"  , TRANSACTION_TYPE_OUT_REST                         ) );
+                dataElement.addChild( XMLElement( "BIK"              , {MFO_Bank}                                        ) );
+                dataElement.addChild( XMLElement( "AccountNumber"    , clientAccounts.value( "ACCOUNT" )                 ) );
+                dataElement.addChild( XMLElement( "TransactionDate"  , fsspDate( {curdate} )                             ) );
+                dataElement.addChild( XMLElement( "Amount"           , accountRest( clientAccounts, {curdate} )          ) );
+                dataElement.addChild( XMLElement( "ContragentName"   , DebtorName                                        ) );
+                dataElement.addChild( XMLElement( "CorrBIK"          , {MFO_Bank}                                        ) );
+                dataElement.addChild( XMLElement( "CorrAccountNumber", {CORAC_Bank}                                      ) );
+                dataElement.addChild( XMLElement( "Grounds"          , "Остаток на конец периода"                        ) ); // ?
+
+                print( dataElement.toString( indent + indent ) );
+
+                println( indent + simpleXMLCloseTag( "Data" ) );
+
+            end;
+
+            println( simpleXMLCloseTag( "AccountAnswer" ) );
+
+            setOutput( null, true );
+        end;
+
+        if( not doNotProcess )
+            if( error != 0 )
+                setOutput( answerError, false        );
+                println  ( getAccountAnswerErrorText );
+                setOutput( null, true                );
+                if( not move_file( answerError, getAccountAnswerFileName ) )
+                    println( "Неудалось создать файл " + getAccountAnswerFileName ); 
+                else
+                    if(not mass_mode) viewfile( getAccountAnswerFileName ); end;
+                end;
+            else
+                if( not move_file( answer, getAccountAnswerFileName ) )
+                    println( "Неудалось создать файл " + getAccountAnswerFileName ); 
+                else
+                    if(not mass_mode) viewfile( getAccountAnswerFileName ); end;
+                end;
+            end;       
+
+            regAnswer( id, answerKey );
+            setMessageStatus( 1 );
+        end;
+
+        return error;
+    end;
+
+    init( mes_id );
+
+end;
+/*
+// для теста!!!
+var mes = TFSSP_AccountQuery( 5961 );            
+
+mes.create( 2 );
+
+ViewFile( mes.getAccountAnswerFileName );
+
+exit(1);*/

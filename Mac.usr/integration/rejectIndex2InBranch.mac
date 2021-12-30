@@ -1,0 +1,234 @@
+import ptinter, oprinter;
+import "globals.mac","lib_registry.mac";
+import InsCarryDoc, FIInter, payconst,payinter, PTInter, sfinsdoc, "catfdoc.mac", cbsttls, "mpckvit.mac";
+import pm_common, pm_setst, "AvtoTypePayment.mac", Календарь;                       
+import oralib, likepy;
+
+import oralib, rcw, likepy, globals, RsbFormsInter, KeyCodes, PaymInter;
+
+const BLOCK_ID_RECALL_I2 = 10000127;
+
+private var countAccounts = -1;
+private var repName = GetTXTFileName( "transferAccounts" );
+private var Scheme = "RSBANK_EVS";
+
+
+private macro getMaxStep( idOp )
+    private var cmd,rs;
+    cmd = rsdCommand( " SELECT MAX (T_ID_STEP) MAXSTEP FROM doprstep_dbt WHERE T_ID_OPERATION = :idop AND T_ISEXECUTE != chr(0) " );
+    cmd.addparam( "", RSDBP_IN, idOp );
+
+    rs = rsdRecordset( cmd );
+
+    if( rs.movenext ) return int( rs.value( "MAXSTEP" ) ); end;
+    return 0;
+onerror
+    return 0;
+end;
+
+macro insertBranchRecall( idOp )
+    var idBlock    = BLOCK_ID_RECALL_I2;
+    var kindBranch = OPRBR_REMOVE;
+    var idStep     = 10;
+
+    private var cmd = RsdCommand( " BEGIN ? := RSI_RsbOperation.InsertBranchTrn(?, ?, ?, ?, ?, ?, ?, ?, ?); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( idOp ) );
+    cmd.addparam( "", RSDBP_IN,  kindBranch         );
+    cmd.addparam( "", RSDBP_IN,  idBlock            );
+    cmd.addparam( "", RSDBP_IN,  idStep             );
+    cmd.addparam( "", RSDBP_IN,  {curdate}          );
+    cmd.addparam( "", RSDBP_IN,  0                  );
+    cmd.addparam( "", RSDBP_IN,  0                  );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro execOperationStep( idOp )
+    private var cmd = RsdCommand( " BEGIN ? := RSI_RsbOperation.executeStepTrn(?, ?, ?, ?, ?, ?, ? ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( idOp ) );
+    cmd.addparam( "", RSDBP_IN,  strFor( 88 )       );
+    cmd.addparam( "", RSDBP_IN,  {curdate}          );
+    cmd.addparam( "", RSDBP_IN,  {oper}             );
+    cmd.addparam( "", RSDBP_IN,  strFor( 0 )        );
+    cmd.addparam( "", RSDBP_IN,  strFor( 0 )        );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro insOprStatus( docKind, idOp, statusKind, statusValue )
+    private var cmd = RsdCommand( " BEGIN RSI_RsbOperation.SetOprStatusValueOnStep(?, ?, ?, ?, ?, ?); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  docKind            );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  statusKind         );
+    cmd.addparam( "", RSDBP_IN,  statusValue        );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( idOp ) );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro setClosePaymStatus( paymentid, operationid )
+    private var cmd = RsdCommand( " BEGIN ? := pm_common.changepaymstatus( :paymentid, :status, :operationId, :idStep, :oper ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+    cmd.addparam( "", RSDBP_IN,  paymentid );
+    cmd.addparam( "", RSDBP_IN,  32000 );
+    cmd.addparam( "", RSDBP_IN,  operationid );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( operationid ) );
+    cmd.addparam( "", RSDBP_IN,  {oper} );
+    cmd.execute;
+
+    cmd = RsdCommand( " BEGIN ? := ps_payord.ChangePayOrderStatus( :paymentid, :status, :operationId, :idStep, :oper, 'X' ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+    cmd.addparam( "", RSDBP_IN,  paymentid );
+    cmd.addparam( "", RSDBP_IN,  15 );
+    cmd.addparam( "", RSDBP_IN,  operationid );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( operationid ) );
+    cmd.addparam( "", RSDBP_IN,  {oper} );
+    cmd.execute;
+
+    return cmd.Param(0).value;
+end;
+
+macro saveLogError( _account, _paymentid, _errmsg )
+    var sqlText = " INSERT INTO USR_RECALLINDEX2_RESULT_TMP VALUES( :acc, :paymentid, :error ) ";
+    execSQL( sqlText, makeArray( sqlParam( "acc", _account ), sqlParam( "paymentid", _paymentid ), sqlParam( "error", _errmsg ) ) );
+end;
+
+macro chechForTransferPayment( paymentid )
+    return rsdRecordset( " SELECT   1 "
+                         "   FROM   "+Scheme+".DPMPAYM_DBT PAYM, "+Scheme+".USR_TRANSFERINDEX2_LOG LOG " // RSBANK_EVS для теста RSSAR_TEST
+                         "  WHERE   PAYM.T_PAYMENTID = LOG.T_PAYMENTID "
+                         "          AND LOG.T_DEPPAYMENTID = " + paymentid ).movenext;
+onerror return false;
+end;
+
+macro removeIndex2
+    file operation( oproper ) key 1;
+    private var conformityAccTable = execSQLselect( " SELECT * FROM "+Scheme+".USR_CONFORMITY_ACC_TABLE_DBT " );
+    private var oldAcc;
+    private var newAcc;
+    private var newOper;
+    private var stat;
+    private var i = 0;
+    
+    initProgress( countAccounts, "Перенос картотеки №2", "Перенос картотеки №2" );
+
+    execSQL( " DELETE FROM USR_RECALLINDEX2_RESULT_TMP "    );
+
+    while( conformityAccTable.movenext )
+        oldAcc = conformityAccTable.value( "T_ACCOUNT_BRANCH" );
+
+        /**
+         * Поиск документов в картотеке №2
+         */
+        var index2Payments = execSQLselect( " SELECT * FROM DPMPAYM_DBT WHERE T_PAYERACCOUNT = :ACC AND T_PAYMSTATUS = 2000 AND T_DOCKIND = 201 ", makeArray( sqlParam( "ACC", oldAcc ) ) );
+
+        while( index2Payments.movenext )
+            var paymentid  = index2Payments.value( "T_PAYMENTID" );
+            var documentid = string( int( paymentid ):34:o );
+            var docKind    = index2Payments.value( "T_DOCKIND" );
+            var paymObject = rsbPayment( paymentid );
+
+            operation.DOCUMENTID = documentid;
+            operation.DOCKIND    = docKind;
+
+            if( not chechForTransferPayment( paymentid ) )
+                saveLogError( oldAcc, paymentid, "Документ ещё не перенесен id#" + paymentid );
+            else
+                if( getEQ( operation ) )
+                    var operationId = operation.ID_OPERATION;
+
+                    /**
+                     * Закрываю операцию
+                     */
+                    insertBranchRecall( operationId                  );
+                    insOprStatus      ( docKind, operationId, 291, 3 );
+                    execOperationStep ( operationId                  );
+                    setClosePaymStatus( paymentid, operationId       );
+
+                    /** 
+                     * Проводка по внебалансу
+                     */
+                    var stepForCarry = getMaxStep( operationId );
+                    var i2RejCarry   = paymObject.MakeTransaction;
+          
+                    var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+                    var СистемныйСчетДляКартотек          = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+
+                    i2RejCarry.chapter         = 3;
+                    i2RejCarry.FIID            = paymObject.PayerFIID;
+                    i2RejCarry.AccountPayer    = СистемныйСчетДляКартотек;
+                    i2RejCarry.AccountReceiver = PaymIndex2_FirstDoc( paymObject.paymentid ).FindAndOpenAccount( "Картотека 2", 0, {curdate} );
+                    i2RejCarry.Sum             = paymObject.FutureBaseAmount;
+                    i2RejCarry.Ground          = "Отзыв из картотеки №2 " + paymObject.ground;
+                    i2RejCarry.Date_Carry      = {curdate};
+                    i2RejCarry.Shifr_Oper      = "09";
+                    i2RejCarry.Kind_Oper       = " 6";
+                    i2RejCarry.ResultCarry     = 53; // отзыв из картотеки 2
+                    i2RejCarry.ID_Operation    = operationId;
+                    i2RejCarry.ID_Step         = stepForCarry;
+
+                    if( not i2RejCarry.Carry ) 
+                        saveLogError( oldAcc, paymentid, getErrMsg + " id#" + paymentid );
+                    else
+                        execSQL( " DELETE FROM DPSINPROP_DBT WHERE T_PAYMENTID = :PAYMENTID ", makeArray( sqlParam( "PAYMENTID", paymentid ) ) );
+                        saveLogError( oldAcc, paymentid, "Документ отозван id#" + paymentid );
+                    end;
+                else
+                    saveLogError( oldAcc, paymentid, "Не найдена операция по платежу id#" + paymentid );
+                end;
+            end;
+//        else
+//            saveLogError( oldAcc, -1, "Нет документов в картотеке для отзыва" );
+        end;
+
+        i = i + 1;
+        useProgress(i);
+    end;
+
+    remProgress;
+onerror(x)
+    saveLogError( oldAcc, -1, "Непредусмотренная ошибка: " + x.message );
+end;
+
+macro printErrors
+    setOutput( repName, false );
+//    var conformityAccTable = execSQLselect( " SELECT * FROM USR_CONFORMITY_ACC_TABLE_TMP " );
+//    while( conformityAccTable.movenext )
+//        var oldAcc     = conformityAccTable.value( "t_oldAccount" );
+        var errorsRSet = execSQLselect( " SELECT   nvl(PMPROP.T_NUMBER,       ' ') T_NUMBER, "
+                                        "          PMPROP.T_DATE                   T_DATE,"
+                                        "          nvl(PAYM.T_PAYERACCOUNT,   ' ') T_PAYERACCOUNT, "
+                                        "          nvl(PAYM.T_RECEIVERACCOUNT,' ') T_RECEIVERACCOUNT, "
+                                        "          nvl(PAYM.T_AMOUNT,          0 ) T_AMOUNT, "
+                                        "          RECALL.T_ERRORTXT "
+                                        "   FROM   USR_RECALLINDEX2_RESULT_TMP RECALL, "
+                                        "          DPMRMPROP_DBT PMPROP, "
+                                        "          DPMPAYM_DBT PAYM "
+                                        "  WHERE   RECALL.T_PAYMENTID = PMPROP.T_PAYMENTID(+) "
+                                        "          AND RECALL.T_PAYMENTID = PAYM.T_PAYMENTID(+) " );//, makeArray( sqlParam( "acc", oldAcc ) ) ); 
+
+            [                                                     Отзыв из картотеки №2
+              ┌─────────┬──────────────────┬──────────────────────────┬─────────────────────────┬─────────────────────┬─────────────────────────────────────────────────┐
+              │    №    │       Дата       │     Счет плательщика     │     Счет получателя     │    Сумма платежа    │                    Результат                    │ 
+              ├─────────┼──────────────────┼──────────────────────────┼─────────────────────────┼─────────────────────┼─────────────────────────────────────────────────┤ ];//( oldAcc );
+
+        while( errorsRSet.movenext )
+            [ │ ####### │ ################ │ ######################## │ ####################### │ ################### │ ############################################### │ ]
+            ( errorsRSet.value( "T_NUMBER" ):c, date( errorsRSet.value( "T_DATE" ) ):c, errorsRSet.value( "T_PAYERACCOUNT" ), errorsRSet.value( "T_RECEIVERACCOUNT" ), errorsRSet.value( "T_AMOUNT" ), errorsRSet.value( "T_ERRORTXT" ):w );
+        end;
+            [ └─────────┴──────────────────┴──────────────────────────┴─────────────────────────┴─────────────────────┴─────────────────────────────────────────────────┘ ];
+
+//    end;
+    setOutput( null, false );
+end;
+
+removeIndex2;
+printErrors;
+viewFile( repName );
+exit(1);

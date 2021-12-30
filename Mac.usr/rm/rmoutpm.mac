@@ -1,0 +1,441 @@
+/***********************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                             */
+/***********************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                             */
+/*          Проверки начального платежа, функция пользователя                      */
+/*                                                                                 */
+/*  Имя файла: rmoutpm.mac                                                         */
+/*  Создан:    24.07.03                                     Панов А.Б.             */
+/*  Правки:                                                                        */
+/*    KS       20.09.2012 C-14283 Документы не прошедшие авто-контроль             */
+/*    KS       01.10.2012 Отчет по платежу C-14283                                 */
+/*    KS       03.10.2012 C-14283 Нечеткий поис теперь зависит от скроллинга       */
+/*    Gurin S. 25.04.2013 C-18664-6: "Отправить сообщение ЕД 244 без запроса"      */
+/*                        по Ctr+Z                                                 */
+/*    Gurin S. 27.08.2013 C-21844-6: "Формирование сообщение ЕД 243" по Ctr+Z      */
+/*    KS       09.12.2013 Перенос пользовательских доработок в 31ю сборку          */
+/*    Golovkin 24.08.2015 Выгрузка в РосКап                                        */
+/***********************************************************************************/
+import "KeyCodes.mac";
+import PaymInter, globals, PTInter, OprInter, CTInter, FIInter, "rmtools.mac", "multypm.mac", "rmtplstr.mac";
+import "cb_FillFactura.mac";
+import "cdoub.mac", "doub.mac", "coperna.mac";
+
+//Str!
+import "NUMBERPACK.mac","ShifrOper.mac", rsd;
+import "diver.mac"; //Diver
+import "lib_str.mac"; // SDA 12/03/2012 - библиотека работы со строками
+import "uf_request.mac";
+import "uf_answer_norequest.mac";
+import "upd_grnd.mac";
+
+record Curpmpaym   ( pmpaym   );
+record Curpmdebet  ( pmprop   );
+record Curpmcredit ( pmprop   );
+record Curpmrmprop ( pmrmprop );
+record Curpmakkr   ( pmakkr   );
+record CurCurTr    ( pmcurtr  );
+record CurPmkz     ( pmkz     );
+
+record Oldpmpaym   ( pmpaym   );
+record Oldpmdebet  ( pmprop   );
+record Oldpmcredit ( pmprop   );
+record Oldpmrmprop ( pmrmprop );
+record Oldpmakkr   ( pmakkr   );
+record OldCurTr    ( pmcurtr  );
+record OldPmkz     ( pmkz     );
+record pmpaym   ( pmpaym   );
+record pmrmprop ( pmrmprop );
+
+var m; 
+var docs = "";
+
+// EVG 17/8/2015 Для печати в Excel
+var needExcel;
+
+
+private macro ПроверитьИдентичностьСводногоПлатежа() : integer
+  if( not ( ПроверкаИдентичности(Curpmpaym,   Oldpmpaym, "PayType"  ) and
+            ПроверкаИдентичности(Curpmdebet,  Oldpmdebet ) and
+            ПроверкаИдентичности(Curpmcredit, Oldpmcredit) and
+            ПроверкаИдентичности(Curpmrmprop, Oldpmrmprop, 
+                                 "PayerINN", "PayerName", "ReceiverINN", "ReceiverName",
+                                 "Ground", "TaxAuthorState", "BTTTICode", "OKATOCode",
+                                 "TaxPmGround", "TaxPmPeriod", "TaxPmNumber",
+                                 "TaxPmDate", "TaxPmType"
+                                ) and
+            ПроверкаИдентичности(Curpmakkr,   Oldpmakkr  ) and
+            ПроверкаИдентичности(CurCurtr,    OldCurtr ) and
+            ПроверкаИдентичности(CurPmkz,     OldPmkz    ) ) 
+    )
+    msgbox("В сводном платеже разрешено изменять только реквизиты плательщика и получателя, назначение платежа и налоговые реквизиты");
+    return CHANG_NOTKEEP;
+  end;
+
+  return 0;
+end;
+
+macro Проверить_Документ( Режим )
+
+  if (Режим == 3) /* Редактирование документа */
+    if( (Curpmpaym.DocKind == DLDOC_MULTYPM) and (Curpmpaym.PaymStatus <= PM_IS_SENDING) )
+      return ПроверитьИдентичностьСводногоПлатежа();
+    else // пока что запрещено редактировать все, кроме сводных
+      return CHANG_NOTKEEP;
+    end;
+  elif (Режим == 4) /* Откат операции */
+    return 0;
+  elif (Режим == 5) /* Инициализация операции */
+    return 0;
+  end;
+
+  return 0;
+end;
+
+/*
+ return 0;        // никаких действий после работы макросы не делать
+ return UPDTREC   // обновить в скролле текущюю запись
+ return UPDTPAGE  // обновить страницу скроллла         
+*/
+/*
+macro Функция_Пользователя(Режим)
+  if (Режим == UFN_PANEL_INPUT)
+    // функция вызвана из панели ввода объекта
+  end;
+  if (Режим == UFN_PANEL_EDIT)
+    // функция вызвана из панели корректировки объекта  
+  end;
+  if (Режим == UFN_SCROL)
+    // функция вызвана из панели скроллинга, единичный вызов (read-only)  
+  end;
+
+  return 0;
+end;
+*/
+
+/* Хинты */
+
+// а) списки по шагу
+private const Hint_ByStep:string = "/*+FIRST_ROWS LEADING(oprstep oproper t pmpaym pmrmprop prop2) INDEX(oprstep doprstep_dbt_idx10) INDEX(t dpmprop_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(oprstep oproper t pmpaym pmrmprop prop2)*/";
+// б) списки по статусу свойств
+private const Hint_ByPropStatus:string = "/*+FIRST_ROWS LEADING(t pmpaym pmrmprop prop2 oproper oprstep) INDEX(t dpmprop_dbt_idx4) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(oprstep doprstep_dbt_idx0) USE_NL(t pmpaym pmrmprop prop2 oproper oprstep)*/";
+// в) списки по статусу свойств, где документов слишком много, и необходима фильтрация по дате
+// в1) Если фильтрация по дате значения
+private const Hint_ByValueDate:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dpmprop_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep)*/";
+// в2) Если фильтрация по ДПП
+private const Hint_ByTransferDate:string = "/*+FIRST_ROWS LEADING(t pmpaym pmrmprop prop2 oproper oprstep) INDEX(t dpmprop_dbt_idx1) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(oprstep doprstep_dbt_idx0) USE_NL(t pmpaym pmrmprop prop2 oproper oprstep)*/";
+// в3) Если фильтрация по дате закрытия
+private const Hint_ByCloseDate:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dpmprop_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep)*/";
+// г) списки по статусу платежа
+private const Hint_ByPaymStatus:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep) INDEX(pmpaym dpmpaym_dbt_idx16) INDEX(t dpmprop_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+
+  /* Возможные значения ScrolStates:
+  PM_OUTALL_SCR         = 0,  // Список всех начальных платежей
+  PM_READY_TO_DISCH_SCR = 1,  // Готовые к отправке 
+  PM_DISCHARGED_SCR     = 2,  // Выгруженные из АРМ
+  PM_UPLOADED_SCR       = 3,  // Все отправленные корреспонденту
+  PM_DEFECTED_SCR       = 4,  // Отбракованные адресатом
+  PM_OUT_UNKVIT_SCR     = 5,  // несквитованные платежи
+  PM_OUT_CARDFILE_SCR   = 6,  // Документы на картотеках к корсчетам
+  PM_UNFINISHED_SCR     = 7,  // Помещенные в незавершенные
+  PM_RETFROMFRONT_SCR   = 8,   // Список возвращенных из фронт-офиса платежей
+  PM_OUT_REJECTED_WORK_SCR  = 9,  // список обрабатываемых отвергнутых платежей
+  PM_OUT_REJECTED_SCR       = 10, // список отвергнутых платежей
+  PM_FINISHED_SCR           = 11, // Платежи с завершенной обработкой (закрытые)
+  PM_PLANED_SCR             = 12, // Список планируемых платежей 
+  PM_FOR_POSITIONING_SCR    = 13, // Для позиционирования   
+
+  */
+
+  SetGlobalParameter("ScrolStatesForFM",ScrolStates); // KS 03.10.2012 C-14283 Сохраним в каком скроллинге мы
+
+  if( ( ScrolStates ==  2 ) or   /* Выгруженные в фронт-офис   */
+      ( ScrolStates ==  3 ) or   /* Все отправленные           */
+      ( ScrolStates ==  4 ) or   /* Отбракованные адресатом    */
+      ( ScrolStates ==  6 ) or   /* На картотеках к корсчетам  */
+      ( ScrolStates ==  9 ) or   /* Обработка отвергнутых      */
+      ( ScrolStates == 10 ) or   /* Отвергнутые                */
+      ( ScrolStates == 12 ) )    /* Планируемые                */
+    
+    return Hint_ByPropStatus;
+  
+  elif ( ScrolStates == 7 )      /* Помещенные в незавершенные */
+  
+    return Hint_ByPaymStatus;
+  
+  elif ( ( ScrolStates == 1 ) or /* Готовые к выгрузке  */
+         ( ScrolStates == 5 ) or /* Несквитованные */
+         ( ScrolStates == 8 ) or /* Список возвращенных из фронт-офиса платежей */
+         ( ScrolStates == 13) )  /* Для позиционирования */
+    
+    return Hint_ByStep;
+  
+  elif( ( ScrolStates == 11 ) or /* Закрытые */
+        ( ScrolStates ==  0 ) )  /* Все */
+
+    var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+    if( dtflt.IsSet( DTFL_TRANSFERDATE ) )
+      return Hint_ByTransferDate;
+    elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+      return Hint_ByValueDate;
+    elif( dtflt.IsSet( DTFL_CLOSEDATE ) )
+      return Hint_ByCloseDate;
+    else
+      return Hint_ByPropStatus;
+    end;
+
+  end; 
+  return DefaultHint;
+
+END;
+
+macro Функция_Пользователя(Режим)
+
+  var PaymentObj:Rsbpayment=Rsbpayment(curPmpaym.paymentId);
+  var cmd, rs, i, PK, tpschem, sql;
+  array mn;
+  array FlgPM, FlgRM, FlgCP;
+
+  Macro IsOperInGroup(oper, group)
+    var SQL, cmd, rs;
+    SQL = "SELECT 1 FROM DACSGROUPOPER_DBT WHERE t_oper = ? and t_groupid = ?";
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("", RSDBP_IN, oper);
+    cmd.AddParam("", RSDBP_IN, group);
+    cmd.Execute();
+    rs = RsdRecordSet(cmd);
+    if(rs.MoveNext())
+      return true;
+    end;
+    return false;
+ end;
+
+  if (Режим == UFN_PANEL_INPUT)
+    // функция вызвана из панели ввода объекта
+  end;
+  if (Режим == UFN_PANEL_EDIT)
+    // функция вызвана из панели корректировки объекта  
+  end;
+  if (Режим == UFN_SCROL)
+    // функция вызвана из панели скроллинга, единичный вызов (read-only)  
+  end;
+  if (Режим == UFN_SCROL_FMASS)
+    // функция предобработки массового режима
+  end;
+  if (Режим == UFN_SCROL_NMASS)
+    // функция обработки массового режима
+  end;
+  if (Режим == UFN_SCROL_LMASS)     // функция постобработки массового режима
+    if (m == 6) 
+       /* EVG 17/8/2015 Добавил передачу параметра для печати в Excel*/
+       /*VDN 18.08.2015 Реализовано в макросе отчета!!!, хватит перезатирать макросы*/
+       execMacroFile ("rep_corschem.mac", "printDocuments", subStr(docs, 1, strLen(docs) - 3) ); 
+       /*execMacroFile ("rep_corschem.mac", "printDocuments", subStr(docs, 1, strLen(docs) - 3), needExcel );*/
+       docs = ""; 
+    end;
+  end; 
+
+  /*01.04.2015 Chesnokov D.S. По заявке C-31920 добавил обработку массового выделения*/
+  if (Режим == UFN_SCROL_FMASS)
+    mn(asize(mn))="Контроль дублирования документов";
+    mn(asize(mn))="Контроль задвоенных внешних списаний";
+    mn(asize(mn))="Контроль операций нерезидентов";
+    mn(asize(mn))="Нечеткий поиск";
+    mn(asize(mn))="Документы не прошедшие авто-контроль";
+    mn(asize(mn)) = "Массовая установка кода ФМ и заполнение descr";
+    mn(asize(mn)) = "Печать реестра";
+    mn(asize(mn)) = "Массовая выгрузка в Клиент-банк Рос. Кап.";
+    mn(asize(mn)) = "Массовая выгрузка в Клиент-банк СКБ";
+    /*** отрисовываем меню ***/
+    m=menu(mn, null, "Выберите массовое действие");
+
+    if (m < 0)
+      return 1;
+    elif (mn(m) == "Контроль дублирования документов")
+      cdoubl();
+    elif (mn(m) == "Контроль задвоенных внешних списаний")
+      doubl();
+    elif (mn(m) == "Контроль операций нерезидентов")
+      outall();
+    elif (mn(m) == "Нечеткий поиск")
+      execmacrofile("fm_terr_uor.mac", "fm_run", GetGlobalParameter("ScrolStatesForFM",false));
+    elif (mn(m) == "Документы не прошедшие авто-контроль")
+      execmacrofile("ExecPmDocs_Report.mac", "Not_Control_Payment");
+    elif (mn(m) == "Массовая установка кода ФМ и заполнение descr")
+      return execMacroFile ("fm_inscode_mass.mac", "Dialog_mass");
+    // EVG 17/8/2015 Добавил вопрос
+    /*VDN 18.08.2015 Реализовано в макросе отчета!!!, хватит перезатирать макросы*/
+    /*elif( mn(m) == "Печать реестра" )
+      needExcel = true;
+      getTrue( needExcel, "Печатать в Excel?" );*/
+    
+    // Golovkin 24.08.2015 Выгрузка в РосКап
+    elif(mn(m) = "Массовая выгрузка в Клиент-банк Рос. Кап.")
+      return execMacroFile ("export1CRosCap.mac", "prepareToExport");
+
+    // DAI 21.04.2016 Выгрузка в СКБ
+    elif(mn(m) = "Массовая выгрузка в Клиент-банк СКБ")
+      if (_bank.is_EXV)
+        return execMacroFile ("export1CSKB.mac", "prepareToExport");
+      else
+        msgbox ("Реализовано только для ЭВ");
+        return 0;
+      end;
+    end;
+
+    return 0;
+  elif (Режим == UFN_SCROL_NMASS) // Обработка массового режима
+    if (InList(m,0,1,2,3,4))
+      msgbox("Выполнено успешно");
+    elif (m == 5) //Массовая простановка кода ФМ
+      return execMacroFile ("fm_inscode_mass.mac", "SetCodeAndDescr", Curpmpaym);          
+    
+    // Golovkin 24.08.2015 Выгрузка в РосКап
+    elif (m == 7) //Массовая выгрузка в РосКап.
+      return execMacroFile ("export1CRosCap.mac", "addPaymentForExport", Curpmpaym);
+
+    // DAI 21.04.2016 Выгрузка в СКБ
+    elif (m == 8) //Массовая выгрузка в СКБ")
+      if (_bank.is_EXV)
+        return execMacroFile ("export1CSKB.mac", "addPaymentForExport", Curpmpaym);
+      else
+        msgbox ("Реализовано только для ЭВ");
+        return 0;
+      end;
+
+    else
+      /*VDN 13.08.2015 Формируем строку ид платежей*/
+      if (m == 6) docs = docs + "p.t_paymentid = " + Curpmpaym.PaymentID + " OR "; end;
+      msgbox("Это не ошибка. Это заглушка массовой обработки. Что бы не пропало выделение записей в скролинге.");
+      return 1;
+    end;
+  elif (Режим == UFN_SCROL_LMASS) // Постобработка массового режима 
+    
+    // Golovkin 24.08.2015 Выгрузка в РосКап
+    if (m == 7)
+      return execMacroFile ("export1CRosCap.mac", "exportPayments");
+    // DAI 21.04.2016 Выгрузка в СКБ
+    elif (m == 8) 
+      if (_bank.is_EXV)
+        return execMacroFile ("export1CSKB.mac", "exportPayments");
+      else
+        msgbox ("Реализовано только для ЭВ");
+        return 0;
+      end;
+    end;
+
+    return 0;
+  else//обрабатываем остальные режимы
+
+    mn(asize(mn))="Контроль дублирования документов";
+    mn(asize(mn))="Контроль задвоенных внешних списаний";
+    mn(asize(mn))="Контроль операций нерезидентов";
+    mn(asize(mn))="Нечеткий поиск";
+    mn(asize(mn))="Документы не прошедшие авто-контроль"; // KS 20.09.2012 C-14283
+    mn(asize(mn))="Статистика по прохождению начального платежа";        // KS  1.10.2012 C-14283
+    mn(asize(mn))="Номер пачки";
+    mn(asize(mn))="Просмотреть сеанс отправки";
+    mn(asize(mn))="Редактировать примечания платежа";//по заявке A50141 (с) Diver
+    mn(asize(mn))="Вид платежа";
+    if (PaymentObj.PaymStatus == 32000)
+       mn(asize(mn))="Отправить сообщение ЕД 244 без запроса"; //Gurin S. 11.04.2013 C-18664-6
+       mn(asize(mn))="Формирование запроса ЕD243"; //Gurin S. 27.08.2013 C-21844-6
+    end;
+    //Gurin S. 17.08.2015 R-614396-2
+    if(Curpmcredit.PropStatus == 7300 /*В картотеке корсчета*/)
+       mn(asize(mn))="Возврат клиенту";
+       //Gurin S. 24.09.2015 R-620962-2
+       mn(asize(mn)) = "Изменение основания платежа";
+    end;
+    
+    //Gurin S. 06.03.2015 I-00555248-2
+    sql = execSqlSelect("select 1 from USR_ROBOT_PAYMENT_TMP where paymid = :id", makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+    if (sql.movenext()) 
+      mn(asize(mn))="Убрать с очереди автоматической обработки";
+    end;
+
+    i=menu (mn);
+
+    if (i < 0)
+      return 1;
+    elif (mn(i) == "Контроль дублирования документов")
+      cdoubl();
+    elif (mn(i) == "Контроль задвоенных внешних списаний")
+      doubl();
+    elif (mn(i) == "Контроль операций нерезидентов")
+      outall();
+    elif (mn(i) == "Нечеткий поиск")
+    // KS 03.10.2012 C-14283 Прочитаем в каком скроллинге мы
+    //execmacrofile("fm_terr_uor.mac", "fm_run");
+      execmacrofile("fm_terr_uor.mac", "fm_run", GetGlobalParameter("ScrolStatesForFM",false));
+    elif (mn(i) == "Документы не прошедшие авто-контроль") // KS 20.09.2012 C-14283
+      execmacrofile("ExecPmDocs_Report.mac", "Not_Control_Payment");
+    elif (mn(i) == "Статистика по прохождению начального платежа") // KS  1.10.2012 C-14283
+      execmacrofile("rep_paym_other_bank.mac", "GetPayments", PaymentObj.PaymentID, 1);
+    elif (mn(i) == "Номер пачки")
+      NUMBERPACK(paymentObj.paymentID,PaymentObj.NumberPack);
+    elif (mn(i) == "Просмотреть сеанс отправки")
+      rs = RsdRecordSet(
+                        " Select  ses.t_number , mes.t_MESID, mes.t_outsideabonentdate "+           
+                        "  From DWlPm_dbt wlp, DWlMesLnk_dbt lnk, DWlMes_dbt mes, dwlsess_dbt ses "+
+                        "  Where wlp.t_PaymentID = "  +paymentObj.paymentID+
+                        "    and lnk.t_ObjKind   = '501' "+                                         
+                        "    and lnk.t_ObjID     = wlp.t_WlPmID "+                                  
+                        "    and mes.t_MesID     = lnk.t_MesID "+                                   
+                        "    and ses.t_SessionID = mes.t_SessionID"
+                       );
+      if (rs.MoveNext())
+        msgbox("Платёж был отправлен "+rs.Value(2)+" сеансом №"+rs.Value(0)+". ID сообщения в сеансе  "+rs.Value(1)); 
+      else
+        msgbox ("Платеж ещё не отправлен");
+      end;
+    elif (mn(i) == "Редактировать примечания платежа")
+      if (ВходитВГруппу({oper},170)) //170 - "Правка примечаний платежа"
+        ВывестиПримечанияНаРедактирование(paymentObj.paymentID); 
+      else
+        msgbox("Вы не включены в группу \"Правка примечаний платежа\" ");
+      end;
+    elif (mn(i) == "Вид платежа")
+      FlgRM[PNRMPM_KIND1]          = 1;
+      FlgRM[PNRMPM_SHIFR]          = 1;
+      FlgRM[PNRMPM_PACK]           = 1;
+      if (PM_ProcessPanel(PaymentObj, 1, null, FlgRM))
+        return 1;
+      end;
+      NUMBERPACK(PaymentObj.paymentID,PaymentObj.NumberPack,1);
+
+      rs = RsdCommand("update dpmrmprop_dbt p set p.t_paymentkind = '"+PaymentObj.PaymentKind+"' where p.t_paymentid = "+paymentObj.paymentID);
+      rs.Execute();
+
+      Curpmpaym.NumberPack    = PaymentObj.NumberPack;
+      Curpmrmprop.PaymentKind = PaymentObj.PaymentKind;
+
+      return UPDTPAGE; 
+
+    //Gurin S. 11.04.2013 C-18664-6
+    elif (mn(i) == "Отправить сообщение ЕД 244 без запроса")
+      //execmacrofile("uf_answer_norequest.mac", "uf_answer_norequest", PaymentObj.PaymentID);
+      uf_answer_norequest(PaymentObj.PaymentID);
+    //Gurin S. 27.08.2013 C-21844-6
+    elif (mn(i) == "Формирование запроса ЕD243")
+      UF_Request.CreateRequest(PaymentObj.PaymentID); 
+    //Gurin S. 17.08.2015 R-614396-2
+    elif (mn(i) == "Возврат клиенту")
+      rs = RsdCommand("update dpmpaym_dbt p set p.t_futurereceiveraccount = '"+PaymentObj.PayerAccount+"' where p.t_paymentid = "+paymentObj.paymentID);
+      rs.Execute();
+      msgbox("Выполнено. Списывайте документ.");
+      return UPDTPAGE; 
+    //Gurin S. 24.09.2015 R-620962-2
+    elif (mn(i) == "Изменение основания платежа")
+      main(PaymentObj.PaymentID);
+      return UPDTPAGE;  
+    //Gurin S. 06.03.2015 I-00555248-2
+    elif (mn(i) == "Убрать с очереди автоматической обработки")
+      execSql("delete from USR_ROBOT_PAYMENT_TMP where paymid = :id", makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+    end;
+  end;
+  return 0;
+end;

@@ -1,0 +1,306 @@
+  /***************************************************************************************************************
+   Имя файла..:       CassCarrys.mac
+   Назначение.:       Отчет по кассовым платежам в разрезе клиентов
+   Заявка.....:       R-581021
+   Дата.......:       15.05.2015
+   Автор......:       DPN                        
+****************************************************************************************************************/
+  import RSD, "ldmklbr.mac", "fg_Life_parm.mac", "KeyCodes.mac", globals, activeX, lib_sqltools, RCW, Rsexts;
+  var StatusBar = "F2 Выполнить ESC Выход"; 
+  var startDate;
+  var endDate;
+  FILE f_rep_out() txt;
+
+  private Class Report (beginDate, endDate, amount)
+    var beginDateReport = beginDate;
+    var endDateReport   = endDate  ;
+    var amountReport    = amount   ;
+
+    private var myWorkBook;
+    private var myWorkExcel;
+    private var myWorkSheet;
+    var numSheet = 1;
+
+    private var myRecord = null;
+
+    private var myFileName = "CassCarrys" + Date();
+    private var cntRecord = 0;
+
+    /*Определение рабочей директории временных файлов*/
+    private macro GetWorkDirName() : string
+      var DirName:string = "", 
+          StrErr :string = "";
+
+      GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, DirName, StrErr );        
+      if( DirName )     
+        if( SubStr(DirName, 1, 1) == "." ) DirName = "$" + GetCurDir(TRUE) + replace (DirName, "..",""); end;     
+        if (existFile(DirName))  return DirName;  end;
+      end;
+
+      DirName = "$" + GetEnv("TEMP");
+
+      if( NOT DirName ) DirName = "$" + GetEnv("TMP"); end;
+      if (existFile(DirName)) return DirName; end;
+
+      msgbox("Ошибка поиска папки для временных файлов на терминале");
+
+      return "";
+    end;
+
+    /*Копирование файла на терминал*/
+    private macro myCopyFile (Name_file)
+      var Templs_Dir_Term = GetWorkDirName();
+
+      var TermFileName = toAnsi(Name_file);
+      var SPFileName;
+
+      if ( Templs_Dir_Term == "" )  return "";  end;
+      SPFileName = "..\\txtfile\\" + Name_file;
+
+      if (not existFile(SPFileName)) MsgBox(string("Транспортный временный файл не найден: |", SPFileName)); return ""; end;
+      if( not CopyFile(SPFileName, Templs_Dir_Term + "\\" + TermFileName) ) RunError("Ошибка при передаче файла на терминал\n" + Templs_Dir_Term + "\\" + TermFileName); end;
+
+      return subStr(Templs_Dir_Term + "\\" + TermFileName, 2);      
+    end;
+
+    /*Определение формата загружаемых данных*/
+    private macro SetTypeColumns();
+      var result_arr = TArray(true), i;
+ 
+      for(i, 1, 10)
+        var templs_arr = TArray(true);         
+        templs_arr(0) = i;
+        templs_arr(1) = 2;
+
+        result_arr(i - 1) = templs_arr;
+      end; 
+
+      return result_arr;
+    end;
+
+    /*Поиск "плохих" символов*/
+    private macro ClearSymble(str, split_char)
+      str = StrSubst(str, strfor(13), "" );
+      str = StrSubst(str, strfor(10), "" );
+      str = StrSubst(str, split_char, " ");
+      return string(str);   
+    end;
+
+    /*Формирвоание выборки данных*/
+    private macro FullRecord() 
+       initprogress(-1, "", "Ожидайте, формируется выборка");
+       startQueryCapture ();
+       [
+           select date_carry, t_number, date_pay, p_ac, r_ac, amount,  LISTAGG(symb, ', ') WITHIN GROUP (ORDER BY symb) symb, ground, nvl(decode(substr(p_ac, 1,5), 20202, r_name, p_name), ' ') name, 
+                  nvl(decode(substr(p_ac, 1,5), 20202, r_inn, p_inn), ' ') inn 
+            from(   select  TO_CHAR(trn.t_date_carry, 'dd.mm.yyyy') date_carry,  prop.t_number, TO_CHAR(paym.t_valuedate, 'dd.mm.yyyy') date_pay,
+                    paym.t_payeraccount p_ac, paym.t_receiveraccount r_ac,  trn.t_sum_natcur amount, SYMB.T_SYMBOL symb, SYMB.T_KIND, trn.t_ground ground,  PRT_p.T_NAME p_name, prt_r.t_NAME r_name,
+                    decode(prt_p.t_legalform, 2,(SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = prt_p.t_partyid), 
+                                                (SELECT TO_CHAR(t_code) FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = prt_p.t_partyid))p_inn, 
+                    decode(prt_r.t_legalform, 2,(SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = prt_r.t_partyid), 
+                                                (SELECT TO_CHAR(t_code) FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = prt_r.t_partyid)) r_inn
+                    FROM dpmpaym_dbt paym, dpmdocs_dbt docs, dacctrn_dbt trn,   dpmrmprop_dbt prop, dsymbcash_dbt symb, DPARTY_DBT prt_p, DPARTY_DBT prt_r
+                    where paym.t_paymentid = docs.t_paymentid
+                    and paym.t_paymentid = prop.t_paymentid
+                    AND docs.t_acctrnid = trn.t_acctrnid
+                    and SYMB.T_ACCTRNID = TRN.T_ACCTRNID        
+                    AND prt_P.t_partyid(+) = paym.t_payer
+                    AND prt_r.t_partyid(+) = paym.t_receiver
+                    AND trn.t_sum_natcur >= :amount
+                    AND (SUBSTR (trn.t_account_receiver, 1, 5) = ('20202')
+                         OR SUBSTR (trn.t_account_payer, 1, 5) = ('20202'))
+                    AND trn.t_date_carry BETWEEN :date_begin AND  :date_end
+        
+                )  general
+            group by date_carry, t_number, date_pay, p_ac, r_ac, amount, ground,  p_name, r_name, p_inn, r_inn
+            order by amount
+      ];
+
+       var cmd = RsdCommand (endQueryCapture ());
+       cmd.addParam ("amount",     RSDBP_IN, amountReport   );
+       cmd.addParam ("date_begin", RSDBP_IN, beginDateReport);
+       cmd.addParam ("date_end",   RSDBP_IN, endDateReport  );
+        
+       myRecord = RsdRecordSet(cmd);
+       remprogress;
+
+     OnError(er)
+       msgBox(er.Message);
+     end;
+      
+    /*Формирование и открытие файла Excel*/
+    private macro OpenExcel()
+      private var objectXls, WorkExcel;
+
+      objectXls = CreateObject ("rsax", "TRsAxServer", string("RsAxServer", UserNumber()), IsStandAlone());
+      WorkExcel = objectXls.CreateComObject ("Excel.Application"); 
+
+      myWorkExcel = WorkExcel;
+
+      return true;
+
+    OnError(er)
+      msgbox(er.Message); 
+      return false;
+    end;
+
+    /*Заполнение заголовков столбцов, формирование сетки таблицы*/
+    private macro SetHeaderExcelTable()
+      var i; 
+      myWorkBook.Sheets(numSheet);
+      myWorkSheet = myWorkBook.ActiveSheet();
+
+      myWorkSheet.Cells(1, 1).Value  = "Дата операции";
+      myWorkSheet.Cells(1, 2).Value  = "Номер документа";
+      myWorkSheet.Cells(1, 3).Value  = "Дата документа";
+      myWorkSheet.Cells(1, 4).Value  = "Счет плательщика";
+      myWorkSheet.Cells(1, 5).Value  = "Счет получателя";
+      myWorkSheet.Cells(1, 6).Value  = "Сумма в рублях или рублевом эквиваленте";
+      myWorkSheet.Cells(1, 7).Value  = "Кассовый символ";
+      myWorkSheet.Cells(1, 8).Value  = "Основание";
+      myWorkSheet.Cells(1, 9).Value  = "Наименование плательщика (для ФЛ - ФИО, для ЮЛ - наименование ЮЛ)";
+      myWorkSheet.Cells(1, 10).Value = "Идентификатор плательщика (для ФЛ - год рождения, для ЮЛ, ИП - ИНН)";
+     
+     myWorkSheet.Cells(1, 1).ColumnWidth = 12;
+     myWorkSheet.Cells(1, 2).ColumnWidth = 12;
+     myWorkSheet.Cells(1, 3).ColumnWidth = 12;
+     myWorkSheet.Cells(1, 4).ColumnWidth = 20;
+     myWorkSheet.Cells(1, 5).ColumnWidth = 20;
+     myWorkSheet.Cells(1, 6).ColumnWidth = 20;
+     myWorkSheet.Cells(1, 7).ColumnWidth = 9;
+     myWorkSheet.Cells(1, 8).ColumnWidth = 50;
+     myWorkSheet.Cells(1, 9).ColumnWidth = 50;
+     myWorkSheet.Cells(1, 10).ColumnWidth = 50;
+    
+     
+      for (i, 1, 10)
+        myWorkSheet.Cells(1, i).HorizontalAlignment = 3;
+        myWorkSheet.Cells(1, i).Font.Bold = true; 
+        
+        
+      end; 
+
+      myWorkSheet.Range("A1:J" + (cntRecord + 1)).Borders.Weight = 2;  
+      myWorkSheet.Range("A1:J1").Interior.Color = #B5B5B5;
+      myWorkSheet.Cells(1,1).WrapText = true;
+      myWorkSheet.Cells(1,2).WrapText = true;
+      myWorkSheet.Cells(1,3).WrapText = true;
+      myWorkSheet.Cells(1,4).WrapText = true;
+      myWorkSheet.Cells(1,5).WrapText = true;
+      myWorkSheet.Cells(1,6).WrapText = true;
+      myWorkSheet.Cells(1,7).WrapText = true;
+      myWorkSheet.Cells(1,8).WrapText = true;
+      myWorkSheet.Cells(1,9).WrapText = true;
+      myWorkSheet.Cells(1,10).WrapText = true;
+                                                                                                 	
+      return true;
+
+     OnError
+       return false;
+     end;     
+
+     /*Запись данных в временный файл*/
+     macro SetToFile()
+       FullRecord();
+       initprogress(-1, "", "Ожидайте, идет запись данных");
+       setoutput("..\\txtfile\\" + myFileName); 
+
+       var separator = "┼";
+       println(separator);
+
+       while (myRecord.MoveNext())
+         var text = "", i;
+
+         for (i, 1, 10) text = text + ClearSymble(string(myRecord.value(i - 1)), "┼") + separator; end;
+         println(text);
+
+         cntRecord = cntRecord + 1;
+         useprogress(cntRecord);
+       end;
+
+       setoutput(null, true);       
+       remprogress;
+     end;
+
+     /*Копирование данных в файл Excel*/
+     macro CopyValueToExcel()
+       initprogress(-1, "", "Подготовка файла Excel");
+       myFileName = myCopyFile(myFileName); 
+
+       if ( OpenExcel() and  myFileName != "")      
+          	
+         myWorkExcel.Workbooks.OpenText (myFileName, 866, 1, 1, 2, false, false, false, false, false, true, "┼", SetTypeColumns(), 1, "."," ", true, false);
+         myWorkBook = myWorkExcel.Workbooks.Application;
+
+         SetHeaderExcelTable();
+         
+        // MsgBox("Файл успешно записан");
+         myWorkExcel.Visible = true;
+       end;         
+       remprogress;
+     OnError(er)
+       msgBox(er.Message);
+     end;     
+  end;/*End class Report*/  
+
+  Class (TRecHandler) TParm(LbrName)    
+     InitTRecHandler ("statCB", (LbrName), true);    
+     Macro Handler (dlg, cmd, id, key)            
+       if (cmd == DLG_KEY)	
+         if (KEY == KEY_F2)
+           debugbreak;
+           var myReport = Report(dlg.("BeginDate"), dlg.("EndDate"), dlg.("Amount"));               
+               myReport.SetToFile();
+               myReport.CopyValueToExcel();                   
+  
+         elif (KEY == KEY_ESC) return CM_CANCEL; end;
+        end; 
+     End;
+     
+     Macro Run 
+        return RunDialog (this, R2M (this, "Handler"));  
+     End;
+  End; 
+
+  Macro MyPanel( lbr )    
+     var rc = lbr.AddPanel( "statCB", 40, 10, 30, 5, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+     rc.Title = "Настройка отчета";
+     rc.StatusLine = StatusBar;
+    
+     elem = rc.AddFrame(0, 0, 30, 6, 2);
+     elem = rc.AddLabel( 1, 1, "Начало периода:");
+     elem = rc.AddField( 19, 1,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "BeginDate", 10, 1);
+     elem = rc.AddLabel( 1, 2, "Конец  периода:");
+     elem = rc.AddField( 19, 2,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "EndDate", 10, 1); 
+     elem = rc.AddLabel( 1, 4, "Сумма, от:");
+     elem = rc.AddField( 14, 4,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DOUBLE, "Amount", 15, 1);        
+  end;
+
+  Macro MyLbr
+    var Fulloutputlbr, outputlbr = "statCBOperation.lbr", outlbr, lbr;
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, outlbr);
+    Fulloutputlbr = outlbr + "\\" + outputlbr;
+    lbr = TLbrFile( Fulloutputlbr, "C" );
+    MyPanel( lbr );
+
+    lbr.Save(); 
+    lbr = NULL;
+    return Fulloutputlbr;
+  end;
+
+  /********************Точка входа***********************/
+  private var LbrName, Parm;
+  LbrName = MyLbr();
+
+  Parm = TParm(LbrName);
+
+  Parm.rec.BeginDate  = Date() - 365;
+  Parm.rec.EndDate    = Date();
+  Parm.rec.Amount     = 300000.00; 
+
+  if( not Parm.Run() )
+     Parm = null;
+     DelFile(LbrName);
+     Exit (1);
+  end;
+end;

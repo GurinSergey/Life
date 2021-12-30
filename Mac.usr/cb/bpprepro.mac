@@ -1,0 +1,452 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29014 - "Предобработка платежа банка"
+// Шаг      : 10    - "Предобработка"
+// Описание : Макрос шага
+// Изменил  : Gurin S. 23.10.2012 C-13369 
+//            Gurin S. 24.12.2012 C-15920-5
+//            Gurin S. 31.01.2013 по звоноку Вараксина 
+//            Gurin S. 14.03.2013 R-162484-2
+//            Gurin S. 18.03.2013 переход на inList
+//            Gurin S. 20.03.2013 I-00343485-2 Go против 60312*
+//            zip_z.   27.03.2013 C-16618
+//            Gurin S. R-174187-2 02.04.2013 (неверно открыли счет, поэтому делаем исключение для Ульновска)
+//            Gurin S. 20.05.2013 R-192398-2
+//            KS 26.11.2013 Адаптация под 31ю сборку
+//            RR 10.02.2014 Приватим PaymentObj
+//            Jushmanov 2014-02-20 C-19151 Логгирование массово выполненных шагов
+//            TAM       06.03.2015 C-37632 - позиционирование на схему Саратова, платежей на Сбер
+//            TAM          09.07.2015 C-39202: отмена шага контроля
+//            RR 15.12.2015 Доработки в соответствии с R-631562
+//            VDN 04.02.2016 R-638289
+//-----------------------------------------------------------------------------
+import PaymInter, pmdefbo, bpchkrst, pmterror;
+import pm_syscont, pmchk117, pmprepromass, FrontCommon, FrontRoute, pbp, Commisslib, naVK, AvtoCode, SetVOStaff, 
+       lib_const, lib_compare, lib_pm_check;
+import OprInter, oralib; //Jushmanov 2014-02-20 C-19151
+import lib_fg;
+
+private var PaymentObj:RsbPayment;
+
+MACRO ExecuteStep( doc, paymDoc )
+   var stat:integer = 0;
+   var obj:object;
+   var AcNer, errAn, StatBank;
+   debugbreak;
+
+   if( stat == 0 )
+      //TAM 13.02.2015 C-34990
+      if((PaymentObj.dockind == DLDOC_BANKPAYMENT) and
+         (substr(PaymentObj.ReceiverAccount, 1, 5) == "40822"))
+         //проверка на длину в 25 знаков
+         if(StrLen(trim(PaymentObj.UIN)) != 25)
+            msgbox("Заполните поле <КОД> значением в 25 знаков");
+            return 1;
+         //проверку прошёл, проверяем ключ
+         else
+            if(not Check_UIN_Control_Key("40822", substr(trim(PaymentObj.UIN), 1, 16)))
+               msgbox("Контрольный ключ УИН не верен");
+               return 1;
+            end;
+         end;
+      end;
+      
+      /* EVG Заполнение параметров, необходимых для валютного контроля */
+      if ( strLen (ReadNoteForPayment (PaymentObj.paymentID, PM_USR_NOTEKIND_VO_CODE)) == 0 )
+          InsertNoteForPayment(PaymentObj.paymentID, PM_USR_NOTEKIND_VO_CODE, VK_PLACEHOLDER_STRING);
+      end;
+    
+      УстановитьКодВОиПаспортСделкиИзПримечания( PaymentObj );
+      UpdateNRCountryInPaymetnCat( PaymentObj, PaymentObj.Payer, PM_USR_CAT_COUNTRY_SEND );
+      UpdateNRCountryInPaymetnCat( PaymentObj, PaymentObj.Receiver, PM_USR_CAT_COUNTRY_RECV );
+    
+      if( PaymentObj.DocKind == BBANK_CPORDER )
+         obj = GenObject( "RsbBbCpOrder", PaymentObj.DocumentID );
+      elif( PaymentObj.DocKind ==  DLDOC_BANKPAYMENT )
+         obj = GenObject( "RsbBankPayment", PaymentObj.DocumentID );
+      end;
+
+      if (PaymentObj.BaseFiid == NATCUR)  
+         if(ПользовательскиеПроверкиПредобработки(PaymentObj,StatBank))                   
+            PaymentObj.PaymStatus = PM_REJECTED;
+            PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_REJECTED ); 
+            stat = УстановитьСтатусыПлатежа(OPR_PAYM_STATE,OPR_PM_ST_REJECT);  
+            return 0;
+         end;
+      end;
+
+      //Контроль
+      if( ( PaymentObj.Origin == PAYMENT_OR_AUTO ) and ( not ДокументПорожденВходящимЭСИД( PaymentObj.PaymentID ) ) )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+      else
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL );
+      end;
+    
+      if ( strLen(PaymentObj.FutureReceiverAccount) == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+      end;
+    
+      if((inList(Obj.Origin,USR_PAYMENT_OR_FRONT_IND,USR_PAYMENT_OR_DEK_CASH_1,USR_PAYMENT_OR_FRONT_DEK) or 
+         (inList(Obj.Origin,0,USR_PAYMENT_OR_FRONT_CASH) and _bank.is_PRBB ) )  and (Obj.Payment.BaseFiid == NATCUR))
+         // Gurin S. 24.12.2012 C-15920-5 add  60312*
+         // TAM 17.06.2014 C-30388 - добавляются для выгрузки без контроля счета 40817*60310 и 47422*60310
+         if( (stringEqMask(PaymentObj.PayerAccount,"40911*, 42301*, 42601*, 40820*, 40817810*60310, 47422810*60310") or 
+             (stringEqMask(PaymentObj.PayerAccount,"60312*") and not _bank.is_GO) or
+             (stringEqMask(PaymentObj.PayerAccount,"30232810?010700*") and _bank.is_VUZ)) and //Gurin S. 17.07.2015 R-605137-2
+            (PaymentObj.IsExternal) ) 
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+         end;
+      end;
+
+      //Gurin S. 18.09.2014 C-32743-7 Для Банков - ПРББ, ВУЗ, Э-В Саратов, Э-В Волгоград, ГЭБ, Солид
+      if ((Obj.Origin == USR_PAYMENT_OR_FRONT_IND) and (Obj.Payment.BaseFiid == NATCUR) 
+           and (_bank.is_PRBB or _bank.is_VUZ or _bank.is_EXV_Saratov or _bank.is_EXV_Volgograd or _bank.is_GEB or _bank.is_SLD))
+         if (stringEqMask(PaymentObj.PayerAccount,"60311810*") and (PaymentObj.IsExternal))
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+         end;
+      end;
+
+      if(inList(Obj.Origin,USR_PAYMENT_OR_FRONT_IND,USR_PAYMENT_OR_DEK_CASH_1,USR_PAYMENT_OR_FRONT_DEK) and (Obj.Payment.BaseFiid == NATCUR) 
+         and (_bank.is_EXV))
+         if( stringEqMask(PaymentObj.PayerAccount,"30232*") and (PaymentObj.IsExternal) )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+         end;
+      end;
+
+      if (((Obj.Origin == USR_PAYMENT_OR_DIASOFT) or InList(PaymentObj.NumberPack,1220,373,1228,1221))//Gurin S. 20.05.2013 R-192398-2 add 1221 пачку
+         and (_bank.is_GO))
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );       
+      end;
+    
+      // Gurin S. 23.10.2012 C-13369
+      // 2013-03-27 zip_z. C-16618 : + "ELC", "INQ", "EDC", "IDC"
+      var Number_First3Chars = StrUpr(SubStr(PaymentObj.Number,1,3));
+      if ((Obj.Origin == USR_PAYMENT_OR_FRONT_LEG) and (PaymentObj.DocKind == BBANK_CPORDER) and (inList (Number_First3Chars, "ILC", "ELC", "INQ", "EDC", "IDC")))
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+      end;
+    
+      if((Obj.Origin == USR_PAYMENT_OR_FRONT_IND) and (PaymentObj.DocKind == DLDOC_BANKPAYMENT))
+         // zip_z.: красавцы...
+         //Gurin S. 02.04.2013 R-174187-2
+         if ((stringEqMask(PaymentObj.PayerAccount, "40912810?0*0060043, 40913810?0*0060043") 
+                       or (PaymentObj.PayerAccount == "40912810650000060043" and _bank.is_EXV_Ulyanovsk))
+            and ((_bank.is_EXV_Saratov   and PaymentObj.FutureReceiverAccount == "30102810300000000091") or
+                 (_bank.is_EXV_Voronezh  and PaymentObj.FutureReceiverAccount == "30102810100000000755") or          
+                 (_bank.is_EXV_Volgograd and PaymentObj.FutureReceiverAccount == "30102810701000000007") or
+                 (_bank.is_EXV_Stavropol and PaymentObj.FutureReceiverAccount == "30102810000000070756") or
+                 (_bank.is_EXV_Ulyanovsk and PaymentObj.FutureReceiverAccount == "30102810050000000902")))
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+         end;
+      end;
+
+      //TAM 09.07.2015 C-39202: отмена шага контроль
+      if ((Obj.Origin == USR_PAYMENT_OR_FRONT_IND) and 
+          PaymentObj.IsExternal and 
+          (PaymentObj.oper == 20028) and
+          stringEqMask(PaymentObj.PayerAccount, "407*, 408*"))
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+      end;
+
+      //VDN 04.02.2016 R-638289
+      if ( (obj.origin == USR_PAYMENT_OR_FRONT_IND) and 
+            paymentObj.isExternal and 
+            stringEqMask(paymentObj.payerAccount, "40817*, 40820*, 423*") and
+            inList (true, _bank.is_EXV_Saratov, _bank.is_EXV_Volgograd)
+         )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+      end;
+
+      //RR 15.12.2015 Все условия ниже
+      var UIN_NEED_FILL = "Необходимо заполнение Уникального Индентификатора Платежа в поле <КОД>";
+      var KPP_NEED_FILL = "Необходимо заполнить КПП получателя";   
+      debugbreak;
+
+      //RR Временная заглушка
+      if (_bank.is_VUZ)
+        if (    (PaymentObj.dockind == DLDOC_BANKPAYMENT)
+            and (inList(Obj.Origin, PSPO_OR_MANUAL, PSPO_OR_CLB, USR_PAYMENT_OR_ABBYY_FC))
+           )
+          /* При заведении платежа, установить контроль и запрет на сохранение и проведение  платежа, 
+             если счет получателя 40101*, КБК (поле 104) в разрядах с 4 по 9 содержат набор цифр 116300 (это штрафы ГИБДД), 
+             и при этом поле 22 пустое или <0>. При попытке сохранить и провести такой  платеж, должно выдаваться сообщение 
+             <Необходимо заполнение Уникального идентификатора платежа> в поле <код>. */
+          if (ExecMacroFile("lib_pm_check.mac","CheckFillUIN", PaymentObj))
+            if (GetDialogFlag()) 
+              msgBox(UIN_NEED_FILL); 
+            end;
+            return УстановитьСтатусыПлатежа(OPR_PAYM_STATE,OPR_PM_ST_REJECT);
+          end;
+          /* Поставить контроль на обязательное заполнение КПП Получателя( поле 103), при заведении платежа, где счет получателя = 
+             40101*,40302*,40501????????2*,40601????????1*,40601????????3*,40701????????1*,40701????????3*,40503????????4*,40603????????4*,
+             40703????????4* (в соответствии с 383-П). При попытке сохранить и отправить  платеж  , без указания КПП должно выдаваться 
+             сообщение <Необходимо заполнить КПП Получателя. */
+          if (ExecMacroFile("lib_pm_check.mac","CheckFillKPP", PaymentObj))
+            if (GetDialogFlag()) 
+              msgBox(KPP_NEED_FILL); 
+            end;
+            return УстановитьСтатусыПлатежа(OPR_PAYM_STATE,OPR_PM_ST_REJECT);
+          end;
+          
+          if (   ((CompareStrWithMasks ("40101*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40302*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40302*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40501????????2*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40601????????1*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40601????????3*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40701????????1*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40701????????3*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40503????????4*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40603????????4*", PaymentObj.ReceiverAccount, 1)) == 0)
+              or ((CompareStrWithMasks ("40703????????4*", PaymentObj.ReceiverAccount, 1)) == 0))
+             if (GetDialogFlag()) 
+               if (not gettrue(false,"Вы уверены, что поле <КОД> заполнено верно?"))
+                 return УстановитьСтатусыПлатежа(OPR_PAYM_STATE,OPR_PM_ST_REJECT);
+               end;
+             end;
+          end;
+          
+        end;
+      end;
+      
+      //Направление
+      if( stat == 0 )
+         if( PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT );
+         else
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_INTERNAL );
+         end;
+         //TAM С-37632 05.03.2015 
+         //Gurin S. 25.08.2015 I-00580699-2 закомментировал
+         //if ((_bank.is_EXV_Volgograd or _bank.is_EXV_Voronezh or _bank.is_EXV_Stavropol) and
+         //    (PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) and 
+         //    (PaymentObj.BaseFiid == NATCUR) and
+         //    (PaymentObj.PaymentKind != "С") and //TAM 19.03.2015 
+         //    (IsPartyTheSberbank(PaymentObj.ReceiverBankID)))
+         //   var CorSchemId = 0,
+         //       TransportId = 0,
+         //       SchemaId = 0,
+         //       ReleaseId = 0;
+         //   if(GetMfrParamsForExvBank("046311808", TransportId, SchemaId, ReleaseId, CorSchemId))
+         //      PaymentObj.SetReceiverPI( PAYMENTS_GROUP_EXTERNAL, 
+         //                                PaymentObj.ReceiverBankID, 
+         //                                PaymentObj.ReceiverBankCodeKind, 
+         //                                PaymentObj.ReceiverBankCode, 
+         //                                PaymentObj.ReceiverBankName,
+         //                                PaymentObj.ReceiverBankCorrAcc,
+         //                                PaymentObj.ReceiverFIID, 
+         //                                PaymentObj.chapter,
+         //                                PaymentObj.ReceiverAccount, 
+         //                                null, 
+         //                                PaymentObj.ReceiverName, 
+         //                                PaymentObj.ReceiverINN,
+         //                                null,
+         //                                null,
+         //                                CorSchemId,
+         //                                PM_CORRPOS_TYPE_USER /* PM_CORRPOS_TYPE_SYSTEM*/);
+         //      PaymentObj.OutTransport = TransportId;
+         //      PaymentObj.OutTpSchem   = SchemaId;
+         //      PaymentObj.OutRlsForm   = ReleaseId;
+         //      stat = УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT );
+         //   end;
+         //end;
+      end; 
+               
+      //Уточнение причастности к терроризму - Не требуется
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_TERR, OPR_PAYM_ST_TERR_NOTNEED );
+      end;  
+          
+      //Квитовка - не сквитован
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_UNKVIT );
+      end;
+
+      //Квитанция - не сквитован
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_KVT, OPR_PM_ST_UNKVIT );
+      end;  
+    
+      //ЦАБС - не проведен по счетам МФР 
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_CABS, OPR_PM_ST_MFR_NO );
+      end;  
+          
+      //Обработка в БО - нет
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_BO_PROCESS, OPR_PAYM_ST_BO_NO );
+      end;  
+    
+      // ПЗО
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NOTNEED );
+      end;
+
+      // РО - не требуется
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED );
+      end;  
+
+      // МФ
+      if( stat == 0 )
+         if( PaymentObj.StartDepartment != PaymentObj.EndDepartment )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_BRANCH, OPR_PAYM_ST_BRANCH_YES );
+         else
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_BRANCH, OPR_PAYM_ST_BRANCH_NO );
+         end;
+      end;      
+          
+      // КАРТ - нет
+      if( stat == 0 )
+         stat = УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO );
+      end;
+
+      // ВК
+      if( stat == 0 )
+         If ( naVK(PaymentObj) == 1 )
+            stat = УстановитьСтатусыПлатежа(117,1);
+            PaymentObj.IsVO = "X";
+         End;
+      end;
+
+      if( stat != 0 )      
+         msgbox("Ошибка при установке статуса платежа");
+         return 1;
+      end;
+   end; //stat == 0
+  
+   // Выбор бэк-офиса
+   stat = 0;
+   if( stat == 0 ) 
+      stat = ExecuteSysControlStep( PaymentObj );// Системный контроль
+      if( stat < 0 ) return 1; elif( stat > 0 ) return 0; end;
+   end;
+
+   If(Paymentobj.origin==3)
+      AvCodeVo(PaymentObj);
+   End;
+  
+   if( stat == 0 ) 
+      stat = BP_CheckAccRest( PaymentObj ); // Проверка остатков по счетам
+   end;
+  
+   if (IsFrontPayment(PaymentObj))
+      InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_YES);//Установка Выгрузка во Фронт = Требуется 
+   end;
+
+   if (IsPaymentForBankCommission( PaymentObj, PaymentObj.PayerAccount ))
+      УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NEED );
+   end;
+
+   if ((IsFrontPayment(PaymentObj)) and (PaymentObj.IsExternal))
+      PaymentObj.Origin = 0;
+   end;
+
+   //если отвергли, сбросить ручную обработку, чтобы можно было после перезапуска запланировать предобработку
+   if (GetOprStatus(OPR_PAYM_STATE)==OPR_PM_ST_REJECT) 
+      stat = УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED );
+   end;
+
+   //Gurin S. I-00497621-2 27.06.2014 ошибка тянется с usr_payments при вставке, БИК получателя наш - значит внутренний платеж
+   private var _acc = RSL_Account(PaymentObj.ReceiverAccount, Acc_GetFiidByAccount(PaymentObj.ReceiverAccount));
+   if ( (PaymentObj.ReceiverBankCode  == {MFO_BANK}) and 
+        ((PaymentObj.OutCorschem != -1) or (not(_acc.rec.account))) //not exists
+      )
+      PaymentObj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                PaymentObj.ReceiverBankID, 
+                                PaymentObj.ReceiverBankCodeKind, 
+                                PaymentObj.ReceiverBankCode, 
+                                PaymentObj.ReceiverBankName,
+                                PaymentObj.ReceiverBankCorrAcc,
+                                PaymentObj.ReceiverFIID, 
+                                PaymentObj.Chapter,
+                                PaymentObj.ReceiverAccount, 
+                                PaymentObj.Receiver, 
+                                PaymentObj.ReceiverName, 
+                                PaymentObj.ReceiverINN );
+   end;
+   return stat;
+END;
+
+//Jushmanov 2014-02-20 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+   private var logquery;
+
+   if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+      if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+      if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+      logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                 " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+      ExecSQL(logquery, null, false);
+   end;
+    
+   return 0;
+end;
+
+/* -----------------------------------------------------------------------------
+   Массовое выполнение шага "Предобработка платежа банка"
+   ----------------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------------
+   Предтранзакционные действия 
+   Все проверки отражаются только на временной таблице dpmprepro_tmp,
+   никакие изменения в БД не делаются
+   ----------------------------------------------------------------------------- */
+macro PrepMassExecuteStep() 
+   // Подготовительные действия
+   var stat:integer = execStoredFunc( "BB_BPPREPRO.MassPreprocessPrepare", V_INTEGER );
+
+   if( not stat )
+      stat = PM_MassPreproPrepare();
+   end;
+  
+   // Системный контроль
+   if( not stat )
+      stat = execStoredFunc( "BB_BPPREPRO.MassSysControlPrepare", V_INTEGER );
+   end;
+
+   // Проверка остатка
+   if( not stat )
+      stat = execStoredFunc( "BB_BPPREPRO.MassCheckRestPrepare", V_INTEGER );
+   end;
+
+   if( stat )
+      MemoryError( stat );
+   end;
+   return stat; 
+end;
+
+/* -----------------------------------------------------------------------------
+   Транзакционные действия 
+   Всё, что напроверяли, отражается на статусах документа, платежа, операции 
+   ----------------------------------------------------------------------------- */
+macro MassExecuteStep()
+   var stat:integer = execStoredFunc( "BB_BPPREPRO.MassPreprocessExecute", V_INTEGER );
+   if( not stat )
+      stat = PM_MassPreproExecute();
+   end;
+
+   if( stat )
+      MemoryError( stat );
+   end;
+   return stat;
+end;
+
+/* -----------------------------------------------------------------------------
+   Действия после транзакции
+   Заполняем лог обработки платежей для отчета 
+   ----------------------------------------------------------------------------- */
+macro PostMassExecuteStep()
+   var stat:integer = execStoredFunc( "PM_PREPRO.MassFillLog", V_INTEGER );
+   if( stat )
+      MemoryError( stat );
+   end;
+   return stat;
+end;

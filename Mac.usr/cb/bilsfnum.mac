@@ -1,0 +1,228 @@
+// -------------------------------------------------------------------------------------------------
+// @desc   : Пользовательская нумерация счетов-фактур согласно технологии ПРББ. Маска  нумерации:  ФФФ-ММ / ДДNNNN (для каждого банка разная)
+//           ФФФ    - номер филиала (имеет диапазон значений 000-999, для головного офиса принимает значение 000, 
+//                    далее присваивается номер филиала из справочника территориальной структуры: 001,002, 003);
+//           ММ     - месяц - текущий календарный месяц;
+//           ДД     - дата
+//           NNNNNN - порядковый номер. Заполняется с разряда единиц, свободные разряды заполняются значением  "0"  
+//                    Обеспечивается сквозная нумерация  в целом по Банку, включая филиалы. 
+//                    Возобновляется ежемесячно (с 1 числа каждого нового календарного месяца)
+// @author : 2009-06-01 zip_z init
+// @changes: 2013-04-15 zip_z рефакторинг
+// @changes: 2013-05-07 Gurin S. I-00366089-2
+// @changes: 2013-06-05 TAM I-00379771-2
+// -------------------------------------------------------------------------------------------------
+
+import PTInter, BankInter, globals, RSD, cb_sql;
+import lib_registry;
+
+var mask_sf = RSL_GetRegistryValue ("CB/BILLFACT/МАСКА_СФ", true);
+//TAM 16.04.2013 - если в реестре пусто, то происходит ошибка
+if (mask_sf == "")
+   mask_sf = "ФФФ-ДД/ММNNNN";
+end;
+var monPos = Index(mask_sf,"ММ");
+var DayPos = Index(mask_sf,"ДД");
+
+macro GetRefSF( SeqValue, ObjKind, ObjAddr )
+    /* EVG Процедура ищет вышестоящий узел для узла ТС */
+    private macro GetUpperTSNode( code:@integer, type:@integer );
+        var cmd, RS;
+        cmd = RSDCommand ("select dpt.t_name nodeName, dpt.t_parentcode prntCode, dpt.t_nodetype nodeType "
+                 + "\n" + "  from ddp_dep_dbt dpt"
+                 + "\n" + " where dpt.t_code = ?");
+        cmd.addParam ("code", RSDBP_IN, code);
+        rs = RSDRecordset(cmd);
+        if ( rs and rs.movenext )
+           code = rs.value("prntCode");
+           type = rs.value("nodeType");
+           return rs.value("nodeName");
+        end;
+    end;
+
+    
+    private macro GetTSNodeNumber ()
+        var cmd, RS, NodeName, PrntCode, NodeType;
+        cmd = RSDCommand ("select dpt.t_name nodeName, dpt.t_parentcode prntCode, dpt.t_nodetype nodeType "
+                 + "\n" + "  from ddp_dep_dbt dpt"
+                 + "\n" + " where dpt.t_code = (select dp.t_codedepart"
+                 + "\n" + "                       from dperson_dbt dp"
+                 + "\n" + "                      where dp.t_oper =  ? )" );
+        cmd.addParam ("opernum",RSDBP_IN, {Oper});
+        rs = RSDRecordset(cmd);
+        if (rs.movenext)
+            NodeName = rs.value("nodeName");
+            NodeType = rs.value("nodeType");
+            if ( NodeType == 1)   // Филиал
+                return NodeName;
+            else                  // ВСП
+                PrntCode = rs.value("prntCode");
+                While ( NodeType != 1)
+                    NodeName = GetUpperTSNode( @PrntCode, @NodeType );
+                end;
+                return NodeName;
+            end;
+        end;
+        return -1;
+    end;
+
+    private macro GetMonth ()
+        return substr(string({CurDate}), 4,2);
+    end;
+  
+    /* EVG Функция возвращает следующий номер счёта-фактуры для переданного в формате 01, 02 ... 12 номера месяца. */
+    macro GetNextNumber_Month ( month )
+        var SQL, rs, lastNum = 0;
+        SQL = " select max (to_number (substr (bf.t_facturanumber, 8))) from dbilfactura_dbt bf where substr (bf.t_facturanumber, "+monPos+", 2) = " + GetSQLString( month );
+        rs = rsdRecordSet( SQL );
+        if ( rs and rs.MoveNext() )
+            lastNum = SQL_ConvTypeInteger (rs.Value(0, null, V_INTEGER));
+        end;
+        return lastNum + 1;
+    end;
+
+
+    /* EVG Функция возвращает следующий номер счёта-фактуры для месяца и дня. */
+    macro GetNextNumber_MonthDay ( month, day )
+        var SQL, rs, lastNum = 0;
+        SQL = " select max (to_number (substr (bf.t_facturanumber, 10))) from dbilfactura_dbt bf where substr (bf.t_facturanumber, "+monPos+", 2) = " + GetSQLString( month );
+        SQL = SQL + "   and substr (bf.t_facturanumber, "+dayPos+", 2) = " + GetSQLString( day );
+        rs = rsdRecordSet( SQL );
+        if ( rs and rs.MoveNext() )
+            lastNum = SQL_ConvTypeInteger (rs.Value(0, null, V_INTEGER));
+        end;
+        return lastNum + 1;
+    end;
+
+    /* EVG Функция возвращает следующий номер счёта-фактуры для месяца и дня - с учётом пропусков. */
+    macro GetNextFreeNumber_MonthDay ( month, day, year )
+        var SQL, rs, currentNum = 0, lastNum = 0;
+        var pos_nn_start,pos_nn_count,i;
+        pos_nn_start = Index(mask_sf, "N");
+        pos_nn_count = 1;
+        var regdate = date(int(day),int(month), int(year)); //TAM 05.06.2013 I-00379771-2
+        while (substr(mask_sf+"*",pos_nn_start+pos_nn_count,1)  == "N")
+            pos_nn_count = pos_nn_count + 1;
+        end;
+         debugbreak;
+        //SDA 26.04.2012 - счетчик провернулся.... добавил условие проверки года
+        //Gurin S. 07.05.2013 I-00366089-2
+        //SQL = " select to_number (substr (bf.t_facturanumber, "+pos_nn_start+", "+pos_nn_count+")) numb ";
+        SQL = " select TO_NUMBER (SUBSTR(replace(bf.t_facturanumber,'/'||TRANSLATE (bf.t_facturanumber, '_0123456789-/ ', '_'),''), "+pos_nn_start+", "+pos_nn_count+")) numb ";
+        SQL = SQL + "  from dbilfactura_dbt bf ";
+        //TAM 05.06.2013 I-00379771-2
+        //SQL = SQL + " where  to_char(BF.T_REGDATE, 'YYYY') = " + string( year );
+        SQL = SQL + " where  BF.T_REGDATE = to_date('" + regdate + "','dd.mm.yyyy')";
+        SQL = SQL + "   and substr (bf.t_facturanumber, "+ monPos +", 2) = " + GetSQLString( month );
+        SQL = SQL + "   and substr (bf.t_facturanumber, "+ dayPos +", 2) = " + GetSQLString( day );
+        SQL = SQL + " order by numb";
+
+        rs = rsdRecordSet( SQL );
+        while ( rs and rs.MoveNext() )
+            currentNum = SQL_ConvTypeInteger (rs.Value(0, null, V_INTEGER));
+            if (currentNum > (lastNum + 1))
+                return lastNum + 1;
+            end;
+            lastNum = currentNum;
+        end;
+        return lastNum + 1;
+    end;
+
+    macro AddZero( prm:string )
+        while ( strLen(prm) < 2 )
+            prm = "0" + prm;
+        end;
+        return prm;
+    end;
+    
+    var ff = GetTSNodeNumber ();
+    var mm, dd, yyyy;
+    var dtNeed = date();
+
+    var TxtPath = RSL_GetRegistryValue ("BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/TEXTDIR");
+    var NameFile_monValueForRef = TxtPath + "\\monValueForRef." + UserNumber;
+
+    FILE monValueForRef() txt;
+    If (open(monValueForRef,NameFile_monValueForRef))
+        next(monValueForRef);
+        dtNeed =  date(trim(monValueForRef.str));
+        dateSplit(dtNeed, dd, mm, yyyy);
+    Else 
+        dateSplit({CurDate}, dd, mm, yyyy);
+    End;
+
+    mm = AddZero(mm);
+    dd = AddZero(dd);
+    
+    var nn = String( GetNextFreeNumber_MonthDay( mm, dd, yyyy ));
+    var mask_nn = "", pos_nn = 0;
+    var refer = mask_sf; 
+    
+    refer = StrSubst (refer, "ФФФ", ff);
+    refer = StrSubst (refer, "ММ", mm);
+    refer = StrSubst (refer, "ДД", dd);
+    pos_nn = Index(refer, "N");
+    
+    while (pos_nn > 0)
+        refer = substr(refer, 1, pos_nn - 1) + "n" + substr(refer, pos_nn + 1, strlen(refer) - pos_nn);
+        mask_nn = mask_nn + "n";
+        if ( strlen(nn) < strlen(mask_nn) )
+            nn = "0" + nn;
+        end;
+        pos_nn = Index(refer, "N");
+    end;
+    
+    refer = StrSubst (refer, mask_nn, nn);
+    refer = StrSubst (refer , " ", "0");
+    return refer;
+end;
+
+
+/* EVG 29/11/2013 Функция MassGetRefSF() полностью дистрибутивная. Судя по коду, она задумана для того, чтобы
+   определить фиксированнуя часть номера СФ, к которой бы при вставке в таблицу drefgenprm_tmp добавлялось 
+   значение из последовательности (drefgenprm_tmp.t_SeqNum). Наш алгоритм формирования номера СФ с учётом 
+   пропусков за месяц в подобном варианте реализовать невозможно, т.к. последовательность не используется,
+   т.е. номер формируется динамически, исходя из номеров имеющихся на момент счётов-фактур. Сформировать 
+   номера массово для неограниченного количества СФ, на первый взгляд, невозможно.
+   Но функция с дистрибутивным алгоритмом пусть пока будут - возможно, когда-нибудь возникнет возможность
+   и необходимость её использовать.
+*/
+
+macro MassGetRefSF()
+  var refer:string, bank, CodeClir, CodeSMFR, error, CodeClirBank, CodeSMFRBank;
+  var sqlString, cmd;
+
+  bank = {OurBank};
+  CodeClir = PTCK_CLIRING;
+  CodeSMFR = PTCK_SMFR;
+ 
+  CodeClirBank = ПолучитьКодСубъекта( bank, CodeClir, error );
+  if( error!=0 )
+     CodeClirBank = "000000000000000";
+     error = 0;
+  end;
+
+  CodeSMFRBank = ПолучитьКодСубъекта( bank, PTCK_SMFR, error );
+  if( error!=0 )
+    error = 0;
+    GetRegistryValue( "COMMON\\Категории средств\\ВИД_КОДА_ФИЛИАЛА", V_INTEGER, CodeSMFR, error );
+    
+    if(error == 0)
+      CodeSMFRBank = ПолучитьКодСубъекта( bank, CodeSMFR, error );
+    end;
+
+    if( error!=0 )
+      CodeSMFRBank= "0000";
+      error = 0;
+    end;
+  end;
+
+  refer=SubStr(string(CodeClirBank),1,2)+"-"+CodeSMFRBank+"-";
+
+  sqlString = "UPDATE drefgenprm_tmp SET t_RefNum = CONCAT(?, LPAD(TO_CHAR(t_SeqNum), 6,'0'))";
+  cmd = RSDCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, refer );
+  cmd.Execute();
+
+  return 0;
+end;

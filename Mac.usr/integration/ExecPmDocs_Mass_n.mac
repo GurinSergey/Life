@@ -1,0 +1,871 @@
+/******************************************************************************
+   Имя файла..:       ExecPmDocs_Mass_n.mac
+   Назначение.:       РОБОТЫ-ПЛАНИРОВЩИКИ 24/7, присланные из будущего, чтобы изменить настоящее
+   Заявка.....:       C-14227
+   Дата.......:       07.09.2012
+   Автор......:       Котов Сергей
+   Комментарий:       Расписание хранится в таблице usr_me_time_pm_dbt
+                      Управление расписанием осуществляется из макроса usr_me_time_panel_pm.mac,
+                      который вызывается из панели планировщика по F7 (при неактивном режиме).
+
+                      Признак внешней остановки хранится в таблице usr_curdate, таже самая таблица, что и для остановки обработчиков (CurDateProc.mac),
+                      поэтому после смены операционного дня остановка планировщика будет снята.
+                      Управлять признаком внешней остановки можно из модуля ExecPmDocs_Remote.mac.
+
+                      Запуск операций идёт асинхронно. Отправляется сообщение в канал (OperationsProc.mac:RsbExecuteStep).
+                      И только  через какое-то время читаются ответы (процедура TestPipe). При запуске операций, идентификаторы документов
+                      сохраняются в dpmpaym_tmp, при получении ответов об обработке - удаляются. Если при обработке произошли ошибки, то
+                      на документе проставляется категория "Ручная обработка".
+
+                      Для запуска из командной строки можно использовать следующий пример (210 - номер модуля в ГК(131)):
+                      startbnk.exe имя пароль /w /modnum:131 /exec:210 /autostart:yes
+
+// KS    24.10.2012 C-15088 Новое расписание
+// KS    26.10.2012 C-15149 Добавить возможность авто-запуска модуля с параметрамом Старт обработки
+// KS    30.10.2012 C-15149 Отправка письма по документам "со вчера"
+// TAM   04.12.2014 Логгирование старта и запуска
+******************************************************************************/
+import RSD, Календарь, BankInter;
+import "KeyCodes.mac", "OperationsProc.mac", "pmreport_mass.mac", "ldmklbr.mac", "CurDateProc.mac", "acs_func.mac",
+       "ExecPmDocs_Doub.mac",
+       "ExecPmDocs_Send.mac",
+       "ExecPmDocs_TestPm.mac";
+//Gurin S. 05.01.2015 C-36593-7
+import "fm_terr_uor.mac"; 
+
+// Условия по расписанию - это систему можно развить, но пока она здесь присутствует в вырожденном виде
+private const m_nothing_clause = "(2 = 1)";                       // Никакие платежи
+private const m_all_clause     = "(1 = 1)";                       // Все платежи
+private const m_out_clause     = "(pmprop.t_debetcredit = 1)";    // Исходящие (также добавил процедуру m_out)
+private const m_in_clause      = "(pmprop.t_debetcredit = 0)";    // Входящие  (также добавил процедуру m_in)
+private const groupid          = 126; // Группа с правами запуска робота
+
+// TAM 01.12.2014 Внесем запись о старте обработчика, чтобы хотя бы представлять, запускался или нет.
+private const LOG_ENTRY = "ExecPmDocs_Mass_n.mac::Планировщик 24/7::Старт";
+private const LOG_EXIT  = "ExecPmDocs_Mass_n.mac::Планировщик 24/7::Завершение";
+ExecMacroFile ("lib_log.mac", "LogProcedure", LOG_ENTRY);
+
+// Ничего
+macro m_nothing()
+   var retval;
+   retval =  m_nothing_clause;
+   setparm(0,retval);
+end;
+
+// KS 24.10.2012 C-15088 start Новое расписание. Генератор условия по корсхемам/БИКам . Заменитель старой GetCorschemCondition
+macro m_corscem(in_out)
+   private var rs, str,
+               retval /*= m_nothing_clause*/,
+               v_time = time(),
+               need_out_our, // Необходимо обработать исходящие внутренние
+               need_out;     // Необходимо обработать исходящие внешние
+   str = "select * from usr_me_time_paym_dbt ";
+   if (isholiday) // Чтобы не отбирать лишние строки - позже будет ещё одно условие
+      if (in_out == "m_out")
+         str = str + "where ((t_is_holiday_out_our = chr(88)) or (t_is_holiday_out = chr(88)))";
+      else
+         str = str + "where (t_is_holiday_in = chr(88))";
+      end;
+   end;
+
+   rs = trsbdataset(str);
+   while (rs and rs.movenext) // Перебираем все корсхемы
+      if (in_out == "m_out")
+         need_out_our = need_out = 0;
+         if ((v_time >= time(rs.t_timebegin_out_our)) and
+             (v_time <  time(rs.t_timeend_out_our)) and
+             (not isholiday or rs.t_is_holiday_out_our == "X")
+            )
+            need_out_our = 1;
+         end;
+         if ((v_time >= time(rs.t_timebegin_out)) and
+             (v_time <  time(rs.t_timeend_out)) and
+             (not isholiday or rs.t_is_holiday_out == "X")
+            )
+            need_out = 1;
+         end;
+         // Условие чисто для исходящих внутренних
+         if ((need_out_our == 1) or (need_out == 1))
+            if (rs.t_corschem == 0) // Если встретили нулевую корсхему - это значит,
+                                    // что нужно работать по всем схемам кроме тех, по которым есть отдельные строчки
+               retval = retval + " or (pmprop.t_corschem not in (select t_corschem from usr_me_time_paym_dbt)" + "\n"; // Вот это условие отключит РКЦ
+            else // Иначе указывем конкретную схему
+               retval = retval + " or (pmprop.t_corschem = " + rs.t_corschem + "\n";
+            end;
+            // Если сейчас разрешена обработка только внутренних или только внешних, то дополнительно фильтруем ещё и по бикам
+            if ((need_out_our == 1) and (need_out == 0))   // только внутренние
+               retval = retval + " and (" + ConvertMaskToSQLFormat(rs.t_bic,"pmprop.t_bankcode") + ")" + "\n";
+            elif ((need_out_our == 0) and (need_out == 1)) // только внешние
+               retval = retval + " and not (" + ConvertMaskToSQLFormat(rs.t_bic,"pmprop.t_bankcode") + ")" + "\n";
+            end;
+            retval = retval + ")" + "\n";
+         end;
+      // Что-то мне подсказывает, что корсхема 1 и так не будет отбираться с таким алгоритмом
+      else
+         if ((v_time >= time(rs.t_timebegin_in)) and (v_time <= time(rs.t_timeend_in)))
+            // KS 02.11.2012 C-15088 start Замечание по реализации - фильтр по корсхемам должен быть и для входящих
+            //retval = retval + " or (" + m_all_clause + ") \n";
+            if (rs.t_corschem == 0) // Если встретили нулевую корсхему - это значит,
+                                    // что нужно работать по всем схемам кроме тех, по которым есть отдельные строчки
+               retval = retval + " or (pmprop.t_corschem not in (select t_corschem from usr_me_time_paym_dbt))" + "\n"; // Вот это условие отключит РКЦ
+            else // Иначе указывем конкретную схему
+               retval = retval + " or (pmprop.t_corschem = " + rs.t_corschem + ")\n";
+            end;
+            // KS 02.11.2012 C-15088 end
+         end;
+      end;
+   end;
+
+   // KS 02.11.2012 C-15088 start Оптимизация
+   if (strlen(retval) == 0)
+      retval = m_nothing_clause;
+   else
+      retval = substr(retval,index(retval,"or")+2,strlen(retval)-index(retval,"or")-2);
+   end;
+   // KS 02.11.2012 C-15088 end
+   return retval;
+end;
+// KS 24.10.2012 C-15088 end
+
+// Только исходящие
+macro m_out()
+   var retval;
+   // KS 24.10.2012 C-15088 Новое расписание
+   retval =  m_out_clause + " and (" + m_corscem("m_out") + ")";
+   setparm(0,retval);
+end;
+
+// Только входящие
+macro m_in()
+   var retval;
+   // KS 24.10.2012 C-15088 Новое расписание
+   retval =  m_in_clause + " and (" + m_corscem("m_in") + ")";
+   setparm(0,retval);
+end;
+
+// Всё
+macro m_all()
+   var retval;
+   // KS 24.10.2012 C-15088 Новое расписание
+   retval =  "((" + m_in_clause  + " and (" + m_corscem("m_in")  + ")" + ") or " + "\n" +
+              "(" + m_out_clause + " and (" + m_corscem("m_out") + ")" + "))";
+   // KS 02.11.2012 C-15088 end
+   setparm(0,retval);
+end;
+
+private const DefStatusLineActive  = "F2 Проводка документов F3 Стоп для всех F5 Обработка/пауза для исходящих F6 Обработка/пауза для входящих F9 Выход";
+private const DefStatusLinePassive = "F2 Старт для всех F3 Стоп для всех F5 Обработка/пауза для исходящих F6 Обработка/пауза для входящих F7 Расписание F9 Выход";
+
+Class (TRecHandler) TParmAgentPm (LbrName)
+   private const flag_yes  = "Да";
+   private const flag_no   = "Нет";
+   InitTRecHandler ("monitor", (LbrName), true);
+
+   MACRO ClearTmp
+      private var cmd;
+      cmd = RSDCommand("truncate table dpmpaym_tmp");
+      cmd.execute;
+   end;
+
+   MACRO StartAgent (dlg)
+      private var   _key = KEY_F2;
+      private var   count_doc_out = 0,                   // Количество обработанных исходящих
+                    count_doc_in  = 0;                   // Количество обработанных входящих
+      private const flag_out_cat_first= "_out_cat_first";// Первичная простановка категории
+      private const flag_out_cat      = "_out_cat";      // Простановка категории
+      private const flag_out          = "_out";          // Обработка исходящих
+      private const flag_in           = "_in";           // Обработка входящих
+      private const flag_send         = "_send";         // Отправка письма - отчета
+      private const flag_pause        = "_pause";        // Ожидание следующей обработки
+      private const flag_payments     = "_payments";     // Проверка Пэйментс
+      private var   flag_action = flag_out_cat_first;    // Начальное состояние - простановка категорий
+      private var   PaymentId = 0,                       // Обрабатываемый платёж
+                    DocKind   = 0;                       // Тип обрабатываемого платёжа
+      private var   StartTimeOut     = time(),           // Время начала обработки исходящих
+                    StartTimeIn      = time(),           // Время начала обработки входящих
+                    LastTimeTest     = time(),           // Время последнего получения ответа от обработчиков
+                    LastTimeSend     = time(),           // Время последней отсылки сообщения операционистам
+                    LastTimeExec     = time(),           // Время последнего проведения документов
+                    LastTimeCat      = time(),           // Время последней простановки категорий
+                    LastTimePayments = time();           // Время последней проверки Пэйментс
+      private const FreqTimeTest     = 10,               // Периодичность проверки ответов от обработчика  - 10 секунд
+                    FreqTimeSend     = 30,               // Периодичность отсылки сообщения операционистам - 30 минут
+                    FreqTimeExec     = 5*60,             // Периодичность проведения документов - 5 минут
+                    FreqTimeCat      = 5*60;             // Периодичность простановки категорий - 5 минут
+      private var   FreqTimePayments = FreqTimeSend;     // Периодичность проверки Пэйментс - 30 минут
+      private var   mes = DefStatusLineActive;           // Строка состояния
+      private var   clause = "";                         // Дополнительное условие по расписанию
+      private var   cnt_cdoub  = 0,                      // Количество дублированных документов
+                    cnt_doub   = 0,                      // Количество задвоенных документов
+                    cnt_terror = 0;                      // Количество документов, попавших под контроль 115-ФЗ
+
+      private var   errcode;
+
+      private var payments_mail; // Получатели уведомлений
+      GetRegistryValue("PRBB\\MASS_EXEC\\PAYMENTS_MAIL", V_STRING, payments_mail, errcode);
+      if (errcode > 0) 
+         msgbox("Внимание!!!||Значение настройки PRBB\\MASS_EXEC\\PAYMENTS_MAIL получено не было!||Уведомления отправляться не будут.");
+         payments_mail = "";
+      end;
+
+      // Проверка Пэйментс с последующей отправкой уведомления. 
+      // При превышении разницы величины, определенной в настройке, отправлять письмо.
+      GetRegistryValue("PRBB\\MASS_EXEC\\PAYMENTS_LOG", V_INTEGER, FreqTimePayments, errcode);
+      if (errcode > 0) 
+         FreqTimePayments = FreqTimeSend;
+      end;
+
+      // KS 24.10.2012 start C-15088 Новое расписание
+      macro get_actionForDoc(v_time, flag)
+         private var rs, str;
+         str = "select * from usr_me_time_paym_dbt ";
+         if (isholiday)
+            if (flag == flag_out)
+               str = str + "where ((t_is_holiday_out_our = chr(88)) or (t_is_holiday_out = chr(88)))";
+            else
+               str = str + "where (t_is_holiday_in = chr(88))";
+            end;
+         end;
+         rs = trsbdataset(str);
+         while (rs and rs.movenext)
+            if (flag == flag_out)
+               if (((v_time >= time(rs.t_timebegin_out_our)) and (v_time < time(rs.t_timeend_out_our)))or
+                   ((v_time >= time(rs.t_timebegin_out    )) and (v_time < time(rs.t_timeend_out    ))))
+                  return 1;
+               end;
+            else
+               if ((v_time >= time(rs.t_timebegin_in     )) and (v_time <= time(rs.t_timeend_in    )))
+                  return 1;
+               end;
+            end;
+         end;
+         return 0;
+      end;
+      // KS 24.10.2012 end C-15088
+
+      //Выбираем необходимое действие в зависимости от времени и настроек в таблице usr_me_time_paym_dbt
+      macro get_action(v_time)
+      // KS 24.10.2012 start C-15088 Новое расписание
+         var need_out     = get_actionForDoc(v_time, flag_out),
+             need_in      = get_actionForDoc(v_time, flag_in );
+         if ((need_out == 1)and(need_in == 1))
+            return "m_all";
+         elif (need_out == 1)
+            return "m_out";
+         elif (need_in  == 1)
+            return "m_in";
+         end;
+         // KS 24.10.2012 end C-15088
+         return "m_nothing";
+      end;
+
+      private macro GetPM(clause)
+         private var query = "", r;
+         query = "select /*+FIRST_ROWS */ pm.t_paymentid, pm.t_dockind" + "\n" +
+                 "  from dpmpaym_dbt pm, dpmprop_dbt pmprop";
+         if (flag_action == flag_out)
+            query = query + ", doproper_dbt op, doprstep_dbt st";
+         end;
+         query = query  + "\n" +
+                  " where pm.t_dockind in (16, 201, 320, 322)" + "\n" +
+                  "   and pm.t_paymentid = pmprop.t_paymentid" + "\n" +
+                  "   and pm.t_basefiid = 0" + "\n" +
+                  "   and (" + clause + ")" + "\n" + // из расписания
+                  // KS 24.10.2012 C-15088 Новое расписание. Функция не нужна. Теперь корсхемы можно выцепить из таблицы расписания. Уже всё есть в переменной clause
+                  "";
+         if (flag_action == flag_out)
+            query = query +
+                  "   and pmprop.t_transferdate = " + GetSQLDate({curdate}) + "\n" +
+                  //"   and pmprop.t_transferdate = " + GetSQLDate({curdate}-1) + "\n" + // Для теста
+                  "   and pmprop.t_debetcredit = 1" + "\n" +
+                  "   and pmprop.t_propstatus = 3000" + "\n" +
+                  "   and op.t_documentid = lpad(pm.t_paymentid,34,'0')" + "\n" +
+                  "   and op.t_dockind = pm.t_dockind" + "\n" +
+                  "   and op.t_id_operation = st.t_id_operation" + "\n" +
+                  "   and st.t_blockid = 10000145" + "\n" +  // Блок выгрузки в МБР
+                  "   and st.t_number_step = 190" + "\n" +   // Шаг выгрузки в МБР
+                  "   and st.t_isexecute = 'R'" + "\n" + // Всё-таки надо завязаться на шаг, т.к. условие t_propstatus = 3000 справедливо и для "Заверешние платежа RS-Payments" "Готов к выполнению"
+                  // Условие для категории. "контроль пройден".
+                  //LAO 15.05.2013 убрал Exists что бы план строился корректнее
+                  "   and 1 = ( SELECT 1 " + "\n" +
+                  "               FROM dobjatcor_dbt " + "\n" +
+                  "              WHERE     t_objecttype = 501 " + "\n" +
+                  "                    AND t_groupid = 1016 " + "\n" +   // Номер категории "Проверка платежа перед выгрузкой"
+                  "                    AND t_attrid = 6 " + "\n" + // Контроль пройден
+                  "                    AND t_object = LPAD (pm.t_paymentid, 10, '0') and rownum = 1)  " + "\n" +
+                  "   and (pm.t_paymentid, pm.t_dockind) not in (select t_paymentid, t_dockind from dpmpaym_tmp)"; // Условие для обрабатываемых документов
+
+         elif (flag_action == flag_in)
+            query = query +
+                  "   and pm.t_dockind in (320)" + "\n" +
+                  "   and pm.t_valuedate = " + GetSQLDate({curdate}) + "\n" +
+                  //"   and pm.t_valuedate = " + GetSQLDate(date(15,06,2012)) + "\n" + // Для теста
+                  "   and pmprop.t_debetcredit = 0" + "\n" +
+                  "   and pmprop.t_propstatus = 300" + "\n" +
+                  "   and pm.t_paymstatus = 2990" + "\n" +
+                  // Условие для категории. Исключение ручной обработки
+                  "   and NOT EXISTS ( SELECT 1 " + "\n" +
+                  "                      FROM dobjatcor_dbt " + "\n" +
+                  "                     WHERE     t_objecttype = 501 " + "\n" +
+                  "                           AND t_groupid = 1016 " + "\n" +   // Номер категории "Проверка платежа перед выгрузкой"
+                  "                           AND t_attrid = 7 " + "\n" + // Ручная обработка
+                  "                           AND t_object = LPAD (pm.t_paymentid, 10, '0'))  " + "\n" +
+                  "   and (pm.t_paymentid, pm.t_dockind) not in (select t_paymentid, t_dockind from dpmpaym_tmp)"; // Условие для обрабатываемых документов
+         end;
+         r = rsdrecordset (query);
+         if (r.movenext())
+            setparm(1,r.value(0));
+            setparm(2,r.value(1));
+            return 1;
+         else
+            setparm(1,0);
+            setparm(2,0);
+            return 0;
+         end;
+      end;
+
+      // Добавить обрабатываемый платёж в тмр
+      Private Macro AddPM(PaymentId,DocKind)
+         private var cmd = RSDCommand("insert into dpmpaym_tmp (t_paymentid, t_dockind, t_purpose) values (?,?,?)");
+         cmd.addParam("paymentid", RSDBP_IN, PaymentId);
+         cmd.addParam("dockind",   RSDBP_IN, DocKind);
+         if (flag_action == flag_out) // Лучше направление будем хранить в отдельном поле, т.к. это по доккайнду нельзя отпределить
+            cmd.addParam("direct",  RSDBP_IN, 0);
+         else
+            cmd.addParam("direct",  RSDBP_IN, 1);
+         end;
+         cmd.execute;
+      end;
+
+      // Проверить ответный пайп
+      Private Macro TestPipe()
+         private var cmd, r;
+         r = rsdrecordset ("select nvl(sum(case when t_purpose = 1 then 1 else 0 end),0) cnt_in,"+
+                           "       nvl(sum(case when t_purpose = 0 then 1 else 0 end),0) cnt_out from dpmpaym_tmp");
+         if (r.movenext())
+            count_doc_in  = count_doc_in  + r.value(0);
+            count_doc_out = count_doc_out + r.value(1);
+         end;
+         // Если в канале есть ответ для меня, то удаляю запись 
+         cmd = RSDCommand("declare" + "\n" +
+                          "  stat number := 0;" + "\n" +
+                          "  message varchar2(1000);" + "\n" +
+                          "  paymentid dpmpaym_tmp.t_paymentid%type;" + "\n" +
+                          "begin" + "\n" +
+                          "  while (stat = 0) loop" + "\n" +
+                          "    stat := dbms_pipe.receive_message (dbms_pipe.unique_session_name, 0);" + "\n" +
+                          "    if (stat=0) then" + "\n" +
+                          "      dbms_pipe.unpack_message (message);" + "\n" +
+                          "      dbms_pipe.unpack_message (message);" + "\n" +
+                          "      paymentid := to_number(substr(message,instr(message,usr_common.c_delimiter)+1));" + "\n" +
+                          "      if instr(message,usr_common.c_err_success)=1 then" + "\n" + // Если обработка прошла без ошибок
+                          "        delete from dpmpaym_tmp where t_paymentid = paymentid;" + "\n" + // Очистим временную таблицу
+                          "      else" + "\n" + // Иначе проставляем категорию "ручная обработка"
+                          "          delete from dobjatcor_dbt" + "\n" +
+                          "           where t_objecttype = 501 " + "\n" +
+                          "             and t_groupid = 1016 " + "\n" +
+                          "             and t_object = lpad(paymentid,10,'0');" + "\n" +
+                          "          insert into dobjatcor_dbt values(501,1016,7," + "\n" +
+                          "             lpad(paymentid,10,'0')," + "\n" +
+                          "             chr(0),?,?," + "\n" +
+                          "             to_date('31.12.9999','DD.MM.YYYY')," + "\n" +
+                          "             trunc(sysdate)," + "\n" +
+                          "             sysdate-trunc(sysdate)+to_date('01.01.0001','DD.MM.YYYY')," + "\n" +
+                          "             chr(0));" + "\n" +
+                          "      end if;" + "\n" +
+                          "      commit;" + "\n" +
+                          "    end if;" + "\n" +
+                          "  end loop;" + "\n" +
+                          "exception" + "\n" +
+                          "  when others then null;" + "\n" +
+                          "end;");
+
+         cmd.addParam("", RSDBP_IN, {curdate});
+         cmd.addParam("", RSDBP_IN, {oper});
+         cmd.execute();
+         r = rsdrecordset ("select nvl(sum(case when t_purpose = 1 then 1 else 0 end),0) cnt_in,"+
+                           "       nvl(sum(case when t_purpose = 0 then 1 else 0 end),0) cnt_out from dpmpaym_tmp");
+         if (r.movenext())
+            count_doc_in  = count_doc_in  - r.value(0);
+            count_doc_out = count_doc_out - r.value(1);
+         end;
+         return 0;
+
+      OnError
+         return -1;
+      end;
+
+      private macro catch(x)
+         var err_count = 0, is_no_wait = 0;
+         var lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message;
+         setdialogflag(1);
+         while( err_count < RSLDefEnv.ErrorCount )
+            if(RSLDefEnv.error(err_count).nativeerror == 54)
+               setdialogflag(0);
+               is_no_wait = RSLDefEnv.error(err_count).nativeerror;
+            end;
+            lasterror = lasterror + "|"+RSLDefEnv.error(err_count).descr;
+            err_count = err_count + 1;
+         end;
+         if (RSLDefCon.IsinTrans)
+            RSLDefCon.RollbackTrans;
+         end;
+         if(is_no_wait == 54)
+            println(lasterror);
+            setdialogflag(1);
+         else
+            msgbox (lasterror);
+         end;
+      end;
+
+      Private Macro goto_action(action)
+         flag_action = action;
+         if (flag_action == flag_out)
+            mes = DefStatusLineActive + ". Обработка исходящих.";
+         elif (flag_action == flag_in)
+            mes = DefStatusLineActive + ". Обработка входящих.";
+         elif ((flag_action == flag_out_cat) or (flag_action == flag_out_cat_first))
+            mes = DefStatusLineActive + ". Простановка категорий для исходящих.";
+         elif (flag_action == flag_send)
+            mes = DefStatusLineActive + ". Отправка уведомлений.";
+         elif (flag_action == flag_payments)
+            mes = DefStatusLineActive + ". Проверка Пэйментс.";
+         elif (flag_action == flag_pause)
+            mes = DefStatusLineActive + ". Ожидание.";
+         end;
+      end;
+
+      Private Macro InvertFlag(flag);
+         if (flag  == flag_yes)
+            return flag_no;
+         else
+            return flag_yes;
+         end;
+      end;
+
+      Private Macro UsrMsg(flag);
+         if (flag  == flag_yes)
+            return "приостановить";
+         else
+            return "запустить";
+         end;
+      end;
+
+      Private Macro SecToTime(t) // Перевод секунд во время
+         return time(0,int(t/60),(t-60*int(t/60)),0);
+      end;
+
+      Private Macro MinToTime(t) // Перевод минут во время
+         return time(int(t/60),(t-60*int(t/60)),0,0);
+      end;
+
+      Private Macro IsEnable(flag_action) // Проверка возможности обработки
+         private var clause = "";                       // Дополнительное условие по расписанию
+         private var clause_macro = get_action(time()); // KS 24.10.2012 C-15088 Новое расписание. Макро-функция получения условия отбора
+         // Проверим расписание
+         // Получим дополнительное условие
+         // KS 24.10.2012 C-15088 start Новое расписание.
+         if( execmacro(clause_macro,clause) )
+            if (clause_macro == "m_all") // Все
+               // Возобновление работы по расписанию
+               dlg.rec.ShdStopOut = flag_no;
+               dlg.rec.ShdStopIn  = flag_no;
+            elif (clause_macro == "m_out") // Исходящие внутренние и внешние
+               dlg.rec.ShdStopOut = flag_no;
+               dlg.rec.ShdStopIn  = flag_yes;
+            elif (clause_macro == "m_in") // Входящие
+               dlg.rec.ShdStopOut = flag_yes;
+               dlg.rec.ShdStopIn  = flag_no;
+            else
+               // Остановка работы по расписанию
+               dlg.rec.ShdStopOut = flag_yes;
+               dlg.rec.ShdStopIn  = flag_yes;
+               return false;
+            end;
+         // KS 24.10.2012 C-15088 end
+         else
+            // Остановка работы по расписанию
+            dlg.rec.ShdStopOut = flag_yes;
+            dlg.rec.ShdStopIn  = flag_yes;
+            return false;
+         end;
+
+         // Проверка внешней остановки
+         if (GetLastOperDay() != date(0,0,0))
+            // Возобновление работы удалённо
+            dlg.rec.RmtStopOut = flag_no;
+            dlg.rec.RmtStopIn  = flag_no;
+         else
+            // Остановка работы удалённо
+            dlg.rec.RmtStopOut = flag_yes;
+            dlg.rec.RmtStopIn  = flag_yes;
+            return false;
+         end;
+
+         if (((flag_action == flag_out)  and (dlg.rec.ActiveOut == flag_yes)) or
+             ((flag_action == flag_in)   and (dlg.rec.ActiveIn  == flag_yes))
+            )
+            // Если формальное разрешение на проведение документов есть, то надо ещё проверить какой операционный день открыт и не остановлены ли обработчики
+            if (date() > {curdate})
+               usr_SetOperDay();
+            end;
+            //if (date() == {curdate}) // На время теста эту проверку надо убрать
+            if (1==1)
+               setparm(1,clause);
+               return true;
+            else
+               return false;
+            end;
+         elif (flag_action == flag_send)
+            return true;
+         else
+            return false;
+         end;
+      end;
+
+      Private Macro StartPM(PaymentId,DocKind)
+         rsldefcon.BeginTrans;
+         rsldefcon.CommitTrans;
+         RsbExecuteStep(Paymentid,DocKind);
+         AddPM(PaymentId,DocKind); // запишем информацию по платежу во временную таблицу, а при проверке ответов из пайп-канала - удалим эту информацию.
+
+         rep_file_succ = GetTxtFileName("report_paym_succ");
+         rep_file_err  = GetTxtFileName("report_paym_err");
+         setoutput(null,true);
+
+         onerror(er)
+            catch(er);
+      end;
+
+      Private Macro getObjAtCorCnt(groupId,AttrId)
+         private var cmd, rs, query;
+         query = "select count(*)" + "\n" +
+                  "  from dpmpaym_dbt pm, dpmprop_dbt pmprop, dpmrmprop_dbt pmrmprop, dobjatcor_dbt objatcor, dobjattr_dbt objattr" + "\n" +
+                  " where ((pm.t_dockind in (16, 201, 320, 322) and" + "\n" +
+                  "         pmprop.t_transferdate = " + GetSQLDate({curdate}) + ") or" + "\n" +
+                   "        (pm.t_dockind in (320            , 322) and" + "\n" +
+                  "         pm.t_valuedate = " + GetSQLDate({curdate}) + "))" + "\n" +
+                  "   and pm.t_paymentid = pmprop.t_paymentid" + "\n" +
+                  "   and pm.t_paymentid = pmrmprop.t_paymentid" + "\n" +
+                  "   and pmprop.t_debetcredit = 1" + "\n" +
+                  "   and objattr.t_objecttype = 501" + "\n" +
+                  "   and objattr.t_groupid = ?" + "\n" + 
+                  "   and objattr.t_attrid = objatcor.t_attrid" + "\n" +
+                  "   and objatcor.t_objecttype = 501" + "\n" +
+                  "   and objatcor.t_groupid = objattr.t_groupid" + "\n" +
+                  "   and (" + ConvertMaskToSQLFormat(AttrId,"objatcor.t_attrid") + ")" + "\n" +
+                  "   and objatcor.t_object = LPAD(pm.t_paymentid, 10, '0')";
+
+         cmd = rsdcommand(query);
+         cmd.addparam("groupId",RSDBP_IN,groupId);
+         cmd.execute();
+         rs = rsdrecordset(cmd);
+         if (rs.movenext())
+            return rs.value(0);
+         else
+            return -1;
+         end;
+         onerror(er)
+            return -1;
+      end;
+
+      ClearTmp;
+      IsEnable(flag_action);
+      set_pipe_server(pipe_server_roboplan);
+      while (1 == 1)
+         if (flag_action == flag_pause)
+            _key = testevent(500); // Здесь можно ещё поставить паузу
+         else
+            _key = testevent(50); /*нетрадиционным писателям посвящается */
+         end;
+         // Делаем что-то похожее на конечный автомат с четырьмя состояниями
+         // Тут всё самое главное из обработки
+         // Состояние простановки категорий
+         if ((flag_action == flag_out_cat) or (flag_action == flag_out_cat_first)) // Простановка категорий - может осущетвляться при одном работающем планировщике
+            // Проставляем категории
+            // Мегапроцедура простановки категорий!!!
+            Check_Doub(cnt_cdoub,cnt_cdoub);
+            //Gurin S. 05.01.2015 C-36593-7 Контроль по 115-ФЗ 
+            fm_run(1/*ScrolStates*/, null, true);
+
+            dlg.rec.CDoubDocsOut   = getObjAtCorCnt(1016,"1-4");
+            dlg.rec.DoubDocsOut    = getObjAtCorCnt(1016,"5");
+            dlg.rec.TerrorDocsOut  = getObjAtCorCnt(1016,"8");
+
+            LastTimeCat = time();
+            if (flag_action == flag_out_cat)
+               goto_action(flag_pause);       // После простановки категорий переходим к паузе,
+                                              // но если нужно будет, чтобы сразу после категорий толкались документы,
+                                              // нужно сделать FreqTimeCat = FreqTimeExec в константах и здесь выполнить
+                                              // goto_action(flag_out); и LastTimeExec = time();
+                                              // Можно также возвращаться к первичной простановке категорий
+            else // Если категории мы проставляли впервые,
+               goto_action(flag_out); // То переходим к обработке исходящих
+               LastTimeExec = time(); // Здесь время выставляем сразу
+            end;
+         // Состояние отправки писем
+         elif (flag_action == flag_send) // Отправка - может осущетвляться при одном работающем планировщике
+            // Оправляем письма
+            // Мегапроцедура отправки писем!!!
+            if ((IsEnable(flag_action))and(strlen(payments_mail)>0))
+               send_l_objatcor(payments_mail);
+               send_l_out_old(payments_mail); // KS 25.10.2012 C-15149 Включить анализ входящих(ответных) документов
+               LastTimeSend = time();
+            end;
+            goto_action(flag_pause);       // После простановки категорий переходим к паузе
+         // Состояние проверки Пэйментс
+         elif (flag_action == flag_payments)
+            // Проверка Пэйментс
+            // Мегапроцедура проверки Пэйментс!!!
+            TestPayments(payments_mail,FreqTimeSend);
+            LastTimePayments = time();
+            goto_action(flag_pause);       // После простановки категорий переходим к паузе
+         // Состояние ожидания
+         elif (flag_action == flag_pause) // Если мы сейчас в ожидании, то можем позаниматься категориями, отправкой писем или начать проводить документы
+            // Проверка времени простановки категорий
+            if   (time() - LastTimeCat  > SecToTime(FreqTimeCat))
+               goto_action(flag_out_cat);
+            // Проверка времени отправки писем
+            elif (time() - LastTimeSend > MinToTime(FreqTimeSend))
+               goto_action(flag_send);
+            // Проверка Пэйментс
+            elif (time() - LastTimePayments > MinToTime(FreqTimePayments))
+               goto_action(flag_payments);
+            elif (time() - LastTimeExec > SecToTime(FreqTimeExec)) // Если пришло время обрабатывать документы
+               goto_action(flag_out); // То переходим к обработке исходящих
+               LastTimeExec = time(); // Здесь время выставляем сразу
+            end;
+         // Состояние обработки документов
+         elif (IsEnable(flag_action,clause))
+            if (getPM(clause,PaymentId,DocKind) > 0) // Если есть платёж к обработке
+               StartPM(PaymentId,DocKind);     // то запускаем его асинхронно
+            else // Если больше обрабатывать нечего - переходим к следующему этапу
+               if (flag_action == flag_out)     // Если обработали все исходящие,
+                  goto_action(flag_in);          // то переходим к обработке входящих
+               elif (flag_action == flag_in)    // Если обработали все входящие,
+                  goto_action(flag_pause);       // то переходим ожиданию
+               end;
+            end;
+         end;
+
+         // Если какое-то из действий сейчас заблокировано, то переходим к следующему шагу
+         if ((flag_action == flag_out)  and // Если заблокирована обработка исходящих
+            (not IsEnable(flag_action)))
+            goto_action(flag_in);          // то переходим к обработке входящих
+         end;
+         if ((flag_action == flag_in)  and // Если заблокирована обработка входящих
+            (not IsEnable(flag_action)))
+            goto_action(flag_pause);      // то переходим ожиданию
+         end;
+
+         // Проверка ответов - можно в принципе делать не в состоянии ожидания,
+         // поэтому не буду выжелять в отдельное состояние,
+         // чтобы можно было видеть как меняется счетчик даже при проводке большого числа документов
+         if (time() - LastTimeTest > time(0,int(FreqTimeTest/60),(FreqTimeTest-60*int(FreqTimeTest/60)),0)) // Проверять пайп раз в 10 секунд
+            IsEnable(flag_action);
+            TestPipe();
+            dlg.rec.DocsOut = count_doc_out;
+            dlg.rec.DocsIn  = count_doc_in;
+            LastTimeTest = time();
+         end;
+
+         // Время работы
+         if (dlg.rec.ActiveOut == flag_yes)
+            dlg.rec.WorkTimeOut = time() - StartTimeOut;
+         end;
+         if (dlg.rec.ActiveIn  == flag_yes)
+            dlg.rec.WorkTimeIn  = time() - StartTimeIn;
+         end;
+
+         // Выставим таймер следующего старта
+         if (time() > SecToTime(FreqTimeExec) + LastTimeExec)
+            dlg.rec.NextStart = time(0,0,0,0);
+         else
+            dlg.rec.NextStart = LastTimeExec + SecToTime(FreqTimeExec)-time();
+         end;
+
+         message (mes);
+         if ( _key == KEY_F5 )
+            //Gurin S. 16.12.2014 I-00539629-2
+            if (GetTrue(true, string("Вы действительно хотите ", UsrMsg(dlg.rec.ActiveOut), " обработку исходящих документов?")))
+               dlg.rec.ActiveOut = InvertFlag(dlg.rec.ActiveOut);
+            end;
+            if (dlg.rec.ActiveOut == flag_yes)
+               StartTimeOut = time();
+            end;
+         elif ( _key == KEY_F6 )
+            //Gurin S. 16.12.2014 I-00539629-2
+            if (GetTrue(true, string("Вы действительно хотите ", UsrMsg(dlg.rec.ActiveIn), " обработку исходящих документов?")))
+               dlg.rec.ActiveIn  = InvertFlag(dlg.rec.ActiveIn);
+            end;
+            if (dlg.rec.ActiveIn  == flag_yes)
+               StartTimeIn  = time();
+            end;
+         elif ( _key == KEY_F2 )
+            goto_action(flag_out); // То переходим к обработке исходящих
+            LastTimeExec = time(); // Здесь время выставляем сразу
+         elif ( _key == ALT_5) // "Пасхальные яйца" - alt-5
+            goto_action(flag_out_cat); // То переходим к простановке категорий
+         end;
+       
+         if ((dlg.rec.ActiveOut == flag_no) and
+            (dlg.rec.ActiveIn  == flag_no))
+            _key = KEY_F3; // Если оба планировщика остановлены, то, в принципе, можно вообще выходить
+         end;
+         
+         if   ( _key == KEY_F3 )
+            mes = DefStatusLinePassive;
+            message (mes);
+            Return _key; // Вообще выходим, чтобы не грузить зря машину
+         elif ( _key == KEY_F9 )
+            ClearTmp;
+            Return _key;
+         end;
+
+         UpdateFields(dlg);
+
+      end;
+   end;
+
+   MACRO Event (dlg, cmd, id, key) 
+      var autostart = "no"; // KS 26.10.2012 C-15149 Добавить возможность авто-запуска модуля с параметрамом Старт обработки
+      /*Инициализация диалогового окна*/
+      if(cmd == DLG_INIT)
+         ClearTmp;
+         // Следующий запуск роботов
+         dlg.rec.NextStart   = time(0,0,0,0);
+         // Время начала работы планировщиков
+         dlg.rec.WorkTimeOut = time(0,0,0,0);
+         dlg.rec.WorkTimeIn  = time(0,0,0,0);
+         // Включено / выключено
+         dlg.rec.ActiveOut  = flag_no;
+         dlg.rec.ActiveIn   = flag_no;
+         // Остановка работы по расписанию
+         dlg.rec.ShdStopOut = flag_no;
+         dlg.rec.ShdStopIn  = flag_no;
+         // Остановка работы удалённо
+         dlg.rec.RmtStopOut = flag_no;
+         dlg.rec.RmtStopIn  = flag_no;
+         UpdateFields(dlg); 
+         // KS 26.10.2012 C-15149 start Добавить возможность авто-запуска модуля с параметрамом Старт обработки
+         GetCmdLineParm("autostart",autostart);
+         if (autostart == "yes")
+            cmd = DLG_KEY;
+            KEY = KEY_F2;
+         end;
+         // KS 26.10.2012 C-15149 end
+      end;
+
+      if (cmd == DLG_KEY)
+         /*Запуск робота*/
+         if ( KEY == KEY_F2 ) // Старт для всех
+            //Gurin S. 13.01.2014 C-36349-5
+            if (not GetTrue(true, string("Вы действительно хотите начать обработку?")))
+                return CM_CANCEL;
+            end;
+            dlg.rec.ActiveOut = flag_yes;
+            dlg.rec.ActiveIn  = flag_yes;
+            KEY = StartAgent(dlg);
+         elif ( KEY == KEY_F5 ) // Старт для исходящих
+            dlg.rec.ActiveOut = flag_yes;
+            dlg.rec.ActiveIn  = flag_no;
+            KEY = StartAgent(dlg);
+         elif ( KEY == KEY_F6 ) // Старт для входящих
+            dlg.rec.ActiveOut = flag_no;
+            dlg.rec.ActiveIn  = flag_yes;
+            KEY = StartAgent(dlg);
+         elif ( KEY == KEY_F7 ) // Расписание
+            // KS 24.10.2012 C-15088 start Новое расписание
+            //execmacrofile("usr_me_time_panel_pm.mac","Run_panel");
+            execmacrofile("usr_me_time_panel_paym.mac","Run_panel");
+            // KS 24.10.2012 C-15088 end
+         end;
+         if ( KEY == KEY_F3 ) // Стоп для всех
+            dlg.rec.ActiveOut = flag_no;
+            dlg.rec.ActiveIn  = flag_no;
+            dlg.rec.NextStart = time(0,0,0,0);
+         end;
+         UpdateFields(dlg);
+         /*Выход из диалогового окна*/
+         if ( KEY == KEY_F9 ) // Выход
+            //TAM 04.12.2014
+            ExecMacroFile ("lib_log.mac", "LogProcedure", LOG_EXIT);
+            return CM_CANCEL;
+         end;
+      end;
+   end;
+
+   Macro Run
+      return RunDialog (this, R2M (this, "Event"));
+   End;
+end;
+
+Macro MkDatePanelAgentPm( lbr )
+   Var rc = lbr.AddPanel( "monitor", 30, 5, 48, 10, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+   rc.title = "Проведение внешних платежей Payments";
+   rc.StatusLine = DefStatusLinePassive;
+   elem = rc.AddLabel( 3, 1, "Следующий запуск:");
+   elem = rc.AddField( 24, 1, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "NextStart", 10 );
+
+   elem = rc.AddLabel( 26, 2, "Начальные");
+   elem = rc.AddLabel( 27, 3, "платежи");
+   elem = rc.AddLabel( 37, 2, "Ответные");
+   elem = rc.AddLabel( 38, 3, "платежи");
+
+   elem = rc.AddLabel( 3, 4, "Время работы:");
+   elem = rc.AddField( 24, 4, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "WorkTimeOut", 10 );
+   elem = rc.AddField( 35, 4, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "WorkTimeIn", 10 );
+
+   elem = rc.AddLabel( 3, 5, "Проведенных документов:");
+   elem = rc.AddField( 24, 5, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DocsOut", 10 ); 
+   elem = rc.AddField( 35, 5, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DocsIn", 10 );
+
+   elem = rc.AddLabel( 3, 6, "Остановка по расписанию:");
+   elem = rc.AddField( 24, 6, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ShdStopOut", 10 );
+   elem = rc.AddField( 35, 6, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ShdStopIn", 10 );
+
+   elem = rc.AddLabel( 3, 7, "Внешняя остановка:");
+   elem = rc.AddField( 24, 7, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "RmtStopOut", 10 );
+   elem = rc.AddField( 35, 7, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "RmtStopIn", 10 );
+
+   elem = rc.AddLabel( 3, 8, "Активен:");
+   elem = rc.AddField( 24, 8, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ActiveOut", 10 );
+   elem = rc.AddField( 35, 8, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ActiveIn", 10 );
+
+   elem = rc.AddLabel( 3, 9, "Дублированных документов:");
+   elem = rc.AddField( 24, 9, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "CDoubDocsOut", 10 );
+
+   elem = rc.AddLabel( 3, 10, "Задвоенных документов:");
+   elem = rc.AddField( 24, 10, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DoubDocsOut", 10 );
+
+   elem = rc.AddLabel( 3, 11, "115-ФЗ:");
+   elem = rc.AddField( 24, 11, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "TerrorDocsOut", 10 );
+end;
+
+Macro MkLbrFileAgentPm
+   var LbrPath, LbrName, errcode, lbr;
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, LbrPath, errcode);
+   if (errcode > 0) 
+      msgbox("Значение настройки TEXTDIR получено не было!!!");
+   end;
+   LbrName = LbrPath + "\\monitorpmdocs" + string(UserNumber) + ".lbr";
+   lbr = TLbrFile( LbrName, "C" );
+   MkDatePanelAgentPm( lbr );
+   lbr.Save(); //сохраняем ресурсы в файле
+   lbr = NULL;
+   return LbrName;
+end;
+
+// Точка входа
+private var LbrName, Parm;
+if (not OperInGroup({oper},groupid))
+   msgbox("Вы не входитев группу "+groupid+"!");
+   return 0;
+end;
+LbrName = MkLbrFileAgentPm();
+Parm = TParmAgentPm(LbrName);
+if ( not Parm.Run () )
+   Parm = null;
+   DelFile(LbrName);
+   Exit (1);
+end;

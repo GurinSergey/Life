@@ -1,0 +1,196 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29009 - "Возврат из картотеки"
+// Шаг      : 10    - "Отзыв из картотеки"
+// Описание : Макрос шага
+// Изменения: 
+//             SDA 13/12/2013 адаптация для 31-й
+//             LVV 01.08.2014 C-31748 Показ информационного сообщения для платежей по исполнительному документу
+//             TAM 03.12.2014 C-32444 При отзыве с К2 формируем ED274 с кодом 7
+//             TAM 08.07.2015 C-38458 - отправка заблокированных сумм в OW
+//-----------------------------------------------------------------------------
+import pm_common, pm_setst, payinter, "pm_categ.mac", cbsttls, "catfdoc.mac";
+import OprInter, oralib; //Jushmanov 2014-02-21 C-19151
+import "pm_answerret.mac"; //TAM 03.12.2014
+import "lib_account.mac";
+
+var PaymentObj:RsbPayment;
+
+
+private macro ValueDateForRecallFromInd(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+    elif( GetParentOrEqualDocKindFromList(DocKind, 
+                                          PMDOC_BANKPAYMENT, PMDOC_BANKCLAIM, WL_INDOC) 
+        )
+        ValueDate = PM_GetOperDay_Balance(Paym.Department);
+    end;
+
+    return ValueDate;
+end;
+
+//TAM 03.12.2014 C-32444
+private macro GetDenialGround( PaymentID : integer, IndexNum : integer, Ground : @string )
+    var select = "Select      t_Ground " +
+                 "  from dpmdenial_dbt " +
+                 " where t_PaymentID = :PaymentID " +
+                 "   and t_IndexNum = :IndexNum ";
+    var params = makeArray( SQLParam("PaymentID", PaymentID),
+                            SQLParam("IndexNum",  IndexNum) );
+    var rs : RsdRecordset = execSQLselect(select, params);
+
+    if(rs and rs.moveNext)
+        Ground = rs.value("t_Ground");
+    else
+        Ground = "";
+    end;
+end;
+
+
+MACRO ExecuteStep( doc, paymDoc, DocKind:integer, ID_Operation:integer, ID_Step:integer )
+    if(CheckDateStartOpr(ID_Operation))
+        return 1;
+    end;
+   //LVV 01.08.2014 C-31748 Показ информационного сообщения для платежей по исполнительному документу	
+    if( PaymentObj.TaxPmGround == "АР" )
+        msgbox("ВНИМАНИЕ! ПЛАТЁЖ ПО ИСПОЛНИТЕЛЬНОМУ ДОКУМЕНТУ");
+    end;
+  
+    PaymentObj.ValueDate = ValueDateForRecallFromInd(PaymentObj);
+    // Установить дату начала операции равной дате операционного дня пользователя
+    SetOprDate(29000000, PaymentObj.ValueDate);
+    // Объекты для КУ
+    var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+
+    // Счета КУ
+    var СистемныйСчетДляКартотек:string = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+
+    var ВнебалСчетКартотеки2:string = "";
+
+    var paymtr:RsbAccTransaction;
+
+    // Если производится отзыв платежного ордера из картотеки НОСТРО
+    if( ( GetOprStatus( OPR_PAYM_INDEX ) == OPR_PAYM_ST_INDEX_NOSTRO ) and
+        ( PaymentObj.PartPaymNumber > 0 ) )
+      // Пока не реализовано, т.к. нигде реально не используется
+        return 0;
+    end;
+
+    // Если платеж в картотеке 2
+    if( PaymentObj.PaymStatus == PM_I2PLACED )
+
+        // Выполнить проводку
+        paymtr = PaymentObj.MakeTransaction();
+
+        if( paymtr == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+
+        paymtr.Chapter         = 3;                                            
+        paymtr.Date_Carry      = {curdate} /*PaymentObj.ValueDate*/;
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 53;
+        paymtr.Shifr_Oper      = "09";
+        paymtr.Kind_Oper       = " 6";
+        paymtr.Ground          = "Отзыв из картотеки №2 "+ PaymentObj.Ground;
+        paymtr.Department      = PaymentObj.Department;
+
+        paymtr.FIIDPayer       = NATCUR; 
+        paymtr.FIIDReceiver    = PaymentObj.BaseFIID;
+        //TAM 06.05.2014 I-00484955
+        paymtr.FIID            = NATCUR;
+        paymtr.AccountPayer    = СистемныйСчетДляКартотек;
+
+        //Gurin S/ 17.02.2015 R-544753-2 ищем внебалансовый счет сначала из связ. объектов к счёту-плательщику 
+        var AccRec = TRecHandler("account.dbt");
+        var СчетКт;
+        AccRec.Clear;
+        AccRec.rec.Account       = PaymentObj.PayerAccount;
+        AccRec.rec.Chapter       = Acc_GetChapterByAccount(PaymentObj.PayerAccount);
+        AccRec.rec.Code_currency = Acc_GetFiidByAccount (PaymentObj.PayerAccount);
+        if (( PaymentObj.PaymStatus == PM_I2PLACED ) and ( GetLinkedObject( OBJROLE_ACC_I2OBACC, OBJTYPE_ACCOUNT, UniID(AccRec, OBJTYPE_ACCOUNT), OBJTYPE_ACCOUNT, СчетКт ) == 0 ))
+           RestoreFromUniID( СчетКт, AccRec, OBJTYPE_ACCOUNT );
+           paymtr.AccountReceiver = AccRec.rec.Account;
+        else
+           // Штатный вариант
+           paymtr.AccountReceiver = PaymIndex2_FirstDoc( PaymentObj.PaymentID ).FindAndOpenAccount( "Картотека 2", 0, {curdate} );
+        end;
+
+        paymtr.SumReceiver     = PaymentObj.DenialAmount;
+
+        if( ConvSum( paymtr.SumPayer, PaymentObj.DenialAmount, PaymentObj.ValueDate, PaymentObj.BaseFIID, NATCUR ) )
+            msgbox("Ошибка конвертации суммы");
+            return 1;
+        end;
+
+        if( not paymtr.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+
+    end;
+
+    // Установить статус платежа
+    PaymentObj.PaymStatus = PM_FINISHED;
+
+    // Установить статус первички "Закрыт"
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_CLOSED );
+
+    // Установить статус сегмента операции
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    return 0;
+END;
+
+
+//Jushmanov 2014-02-21 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+    
+    //TAM 03.12.2014 C-32444
+    if( ( errTrn == 0 ) and ( message == OP_EXECUTE_STEP ) )
+        var DenialGround = "";
+        GetDenialGround(PaymentObj.PaymentID, PAYMENTS_INDEX_2, @DenialGround);
+        var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+        var Narrative : string = "", Queries : string = "";
+        Queries = "InfoCode:7";
+        Narrative = DenialGround;
+        CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step);
+    end;
+    
+    // TAM 08.07.2015 C-38458 - отправка в OW сумм заблокированных средств
+    var rsdcom:RSDCommand;
+    if(message == OP_EXECUTE_STEP) 
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (5," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    elif (message == OP_BACKOUT_STEP)
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (6," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    end;
+
+    return 0;
+end;

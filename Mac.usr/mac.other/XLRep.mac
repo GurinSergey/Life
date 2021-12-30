@@ -1,0 +1,374 @@
+/*---------------------------------------------------------------
+$Keywords
+$Version: $ 1 /$Revision: 2$
+$NoKeywords
+
+(C) R-Style Ukraine, 2002
+//---------------------------------------------------------------*/
+Import blsends,rslx,lgxs,lccodes,f_tools;
+/* EVG */
+import VBAconst;
+
+const XLTEMPLATEDIR_REG_KEY=
+     "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\ZTEMPLATESDIR";
+
+macro GetXLTemplateDir(TplRegKey)
+var ErrCode,RegValue="";
+  if  (ValType(TplRegKey)==V_UNDEF)
+    TplRegKey = XLTEMPLATEDIR_REG_KEY;
+  end;
+  GetRegistryValue(TplRegKey,V_STRING,RegValue,ErrCode);
+  if (ErrCode==0)
+    RegValue = trim(RegValue);
+    if (RegValue=="")
+      return "";
+    end;
+    if (SubStr(RegValue,strlen(RegValue),1)!="\\")
+      RegValue=RegValue+"\\";
+    end;
+    return  RegValue;
+  end;
+  return "";
+end;
+
+
+private file ftxout() write txt 10000;
+
+/*Региональные установки - порядок расположения компонент дат */
+const LSDATEORDER_DMY = 1;
+const LSDATEORDER_MDY = 0;
+const LSDATEORDER_YMD = 2;
+
+/*Параметры импорта текстового файла в Excel */
+private const xlMSDos=3; 
+private const xlDelimited=1; 
+private const xlTextQualifierNone=-4142;
+
+/*Application.WindowState constants */
+const xlWindowMinimized = -4140;
+const xlWindowMaximized = -4137;
+const xlWindowNormal    = -4143;
+
+/* EVG Заменил на import VBAconst, иначе - переопределение.
+const xlPortrait  = 1;
+const xlLandscape = 2;*/
+
+const xlPasteFormats = -4122;
+ 
+/*Аргумент для Paste  в PasteSpecial */
+private const xlPasteValues = -4163;
+
+class CRegionalSettings()
+var DateOrder = LSDATEORDER_DMY;
+var DecimalSeparator = ".";
+var DateSeparator = ".";
+var DateFormat="";
+var ListSeparator=";";
+
+   macro ShowLocaleInformation()
+     MsgBox("Following locale data obtained:|",
+            "DateFormat        : '",DateFormat        ,"'|", 
+            "ListSeparator     : '",ListSeparator     ,"'|",
+            "DecimalSeparator  : '",DecimalSeparator  ,"'|",
+            "DateOrder         : '",DateOrder         ,"'"
+            );
+   end;
+
+
+   macro LoadLocaleInfo()
+   var LocDateFormat;
+   var LocSList;
+   var LocDecSeparator;
+   var LocDateOrder;
+      if (IsStandAlone())
+         LocDateFormat = GetServLocaleInfo(LOCALE_SSHORTDATE);
+         LocSList = GetServLocaleInfo(LOCALE_SLIST);
+         LocDecSeparator = GetServLocaleInfo(LOCALE_SDECIMAL);
+         LocDateOrder =  GetServLocaleInfo(LOCALE_IDATE);
+       else
+         LocDateFormat = GetTermLocaleInfo(LOCALE_SSHORTDATE);
+         LocSList = GetTermLocaleInfo(LOCALE_SLIST);
+         LocDecSeparator = GetTermLocaleInfo(LOCALE_SDECIMAL);
+         LocDateOrder =  GetTermLocaleInfo(LOCALE_IDATE);
+       end;
+       if (LocDateFormat!="")
+         DateFormat = LocDateFormat;
+       end;
+       if (LocSList!="")
+         ListSeparator = LocSList;
+       end;
+       if (LocDecSeparator!="")
+         DecimalSeparator = LocDecSeparator;
+       end;
+       DateOrder = LocDateOrder;
+   end;
+
+LoadLocaleInfo();
+end;
+
+
+var RegSettings = CRegionalSettings();
+
+
+private macro GetFullPathToTxtDir()
+var P = GetStandardDir(TXTFILE);
+var S1 = substr(P,1,1);
+var S2 = substr(P,1,2);
+  if (S1==".")
+    return GetProcessStartPath()+P;
+  elif ( (S1=="\\") and (S2!="\\") )
+    return GetProcessStartPath()+P;
+  end;
+  return P;
+end;
+
+
+
+class CExcelRepMaker(_TplFileName)
+var axExcel=null;
+var SrcDataFileName = "xlrep__."+UserNumber();
+var TextDirRelative = GetStandardDir(TXTFILE);
+var TextDirAbsolute  = GetFullPathToTxtDir();
+var SrcOpened;
+var RepWB;
+var DecimalDigitsInFloat = 2;
+var RowsWritten = 0;
+
+  macro GetValueAsString(V)
+  var D,M,Y,RetS;
+    if (ValType(V)==V_UNDEF)
+      return  "";
+    elif ( ValType(V)==V_DATE )
+      if (V==Date(0,0,0))
+        return "";
+      end;
+      DateSplit(V,D,M,Y);
+      if ( RegSettings.DateOrder==LSDATEORDER_DMY )
+        return string(D,RegSettings.DateSeparator,M,RegSettings.DateSeparator,Y);
+      elif (RegSettings.DateOrder==LSDATEORDER_MDY)
+        return string(M,RegSettings.DateSeparator,D,RegSettings.DateSeparator,Y);
+      else
+        return string(Y,RegSettings.DateSeparator,M,RegSettings.DateSeparator,D);
+      end;
+    
+    elif ( (ValType(V)==V_MONEY) or (ValType(V)==V_MONEYL)
+           or (ValType(V)==V_DOUBLE) or (ValType(V)==V_DOUBLEL) )
+      if (V == 0)
+          return " ";
+      else
+          SetDefPrec(DecimalDigitsInFloat);
+          if (RegSettings.DecimalSeparator!=".")
+              return StrSubst(string(V),".",RegSettings.DecimalSeparator);
+          end;
+      end;
+    end;
+    return string(V);
+  end;
+
+  macro GetXLObject()
+    this.CheckForExcelObject();
+    return axExcel;
+  end;
+
+  macro CheckForExcelObject()
+    if (ValType(axExcel)!=V_UNDEF)
+      return;
+    end;
+    if (IsStandAlone())
+      axExcel = ActiveX("Excel.Application",null,true);
+    else
+      axExcel = tlgActiveX("Excel.Application",true);
+    end;
+  end;
+
+  macro WriteReportRow(/*Любая куча параметров*/)
+  var i,CpN,P,Str="";
+  var StrIsEmpty=true;
+    if (not SrcOpened )
+      if (not Open(ftxout,TextDirRelative+SrcDataFileName) )
+          return;
+      end;
+      SrcOpened = true;
+    end; 
+    RowsWritten = RowsWritten+1;
+    CpN=1;
+    while (GetParm(CpN,P))
+       if (ValType(P)==V_GENOBJ) 
+         i=0;
+         while (i<P.Size)
+           if (not StrIsEmpty)
+             Str = Str+"\t";
+           end;
+           Str = Str + GetValueAsString(P[i]);
+           StrIsEmpty = false;
+           i=i+1;
+         end;
+       else
+           if (not StrIsEmpty)
+             Str = Str+"\t";
+           end;
+           Str = Str + GetValueAsString(P);
+           StrIsEmpty = false;
+       end;
+       CpN = CpN+1;
+    end;
+    Insert(ftxout,Str);
+  end;
+
+  macro  AssureSheetExists(SheetN)
+    while (RepWB.Worksheets.Count<SheetN)
+      RepWB.Worksheets.Add();
+    end;
+  end;
+
+  macro GetRange(RName)
+  var Rng = RepWB.Names(RName).RefersToRange;
+    return Rng;
+  OnError
+    MsgBox("В книге не найден именованный диапазон ячеек "+RName);
+    return null;
+  end;
+
+  macro GetRangeValue(RName)
+  var Rng = RepWB.Names(RName).RefersToRange;
+    return Rng.Value;
+  OnError
+    MsgBox("В книге не найден именованный диапазон ячеек "+RName);
+    return null;
+  end;
+
+
+  macro SetRangeValue(RName,V)
+  var Rng = GetRange(RName);
+      if (ValType(Rng)!=V_UNDEF)
+        Rng.Value = V;
+      end;
+  end;
+
+  macro PaintColumn(Cell,RowsDownCount)
+  var Rng;  
+  var Sheet = Cell.WorkSheet;
+  var CellRow = Cell.Row;
+  var CellCol = Cell.Column;
+      Cell.Copy;
+      Rng = Sheet.Range(Sheet.Cells(CellRow,CellCol),Sheet.Cells(CellRow+RowsDownCount-1,CellCol) );
+      Rng.PasteSpecial(xlPasteFormats);
+  end;
+  
+  macro DefaultPaintRange(RngName,RowsCount)
+  var i=1;
+  var R = RepWB.Names(RngName).RefersToRange;
+    while (i<=R.Columns.Count)
+      PaintColumn(R.Cells(1,i),RowsCount);
+      i=i+1;
+    end;
+  end;
+
+  macro SetRangeRowsCount(RName,Ct)
+  var Rng = RepWB.Names(RName).RefersToRange;
+  var i = Ct - Rng.Rows.Count;
+  var  XLAlertMode = axExcel.DisplayAlerts;
+    axExcel.DisplayAlerts = false; 
+    while (i>0)
+      Rng.Rows(2).EntireRow.Insert();
+      i=i-1;
+    end;
+    while (i<0)
+      Rng.Rows(1).EntireRow.Delete();
+      i=i+1;
+    end;
+    axExcel.DisplayAlerts = XLAlertMode;
+  end;
+
+  macro TransferReportData(/*RangeName or Row,Col,Sheet*/)
+  var  TmpDataFile = TextDirRelative+SrcDataFileName;
+  var  WBTxt;
+  var  WBTxtName;
+  var  WBTxtFullName;
+  var  ErrCode,ErrStr;
+  var  Col=1,Row=1,SheetN=1;
+  var  RngName = null;
+  var  Prm;
+  var  XLAlertMode;
+    if (not SrcOpened)
+      return;
+    end;
+    if (GetParm(1,Prm))
+      if (ValType(Prm)==V_STRING)
+        RngName = Prm;
+      else 
+        if (ValType(Prm)==V_INTEGER)
+           Row = Prm;
+        end;
+        if (GetParm(2,Prm) and (ValType(Prm)==V_INTEGER) )
+          Col = Prm;
+        end;
+        if (GetParm(3,Prm) and (ValType(Prm)==V_INTEGER) )
+          SheetN = Prm;
+        end;
+      end;
+    end;
+    Close(ftxout);
+    SrcOpened = false;
+    this.CheckForExcelObject();
+    if (IsStandAlone())
+      WBTxtName = SrcDataFileName;
+      WBTxtFullName = TextDirAbsolute+WBTxtName;
+    else
+      WBTxtName = "xlr"+UserNumber()+string(int(Time));
+      WBTxtFullName = GetTermTempDir()+WBTxtName;
+      if (not TermFileSend(TmpDataFile,WBTxtFullName,true))
+             ErrCode = GetLastError(ErrStr);
+             MsgBox("Ошибка при посылке файла на терминал.|"+ErrStr+" ("+ErrCode+")"+
+                    "|"+GetTermIOError());
+
+        return;
+      end;
+    end;
+
+    AssureSheetExists(SheetN);
+
+    XLAlertMode = axExcel.DisplayAlerts;
+    axExcel.DisplayAlerts = false;
+    axExcel.Visible = true;
+    axExcel.WorkBooks.OpenText(WBTxtFullName, xlMSDOS, 1, 
+                               xlDelimited, xlTextQualifierNone,false, True);
+    WBTxt = axExcel.WorkBooks(WBTxtName);
+    WBTxt.WorkSheets(1).UsedRange.Copy();
+    if (ValType(RngName)!=V_UNDEF)
+       RepWB.Names(RngName).RefersToRange.Cells(1,1).PasteSpecial(xlPasteValues);
+    else
+       RepWB.WorkSheets(SheetN).Cells(Row,Col).PasteSpecial(xlPasteValues);
+    end;
+    WBTxt.Close(); 
+    axExcel.DisplayAlerts = XLAlertMode;
+    if (not IsStandAlone())
+      TermFileDelete(WBTxtFullName);
+      DelFile(TmpDataFile);
+    else
+      DelFile(TmpDataFile); 
+    end;
+  end;
+
+  SrcOpened = Open(ftxout,TextDirRelative+SrcDataFileName);
+  this.CheckForExcelObject();
+  axExcel.Visible = true;
+
+  if ( (ValType(_TplFileName)==V_STRING) and (_TplFileName!="") )
+    RepWB = axExcel.Workbooks.Add(_TplFileName);
+  else
+    RepWB = axExcel.Workbooks.Add();
+  end;
+  axExcel.WindowState = xlWindowMinimized;
+end;
+
+
+
+//macro DisplayError(e)
+ // MsgBox(e.Message+" |at "+e.Line+" line |in "+e.Module+
+   //      "|AXCode:"+e.AXCode+"|"+e.AxMes);
+
+//end;
+
+
+

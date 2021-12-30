@@ -1,0 +1,468 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: lib_rsl_account.mac
+// @author  : 2013-01-03 zip_z. 
+// @desc    : пользовательские проверки счетов
+// @changes : 2013-01-16 zip_z.    + Acc_GetOpuSymbol (I-00312164)
+//            2013-01-21 zip_z.    + sum_k2_rest
+//                                 + sum_k2_total
+//            2013-02-20 Golovkin  + Acc_IsBankrupt (C-17185)
+//            2013-05-01 zip_z.    ~ Acc_IsBankrupt
+//                                 ~ Acc_GetFiidByAccount
+//                                 ~ Acc_IsActive
+//                                 + Acc_GetBalanceByAccount
+//                                 + Acc_GetChapterByAccount
+//                                 + Acc_GetKindByAccount
+//                                 + Acc_GetAccountUniId
+//                                 ~ RSL_Account::RSL_Account_Init
+//            2013-05-25 zip_z. влил Acc_GetMinPriorityI2 ( C-19427 )
+//            25.06.13             + Acc_GetFiidByCode
+//            2013-06-25 zip_z.    + Acc_GetClientName
+//            2013-08-06 Golovkin    Acc_GetFiidByAccount убрал условие t_fi_kind = 1 (I-00409025)
+//            2013-08-07 Teleshova   Acc_GetFiidByAccount
+//            06.12.2013 RR С-24538 Отправка уведомления об открытии дох. счета в LN SendLotusNoticeAccOpen(Account, Name)
+//            09.12.2013 RR добавил указание имени банка в отправлемом письме endLotusNoticeAccOpen(Account, Name)
+//            16.01.2013 RR поправил SendLotusNoticeAccOpen по R-314532-2
+//            KS 22.11.2013 Предварительная адаптация под 31ю сборку
+//            RR 03.02.2014 Адаптировал новую функцию, заменив {selfid} на {OurBank}
+// -------------------------------------------------------------------------------------------------
+import oralib, likepy, lib_sqltools, lib_registry, lib_types, globals,RsbDataSet, Send_lotus, fg_life_parm;
+
+//TAM 07.08.2013
+private const FI_CURRENCY_UNDEF = -1; //валюта неопределена
+
+// @desc    : получить наименование клиента по счету (быстрый способ) - счет в нашем балансе
+// @return  : V_STRING
+macro Acc_GetClientName (account:string):string
+    var ret = "";
+    var sql = "select t_name from dparty_dbt where t_partyid = (select t_client from daccount_dbt where t_account = :ac)";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("ac", account)));
+    if (sql.moveNext ())
+        ret = sql.value ("t_name", null, V_STRING);
+    end;
+    return ret;
+end;
+
+// zmp 05.05.2014
+macro RSL_getRestAcc(pAccount, pFIID, pRestDate):money
+   var RestDate = {curdate};
+      
+   var sql = " SELECT   r.t_rest                                                        "+
+             " FROM   drestdate_dbt r, daccount_dbt a                                   "+
+             " WHERE  A.T_ACCOUNT = :account AND A.T_ACCOUNTID = R.T_ACCOUNTID          "+
+             "        AND R.T_RESTDATE = (SELECT   MAX (T_RESTDATE)                     "+
+             "                             FROM   drestdate_dbt                         "+
+             "                             WHERE     T_RESTDATE <= :restdate            "+
+             "                                   AND R.T_ACCOUNTID = T_ACCOUNTID        "+
+             "                                   AND R.T_RESTCURRENCY = T_RESTCURRENCY) ";
+
+   var cond =  " AND R.T_RESTCURRENCY = A.T_CODE_CURRENCY ";
+
+   if(valtype(pFIID    ) != V_UNDEF) cond = " AND R.T_RESTCURRENCY = " + pFIID ; end; 
+   if(valtype(pRestDate) != V_UNDEF) RestDate = pRestDate; end;
+
+   sql = execSqlSelect (sql + cond, makeArray (SqlParam ("account"     , pAccount),
+                                               SqlParam ("restdate"    , RestDate)));
+                           
+   if (sql.moveNext ())
+        return sql.value (0, null, V_MONEY);
+   end;
+   return $0;
+end;
+
+macro Acc_GetLimit(acc :string, bankDate :date):money
+   var sql = " with parm as (select :acc acc, :bankDate bankDate from dual) "
+             " select rsi_rsb_account.GetAccLimit(acc, usr_common.get_chapter(acc), usr_common.get_fiid(acc), bankDate ) from dual, parm ";  
+   if (valtype(bankDate) == v_undef) bankDate = {curdate}; end;
+   sql = execSQLSelect(sql, makeArray(SQLParam("acc"     , acc     ),                             
+                                      SQLParam("bankDate", bankDate)));
+   if (sql and sql.moveNext())
+      return sql.value(0, null, v_money);
+   end;
+   return $0;   
+end;
+// Limitdate это не дата установки лимита, это дата окончания лимита, а лимит всегда пишется в дату 00.00.0000
+macro Acc_SetLimit(acc :string, limit :money, limitDate :date)
+   var sql = " MERGE INTO   dacclimit_dbt lim                                                                                         "+
+             "      USING   (SELECT :account account, :limit limdate, :LIMIT LIMIT FROM DUAL) o                                       "+
+             "         ON   (    LIM.T_ACCOUNT = o.account                                                                            "+
+             "               AND LIM.T_CHAPTER = usr_common.get_chapter(o.account)                                                    "+
+             "               AND LIM.T_CODE_CURRENCY = usr_common.get_fiid(o.account)                                                 "+
+             "               AND LIM.T_LIMITDATE = O.limdate)                                                                         "+
+             " WHEN MATCHED THEN UPDATE SET LIM.T_LIMIT = o.LIMIT                                                                     "+
+             " WHEN NOT MATCHED                                                                                                       "+
+             " THEN INSERT VALUES ( o.account, usr_common.get_chapter(o.account),  usr_common.get_fiid(o.account), O.limdate, o.LIMIT)";
+    if (valtype(limitDate) == v_undef) limitDate = {curdate}; end;             
+    var params = makeArray(SQLParam("account", acc), SQLParam("limdate", date(0,0,0)), SQLParam("limit", money(limit)));             
+    //if (limit != $0)  LAO 14.03.2014 не понял зачем эта проверка
+    execSQL(sql, params); 
+    
+    sql = " Update daccount_dbt set T_OPERATIONDATE = :operdate where T_ACCOUNT= :operacc";
+    params = makeArray(SQLParam("operdate", date(limitDate)),SQLParam("operacc", acc));
+    execSQL(sql, params); 
+    //end;   
+    
+    
+onError(e)             
+end;                                                                                                                   
+
+
+// @desc    : проверка на тип счета "<" (признак банкротства) 
+// @return  : V_BOOL
+macro Acc_IsBankrupt( account:string )
+    var cmd = RsdCommand("SELECT 1 FROM daccount_dbt WHERE t_account = :account AND INSTR (t_type_account, 'П') = 0 AND INSTR (t_usertypeaccount, '<') != 0 " );
+    cmd.addparam("account", RSDBP_IN, account);
+    var rs = RsdRecordset(cmd);
+    return rs.movenext();
+end;
+
+// @desc    : проверка на тип счета кассы. У нас любят ставить кассу на покрытие, поэтому daccount_dbt
+// @return  : V_BOOL
+macro acc_isCash (account:string):bool
+    var sql = "select 1 from daccount_dbt where instr (t_type_account, 'А') > 0 and t_account = :ac";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("ac", account)));
+    return sql.moveNext ();
+end;
+
+// @desc    : получить балансовый счёт (2 порядка) по известному лицевому
+// @return  : V_STRING
+macro Acc_GetBalanceByAccount (acc:string):string
+    return substr (acc, 1, 5);
+end;
+
+// @desc    : получить главу по известному лицевому
+// @return  : V_INTEGER
+macro Acc_GetChapterByAccount(Account:string):integer
+    var sql = "select t_chapter from dbalance_dbt where t_iNumplan = 0 and t_balance = :m_balance";
+    
+      // LAO всегда 4 глава 21.10.2014 а вообще  вся  эта процедура полный бред, надо использовать пакет usr_common.get_chapter
+    if (Acc_GetBalanceByAccount(Account) =="00000")
+        return 4;
+    end;
+    
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_balance", Acc_GetBalanceByAccount(Account))));
+    if (sql.moveNext ())
+        return sql.value ("t_chapter", null, V_INTEGER);
+    end;
+    return zeroValue (V_INTEGER);
+end;
+
+// @desc    : получить вид счёта (активный / пассивный / с нулевым остатком)
+//            (!!! информация берётся из плана счётов !!!)
+// @return  : V_STRING
+macro Acc_GetKindByAccount(Account:string):string
+    var sql = "select t_kind_account from dbalance_dbt where t_iNumplan = 0 and t_balance = :m_balance";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_balance", Acc_GetBalanceByAccount(Account))));
+    if (sql.moveNext ())
+        return sql.value ("t_kind_account", null, V_STRING);
+    end;
+    return zeroValue (V_STRING);
+end;
+
+// @desc    : счёт активный? 
+//            (!!! информация берётся из плана счётов !!!)
+// @return  : V_BOOL
+macro Acc_IsActive( acc:string ) :bool
+    return (Acc_GetKindByAccount (acc) == "А");
+end;
+
+// @desc    : получает код валюты из номера счёта
+// @return  : V_INTEGER
+// 06.08.2013 I-00409025 Golovkin убрал условие t_fi_kind = 1
+macro Acc_GetFiidByAccount (acc:string)
+    var sql = "select t_fiid from dfininstr_dbt where /*t_fi_kind = 1 and*/ t_codeinaccount = substr (:acc, 6, 3)";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("acc", acc)));
+    if (sql.moveNext ())
+        return sql.value ("t_fiid", null, V_INTEGER);
+    end;
+    return FI_CURRENCY_UNDEF; //TAM 07.08.2013 - вместо 0 корректно возвращать -1
+end;
+
+
+// @desc    : получает свободный остаток для прохождения платежа (с учётом очерёдности и претензий к счёту)
+// @return  : V_MONEY
+//Gurin S. перенес с pm_chkrst.mac
+macro Acc_GetFreeAmountWithOverClaim( Payment)
+
+  var RestDebetFact;
+/*  var RestDebetFact = AccGetFreeAmount( Payment.PayerAccount, CHAPT1, Payment.PayerFIID, Payment.Priority, Payment.ClaimID, {curdate} );*/
+/*SDA */
+  AccGetFreeAmount( RestDebetFact, null, Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID, {curdate}, Payment.Priority, Payment.ClaimID); /* с учетом претензий */
+
+  var cmd, rs, RestDebet;
+
+// KS 25.11.2013 Адаптация под 31ю сборку
+//  if (Payment.PayerFIID != 0)
+//     cmd = RSDCommand("select t_planrest, t_type_account, t_limit from daccount$_dbt where t_chapter = 1 and t_code_currency = ? and t_account = ?");
+     cmd = RSDCommand("select rsi_rsb_account.planrestac(t_account,t_code_currency,?,t_chapter) t_planrest, " + "\n" +
+                      "       t_type_account, " + "\n" +
+                      "       rsi_rsb_account.GetAccLimit(t_account,t_chapter,t_code_currency,?) t_limit " + "\n" +
+                      "  from daccount_dbt where t_chapter = ? and t_code_currency = ? and t_account = ?");
+     cmd.addparam("restdate", RSDBP_IN, {curdate});
+     cmd.addparam("bankdate", RSDBP_IN, {curdate});
+     cmd.addparam("chapter ", RSDBP_IN, Payment.chapter);
+     cmd.addparam("fiid"    , RSDBP_IN, Payment.PayerFIID);
+     cmd.addparam("acc"     , RSDBP_IN, Payment.PayerAccount);
+/*
+  else
+     cmd = RSDCommand("select t_planrest, t_type_account, t_limit from daccount_dbt where t_chapter = 1 and t_account = ?");
+     cmd.addparam("acc", RSDBP_IN, Payment.PayerAccount);
+  end;
+*/
+
+  rs = RSDRecordset(cmd);
+  rs.MoveNext();
+  RestDebet = money(rs.value(0));
+
+  if (RestDebetFact < RestDebet)
+     RestDebet = RestDebetFact; //возвращаем наименьший остаток
+  end;
+
+  if (index(rs.value("t_type_account"), "О")!=0)
+     RestDebet = RestDebet + rs.value("t_limit");
+  end;
+
+  return RestDebet;
+
+end;
+
+/*
+macro Acc_GetFreeAmountWithOverClaim( Payment:object )
+    var RestDebetFact; 
+    AccGetFreeAmount( RestDebetFact, null, Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID, {curdate}, Payment.Priority, Payment.ClaimID); /* с учетом претензий */
+    
+    var cmd = RSDCommand("select t_planrest, t_type_account, t_limit from daccount_dbt where t_chapter = :chapt and t_code_currency = :fiid and t_account = :acc");
+    cmd.addparam("chapt", RSDBP_IN, Payment.Chapter      );
+    cmd.addparam("fiid",  RSDBP_IN, Payment.PayerFIID    );
+    cmd.addparam("acc" ,  RSDBP_IN, Payment.PayerAccount );
+    
+    var rs = RSDRecordset(cmd);
+    rs.MoveNext();
+    
+    //возвращаем наименьший остаток
+    var RestDebet = rs.value ("t_planrest", null, V_MONEY);
+    if (RestDebetFact < RestDebet)
+        RestDebet = RestDebetFact; 
+    end;
+
+    if (index(rs.value("t_type_account"), "О") !=0 )
+        RestDebet = RestDebet + rs.value("t_limit", null, V_MONEY);
+    end;
+
+    return RestDebet;
+end;
+*/
+
+
+// @desc    : получение символа ОПУ по счёту доходов-расходов
+// @return  : V_STRING (символ ОПУ) или null
+macro Acc_GetOpuSymbol (account:string)
+    var m_definitionKind = RSL_GetRegistryValue ("REPTREG/REP_GROUPS/ФОРМА 102/ЧИСЛО ЗНАКОВ СИМВОЛА В СЧЕТЕ");
+    var m_retval;
+    var m_balance = int (substr (account, 1, 5));
+    
+    if   (m_definitionKind == 4)
+        if   (((m_balance >= 70601) AND (m_balance <= 70605)) or ((m_balance >= 70701) AND (m_balance <= 70705)))
+            m_retval = string (1, substr(account, 14, 4));
+        elif (((m_balance >= 70606) AND (m_balance <= 70611)) or ((m_balance >= 70706) AND (m_balance <= 70711)))
+            m_retval = string (2, substr(account, 14, 4));
+        elif ((m_balance == 70612) or (m_balance == 70712))
+            m_retval = string (3, substr(account, 14, 4));
+        //
+        elif ((m_balance == 70613) or (m_balance == 70713))
+            m_retval = string (1, substr(account, 14, 4));
+        elif ((m_balance == 70614) or (m_balance == 70714))
+            m_retval = string (2, substr(account, 14, 4));
+/* GSP */
+        elif ((m_balance == 70615) or (m_balance == 70715))
+            m_retval = string (2, substr(account, 14, 4));
+        elif ((m_balance == 70616) or (m_balance == 70716))
+            m_retval = string (2, substr(account, 14, 4));
+        end;
+        
+    elif (m_definitionKind == 5)
+        m_retval = substr(account, 14, 5);
+    end;
+    
+    return m_retval;
+end;
+
+// @desc : получение кода (dfininstr_dbt.t_fiid) финансового инструмента по лицевму счету
+macro Acc_GetFiidByCode (fi_code:string)
+    var ret = null;
+    var sql = execSqlSelect ("select t_fiid from dfininstr_dbt where t_fi_code = :code and t_fi_kind = 1", makeArray (SqlParam ("code", fi_code)));
+    if (sql.moveNext ())
+        ret = sql.value ("t_fiid", null, V_INTEGER);
+    end;
+    return ret;
+end;
+
+
+// @desc : получение минимального значения очередности документов на К2 к счету TAM 29.04.2013 C-19427
+//TAM 29.07.2013 - берём только действующую картотеку (нет приостановления в К2)
+//zmp 12.08.2013  R-230298 - добавил в условие связь с dpmpaym_dbt
+macro Acc_GetMinPriorityI2 (acc:string):integer
+    var ret = -1; // документов на К2 нет
+    var sql = " SELECT   NVL (MIN (t_priority), -1) priority                     "+
+              " FROM   dpsinprop_dbt psi, dpmpaym_dbt pm                         "+
+              " WHERE   t_account = :ac                                          "+
+              " AND NOT EXISTS                                                   "+
+              "  (SELECT   1                                                     "+
+              "   FROM   dnotetext_dbt note                                      "+
+              "   WHERE   note.t_ObjectType = 501                                "+
+              "           AND note.t_DocumentID = LPAD (psi.t_PaymentID, 10, 0)  "+
+              "           AND note.t_NoteKind = 40)                              "+
+              "           AND psi.t_PaymentID = PM.T_PAYMENTID                   "+
+              "           AND PM.T_PAYMSTATUS = 2000                             ";
+                                                                                 
+    sql = execSqlSelect (sql, makeArray (SqlParam ("ac", acc)), false);
+    if (sql.moveNext())
+        ret = sql.value ("priority", null, V_INTEGER);
+    end;
+    return ret;
+end;
+
+class (TRecHandler) RSL_Account (acc:string, curr:integer)
+    var sum_k2_total  = $0; // сумма платежей, вставших на К2
+    var sum_k2_rest   = $0; // сумма остатка К2
+    var sum_k2_with40 = $0; // сумма платежей, вставших на К2 с учетом приостановления (примечание 40)
+    
+    // @desc    : проверка вида счёта 
+    // @return  : true, если счёт имеет вид Kind; иначе - false
+    macro check_kind_account (kind:string)
+        return (index (this.rec.kind_account, kind) > 0);
+    end;
+    
+    // @desc    : проверка системного типа счёта 
+    // @return  : true, если счёт имеет системный тип Type; иначе - false
+    macro check_type_account (type:string)
+        return (index (this.rec.type_account, type) > 0);
+    end;
+    
+    // @desc    : проверка пользовательского типа счёта 
+    // @return  : true, если счёт имеет пользовательский тип Type; иначе - false
+    macro check_usertypeaccount (type:string)
+        return (index (this.rec.usertypeaccount, type) > 0);
+    end;
+    
+    // @desc    : проверка наличия К2
+    // @return  : V_BOOL ( true/false )
+    macro check_index2 ( )
+        return (this.rec.index2 == "X");
+    end;
+    
+    // @desc    : проверка наличия претензий на дату
+    // @return  : V_BOOL ( true/false )
+    // @modify  : Gurin S. 06.03.2015 R-553728-2 добавил kind_claim
+    macro check_claims ( bankdate:date, kind_claim )
+        const CLAIM_STATUS_ACTIVE   = 1;
+        const CLAIM_STATUS_MODIFIED = 2;
+        
+        if (isNull (bankdate) ) bankdate = {curdate}; end;
+        if (isNull (kind_claim) ) kind_claim = "1,2,3"; end;
+        var sql = "SELECT count (1) n"                                         + "\n" + 
+                  "  FROM dacclaim_dbt claim, dacclaimstate_dbt acclaimstate"  + "\n" + 
+                  " WHERE    claim.t_Chapter = :m_Chapter"  + "\n" + 
+                  "      AND claim.t_Account = :m_Account"  + "\n" + 
+                  "      AND claim.t_FIID = :m_FIID"        + "\n" + 
+                  "      AND regexp_like (claim.t_ClaimKind, :m_Kind_Claim) "  + "\n" +
+                  "      AND (claim.t_FinishDate = to_date ('01.01.0001', 'dd.mm.yyyy') OR claim.t_FinishDate > :m_FinishDate)"  + "\n" + 
+                  "      AND claim.t_ClaimID = acclaimstate.t_ClaimID"                + "\n" + 
+                  "      AND (acclaimstate.t_State IN (:state1, :state2))"            + "\n" + 
+                  "      AND acclaimstate.t_StateDate = (SELECT max (t.t_StateDate)"  + "\n" + 
+                  "                                      FROM dacclaimstate_dbt t"    + "\n" + 
+                  "                                      WHERE t.t_ClaimID = claim.t_ClaimID AND t.t_StateDate <= :m_StateDate)"; 
+        var parm = makeArray (SqlParam ("m_Chapter"    ,this.rec.Chapter      ),
+                              SqlParam ("m_Account"    ,this.rec.Account      ),
+                              SqlParam ("m_FIID"       ,this.rec.Code_Currency),
+                              SqlParam ("m_Kind_Claim" ,strsubst(string(kind_claim),",","|")),
+                              SqlParam ("m_FinishDate" ,bankdate              ),
+                              SqlParam ("state1"       ,CLAIM_STATUS_ACTIVE   ),
+                              SqlParam ("state2"       ,CLAIM_STATUS_MODIFIED ),
+                              SqlParam ("m_StateDate"  ,bankdate              ));
+        sql = execSqlSelect (sql, parm, false);
+        return ( (sql.moveNext ()) and (sql.value ("n") > 0 ));
+    end;
+    
+    
+    /* конструктор */
+    InitTRecHandler ("account");
+    private macro RSL_Account_Init (acc:string, curr:integer)
+        curr = nvl_ex (curr, Acc_GetFiidByAccount (acc));
+        
+        var sql = "select * from daccount_dbt where t_account = :ac and t_code_currency = :curr";
+        sql = execSqlSelect (sql, makeArray (SqlParam ("ac", acc), SqlParam ("curr", curr)), false);
+        if (sql.moveNext ())
+            copySql2Rsl (sql, this);
+        end;
+        // 2015-06-12 vdn добавил вывод суммы с учетом приостановления к2 (примечание 40)    
+        sql = "SELECT payeraccount, paysum, restsum, with40" 
+            + "\n FROM (SELECT /*+INDEX(pm dpmpaym_dbt_idxc)*/" 
+            + "\n            pm.t_payeraccount AS payeraccount,"
+            + "\n            SUM (pm.t_amount) AS paysum,"
+            + "\n            SUM (pm.t_futurepayeramount) AS restsum," 
+            + "\n            SUM ( NVL((SELECT t_amount"
+            + "\n                   FROM dnotetext_dbt t"
+            + "\n                   WHERE t.t_documentid = LPAD (pm.t_paymentid, 10, '0')"
+            + "\n                     AND t_notekind(+) = 40"
+            + "\n                     AND rsb_struct.getdate (t_text) >= SYSDATE), 0)) AS with40"
+            + "\n      FROM dpmpaym_dbt pm" 
+            + "\n      WHERE pm.t_paymstatus = 2000 AND pm.t_dockind IN (201, 286)" 
+            + "\n      GROUP BY pm.t_fiid, pm.t_payeraccount) i2pm" 
+            + "\n INNER JOIN daccount_dbt ac" 
+            + "\n    ON ( ac.t_chapter = 1 AND ac.t_code_currency = 0 AND ac.t_account = i2pm.payeraccount AND AC.T_ACCOUNT = :ac )";
+        // 2013-07-16 zip_z. оптимизация: если нет картотеки, сумму считать незачем
+        if ( this.check_index2 () == true )
+            sql = execSqlSelect (sql, makeArray (SqlParam ("ac", this.rec.Account)), false);
+            if (sql.moveNext ())
+                this.sum_k2_total  = sql.value ("paysum" ,null, V_MONEY);
+                this.sum_k2_rest   = sql.value ("restsum",null, V_MONEY);
+                this.sum_k2_with40 = sql.value ("with40" ,null, V_MONEY);
+            end;
+        end;
+    end;
+    RSL_Account_Init (acc:string, curr:integer)
+end;
+
+// @desc    : получение UniID для лицевого счёта (быстрый алгоритм)
+// @return  : V_STRING
+macro Acc_GetAccountUniId (p_account:string, p_chapter:integer, p_code_currency:integer):string
+    var ret = "";
+    if (notnull (p_account)) 
+        p_chapter       = nvl_ex (p_chapter      , Acc_GetChapterByAccount (p_account));
+        p_code_currency = nvl_ex (p_code_currency, Acc_GetFiidByAccount    (p_account));
+        var sql = "select to_char ( :m_chapter, 'FM0x' ) || "            + "\n" + 
+                  "       to_char ( :m_code_currency, 'FM0xxxxxx' ) || " + "\n" + 
+                  "       :m_account as m_AccountUniId from dual";
+        sql = execSqlSelect (sql, makeArray (SqlParam ("m_chapter"      , p_chapter       ),
+                                             SqlParam ("m_code_currency", p_code_currency ),
+                                             SqlParam ("m_account"      , p_account       )));
+        if (sql.moveNext ())
+            ret = sql.value ("m_AccountUniId", null, V_STRING);
+        end;
+    end;
+    return ret;
+end;
+
+ MACRO SendLotusNoticeAccOpen(Account, Name)
+  debugbreak;
+  var rs, recipients = "", RText;
+  private var Bank_name = fg_life_subject({OurBank});
+
+  if (index(Substr(Account,1,5), "70601") != 0)
+    rs = RSDRecordset("select T_EMAIL from DUSR_CAE_DBT where t_id != 0 and T_TYPE_EMAIL = 1");
+    while (rs and rs.movenext())
+      if (recipients == "")
+        recipients = rs.value("T_EMAIL");
+      else
+        recipients = recipients + ", " + rs.value("T_EMAIL");
+      end;
+    end;
+    RText = "Банк: "+Bank_Name.BankShortName+"\nОткрыт доходный счет :"+Account+"\nНаименование: "+Name+"\nКопия письма разослана по адресам: "+recipients+"";
+    Send_l("Уведомление об открытии доходного счета", RText, 85, recipients /*"RRahmedov@prbb.ru"*/);
+    msgbox("Уведомление отправлено");
+  else
+    msgbox("Указанные счет не соотвествует маске 70601*");
+  end;
+ onerror(er)
+   msgbox("Не удалось отправить тестовое письмо\n "+recipients+"");
+ END;

@@ -1,0 +1,576 @@
+/******************************************************************************
+   Имя файла.:       ImportScanDoc.mac
+   Назначение:       Импорт отсканированных документов из FineReader
+   Дата......:       22.08.2008
+   Автор.....:       Стадник Александр
+17.03.2009 В.Селезнёв переработал под новые требования банка
+10.10.2012 Gurin S. I-00266506-2
+RR 15.12.2015 Доработки в соответствии с R-631562
+******************************************************************************/
+
+Import BankInter, globals, rsexts, "AvtoTypePayment.mac", "PaymProc.mac", "opr_engine.mac", "PmReport.mac", pm_tools, Календарь;
+Import commonint;
+Import "ProcPaymDate.mac";
+Import "TimeStat.mac"; // KS 18.05.2011 Статистика по времени
+Import "fg_Life_parm.mac"; // KS 19.05.2011 Библиотека для работы с банками группы
+
+file fDocDbf() write dbf;
+
+
+file rep  () txt;
+
+var ImpPathSrc = "$C:\\RSPAR\\";
+
+var ImpPathDst;// = "..\\RSPAR\\";
+
+var   ImpFileSrc;
+var   ImpFileDst;
+
+var   st:integer;
+var   MaskaFileName = "impdoc*.dbf";
+var   ob : TDirList;
+var   i = 0, j = 0, k = 0;
+var   Paym : UsrPayment;
+var   success_cnt = 0, error_cnt = 0;
+var   success_sum = $0, error_sum  = $0;
+var   PmIDs = TArray(); 
+var   opr = opr_engine;
+
+var   ErrorMessage; 
+var   rep_file = GetTxtFileName("report_frb");
+var   cmd, rs, pmtype;
+
+var err_stings = TArray;
+var succ_stings = TArray;
+var u;
+var id;
+
+private var fgBank = fg_life_subject( {OurBank} ); // KS 19.05.2011 Библиотека для работы с банками группы
+
+/* ------------------------------------------------------------------------- */
+
+private var _outString;
+
+private Macro _collectOutProc (str)
+   if (_outString)
+      _outString = _outString + str;
+   else
+      _outString = str;
+//      _outString = StrSubst(_outString,"\n","");
+//      _outString = StrSubst(_outString,"\r","");
+   end;
+end;
+
+macro CaptureOutput
+   _outString = null;
+   SetOutHandler (@_collectOutProc);
+end;
+
+macro StopCaptureOutput
+   var retVal = _outString;
+   _outString = null;
+   SetOutHandler;
+   return retVal;
+end;
+
+
+
+/* ------------------------------------------------------------------------- */
+
+private macro isValidDate (what)
+    var arr = split (what, ".");
+        
+    // парсим строку в массив по разделителю "точка". Если получилось < 3 элементов или прилетел
+    // кривой месяц - это точно не дата
+    if ((arr.size != 3) or ((int (arr (1)) < 1) or (int (arr (1)) > 12)))
+        return false;
+    end;
+
+    // прилетело неправильное количество дней в месяце
+    //Gurin S. 10.10.2012 I-00266506-2 
+    if ((int (arr (0)) > getDaysInMonth (date (1, int (arr(1), 2000)))) or (int(arr(0)) == 0 ))
+        return false;
+    end;
+
+    // пытаемся привести строку с датой во внутренний формат RSL. Если ничего не получается - неверная дата;
+    return true;
+
+onError (e)
+    return false;
+end;  
+
+
+
+macro CheckPmNumber( Str )
+
+  var stat = 0, i = 1, zc = 0, ch, DigitString = "0123456789";
+
+
+  while( i <= strlen(Str)) 
+    ch = SubStr( Str, i, 1 );
+    if( Index( DigitString, ch ))
+      stat = 1; 
+    end;
+
+    if (ch == "0")
+      zc = zc + 1;
+    end;
+
+    i = i + 1;
+  end;
+
+  //в номере нет ни одной цифры, либо одни нули
+  if ((stat == 0) or (zc == i))
+    return false;
+  end;
+
+  return true;
+
+end;
+
+
+macro PrintHead(h)
+
+
+[
+                                                           #
+
+ ───────┬────────────────────┬────────────┬──────────────────────────────────────────────────────────────┬─────────────────────
+  № док.│ Счет плательщика   │   Сумма    │                     Состояние                                │    Имя файла        
+ ───────┼────────────────────┼────────────┼──────────────────────────────────────────────────────────────┼─────────────────────]
+ (h:c) ;
+
+end; 
+
+macro PrintRep(Number, Doc, ErrorMsg, flename)
+   private var i,j;
+
+
+
+   CaptureOutput;
+[ ###### #################### ############ ############################################################## #################### ]
+   (Doc.NumDoc, Doc.PayerAccount, Doc.DebetSum, ErrorMsg:w, flename) ;
+
+   if (ErrorMsg != "Документ успешно создан")
+      if (err_stings.size == 0)
+         i = 0;
+      else
+         i = err_stings.size;
+      end;
+      error_cnt = error_cnt + 1;
+      error_sum = error_sum + money(Doc.DebetSum);
+      err_stings(i) = StopCaptureOutput;
+   else
+      if (succ_stings.size == 0)
+         j = 0;
+      else
+         j = succ_stings.size;
+      end;
+      success_sum = success_sum + money(Doc.DebetSum);
+      succ_stings(j) = StopCaptureOutput;
+   end;
+end;
+
+macro PrintBottom(sum, count)
+
+  [───────┴────────────────────┴────────────┴──────────────────────────────────────────────────────────────┴─────────────────────] ;
+  [ ];
+  [ всего документов:#](count:l);  
+  [ на сумму        :#](sum:l);  
+  [ ];
+  [ ];
+end ;
+
+
+macro FillDocumentFromDbf(Scan, Doc)
+
+
+    //замена символов в строке ( заменяются при выгрузке!)
+    private macro ChangeNotChar(str)
+        str = StrSubst(str, "Ё", "Е");
+        str = StrSubst(str, "ё", "е");
+        str = StrSubst(str, "№", "N");
+        str = StrSubst(str, "%", "пр");
+        str = StrSubst(str, StrFor(10), "");
+        str = StrSubst(str, StrFor(13), " ");
+                                       
+        return str;
+    end;
+
+    Doc.Initialization();
+
+    Doc.Origin    = PSPO_OR_FINEREADER; //FineReader
+    Doc.NumDoc    = Int(Trim(Scan.Number));
+    Doc.DocDate   = date(trim(Scan.Date));
+    Doc.ValueDate = {curdate};
+    Doc.Pack      = 0;
+    Doc.DocKind   = dockind_client_paym;
+    Doc.CheckExists     = 1;//проверяется дублирование
+    Doc.NumOperation = 24001;
+    //Doc.Corschem  = 1;
+    
+    if (Index(StrUpr(Scan.NameShab), "ТРЕБОВАН"))
+        Doc.Shifr = "02";        
+        Doc.DocKind = dockind_client_order;
+
+        Doc.PayerKPP = Trim(Scan.Payer_KPP);
+
+        if(FldIndex(Scan, "Recip_KPP") != -1)
+            Doc.ReceiverKPP = Trim(Scan.Recip_KPP);
+        else
+            Doc.ReceiverKPP = Trim(Scan.KPP);
+        end;
+
+        doc.PayCondition = trim(Scan.Pay_Cond);
+
+        if ((Index(StrUpr(Scan.Pay_Cond), "БЕЗ")) and (Index(StrUpr(Scan.Pay_Cond), "АКЦЕПТ")))
+           Doc.AcceptTerm = 1;
+           Doc.AcceptPeriod = 0;
+
+        elif (Index(StrUpr(Scan.Pay_Cond), "АКЦЕПТ"))
+           Doc.AcceptTerm = 0;
+
+           if (trim(string(Scan.accept_ter)) != "")
+              Doc.AcceptDate = GetDateAfterWorkDays ( {curdate}, int(string(Scan.accept_ter)));
+              Doc.AcceptPeriod = trim(Scan.accept_ter);
+           else
+              Doc.AcceptDate = GetDateAfterWorkDays ( {curdate}, 5);
+              Doc.AcceptPeriod = 5;
+           end;
+
+        end;
+    
+        Doc.PayCondition = Trim(Scan.Pay_Cond);
+    
+    elif (Index(StrUpr(Scan.NameShab), "ИНКАССО"))
+        Doc.Shifr = "06";
+
+        Doc.PayerKPP = Trim(Scan.Payer_KPP);
+        Doc.ReceiverKPP = Trim(Scan.Recip_KPP);
+
+        Doc.KbkCode  = Trim(Scan.KBK);
+
+        Doc.OkatoCode = Trim(Scan.OKATO);
+        
+        Doc.GroundTaxDoc  = Trim(Scan.TAX_Reason);
+        Doc.TaxPeriod     = Trim(Scan.TAX_Period);
+        Doc.NumTaxDoc     = Trim(Scan.TAX_Doc_N);
+        Doc.TaxDate       = Trim(Scan.TAX_Date);
+        Doc.TaxType       = Trim(Scan.TAX_Type);
+        Doc.CreatorStatus = Trim(Scan.TAX_Status);
+    else
+        Doc.Shifr = "01";
+        
+        Doc.PayerKPP    = Trim(Scan.Payer_KPP);
+        Doc.ReceiverKPP = Trim(Scan.Recip_KPP);
+
+        Doc.KbkCode  = Trim(Scan.KBK);
+
+        Doc.OkatoCode     = Trim(Scan.OKATO);
+        Doc.GroundTaxDoc  = Trim(Scan.TAX_Reason);
+        Doc.TaxPeriod     = Trim(Scan.TAX_Period);
+        Doc.NumTaxDoc     = Trim(Scan.TAX_Doc_N);
+        Doc.TaxDate       = Trim(Scan.TAX_Date);
+        Doc.TaxType       = Trim(Scan.TAX_Type);
+        Doc.CreatorStatus = Trim(Scan.TAX_Status);
+
+    end;
+
+    Doc.DebetSum        = Scan.Sum ;           
+    Doc.PayerINN        = Trim(Scan.Payer_Inn);
+    Doc.PayerAccount    = Trim(Scan.Payer_Acc);    
+    Doc.PayerName       = Trim(Scan.Payer);
+    
+    Doc.ReceiverBIC     = Trim(Scan.Recip_Bic);
+    Doc.ReceiverINN     = Trim(Scan.Recip_Inn);
+    Doc.ReceiverAccount = Trim(Scan.Recip_Acc);    
+    Doc.ReceiverName    = Trim(Scan.Recip);
+
+    Doc.Ground          = SubStr(Trim(Scan.Payment_AI), 1, 600);
+
+    /* A.Gregeradsky - 24.11.2009 - Доработка по заявке №А44430 */
+    /* В п/п дата значения (валютирования) не отличается от текущей (в соответствии с информацией в заявке). */
+    /* Для прочих документов может быть отличие */
+    if(Doc.Shifr != "01") 
+
+      /* EVG 20/05/2011 В поручениях на инкассо (06) Scan.Pay_Term что-то совсем какой-то кривой,
+         и как следствие - Bad date used */
+      //msgbox ( Scan.Pay_Term, " - ", valType(Scan.Pay_Term), " - ", valType( trim(Scan.Pay_Term) ) );
+      if (Doc.Shifr != "06")
+         Doc.ValueDate = date(trim(Scan.Pay_Term));
+      end;
+
+
+      if (Doc.ValueDate == date(0, 0, 0))
+          Doc.ValueDate = {curdate};
+      end;
+    else
+      Doc.ValueDate = {curdate};
+    end;
+    /* End Gregeradsky */
+
+    Doc.Priority = Trim(Scan.Pay_Queue);
+    Doc.PackMode = 0;
+
+    Doc.Oper = {oper};
+    
+    Doc.Ground       = ChangeNotChar(Doc.Ground);
+    Doc.PayerName    = ChangeNotChar(Doc.PayerName);
+    Doc.ReceiverName = ChangeNotChar(Doc.ReceiverName);
+
+    //счет получателя может быть не задан, но если задан должен проверяться
+    //ИНН не проверяем, проверится позднее - на предобработке
+    // KS 18.02.2010 Отключил проверку на счет получателя и на наименование плательщика
+    // KS 19.02.2010 Сведение в один макрос
+    if ( fgBank.is_EXV )
+      if (Doc.PayerAccount == "")
+         Doc.SkipCheckMask = skip_recacc_exists+skip_payname_match+skip_pay_inn_fill+skip_rec_inn_fill;
+      else
+         Doc.SkipCheckMask = skip_recacc_exists+skip_payname_match+skip_recname_match;
+      end;
+    else
+      if (Doc.PayerAccount == "")
+         Doc.SkipCheckMask = skip_recacc_exists+skip_pay_inn_fill+skip_rec_inn_fill;
+      end;
+    end;
+
+end ; /* FillDocumentFromDbf */
+
+/* ------------- НАЧАЛО ---------------- */
+
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, ImpPathDst, st);
+if( st != 0)
+   msgbox("Не определена директория временных файлов");
+   exit(1);
+end;
+
+ImpFileSrc = ImpPathSrc + "impdoc.dbf";
+ImpFileDst = ImpPathDst + "\\imp_" + String({oper}) + ".dbf";
+
+Paym = UsrPayment();
+ob = TDirList(ImpPathSrc + MaskaFileName, "f");
+
+
+set_pipe_server(pipe_server_finereader);
+
+while (i < ob.Count)
+    ImpFileSrc = ImpPathSrc + ob.Name(i);
+       
+    if (not CopyFile(ImpFileSrc, ImpFileDst, true))
+        MsgBox("Ошибка при копировании файла " + ImpFileSrc + " в каталог " + ImpPathDst);
+        Exit(0);
+    end;
+
+    if (not Open(fDocDbf, ImpFileDst))
+        MsgBox("Ошибка открытия файла ", ImpFileDst);
+        Exit(0);
+    end;
+
+    j = 0;
+
+    rewind(fDocDbf);
+
+    id = KSaveBeginTime(); // KS 18.05.2011 Запуск сбора статистики
+
+    while (next(fDocDbf))
+
+        
+        Paym.PayerAccount = Trim(fDocDbf.Payer_Acc);
+        Paym.DebetSum = fDocDbf.Sum;
+        //1.2.1.  проверить БИК плательщика (должен совпадать с  ПРББ)
+        if (trim(fDocDbf.payer_bic) != {MFO_Bank})
+            /* EVG 17/04/2011
+            PrintRep(fDocDbf.Number, Paym, "БИК плательщика не совпадает с ПРББ", ob.Name(i));*/
+            PrintRep(fDocDbf.Number, Paym, "БИК плательщика не совпадает с БИК нашего банка", ob.Name(i));
+        //1.2.2.  очередность платежа должна быть задана
+        elif (trim(fDocDbf.Pay_Queue) =="")
+            PrintRep(fDocDbf.Number, Paym, "Не задана очередность платежа", ob.Name(i))
+        //1.2.3.  номер документа не должен состоять из нулей и имеет хотя бы одну цифру (для нормализации)
+        elif (not CheckPmNumber(trim(fDocDbf.Number)))
+            PrintRep(fDocDbf.Number, Paym, "Номер документа "+fDocDbf.Number+" некорректный", ob.Name(i));
+        //1.2.4.  проверить корсчета банка плательщика (должен совпадать с корсчетом ПРББ)
+        elif (trim(fDocDbf.payer_ks) != {CORAC_Bank})
+            PrintRep(fDocDbf.Number, Paym, "Корсчет банка плательщика не совпадает с ПРББ", ob.Name(i));
+        //1.2.5.  БИК  получателя задан и состоит из 9 символов
+        elif (strlen(trim(fDocDbf.Recip_Bic)) != 9)
+            PrintRep(fDocDbf.Number, Paym, "БИК получателя некорректный", ob.Name(i));
+        //1.2.6.  наличие наименования получателя
+        elif (strlen(trim(fDocDbf.recip)) == 0)
+            PrintRep(fDocDbf.Number, Paym, "Отсутствует наименование получателя", ob.Name(i));
+        elif ((Index(StrUpr(fDocDbf.NameShab), "ТРЕБОВАН")) and (trim(fDocDbf.Pay_Cond) == ""))
+            PrintRep(fDocDbf.Number, Paym, "Для требования не заданы условия оплаты", ob.Name(i));
+        elif (not isValidDate(fDocDbf.Date))
+            PrintRep(fDocDbf.Number, Paym, "Формат даты "+fDocDbf.Date+" некорректный", ob.Name(i)); //Зленко М. 19.04.2012 I-00183395
+        elif ( (ExecMacroFile("lib_pm_check.mac","CheckFillUIN", RSBPayment(Paym.PaymentID))) and ( fgBank.is_VUZ ) )
+            PrintRep(fDocDbf.Number, Paym, "Необходимо заполнение Уникального Индентификатора Платежа в поле <КОД>", ob.Name(i));
+        elif ( (ExecMacroFile("lib_pm_check.mac","CheckFillKPP", RSBPayment(Paym.PaymentID))) and ( fgBank.is_VUZ ) )
+            PrintRep(fDocDbf.Number, Paym, "Необходимо заполнить КПП получателя", ob.Name(i));
+        else
+
+           FillDocumentFromDbf(fDocDbf, Paym);
+           
+           j = j + 1;
+           
+           if (not Paym.InsertPayment())                          
+              ErrorMessage = Paym.ErrorMessage;
+           else
+               
+              pmtype = GetPmtypeByID(Paym.PaymentID);
+
+              /* A.Gregeradsky - 24.11.2009 - Обновление поля "Срок платежа". Доработка выполнена по запросу пользователя в рамках заявки № А44430 */
+              if(Paym.Shifr == "01") /* Клиентское п/п */
+                u = TestDates(Paym.PaymentID);
+              end;
+              /* End Gregeradsky */
+
+              if (pmtype != "Э")
+                 cmd = RSDCommand("update dpmrmprop_dbt set t_paymentkind = ? where t_paymentid = ?");
+                 cmd.addparam("paymentkind", RSDBP_IN, pmtype);
+                 cmd.addparam("paymentid", RSDBP_IN,  Paym.PaymentID);
+                 cmd.execute;
+              elif ((Paym.Shifr == "02") and (Paym.AcceptTerm == 0)) //акцептное требование
+                 cmd = RSDCommand("update dpmrmprop_dbt set t_clientdate = ? where t_paymentid = ?" );
+                 cmd.addparam("cldate", RSDBP_IN,  {curdate});
+                 cmd.addparam("paymentid", RSDBP_IN,  Paym.PaymentID);
+                 cmd.execute;
+              end;
+
+              /* A.Gregeradsky - 25.11.2009 - Доработка (заполнение даты поступления в банк) по заявке № А47018 */
+              if ((Paym.Shifr == "02") or (Paym.Shifr == "06")) //Seleznev добавил 06 по просьбе А.Лавренова
+               /*  FIV 13.10.2010 Paym.DocDate - это дата из бумажки, которую сканируют и не факт, что она совпадет с текущей опер. датой
+                cmd = RSDCommand("update dpmpaym_dbt set t_payerbankenterdate = ? where t_paymentid = ?" ); // t_payerchargeoffdate
+                  Paym.DocDate
+                 /* A.Gregeradsky - 11.01.2010 - Доработано по заявке А50949 (заполнение даты поступления в банк и даты списания со счета плательщика) */
+                 /* cmd.addparam("enterdate", RSDBP_IN,  {curdate});*/
+                 cmd.addparam("enterdate", RSDBP_IN, Paym.DocDate);  /* Дата поступления в банк = дате сканирования */
+                 cmd.addparam("paymentid", RSDBP_IN, Paym.PaymentID);
+                 cmd.execute();
+               */  
+                 /* Добавлена ветка - 11.01.2010 */
+                 if(Paym.Shifr == "06") /* Пока только для инкассовых поручений - в рамках той же заявки */
+                    cmd = RSDCommand("update dpmrmprop_dbt set t_payerchargeoffdate = ? where t_paymentid = ?" );  
+                    cmd.addparam("chargeoffdate", RSDBP_IN, Paym.ValueDate);  /* Дата списания со счета плательщика = дате валютирования */
+                    cmd.addparam("paymentid", RSDBP_IN, Paym.PaymentID);
+                    cmd.execute();
+                 end;
+
+              end;
+              /* End Gregeradsky */
+
+              PmIDs(success_cnt) = Paym.PaymentID;
+
+              success_cnt = success_cnt + 1;
+              ErrorMessage = "Документ успешно создан";
+
+           end;        
+
+           PrintRep(j, Paym, ErrorMessage, ob.Name(i));                  
+  
+        end;
+    end; /* while по dbf-файлу */
+
+
+
+    Close(fDocDbf);    
+
+    RemoveFile(ImpFileDST);
+    RemoveFile(ImpFileSRC);
+
+    i = i + 1;
+end;
+
+KSaveAmount(success_cnt,id);// KS 18.05.2011 Сохраняем количество документов
+
+setoutput(rep_file);
+
+if (i == 0)
+   println("Отсутствуют файлы сканированных документов");
+else
+
+
+   PrintHead("ПЕРЕЧЕНЬ ЗАГРУЖЕННЫХ ОТСКАНИРОВАННЫХ ДОКУМЕНТОВ");//+ StrUpr(ImpFileSrc));
+   i = 0;
+
+   while (i < succ_stings.size)
+      println(succ_stings(i));
+      i = i + 1 ;
+   end;
+
+   PrintBottom(success_sum, success_cnt);
+
+
+
+   PrintHead("ПЕРЕЧЕНЬ ОШИБОК ПРИ ЗАГРУЗКЕ ОТСКАНИРОВАННЫХ ДОКУМЕНТОВ");//+ StrUpr(ImpFileSrc));
+   i = 0;
+
+   while (i < err_stings.size)
+      if (err_stings(i) != "")
+         println(err_stings(i));
+      end;
+      i = i + 1 ;
+   end;
+
+   PrintBottom(error_sum, error_cnt);
+ 
+  //запуск операции
+
+   if (PmIDs.size > 0)
+
+      opr.oper = {oper};
+      opr.kindoperation = 24001;
+      opr.dockind = 201;
+
+      rsldefcon.BeginTrans;
+
+      opr.reg_payments (PmIDs);
+
+      cmd=RSDCommand("begin ? := wld_common.definemessagereleaseforpmmass (false); end;");
+      cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+      cmd.Execute();
+
+   //пока всегда null
+   //   if (cmd.Param("stat").value != 0);
+   //     println("ошибка определения параметров обмена:"+cmd.Param("stat").value);
+   //   end;
+
+
+      if (opr.change_opr_stat(291,2/*состояние=открыт*/) and opr.change_opr_stat(292, 6/*ДО=предобработка*/) and opr.start_operation)
+            println("Операция по загруженным документам стартована");
+         else
+            println("Ошибка запуска операции: "+opr.lasterror+"\nдокументы находятся в списке отложенных");
+            if (rsldefcon.isintrans)
+               rsldefcon.RollbackTrans;
+            end;
+      end;
+
+      rsldefcon.CommitTrans;
+      setoutput(null,true);
+
+      //выполнение предобработки
+      cmd=RSDCommand("begin usr_operations.exec_steps_for_temp; end;");
+      cmd.Execute();
+
+      KSaveEndTime(11,id);// KS 18.05.2011 Заканчиваем
+
+      if ( not Open( rep, rep_file) )
+         MsgBox("Ошибка открытия файла с протоколом");
+      else
+         ViewFile( rep );
+      end;
+
+      //печать отчета обработки
+
+      PrintReport("FineReader");
+   else
+      setoutput(null,true);
+
+      if ( not Open( rep, rep_file) )
+         MsgBox("Ошибка открытия файла с протоколом");
+      else
+         ViewFile( rep );
+      end;
+
+      exit(1);
+   end;
+end;

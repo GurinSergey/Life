@@ -1,0 +1,423 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: xr_client.mac v.1
+// @author  : 2013-05-01 zip_z. 
+// @desc    : ТК Life - субъекты экономики
+// @changes : none
+// -------------------------------------------------------------------------------------------------
+import ptinter, bankinter;
+import soa_core;
+
+/*** ВНУТРЕННИЕ ИНТЕРФЕЙСНЫЕ МЕТОДЫ (исключаем дублирование кода в бизнес-логике) ***/
+
+// @desc    : получить форму собственности по известному partyid
+private macro PT_GetLegalForm (p_partyid):integer
+    var sql = execSqlSelect ("select t_legalform from dparty_dbt where t_partyid = :m_partyid", makeArray (SqlParam ("m_partyid", p_partyid)), false);
+    var ret = null;
+    if (sql.moveNext ())
+        ret = sql.value ("t_legalform", null, V_INTEGER);
+    end;
+    return ret;
+onerror (e) catchUserError (e);        
+end;
+
+
+// @desc    : заполнить и обновить структуру клиента
+// @return  : V_OBJECT TXReturnValueStruct (определено в xr_core.mac)
+private macro PT_FillClientParameters (p_partyid          :integer // dparty_dbt.t_partyid
+                                      ,p_legalform        :integer // форма собственности
+                                      ,p_shortname        :string  // краткое наименование
+                                      ,p_fullname         :string  // полное наименование
+                                      ,p_addname          :string  // дополнительное наименование
+                                      ,p_lastname         :string  // фамилия
+                                      ,p_firstname        :string  // имя
+                                      ,p_secondname       :string  // отчество
+                                      ,p_latname          :string  // латинское полное наименование
+                                      ,p_birthdate        :date    // дата рождения
+                                      ,p_birthplace       :string  // место рождения
+                                      ,p_ismale           :bool    // is мужчина
+                                      ,p_nationality      :string  // национальность
+                                      ,p_isemployer       :bool    // is работотатель (ЧП)
+                                      ,p_workplace        :string  // место работы и должность
+                                      ,p_okpo             :string  // код ОКПО
+                                      ,p_country          :string  // страна
+                                      ,p_superiorid       :integer // id вышестоящей организации
+                                      ,p_charterdate      :date    // {нет документации}
+                                      ,p_capitalfi_iso    :string  // {нет документации}
+                                      ,p_declarecapital   :money   // {нет документации}
+                                      ,p_realcapital      :money   // {нет документации}
+                                      )
+    /** организационно-правовые формы субъектов (dparty_dbt.t_legalform) **/
+    private const PT_PARTYKIND_LEGAL    = 1; // юрик
+    private const PT_PARTYKIND_PHYSICAL = 2; // физик
+    
+    // заполнение
+    var pt = RsbParty (nvl_ex (p_partyid, 0));
+        pt.LegalForm = p_legalform; //LAO Олег, без этого, параметры Капитала недоступны.
+    if   ( p_legalform == PT_PARTYKIND_LEGAL )
+        if (notnull (p_charterdate    )) pt.charterdate    = p_charterdate;    end;
+        if (notnull (p_capitalfi_iso  )) pt.capitalfi      = p_capitalfi_iso;  end;
+        if (notnull (p_declarecapital )) pt.declarecapital = p_declarecapital; end;
+        if (notnull (p_realcapital    )) pt.realcapital    = p_realcapital;    end;
+        if (notnull (p_okpo           )) pt.okpo           = p_okpo;           end;
+    elif ( p_legalform == PT_PARTYKIND_PHYSICAL )
+    
+        if (notnull (p_isemployer     )) pt.isemployer = p_isemployer;         end;
+        if (p_isemployer == true) 
+            if (notnull (p_okpo       )) pt.okpo       = p_okpo;               end;
+        end;
+       
+        if (notnull (p_firstname      )) pt.firstname  = p_firstname;          end;
+        if (notnull (p_secondname     )) pt.patronymic = p_secondname;         end;
+        if (notnull (p_lastname       )) pt.lastname   = p_lastname;           end;
+        if (notnull (p_latname        )) pt.latname    = p_latname;            end;
+        if (notnull (p_birthdate      )) pt.birthdate  = p_birthdate;          end;
+        if (notnull (p_birthplace     )) pt.birthplace = p_birthplace;         end;
+        if (notnull (p_ismale         )) pt.ismale     = p_ismale;             end;
+        if (notnull (p_nationality    )) pt.ethnos     = p_nationality;        end;
+        if (notnull (p_workplace      )) pt.placework  = p_workplace;          end;
+    end;
+    
+    // общее для всех
+  //  if (notnull (p_legalform )) pt.legalform  = p_legalform; end; определяется сверху
+    if (notnull (p_shortname )) pt.shortname  = p_shortname; end;
+    if (notnull (p_fullname  )) pt.fullname   = p_fullname;  end;
+    if (notnull (p_addname   )) pt.addname    = p_addname;   end;
+    if (notnull (p_latname   )) pt.latname    = p_latname;   end;//LAO Добавил в обработку, параметр общий для ю/ф
+    // если внешняя система не передала параметры, заполняем их значениями по умолчанию
+    pt.nrcountry  = nvl_ex (p_country, "RUS");
+    pt.superiorid = nvl_ex (p_superiorid, -1);
+    
+    // обновление, возврат результата 
+    if (true == pt.update ())
+        return pt.partyid;
+    end;
+
+onerror (e) catchUserError (e);    
+end;
+
+/*** КЛИЕНТЫ (usr_create_client; usr_update_client; usr_delete_client) ***/
+
+// @desc    : создать клиента
+macro usr_create_client (p_legalform        :integer // форма собственности
+                        ,p_country          :string  // страна
+                        ,j                  :object  // описание ЮЛ
+                        ,p                  :object  // описание ФЛ
+                        ):integer
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    return PT_FillClientParameters ( null
+                                    ,p_legalform
+                                    ,safeGetProp (j, "shortname"       ,   V_STRING  )
+                                    ,safeGetProp (j, "fullname"        ,   V_STRING  )
+                                    ,safeGetProp (j, "addname"         ,   V_STRING  )
+                                    ,safeGetProp (p, "lastname"        ,   V_STRING  )
+                                    ,safeGetProp (p, "firstname"       ,   V_STRING  )
+                                    ,safeGetProp (p, "secondname"      ,   V_STRING  )
+                                    ,safeGetProp (p, "latname"         ,   V_STRING  ) //LAO Добавил в обработку
+                                    ,safeGetProp (p, "birthdate"       ,   V_DATE    )
+                                    ,safeGetProp (p, "birthplace"      ,   V_STRING  )
+                                    ,safeGetProp (p, "ismale"          ,   V_BOOL    )
+                                    ,safeGetProp (p, "nationality"     ,   V_STRING  )
+                                    ,safeGetProp (p, "isemployer"      ,   V_BOOL    )
+                                    ,safeGetProp (p, "workplace"       ,   V_STRING  )
+                                    ,safeGetProp (j, "okpo"            ,   V_STRING  )
+                                    ,safeGetProp (j, "country"         ,   V_STRING  )
+                                    ,nvl_ex (safeGetProp (j, "superiorid", V_INTEGER ), -1)
+                                    ,safeGetProp (j, "charterdate"     ,   V_DATE    ) 
+                                    ,safeGetProp (j, "capitalfi_iso"   ,   V_STRING  )
+                                    ,safeGetProp (j, "declarecapital"  ,   V_MONEY   )
+                                    ,safeGetProp (j, "realcapital"     ,   V_MONEY   )
+                                   );
+onerror (e) catchUserError (e);    
+end;
+
+// @desc    : обновить параметры клиента
+macro usr_update_client (p_partyid          :integer // dparty_dbt.t_partyid
+                        ,j                  :object  // описание ЮЛ
+                        ,p                  :object  // описание ФЛ
+                        ):integer
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    return (0 < PT_FillClientParameters ( p_partyid
+                                        ,PT_GetLegalForm (p_partyid)
+                                        ,safeGetProp (j, "shortname"       ,   V_STRING  )
+                                        ,safeGetProp (j, "fullname"        ,   V_STRING  )
+                                        ,safeGetProp (j, "addname"         ,   V_STRING  )
+                                        ,safeGetProp (p, "lastname"        ,   V_STRING  )
+                                        ,safeGetProp (p, "firstname"       ,   V_STRING  )
+                                        ,safeGetProp (p, "secondname"      ,   V_STRING  )
+                                        ,safeGetProp (p, "latname"         ,   V_STRING  ) // zip_z
+                                        ,safeGetProp (p, "birthdate"       ,   V_DATE    )
+                                        ,safeGetProp (p, "birthplace"      ,   V_STRING  )
+                                        ,safeGetProp (p, "ismale"          ,   V_BOOL    )
+                                        ,safeGetProp (p, "nationality"     ,   V_STRING  )
+                                        ,safeGetProp (p, "isemployer"      ,   V_BOOL    )
+                                        ,safeGetProp (p, "workplace"       ,   V_STRING  )
+                                        ,safeGetProp (j, "okpo"            ,   V_STRING  )
+                                        ,safeGetProp (j, "country"         ,   V_STRING  )
+                                        ,nvl_ex (safeGetProp (j, "superiorid", V_INTEGER ), -1)
+                                        ,safeGetProp (j, "charterdate"     ,   V_DATE    )
+                                        ,safeGetProp (j, "capitalfi_iso"   ,   V_STRING  )
+                                        ,safeGetProp (j, "declarecapital"  ,   V_MONEY   )
+                                        ,safeGetProp (j, "realcapital"     ,   V_MONEY   )
+                                       ));
+onerror (e) catchUserError (e);    
+end;
+
+// @desc    : заблокировать клиента
+macro usr_delete_client (p_partyid:integer):bool
+    var pt = RsbParty (p_partyid);
+    return pt.lock ();
+onerror (e) catchUserError (e);    
+end;
+
+/*** ОБСЛУЖИВАНИЕ КЛИЕНТОВ ***/
+
+// @desc    : установить вид обслуживания клиента
+macro usr_set_client_service (p_partyid       :integer // dparty_dbt.t_partyid
+                             ,d               :object  // блок данных "описание подразделения"
+                             ,s               :object  // блок данных "вид обслуживания"
+                             ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    return PT_BindClientWithBranch (p_partyid
+                                   ,nvl_ex (safeGetProp (s ,"servkind"  ,V_INTEGER), 3              )
+                                   ,nvl_ex (safeGetProp (d ,"branch"    ,V_INTEGER), {OPERDPRTNODE} )
+                                   ,nvl_ex (safeGetProp (s ,"oper"      ,V_INTEGER), {OPER}         )
+                                   ,nvl_ex (safeGetProp (s ,"startdate" ,V_DATE   ), {CURDATE}      )
+                                   );
+
+onerror (e) catchUserError (e);    
+end;
+
+// @desc    : удалить вид обслуживания клиента
+macro usr_del_client_service (p_partyid:integer, p_servkind:integer)
+    return PT_CloseClientService(p_partyid, p_servkind, {curdate}, true);
+onerror (e) catchUserError (e);    
+end;
+
+/*** КОДЫ КЛИЕНТОВ ***/
+
+// @desc    : установить клиенту p_partyid код вида p_codekind со значением p_codevalue
+// @return  : V_OBJECT TXReturnValueStruct (определено в xr_core.mac)
+macro usr_set_client_code (p_partyid   :integer  // dparty_dbt.t_partyid
+                          ,p_codekind  :integer  // вид кода
+                          ,p_codevalue :variant  // значение кода
+                          )
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    // дозаполняем непереданные параметры
+    p_codekind = nvl_ex (p_codekind, PTCK_CONTR);
+    
+    // инициализируем RsbParty, закрываем старый код, устанавливаем новый (если p_codevalue) задан
+    // если прилетает p_codekind == 1 (PTCK_CONTR), зовем нашу собственноручно писанную установку RS-кода,
+    // на переданное значение p_codevalue не обращаем внимания (ничего страшного, таке життя)
+    var pt   = RsbParty (p_partyid);
+    var code = pt.code;
+    
+    code.closeCode (p_codekind); 
+    if (notnull (p_codevalue)) code.setCode (p_codekind, p_codevalue); end;
+    
+    if (p_codekind == PTCK_CONTR) 
+        execMacroFile ("set_rscode.mac", "SetRScode", pt); 
+    else
+        code.setCode (p_codekind, p_codevalue); 
+    end;
+    
+    return pt.update ();
+
+onerror (e) catchUserError (e);    
+end;
+
+// @desc    : удалить у клиента p_partyid код вида p_codekind
+macro usr_del_client_code (p_partyid:integer, p_codekind:integer):bool
+    var pt = RsbParty (p_partyid);
+    var code = pt.code;
+    code.DeleteCode (p_codekind); 
+    return pt.update ();
+
+onerror (e) catchUserError (e);    
+end;
+
+
+/*** АДРЕСА КЛИЕНТОВ ***/
+
+macro usr_set_client_address (p_partyid         :integer 
+                             ,p_addresstype     :integer
+                             ,p_country         :string
+                             ,p_address         :string
+                             ,p_phonenumber     :string
+                             ,p_phonenumberad   :string
+                             ,p_faxnumber       :string
+                             ,p_email           :string
+                             ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+    
+    var pt   = RsbParty(p_partyid);
+    var addr = pt.address(p_addresstype);
+    
+    addr.country       = p_country;
+    addr.address       = p_address;
+    addr.phonenumber   = p_phonenumber;
+    addr.phonenumberad = p_phonenumberad;
+    addr.faxnumber     = p_faxnumber;
+    addr.email         = p_email;
+    
+    return pt.update ();
+
+onerror (e) catchUserError (e);    
+end;
+
+macro usr_del_client_address (p_partyid:integer, p_addresstype:integer):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var pt   = RsbParty(p_partyid);
+    var addr = pt.address(p_addresstype);
+    addr.delete ();
+    return pt.update ();
+
+onerror (e) catchUserError (e);    
+end;
+
+
+/*** ДАННЫЕ РЕГИСТРАЦИИ КЛИЕНТОВ ***/
+
+macro usr_set_client_paper (p_partyid         :integer
+                           ,p_paperkind       :integer
+                           ,p_series          :string
+                           ,p_number          :string
+                           ,p_issueddate      :date
+                           ,p_issuer          :string
+                           ,p_issuercode      :string
+                           ,p_is_main         :bool
+                           ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var pt   = RsbParty(p_partyid);
+    var p    = pt.personPaper (p_paperkind);
+    
+    if (notnull (p_series     )) p.series     = p_series;     end;
+    if (notnull (p_number     )) p.number     = p_number;     end;
+    if (notnull (p_issueddate )) p.issueddate = p_issueddate; end;
+    if (notnull (p_issuer     )) p.issuer     = p_issuer;     end;
+    if (notnull (p_issuercode )) p.issuercode = p_issuercode; end;
+    if (notnull (p_is_main    )) p.ismain     = p_is_main;    end;
+    
+    return pt.update ();
+onerror (e) catchUserError (e);    
+end;
+
+macro usr_del_client_paper (p_partyid         :integer
+                           ,p_paperkind       :integer
+                           ):bool
+    var pt   = RsbParty (p_partyid);
+    var p    = pt.personPaper (p_paperkind);
+    p.delete ();
+    return pt.update ();
+onerror (e) catchUserError (e);    
+end;
+
+/*** РЕГИСТРАЦИОННЫЕ ДОКУМЕНТЫ КЛИЕНТОВ ***/
+
+// @desc   : установка данных о регистрации клиента
+// @return : V_OBJECT TXReturnValueStruct
+macro usr_set_client_regdoc (p_partyid         :integer
+                            ,p_regpartykind    :integer
+                            ,p_regdockind      :integer
+                            ,p_regpartyid      :integer
+                            ,p_regcode         :string
+                            ,p_startdate       :date
+                            ,p_series          :string
+                            ,p_number          :string
+                            ,p_docdate         :date
+                            ,p_ismain          :bool
+                            ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+    
+    var pt = RsbParty (p_partyid);
+    var doc = pt.partyRegDoc(p_regpartykind, p_regdockind);
+    
+    doc.regpartyid = p_regpartyid;
+    doc.startdate  = p_startdate;
+    doc.series     = p_series;
+    doc.number     = p_number;
+    doc.docdate    = p_docdate;
+    doc.ismain     = p_ismain;
+    
+    return pt.update ();
+onerror (e) catchUserError (e);    
+end;
+
+// @desc   : удаление данных о регистрации клиента
+// @return : V_OBJECT TXReturnValueStruct
+macro usr_del_client_regdoc (p_partyid       :integer
+                            ,p_regpartykind  :integer
+                            ,p_regdockind    :integer
+                            ):bool
+    var pt = RsbParty (p_partyid);
+    var doc = pt.partyRegDoc(p_regpartykind, p_regdockind);
+    doc.delete ();
+    return pt.update ();
+onerror (e) catchUserError (e);    
+end;
+
+/*** СОТРУДНИКИ КЛИЕНТА ***/
+macro usr_set_client_officer (p_partyid          :integer
+                             ,p_personid         :integer
+                             ,p_isfirstperson    :bool
+                             ,p_issecondperson   :bool
+                             ,p_post             :string
+                             ,p_datefrom         :date
+                             ,p_dateto           :date
+                             ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var pt   = RsbParty (p_partyid);
+    var off  = pt.officer();
+    var pers = TRecHandler ("party.dbt");
+    
+    off.new();
+    off.personid       = p_personid;
+    off.isfirstperson  = p_isfirstperson;
+    off.issecondperson = p_issecondperson;
+    off.post           = p_post;
+    off.datefrom       = p_datefrom;
+    off.dateto         = p_dateto;
+    
+    // добавляем RS-код сотруднику, если его нет (сомнительная доработка, т.к. используется 110-й референс)
+    var pers_code = "";
+    var p         = RsbParty (p_personid);
+    var pcode     = p.code;
+    var stat      = true;
+    
+    if (ПолучитьКодСубъекта (p_personid, PTCK_CONTR) == EMPTY_STRING)
+        pers.rec.partyid = p_personid;
+        if ( stat = (GenerateReference(110, pers_code, OBJ_PARTY, pers) == EXIT_SUCCESS));
+            if (stat = pcode.setCode (PTCK_CONTR, pers_code))
+                stat = p.Update ();
+            end;
+        end;
+    end;
+
+    if (stat == true) stat = pt.update (); end;
+    return stat;
+onerror (e) catchUserError (e);    
+end;
+
+
+macro usr_del_client_officer (p_partyid:integer, p_personid:integer):bool
+    var pt   = RsbParty (p_partyid);
+    var off  = pt.officer();
+    off.deletePerson (p_personid);
+    return pt.update ();
+onerror (e) catchUserError (e);    
+end;

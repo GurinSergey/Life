@@ -1,0 +1,635 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: FSSP_Scroll.mac 
+// @desc    : Скроллинг принятых сообщений ФССП
+// -------------------------------------------------------------------------------------------------                                               
+
+import RSD, Globals, SbCrdInter, Rslx, Rsexts, rcw;
+import likepy;
+import KeyCodes, WordIntf, lib_types, lib_const, FSSP_AnswerQuery, FSSP_RESTRICTN;
+import "fssp_accountquery.mac", "fssp_restrictn_gmoney.mac", "FSSP_CancelRestrictn.mac";
+
+class FSSP_Scroll ()
+   CONST NO_ACTION_MODE              = 0;
+   CONST SINGLE_ACTION_MODE          = 1;
+   CONST MULTI_ACTION_MODE           = 2; 
+   CONST ROLLBACK_SINGLE_ACTION_MODE = 3;
+   CONST ROLLBACK_MULTI_ACTION_MODE  = 4; 
+    
+   CONST MESSAGE_DELAYED             = 0;
+   CONST MESSAGE_PROCESSED           = 1;
+   CONST MESSAGE_MANUAL              = 3;
+
+   var rs, sql, cmd, cmd_2, rs_2,
+       isRunning :bool   = true,
+       CurrentMesID      = null, 
+       isMultiAction     = false,
+       isRollBack        = false,         
+       ActionArr :Tarray = TArray(), 
+       CurrentMode       = NO_ACTION_MODE,    
+       objFSSP :object,
+       DateBegin, DateEnd, isOnlyChange,
+       isRollbackMsg = false; 
+
+   macro clear_tmp
+       RsdCommand( " DELETE USR_FSSP_ERR_TMP "      ).execute;
+       RsdCommand( " DELETE USR_FSSP_ACCOUNTS_TMP " ).execute;
+   end;
+    
+   macro openExcel()
+       var exObj;
+       var comObj;
+       var list;
+       var listObj;
+      
+       exObj  = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+       comObj = ExObj.CreateComObject ("Excel.Application", False);
+       comObj.Application.DisplayAlerts = True;
+       comObj.Workbooks.Add();
+
+       SetParm( 1, comObj );
+
+       return true;
+   onerror
+       return false;
+   end;
+
+   private macro putCell(lst, x, y, string, al)
+       if (valtype(al) == V_UNDEF) al = 3 end;
+       lst.cells(x, y).Value = string;
+       lst.cells(x, y).horizontalAlignment = al;
+   end;
+
+   class emptyObj()
+      macro create()
+         return 1;
+      end;
+      macro rollback()
+         return 1;
+      end;
+   end;
+
+   macro printFSSPReport()
+       private var cmd,rs;
+       private var reportFile = getTxtFileName ( "fsspReport" );
+       private var showReport = false;
+
+       setOutput( reportFile, false );
+/*
+       rs = RsdRecordset( " select * from USR_FSSP_ERR_TMP ", RSDVAL_CLIENT, RSDVAL_STATIC );
+       if( rs.movenext )
+           showReport = true;
+           [┌──────────────┬────────────────────────┐
+            │ id сообщения │       Информация       │
+            ├──────────────┼────────────────────────┤];
+
+           rs.moveprev;
+
+           while( rs.movenext )
+
+           [│ ############ │ ###################### │]( int( rs.value(0) ), rs.value(1) );
+           end;  
+
+           [└──────────────┴────────────────────────┘];
+
+       end;
+*/
+       rs = RsdRecordset( " SELECT /*+ index ( acc DACCOUNT_DBT_IDX0)*/  PARTY.T_NAME     CLIENT_NAME, "
+                          "          ACCTMP.T_ACCOUNT ACCOUNT,     "
+                          "          ( SELECT   T_CODE                                "
+                          "              FROM   dobjcode_dbt                          "
+                          "             WHERE       T_OBJECTTYPE = 3                  "
+                          "                     AND T_OBJECTID   = FSSPMES.T_PARTY_ID "
+                          "                     AND T_CODEKIND   = 16                 "
+                          "                     AND T_STATE      = 0 "
+                          "                     AND ROWNUM       = 1  ) INN, "
+                          "          NVL(EXTRACTVALUE (XMLTYPE (FSSPMES.T_MES_DATA), '/*/*/DocNum/text()'), ' ') DOC_NUM, "
+                          "          NVL(EXTRACTVALUE (XMLTYPE (FSSPMES.T_MES_DATA), '//IP/IPNum/text()' ), ' ') IP_NUM,  "
+                          "          NVL(EXTRACTVALUE (XMLTYPE (FSSPMES.T_MES_DATA), '//IP/IPDebt/text()'), 0  ) AMOUNT,  "
+                          "          DEP.T_NAME DEPARTMENT "
+                          "   FROM   USR_FSSP_ACCOUNTS_TMP accTmp, USR_FSSP_MES fsspMes, dparty_dbt party, ddp_dep_dbt dep, daccount_dbt acc "
+                          "  WHERE       FSSPMES.T_ID       = ACCTMP.T_MES_ID "
+                          "          AND FSSPMES.T_PARTY_ID = PARTY.T_PARTYID "
+                          "          AND ACCTMP.T_ACCOUNT   = ACC.T_ACCOUNT "
+                          "          AND ACC.T_BRANCH       = DEP.T_CODE ", RSDVAL_CLIENT, RSDVAL_STATIC );
+       if( rs.movenext )
+           var vipExcelReport;
+
+           rs.moveprev;
+
+           if( openExcel( vipExcelReport ) )
+               var list    = vipExcelReport.sheets(1),
+                   listObj = list.rows(1),
+                   i = 5;
+               list.columns("A:A").columnWidth = 45;
+               list.columns("B:B").columnWidth = 25;
+               list.columns("C:C").columnWidth = 25;
+               list.columns("D:D").columnWidth = 30;
+               list.columns("E:E").columnWidth = 30;
+               list.columns("F:F").columnWidth = 10;
+               list.columns("G:G").columnWidth = 17;
+
+               listObj = list.Range("A2:G2");
+               listObj.Merge;
+               putCell(list,2,1,"Предварительный отчёт на запрос ФССП по состоянию на " + date);
+
+               list.range("A4:G4").borders.lineStyle = 1;
+               list.range("A4:G4").Font.Bold         = True;
+               list.range("A4:G4").interior.color    = #B5B5B5;
+
+               list.range("A4:G4").horizontalAlignment = 3;
+               list.range("A4:A4").value = "Клиент";
+               list.range("B4:B4").value = "Счет";
+               list.range("C4:C4").value = "ИНН";
+               list.range("D4:D4").value = "DocNum";
+               list.range("E4:E4").value = "IPNum";
+               list.range("F4:F4").value = "Сумма долга";
+               list.range("G4:G4").value = "Подразделение";
+
+               while( rs.movenext )
+                   list.range("A" + i + ":G" + i).borders.lineStyle   = 1;
+                   list.range("A" + i + ":G" + i).horizontalAlignment = 3;
+                   list.range("A" + i + ":G" + i).numberFormat        = "@";
+                   list.range("A" + i + ":A" + i).value = rs.value( "CLIENT_NAME" );
+                   list.range("B" + i + ":B" + i).value = rs.value( "ACCOUNT"     );
+                   list.range("C" + i + ":C" + i).value = rs.value( "INN"         );
+                   list.range("D" + i + ":D" + i).value = rs.value( "DOC_NUM"     );
+                   list.range("E" + i + ":E" + i).value = rs.value( "IP_NUM"      );
+                   list.range("F" + i + ":F" + i).value = rs.value( "AMOUNT"      );
+                   list.range("G" + i + ":G" + i).value = rs.value( "DEPARTMENT"  );
+                   i = i + 1;
+               end;
+
+               vipExcelReport.visible = True;
+           else
+               showReport = true;
+// пока так
+               [┌────────────────────────────────────────────┬──────────────────────┬────────────────────────┬────────────────┬─────────────┬────────────┬───────────────┐
+                │                   Клиент                   │         Cчет         │          ИНН           │     DocNum     │    IPNum    │   IPDebt   │ Подразделение │
+                ├────────────────────────────────────────────┼──────────────────────┼────────────────────────┼────────────────┼─────────────┼────────────┼───────────────┤];
+
+               while( rs.movenext )
+               [│ ########################################## │ #################### │ ###################### │ ############## │ ########### │ ########## │ ############# │]
+               ( rs.value( "CLIENT_NAME" ), rs.value( "ACCOUNT" ), rs.value( "INN" ), rs.value( "DOC_NUM" ), rs.value( "IP_NUM" ), rs.value( "AMOUNT" ), rs.value( "DEPARTMENT" ) );
+               end;  
+
+               [└────────────────────────────────────────────┴──────────────────────┴────────────────────────┴────────────────┴─────────────┴────────────┴───────────────┘];
+           end;
+       end;
+
+       setOutput( null, true );
+
+       if( showReport )viewfile( reportFile ); end;
+   end;    
+
+   macro RewriteXML(FilePath, ID)
+       var hd, rs, strm, cmd;       
+       strm = TStream(FilePath, "R");               
+       hd = TRecHandler ("ClobRead", makeArray("Clob", V_STRING, strm.getsize, 0, 0));
+       strm.read2(hd); 
+       cmd = RSDCommand("select t_id, T_MES_DATA from usr_fssp_mes where t_id = ? for update");
+       cmd.AddParam("", RSDBP_IN, ID);
+       rs = RSDRecordset(cmd, null, RSDVAL_STATIC); 
+       rs.bloblimitsize = 1;        
+       if(rs and rs.MoveNext() ) 
+          rs.edit; 
+          rs.Fld(1).Write(hd);
+          rs.update; 
+       else
+          msgBox("Не удалось выполнить чтение CLOB");      
+       end;        
+   end;
+   
+   macro ReadXML(FilePath, ID)
+       var hd, rs, strm, cmd;
+       var sql = "SELECT DBMS_LOB.GETLENGTH(T_MES_DATA) FROM USR_FSSP_MES WHERE T_ID = " + int(id);
+       sql = execSQLselect(sql);
+       if (not sql.moveNext()) 
+          msgBox("Не удалось получить размер CLOB");
+          return false;
+       end;
+       hd = TRecHandler ("ClobRead", makeArray("Clob", V_STRING, sql.value(0, null, v_integer), 0, 0));
+       cmd = RSDCommand("select t_id, T_MES_DATA from usr_fssp_mes where t_id = ? ");
+       cmd.AddParam("", RSDBP_IN, ID);
+       rs = RSDRecordset(cmd, null, RSDVAL_STATIC);     
+       if(rs and rs.MoveNext() )
+          rs.Fld(1).Read(hd);
+          strm = TStream(FilePath, "WA");
+          strm.Write2( hd );   
+          return true;
+       else
+          return false;
+       end;
+   end;       
+   
+    
+    macro CreateObjFSSP(MesID, MesType, kindAction) :object
+        var obj :object;
+        if (  MesType == 1)
+           obj = TFSSP_QUERY(MesID, kindAction);
+        elif (MesType == 2)      
+           obj = TFSSP_ACCOUNTQUERY(MesID);
+        elif(inList(MesType, 3,4))
+           obj = TFSSP_QUERY_RESTRICTN(MesID, MesType, kindAction);                
+        elif(inList(MesType, 5,6))
+           obj = TFSSP_CANCEL_RESTRICTN(MesID, MesType, kindAction);                
+        elif(inList(MesType, 7,8,9))
+           obj = TFSSP_PENALTY(MesID);   
+        else
+           MsgBox("Пока не реализовано");
+           obj = emptyObj();
+        end;
+        return obj;
+    end;
+    
+    class FSSPSessScroll()
+        var SQL, Column, rsmes;          
+        
+        macro DelSess(ID)
+          rsmes = execSQLselect("select * from usr_fssp_mes mes where MES.T_SESS_ID = ?", makeArray(SQLParam("",ID))); 
+          rsldefcon.BeginTrans;                            
+          while(rsmes and rsmes.moveNext())            
+             execSQL("delete from usr_fssp_mes where t_id = ?", makeArray(SQLParam("",rsmes.value("t_ID"))));
+          end;
+          execSQL("delete from usr_fssp_sess where t_id = ?", makeArray(SQLParam("",ID)));
+          rsldefcon.CommitTrans;
+          return true;          
+       onError(er)      
+          if (RSLDefCon.IsinTrans)
+              RSLDefCon.RollbackTrans;
+          end;  
+          return false;   
+       end;       
+        
+        macro FSSPSessEvents ( rs, cmd, id, key )
+           var ret = CM_DEFAULT;
+           if (cmd == DLG_KEY) 
+              if ( key == KEY_DEL)
+                 if(getTrue(false, "Вы уверены что хотите удалить сеанс?"))
+                    rsmes =  execSQLselect("select 1 from usr_fssp_mes mes where MES.T_SESS_ID = ? and MES.T_MES_STATE != 0", makeArray(SQLParam("", rs.value("ID"))));
+                    if(rsmes and not rsmes.moveNext())
+                       if(not DelSess(rs.value("ID")))
+                          MsgBox("Не удалось удалить сообщения по сеансу");
+                          ret = cm_ignore;                        
+                       else
+                          ret = cm_select;      
+                       end;
+                    else
+                        MsgBox("Нельзя удалить сеанс. | По сеансу есть обработанные сообщения.");
+                        ret = cm_ignore;                        
+                    end;                   
+                 end;                   
+              elif(key == KEY_ESC)
+                 ret = cm_cancel;
+              end;
+           end;
+           return ret;
+        end;   
+        
+        Column = makeArray ("ID"      , "Сеанс"           ,5,   0,  0, 0, 
+                            "CDATE" ,   "Опер. день"      ,10,  0,  0, 0,                             
+                            "INFILE"  , "Файл"            ,65,  0, -1, 0, 
+                            "SDATE" ,   "Сист. дата"      ,10,  0,  0, 0, 
+                            "SESTIME" , "Сист. время"     ,10,  0,  0, 0, 
+                            "OPER"    , "Опер"            ,6,   0,  0, 0);
+        SQL = " SELECT   SES.T_ID ID,                                                    "+
+              "    to_date(to_char(SES.T_OPER_DATE,'dd.mm.yyyy'),'dd.mm.yyyy') CDate,    "+
+              "    to_date(to_char(SES.T_SESS_DATE,'dd.mm.yyyy'),'dd.mm.yyyy') SDate,    "+
+              "    to_char(T_SESS_TIME , 'HH24:MI:SS') SesTime,                          "+
+              "    SES.T_SESS_FILE INFILE,                                               "+
+              "    SES.T_OPER oper                                                       "+
+              " FROM   usr_fssp_sess ses                                                 "+              
+              " ORDER BY   SES.T_ID DESC                                                 ";
+                                                                                         
+       macro init()
+         runScroll (RsdRecordSet (sql, RSDVAL_CLIENT, RSDVAL_STATIC), column.size/6, column, null, r2m(this, "FSSPSessEvents"), "Журнал сеансов", "Esc - Выход, Del - Удалить", null);                                           
+       end;
+
+       init();       
+    end;
+    
+    macro getMesState(ID)
+       var sql = "select t_mes_state from usr_fssp_mes where t_id = " + ID;
+           sql = execSQLselect(sql);  
+           if (sql and sql.moveNext()) return sql.value(0, null, v_integer); end;
+           return - 1;            
+    end;    
+    
+    macro getContainXML(ID)
+        var sql = " with t as (select                                                       "+    
+                  " xmlserialize(document xmltype(M.T_MES_DATA) as clob indent size = 4 ) x "+
+                  " from USR_FSSP_MES m                                                     "+
+                  " WHERE M.T_ID = ?)                                                       "+
+                  " select NVL(xmltype(x).getStringVal(),' ') as xml from t                 ";
+            sql = execSQLselect(sql, makeArray(SQLParam("", ID)));      
+            if (sql.moveNext()) return sql.value(0); end; 
+            return ZeroValue(V_STRING);        
+        onError       
+           return ZeroValue(V_STRING);
+    end;
+                     
+
+    macro FastUpdateScroll(rs : RsdRecordset)
+        rs.refreshcommand = RSDCommand(SQL + " AND M.T_ID = " + rs.value("MesID"));
+        rs.refreshcommand.AddParam("", RSDBP_IN, DateBegin);
+        rs.refreshcommand.AddParam("", RSDBP_IN, DateEnd);
+        rs.refreshrecord;
+        UpdateScroll(rs); 
+    end;
+    
+    macro ViewFileInIE(PathFile)
+    var axServer, Application; 
+        if( isStandalone() )
+            Application = ActiveX("InternetExplorer.Application", NULL, false);
+        else
+            if(axServer = CreateObject("rsax", "TRsAxServer", "RsAxServer", isStandalone())) 
+                Application = axServer.CreateComObject("InternetExplorer.Application", false);
+            end;
+        end;
+        Application.Navigate2(PathFile);
+        Application.visible = true;
+        return true;
+    onError()
+        return false;
+    end;
+
+    macro ScrollEvents ( rs, cmd, id, key )
+        private var ret = CM_DEFAULT, i;          
+        
+        if   (cmd == DLG_INIT)  
+            if ((not AddMultiAction (rs, KEY_F2)) or (not AddMultiAction (rs, KEY_F8))) 
+                msgbox ("Ошибка инициализации массовой обработки");
+            end;
+            ActionArr = TArray();           
+            CurrentMode = NO_ACTION_MODE;            
+            if (notNull (CurrentMesID))
+                var flag = false;                 
+                while(rs.movenext () and (flag == false))                                        
+                   if (flag = (CurrentMesID == rs.value("MesID"))) GoTOScroll(); end;             
+                end;             
+              
+              GoTOScroll();
+            end;      
+        end;    
+        if ((Cmd == DLG_MSEL) and ((key == KEY_F2) or (key == KEY_F8)))
+           ActionArr[ActionArr.size()]  = makeArray(rs.value("MesID"), rs.value("MesType"), rs.bookmark);           
+           return CM_MSEL_CONT_CLEAR;        
+        end;   
+        if ((Cmd == DLG_MSELEND) and (key == KEY_F2))           
+           isMultiAction = true;
+           return CM_CANCEL;        
+        end;   
+        if ((Cmd == DLG_MSELEND) and (key == KEY_F8))
+           isRollbackMsg = false;
+           if(getTrue(false, "Вы действительно хотите откатить сообщения?"))
+              isRollBack    = true;  
+              isRollbackMsg = true;
+           end;
+              return CM_CANCEL;        
+        end;   
+        if (cmd == DLG_KEY) 
+            if (key == KEY_ESC) 
+                isRunning = false;              
+                ret = CM_DEFAULT;;
+            elif(isMultiAction)               
+               if (isOnlyChange)
+
+                  clear_tmp;
+
+                  InitProgress(ActionArr.size(),"Ждите... идет обработка сообщений");
+                  for (i, 0, ActionArr.Size - 1 )                  
+                      if(rs.move(ActionArr[i][2], BOOKMARK))
+                         if (getMesState(rs.value("MesID")) != rs.value("MesState")) FastUpdateScroll(rs); end;                   
+                         if(inList(rs.value("MesState"), MESSAGE_DELAYED, MESSAGE_MANUAL))
+                            CreateObjFSSP(rs.value("MesID"), rs.value("MesType")).Create(MULTI_ACTION_MODE);                            
+                            FastUpdateScroll(rs);
+                         end;   
+                      end;
+                      UseProgress(i);      
+                  end;
+                  RemProgress();     
+
+                  printFSSPReport();
+
+                  GoToScroll();
+                  isMultiAction = false;
+                  ActionArr = TArray();
+                  ret = CM_DEFAULT;
+               else
+                  CurrentMode = MULTI_ACTION_MODE;            
+                  ret = CM_SELECT;    
+               end;
+            elif(isRollBack)
+               if (isOnlyChange)
+                  InitProgress(ActionArr.size(),"Ждите... идет откат сообщений");
+                  for (i, 0, ActionArr.Size - 1 )
+                      if(rs.move(ActionArr[i][2], BOOKMARK))
+                         if (getMesState(rs.value("MesID")) != rs.value("MesState")) FastUpdateScroll(rs);  end;                   
+                         if(MESSAGE_PROCESSED == rs.value("MesState"))
+                            CreateObjFSSP(rs.value("MesID"), rs.value("MesType"), 1).Rollback();                            
+                            FastUpdateScroll(rs);
+                         end;  
+                      end;   
+                      UseProgress(i);                      
+                  end;
+                  RemProgress();
+                  GoToScroll();
+                  isRollBack = false;
+                  ActionArr = TArray();
+                  ret = CM_DEFAULT;
+               else
+                  CurrentMode = ROLLBACK_MULTI_ACTION_MODE;            
+                  ret = CM_SELECT;       
+               end;
+            elif(key == KEY_F2)
+
+                 clear_tmp;
+
+                 if (getMesState(rs.value("MesID")) != rs.value("MesState")) FastUpdateScroll(rs);  end;                  
+                 if (not inList(rs.value("MesState"), MESSAGE_DELAYED, MESSAGE_MANUAL))
+                    return CM_IGNORE;
+                 end;
+                 if (isOnlyChange)
+                    CreateObjFSSP(rs.value("MesID"), rs.value("MesType")).Create(SINGLE_ACTION_MODE);                    
+                    FastUpdateScroll(rs);                    
+                    ret = CM_DEFAULT;
+                 else    
+                    CurrentMode = SINGLE_ACTION_MODE;                       
+                    CurrentMesID = rs.value("MesID");                                                    
+                    ret = CM_SELECT;
+                 end;
+
+                 printFSSPReport();
+            elif(key == KEY_F6)
+               debugbreak;
+               viewClientAccLinks(rs.value("MesID", null, v_integer));
+            elif(key == KEY_F8)
+                   isRollbackMsg = false;
+                   if(getTrue(false, "Вы действительно хотите откатить сообщения?"))                      
+                      isRollbackMsg = true;
+                      if (getMesState(rs.value("MesID")) != rs.value("MesState")) FastUpdateScroll(rs);  end;                   
+                      if (MESSAGE_DELAYED == rs.value("MesState"))
+                         return CM_IGNORE;
+                      end;
+                      if(isOnlyChange)
+                         objFSSP = CreateObjFSSP(rs.value("MesID"), rs.value("MesType"));
+                         if (objFSSP.Rollback() == RSL_EXIT_SUCCESS)
+                          //RollBackDataScroll(rs.value("MesID"));
+                         end;                     
+                         FastUpdateScroll(rs);                      
+                         ret = CM_DEFAULT;
+                      else                    
+                         CurrentMode = ROLLBACK_SINGLE_ACTION_MODE;                       
+                         CurrentMesID = rs.value("MesID");                                                    
+                         ret = CM_SELECT;
+                      end;         
+                   end;
+            elif((key == KEY_ENTER) or (key == KEY_CTRL_ENTER))/*Просмотр сообщения*/               
+                var out  = getTxtFileName ("FSSP_MES");                
+                var ContainXML = getContainXML(rs.value("MesID", null, v_integer));                    
+                    if(not ReadXML(out, rs.value("MesID", null, v_integer)))
+                       msgBox("Не удалось прочитать содержимое XML - контейнера");
+                    end;                    
+                    if (key == KEY_ENTER)
+                        var TimeBeforeView :time = ZeroValue(V_TIME);
+                        var TimeAfterView  :time = ZeroValue(V_TIME);                            
+                          getFileInfo(out, null, TimeBeforeView);
+                          viewFile (out);
+                          getFileInfo(out, null, TimeAfterView);
+                          if (TimeBeforeView != TimeAfterView)                                
+                             RewriteXML(out, rs.value("MesID", null, v_integer)); 
+                          end;
+                    else
+                        if(not ViewFileInIE(RSL_FullPath(out)))
+                            MsgBox("Не удается открыть сообщение для просмотра спомощью браузера, | попробуйте воспользоваться клавишей Enter ");
+                        end;
+                    end;                    
+            elif(key == KEY_F11)
+                FSSPSessScroll();
+                return CM_SELECT;
+            elif(key == KEY_CTRL_R)
+               return CM_SELECT;
+            end;                                                                         
+        end;
+    return ret;
+    end;
+
+    macro Init(_DateBegin, _DateEnd, Filter, _ScrollCaption, _isOnlyChange)
+       var col, scrollResult, cmd, i = 0 ;   
+       DateBegin = _DateBegin; DateEnd = _DateEnd; isOnlyChange = _isOnlyChange; 
+       private var scrollCaption = string (_ScrollCaption, " за период с ", DateBegin, " по ", DateEnd); 
+       private var msg = "Esc - Выход, Enter - Просмотр сообщения, F2 - Обработать, F6 - Просмотр счетов, F8 - Откатить, F11 - Журнал сеансов";                                                                                
+
+       if(DateBegin == DateEnd)                                                                                                                                                                                  
+           scrollCaption = string (_ScrollCaption, " за ", DateBegin);                                                                                                             
+       end;                                                                                                                                                                                                         
+       
+       sql =  " SELECT  m.t_id MesID,                                                                " +
+              "         s.t_id SessID,                                                               " +
+              "         NVL(m.T_INTERNALKEY ,'-')  InternalKey,                                      " +
+              "         to_date(m.T_DOC_DATE, 'yyyy-mm-dd')  DocDate,                                " +
+              "         TO_CHAR (m.t_oper_date,'dd.mm.yyyy') MesOperDate ,                           " +
+              "         TO_CHAR (M.T_MES_DATE, 'dd.mm.yyyy') MesSysDate,                             " +
+              "         TO_CHAR (M.T_MES_TIME, 'hh24:mi:ss') MesSysTime,                             " +
+              "         m.t_mes_type MesType,                                                        " +             
+              "         M.T_MES_STATE MesState,                                                      " +
+              "         CASE                                                                         " +
+              "            WHEN m.t_mes_type = 1 THEN 'Запрос о наличии счетов'                      " +
+              "            WHEN m.t_mes_type = 2 THEN 'Запрос о движении д/с'                        " +
+              "            WHEN m.t_mes_type = 3 THEN 'Постановление о розыске и аресте'             " +
+              "            WHEN m.t_mes_type = 4 THEN 'Постановление об аресте'                      " +
+              "            WHEN m.t_mes_type = 5 THEN 'Постановление о снятии ареста'                " +
+              "            WHEN m.t_mes_type = 6 THEN 'Постановление о снятии ареста (БИС)'          " +
+              "            WHEN m.t_mes_type = 7 THEN 'Постановление о снятии ареста и обр. взыск.'  " +
+              "            WHEN m.t_mes_type = 8 THEN 'Постановление об обр. взыскания'              " +
+              "            WHEN m.t_mes_type = 9 THEN 'Постановление о прекращ. обр. взыскания'      " +
+              "            WHEN m.t_mes_type = -1 THEN 'Сообщение повреждено'                        " +
+            //  "         else  m.t_mes_type                                                         " +
+              "         END                                                                          " +
+              "            MesName,                                                                  " +
+              "         CASE                                                                         " +
+              "            WHEN M.T_MES_STATE =  0 THEN 'отложено  '                                 " +
+              "            WHEN M.T_MES_STATE =  1 THEN 'обработано'                                 " +
+              "            WHEN M.T_MES_STATE =  3 THEN 'ручная обработка'                           " +
+              "            WHEN M.T_MES_STATE = 11 THEN 'картотека '                                 " +
+              "            ELSE 'неопределено'                                                       " +
+              "         END                                                                          " +
+              "            MesStatus,                                                                " +
+              "         M.T_PARTY_ID ClientID,                                                       " +
+              "         M.T_DEBTOR_NAME ClientName,                                                  " +
+              "         NVL((SELECT   OBJ.T_CODE                                                      " +
+              "              FROM   dobjcode_dbt obj                                                 " +
+              "                WHERE OBJ.T_OBJECTID = M.T_PARTY_ID and M.T_PARTY_ID not in (0, -1)   " +
+              "              AND OBJ.T_CODEKIND = 1                                                  " +
+              "              AND OBJ.T_OBJECTTYPE = 3                                                " +
+              "              AND OBJ.T_STATE = 0), '-') code                                          " +
+              "  FROM   usr_fssp_mes m, usr_fssp_sess s                                              " +
+              "         where m.t_sess_id =  s.t_id                                                  " ;                           
+       if (notNull(Filter))                                                              
+           sql = sql + " and " + Filter;
+       end;        
+       col = makeArray ("MesID"        , "ID объекта"             ,10,  0,  0, 0, 
+                        "SessID"       , "Сеанс"                  ,10,  0,  0, 0, 
+                        "InternalKey"  , "InternalKey"            ,14,  0, -1, 0, 
+                        "DocDate"      , "DocDate"                ,10,  0, -1, 0, 
+                        "MesOperDate"  , "Опер. день"             ,10,  0, -1, 0, 
+                        "MesSysDate"   , "Сист. дата"             ,10,  0, -1, 0, 
+                        "MesSysTime"   , "Сист. время"            ,10,  0, -1, 0, 
+                        "MesName"      , "Тип сообщения"          ,30,  0, -1, 0,
+                        "MesStatus"    , "Статус"                 ,10,  0, -1, 0,                        
+                        "code"         , "Код клиента"            ,10,  0,  0, 0,
+                        "ClientName"   , "Наименование клиента"   ,40,  0, -1, 0,
+                        "ClientID"     , "ID клиента"             ,10,  0,  0, 0);
+        while (isRunning)
+           cmd = RsdCommand (sql);
+           cmd.addParam("DateBegin", RSDBP_IN, _DateBegin, V_DATE);
+           cmd.addParam("DateEnd"  , RSDBP_IN, _DateEnd,   V_DATE); 
+           rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+           scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "ScrollEvents"), ScrollCaption, msg, null );                      
+               if(CurrentMode == MULTI_ACTION_MODE)
+
+                   clear_tmp;
+
+                   isMultiAction = false;
+                   InitProgress(ActionArr.size(),"Ждите... идет обработка сообщений");
+                   for(i, 0, ActionArr.size - 1)                      
+                      if (inList(getMesState(ActionArr[i][0]),MESSAGE_DELAYED, MESSAGE_MANUAL))
+                         CreateObjFSSP(ActionArr[i][0], ActionArr[i][1]).Create(MULTI_ACTION_MODE);                         
+                      end;
+                      UseProgress(i);                        
+                   end;
+                   RemProgress;                        
+
+                   printFSSPReport();
+
+               elif(CurrentMode == SINGLE_ACTION_MODE)                   
+
+                   clear_tmp;
+
+                   CreateObjFSSP(rs.value("MesID"), rs.value("MesType")).Create(SINGLE_ACTION_MODE);               
+
+                   printFSSPReport();
+
+               elif(CurrentMode == ROLLBACK_SINGLE_ACTION_MODE)                   
+                   if(isRollbackMsg or (getTrue(false, "Вы действительно хотите откатить сообщения?")))
+                      CreateObjFSSP(rs.value("MesID"), rs.value("MesType"), 1).RollBack();                                      
+                   end; 
+               elif(CurrentMode == ROLLBACK_MULTI_ACTION_MODE)                                   
+                   if(isRollbackMsg or (getTrue(false, "Вы действительно хотите откатить сообщения?")))
+                      isRollBack = false;
+                      InitProgress(ActionArr.size(),"Ждите... идет откат сообщений");
+                      for(i , 0, ActionArr.size - 1)
+                         if(MESSAGE_PROCESSED == getMesState(ActionArr[i][0]))
+                            CreateObjFSSP(ActionArr[i][0], ActionArr[i][1], 1).RollBack();                                                                    
+                         end;
+                         UseProgress(i);                            
+                      end;    
+                      RemProgress;                        
+                   end;
+               end;               
+        end;
+    end;                                                                                                                                                            
+
+end;
+
+//FSSP_Scroll.init("16.04.2013", "16.04.2013", null, "Test", true);
+//exit(1);

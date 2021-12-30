@@ -1,0 +1,645 @@
+//-----------------------------------------------------------------------------
+// Блок     : "Предобработка п/п/к"
+// Шаг      : "Предобработка"
+// Описание : Макрос шага
+// KS 16.01.2014 Адаптация пользовательских доработок
+// EVG 18/03/2014 Исправил ошибку в GetFreeAmount(), убрал кучу ненужных debugbreak-ов
+//-----------------------------------------------------------------------------
+
+import PaymInter, PSInter, BankInter, psbccomn, pm_note, FIInter, cbsttls, PTInter, pm_const, pm_common;
+import CTInter, globals, oralib, likepy, pm_tools, pm_setst, lib_pm_check, lib_account, lib_fg, FS;
+import OprInter; //Jushmanov 2014-02-20 C-19151
+//Str! 
+import "AvtoCode.mac";// ? по второй части ТЗ!!!
+import "FrontRoute.mac";
+//Библиотека для работы с банками группы
+import "fg_Life_parm.mac";
+var PaymentObj:RsbPayment;
+/*Str! после констант в "Предобработка п/п/к"*/
+//получить код страны нерезидента из карточки субъекта {GBR}
+
+
+private macro GetFreeAmount( Payment)
+
+  var RestDebetFact; /* = AccGetFreeAmount( Payment.PayerAccount, CHAPT1, Payment.PayerFIID, Payment.Priority, Payment.ClaimID, {curdate});*/
+  /*SDA */
+  AccGetFreeAmount( RestDebetFact, null, Payment.PayerAccount, CHAPT1, Payment.PayerFIID, {curdate}, Payment.Priority, Payment.ClaimID); /* с учетом претензий */
+  var cmd, rs;
+
+  // KS 16.01.2014 t_planrest -> rsi_rsb_account.planrest*
+  var retval, params;
+
+  /* EVG 18/03/2014 Не нужно такого разделения. Для инфо: rsi_rsb_account.planresta вызывает rsi_rsb_account.planrestac.
+     Отдельное спасибо человеку, который написал там V_INTEGER. Дятел.
+  if (Payment.PayerFIID != 0)
+     //cmd = RSDCommand("select t_planrest from daccount$_dbt where t_chapter = 1 and t_code_currency = ? and t_account = ?");
+     //cmd.addparam("fiid", RSDBP_IN, Payment.PayerFIID);
+     //cmd.addparam("acc" , RSDBP_IN, Payment.PayerAccount);
+     params = makeArray( SQLParam( "p_account"  , Payment.PayerAccount ),
+                         SQLParam( "p_cur"      , Payment.PayerFIID    ),
+                         SQLParam( "p_date"     , {curdate}            ),
+                         SQLParam( "p_chaper"   , 1                    ) );
+     retval = execStoredFunc( "rsi_rsb_account.planrestac", V_INTEGER, params );
+  else
+     //cmd = RSDCommand("select t_planrest from daccount_dbt where t_chapter = 1 and t_account = ?");
+     //cmd.addparam("acc", RSDBP_IN, Payment.PayerAccount);
+     params = makeArray( SQLParam( "p_account"  , Payment.PayerAccount ),
+                         SQLParam( "p_date"     , {curdate}            ),
+                         SQLParam( "p_chaper"   , 1                    ) );
+     retval = execStoredFunc( "rsi_rsb_account.planresta",  V_INTEGER, params );
+  end;*/
+  params = makeArray( SQLParam( "p_account"  , Payment.PayerAccount ),
+                      SQLParam( "p_cur"      , Payment.PayerFIID    ),
+                      SQLParam( "p_date"     , {curdate}            ),
+                      SQLParam( "p_chaper"   , 1                    ) );
+  retval = execStoredFunc( "rsi_rsb_account.planrestac", V_MONEY, params );
+  /* EVG 18/03/2014 end */
+
+
+  //rs = RSDRecordset(cmd);
+  //rs.MoveNext();
+  var RestDebet = retval;//money(rs.value(0));
+
+  if (RestDebetFact < RestDebet)
+     RestDebet = RestDebetFact; //возвращаем наименьший остаток
+  end;
+
+
+  if( Payment.PartPaymNumber > 0 )
+    RestDebet = RestDebet + Payment.FuturePayerAmount;
+  end;
+
+  return RestDebet;
+end;
+
+
+
+private macro GetCodNer(ppID:integer)
+  var query:string = "select T_nrcountry from dparty_dbt where t_partyid=" + PPid;
+  var rs:RsdRecordset = execSQLselect(query);
+  if( rs.moveNext() )
+    return rs.Value(0);
+  else
+  msgbox("Ошибка получения кода страны нерезидента");
+   return "";
+  end;
+end;
+//получить ID признака по коду страны строго для 5 группы!!!   //возможно t_ojecttype=501
+private macro GetAttrid(CC:string) 
+  var query:string = "select t_attrid from dobjattr_dbt where t_groupID=5 and t_codelist= " + "'"+ CC +"'";
+//  msgbox(query);
+                                 
+  var rs:RsdRecordset = execSQLselect(query);
+  if( rs.moveNext() )
+//   msgbox(rs.Value(0));
+    return rs.Value(0);
+  else
+  msgbox("Ошибка получения кода признака");
+   return "";
+  end;
+end;
+/*Str!*/
+
+//-----------------------------------------------------------------------------
+// Проверить валюту документа
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckFIID( FIID:integer ):integer
+
+  if( ПолучитьФинИн( FIID ) != 0 )
+    return 1;
+  end;
+
+  return 0;
+END;
+
+//-----------------------------------------------------------------------------
+// Является ли субъект резидентом
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsResident( BankID )
+  private FILE fparty ( "party.dbt" );
+
+  var OldKey, result = true;
+
+  OldKey = KeyNum( fparty, 0 );
+
+  fparty.PartyId = BankID;
+
+  if( getEQ( fparty ) )
+    if( fparty.NotResident == "X" )
+      result = false;
+    end;
+  end;
+
+  keyNum( fparty, OldKey );
+
+  return result;
+END;
+
+
+//-----------------------------------------------------------------------------
+// Проверка внешних платежей
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckExternalPayment( Payment:RsbPayment, err:string ):integer
+
+  var stat   :integer = 0;
+  var err_str:string  = "";
+  var retval:integer = 0;
+  var ExtAcc :string  = "", ExtAccNew :string  = "", BankCode:string = Payment.ReceiverBankCode;;
+  var params:TArray = NULL;
+
+  // Если банк российский
+  if( ( Payment.ReceiverBankID > 0 ) and ( IsResident( Payment.ReceiverBankID )) )
+    
+    stat = PT_CheckBankControlDate( Payment.ReceiverBankID );
+    if( stat > 0 )
+      err_str = GetErrMsg();
+    end;
+
+    // Проверить длину счета
+    if( ( stat == 0 ) and ( strlen( Payment.ReceiverAccount ) > 0 ) )
+      // Проверить ключ счета
+      if( Payment.ReceiverBankCodeKind != PTCK_BIC )
+        params = makeArray( SQLParam( "p_PartyID"    , Payment.ReceiverBankID ),
+                            SQLParam( "p_CodeKind"   , PTCK_BIC               ),
+                            SQLParam( "p_Code"       , V_STRING , RSDBP_OUT   ),
+                            SQLParam( "p_CodeOwnerID", V_INTEGER, RSDBP_OUT   )
+                          );
+        retval = execStoredFunc( "RSBPARTY.PT_GetPartyCodeEx", V_INTEGER, params );
+        if( retval == 0 )
+          BankCode = params.Value(2).value;
+        end;
+      end;
+      ExtAccNew = GetKey( ExtAcc, BankCode );
+      if( ExtAccNew != ExtAcc )
+        err_str = "В номере счета " + ExtAcc + " неверно значение ключа.|Должно быть " + ExtAccNew;
+        stat = 1;
+      end;
+    end;
+  end;
+  
+  SetParm( 1, err_str );
+  return stat;
+END;
+
+//-----------------------------------------------------------------------------
+// Системные проверки при выполнении шага
+// Возвращает ошибку
+// Если заполняет строку ошибки, то возвращает 1
+//-----------------------------------------------------------------------------
+PRIVATE MACRO SystemControl_CommonCheck( Payment:RsbPayment, err_msg:string ):integer
+  var stat   :integer = 0;
+  var obj    :object  = GenObject( "RsbBuyCurrencyOrder", Payment.DocumentID );
+  var RateObj:object  = NULL;
+  AvCodeVoPPK(obj,Payment);
+
+//проверка "дата валютирования==дата опердня"
+  if( Payment.ValueDate != {curdate} )
+    err_msg = "Дата валютирования должна совпадать с датой опердня,| в котором проводится операция";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  
+  // Проверить валюты
+  if( CheckFIID( Payment.PayerFIID ) != 0 )
+    err_msg = "Неверно задана валюта дебета";
+    SetParm( 1, err_msg );
+    return 1;
+  end;  
+  if( CheckFIID( Payment.ReceiverFIID ) != 0 )
+    err_msg = "Неверно задана валюта кредита";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  if( Payment.PayerFIID == Payment.ReceiverFIID )
+    err_msg = "Валюты дебета и кредита должны быть различны";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  /* EVG */
+  var IsAddedPI:bool = IfThenElse( ( Payment.PIList(0).Size > 0 ) or ( Payment.PIList(1).Size > 0 ), true, false );
+
+  if( obj.BankFunds )
+    /* EVG */
+     if (not IsAddedPI)
+        if( Payment.PayerAmount <= 0 )
+          err_msg = "Не задана сумма по дебету";
+          SetParm( 1, err_msg );
+          return 1;
+        end;
+        if( Payment.ReceiverAmount <= 0 )
+          err_msg = "Не задана сумма по кредиту";
+          SetParm( 1, err_msg );
+          return 1;
+        end;
+     end;
+  end;
+  if( (obj.ExchangeFIID > -1 ) AND (CheckFIID( obj.ExchangeFIID ) != 0) )
+    err_msg = "Неверно задана валюта торгов";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  if( Payment.NumberPack < 0 )
+    err_msg = "Неверно задан номер пачки";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  if( Payment.PayerAccount == "" )
+    err_msg = "Не задан счет плательщика";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  if( not AccountExistAndOpen( Payment.PayerFIID, Payment.PayerAccount, CHAPT1 ) )
+    return ERR_INVALID_PAYERACC;
+  end;
+ 
+  // Счет дебета является клиентским. Иначе - "Плательщик не является клиентом. Ошибка выбора операции."
+  //TAM I-00299768-3 17.12.12
+  if( (not IsClientPayerAccount( Payment )) and  (not Substr(Payment.PayerAccount,1,5) == "47405")) 
+     err_msg = "Плательщик не является клиентом. Ошибка выбора операции.";
+     SetParm( 1, err_msg );
+      return 1;
+  end;
+    
+  if( Payment.ReceiverGroup != PAYMENTS_GROUP_EXTERNAL )
+    if( Payment.ReceiverAccount == "" )
+      err_msg = "Не задан счет получателя";
+      SetParm( 1, err_msg );
+      return 1;
+    end;
+    if( not AccountExistAndOpen( Payment.ReceiverFIID, Payment.ReceiverAccount, CHAPT1 ) )
+      return ERR_INVALID_RECEIVERACC;
+    end;
+  else
+    // Проверка для внешних платежей
+    if( ( Payment.PayerGroup == PAYMENTS_GROUP_EXTERNAL ) or ( Payment.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) )
+      if( CheckExternalPayment( Payment, err_msg ) )
+        SetParm( 1, err_msg );
+        return 1;
+      end;
+    end;
+  end;
+  
+  return 0;
+END;
+
+PRIVATE MACRO ExecuteSysControlStep( Payment:RsbPayment ):integer
+  var err:integer = 0;
+  var err_mes:string = "";
+  var obj;
+
+  err = SystemControl_CommonCheck( Payment, err_mes );
+
+  if( err != 0 )
+    if( StrLen( err_mes ) == 0 )
+      InitError();
+      MemoryError( err );
+      err_mes = GetErrMsg();
+    end;
+
+    InitError();
+    // Установить статус платежа
+    Payment.PaymStatus = PM_REJECTED;
+
+    // Установить статус первички
+    BC_SetPrimDocumentState( Payment, PSBCORD_ST_REJECTED );
+
+    // Заполнить статусы сегментов операции
+    if( УстановитьСтатусыПлатежа( OPR_BC_CONTROL, OPR_BC_ST_CTRL_REJECTED ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return -1;
+    end;
+
+    // Заполнить примечание
+    if( Payment.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, err_mes ) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return -1;
+    end;
+    msgbox( err_mes );
+    return 1;
+  end;
+  
+  return 0;
+
+END;
+
+//-----------------------------------------------------------------------------
+// Общие проверки остатков по счетам
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckAccRestCommon( Payment:RsbPayment, err_mes:string ):integer
+  var Sfree = 0, SumR = 0, SumC = 0;
+  var КоэфД:double = 1.0;
+  var err_msg:string = "";
+  var BcOrder:object  = GenObject( "RsbBuyCurrencyOrder", Payment.DocumentID );
+
+  if( NOT DefineCoefficientDepos( {OperDprt}, КоэфД ) )
+    err_msg = "";
+    SetParm( 1, err_msg );
+    return -1;
+  elif( КоэфД < 1.0 )
+    КоэфД = 1.0;
+  end;
+  
+  if( Payment.PayerAmount == 0 )
+
+    if( BcOrder.BCOrdKind == PSBCKIND_BUY ) // покупка
+      if( Payment.ReceiverFIID == BcOrder.ExchangeFIID )
+        if( BcOrder.LimRate != 0 )
+          Payment.PayerAmount = ConvertSum( Payment.ReceiverAmount, BcOrder.LimRate, BcOrder.LimRateScale, BcOrder.LimRatePoint, BcOrder.LimRateInv );
+        else
+          if( ConvSum(SumR, Payment.ReceiverAmount, {curdate}, Payment.ReceiverFIID, 0/*NATCUR*/) )
+            err_msg = "Ошибка при конвертации валюты";
+            SetParm( 1, err_msg );
+            return -1;
+          end;
+          Payment.PayerAmount = SumR * КоэфД;
+        end;
+      else
+        if( BcOrder.LimRate != 0 )
+          if( ConvSum(SumR, Payment.ReceiverAmount, {curdate}, Payment.ReceiverFIID, 0/*NATCUR*/) )
+            err_msg = "Ошибка при конвертации валюты";
+            SetParm( 1, err_msg );
+            return -1;
+          end;
+          if( ConvSum(SumC, SumR, {curdate}, 0/*NATCUR*/, BcOrder.ExchangeFIID) )
+            err_msg = "Ошибка при конвертации валюты";
+            SetParm( 1, err_msg );
+            return -1;
+          end;
+          Payment.PayerAmount = ConvertSum( SumC * КоэфД, BcOrder.LimRate, BcOrder.LimRateScale, BcOrder.LimRatePoint, false );
+        else
+          if( ConvSum(SumR, Payment.ReceiverAmount, {curdate}, Payment.ReceiverFIID, 0/*NATCUR*/) )
+            err_msg = "Ошибка при конвертации валюты";
+            SetParm( 1, err_msg );
+            return -1;
+          end;
+          Payment.PayerAmount = SumR * КоэфД * КоэфД;
+        end;
+      end;
+
+    elif( BcOrder.BCOrdKind == PSBCKIND_PAY ) // продажа
+      
+      if( BcOrder.LimRate != 0 )
+        Payment.PayerAmount = ConvertSum( Payment.ReceiverAmount, BcOrder.LimRate, BcOrder.LimRateScale, BcOrder.LimRatePoint, true );
+      else
+        if( ConvSum(SumC, Payment.ReceiverAmount, {curdate}, 0/*NATCUR*/, PaymentObj.PayerFIID) )
+          err_msg = "Ошибка при конвертации валюты";
+          SetParm( 1, err_msg );
+          return -1;
+        end;
+        Payment.PayerAmount = SumC * КоэфД;
+      end;
+
+    else //конверсия
+      if( BcOrder.LimRate != 0 )
+        if( BcOrder.ConvOper == KINDOPCONV_BUY )
+          Payment.PayerAmount = ConvertSum( Payment.ReceiverAmount, BcOrder.LimRate, BcOrder.LimRateScale, BcOrder.LimRatePoint, false );
+        elif( BcOrder.ConvOper == KINDOPCONV_PAY )
+          Payment.PayerAmount = ConvertSum( Payment.ReceiverAmount, BcOrder.LimRate, BcOrder.LimRateScale, BcOrder.LimRatePoint, true );
+        end;
+      else
+        if( ConvSum(SumR, Payment.ReceiverAmount, {curdate}, Payment.ReceiverFIID, 0/*NATCUR*/) )
+          err_msg = "Ошибка при конвертации валюты";
+          SetParm( 1, err_msg );
+          return -1;
+        end;
+        if( ConvSum(SumC, SumR, {curdate}, 0/*NATCUR*/, Payment.PayerFIID) )
+          err_msg = "Ошибка при конвертации валюты";
+          SetParm( 1, err_msg );
+          return -1;
+        end;
+        Payment.PayerAmount = SumC * КоэфД;
+      end;
+    end;
+
+  end;
+
+  Sfree = GetFreeAmount( Payment);//.PayerAccount, CHAPT1, Payment.PayerFIID, Payment.Priority, Payment.ClaimID, {curdate} );
+
+  if(( Sfree < Payment.PayerAmount ) and (not (PM_CanUseLimit( Payment, Sfree ))))
+    err_msg = "Недостаточно средств на счете плательщика";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+  
+  return 0;
+END;
+
+//-----------------------------------------------------------------------------
+// Проверка остатков по счетам
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckAccRest( Payment:RsbPayment )
+  var err_mes : string  = "";
+  var stat    : integer = CheckAccRestCommon( Payment, err_mes );
+  var BcOrder:object  = GenObject( "RsbBuyCurrencyOrder", PaymentObj.DocumentID );
+
+  if( stat != 0 )
+    if( stat > 0 )
+      // Установить статус платежа
+      Payment.PaymStatus = PM_REJECTED;
+
+      // Установить статус первички
+      BC_SetPrimDocumentState( Payment, PSBCORD_ST_REJECTED );
+
+      // Заполнить статусы сегментов операции
+      if( УстановитьСтатусыПлатежа( OPR_BC_CONTROL, OPR_BC_ST_CTRL_REJECTED ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return -1;
+      end;
+
+      // Заполнить примечание
+      if( Payment.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, err_mes ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return -1;
+      end;
+      msgbox( err_mes );
+      return 1;
+    else
+      if( err_mes != "" )
+        msgbox( err_mes );
+      end;
+      return -1;
+    end;
+  else
+    
+/*    if( BcOrder.Origin != PSBCORD_OR_INRQ )
+      if( Payment.MakeReserve( Payment.PayerAccount, CHAPT1, Payment.PayerFIID, Payment.PayerAmount ) )
+        msgbox("Ошибка при создании резерва на счете плательщика");
+        return -1;
+      end;
+    end;*/
+
+    // Заполнить статусы сегментов операции
+    if( УстановитьСтатусыПлатежа( OPR_BC_DO, OPR_BC_ST_EXECUTION ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return -1;
+    end;
+
+    //return 1;
+  end;
+  
+  return 0;
+
+END;
+
+MACRO ExecuteStep( doc, paymDoc )
+  //debugbreak;
+  var stat:integer = 0;
+  var obj:object;
+  var cmd, rsdrec;
+  PaymentObj.Oper = {oper};
+  obj = GenObject( "RsbBuyCurrencyOrder", PaymentObj.DocumentID );
+
+  if( stat == 0 )     
+
+    //Контроль
+    //Seleznev для продажи валюты от распоряжения по транзитному счету - контроли не нужны
+    //zmp 14.01.2014 C-20812
+    //Gurin S. 08.05.2015 R-579959-2 добавил Солидарность
+    if ((obj.origin == 2000) or ((obj.origin  == 2) and (CheckAutoExecut(PaymentObj.PaymentID)) and (inList(true,_bank.is_PRBB, _bank.is_VUZ, _bank.is_GEB, _bank.is_EXV, _bank.is_SLD))))
+       stat = УстановитьСтатусыПлатежа( OPR_BC_CONTROL, OPR_BC_ST_CTRL_CONTROL );
+       if( stat != 0 )      
+         msgbox("Ошибка при установке статуса платежа");
+         return 1;
+       end;
+    end;
+    // zmp 14.01.2015 курс не обновляет, а проблемы создает. 
+    /*
+    if (obj.origin == 2000)
+
+       
+       /* EVG 20/04/2012 Для поручений на продажу BYR не нужно курс умножать на 10000 */
+       var rateClause = "sell_rate*10000";
+       if( (PaymentObj.BaseFIID == 10) )      // Белорусский рубль
+          rateClause = "sell_rate";
+       end;
+
+       cmd = RSDCommand(
+                        "update   dpmpaym_dbt t " +
+                        "   set   (t_rate,t_scale) = " +
+                        "            (select   " + rateClause + ", sell_scale " +
+                        "               from   usr_trnsf_order o, usr_trnsf_notify nt, dpmlink_dbt lnk " +
+                        "              where       o.notify_num = nt.notify_num " +
+                        "                      and nt.payment_id = lnk.t_purposepayment " +
+                        "                      and lnk.t_initialpayment = t.t_paymentid " +
+                        "                      and t_linkkind = 2000 " +
+                        /*Kozina на случай, если к одному платежу привязано 2 конверсии*/
+                        "                      and SELL_SUM = t.t_amount "+ 
+                        "                      and t_paymlinkid = (select   max (t_paymlinkid) " +
+                        "                                            from   dpmlink_dbt " +
+                        "                                           where   t_linkkind = 2000 and t_purposepayment = lnk.t_purposepayment)) " +
+                        " where   t_paymentid = ? "
+                       );
+       cmd.AddParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+       cmd.execute();
+    
+    end;*/
+
+  end;
+  //zmp 14.01.2014 C-20812
+  SetFrontRoute(PaymentObj,string(paymentObj.dockind),obj.origin);
+
+  // Системный контроль
+  stat = ExecuteSysControlStep( PaymentObj );
+  if( stat < 0 )
+    return 1;
+  elif( stat > 0 )
+    return 0;
+  end;
+
+  if( stat == 0 ) // Проверка остатков по счетам
+    stat = CheckAccRest( PaymentObj );
+    if( stat < 0 )
+      return 1;
+    elif( stat > 0 )
+      return 0;
+    end;
+  end;
+
+  //zmp 14.01.2014 C-20812 установкy правила вынес немного выше
+  //SetFrontRoute(PaymentObj);
+  /*zmp 14.01.2014 C-20812 >>> */
+  if((obj.origin == 2) and (inList(true,_bank.is_PRBB, _bank.is_VUZ, _bank.is_GEB, _bank.is_EXV))); 
+     if(trim(PaymentObj.Ground) == "102")
+        var convPayerAccount :RSL_Account = RSL_Account(PaymentObj.PayerAccount, PaymentObj.PayerFIID) ;
+        var convErrMes = "Не хватает собственных средств на проведение платежа. |"+ 
+                         "Нецелевую конверсию нельзя проводить за счет овердрафта или кредитных средств.";                        
+
+        ChangeFC(PaymentObj.paymentID, 1);        
+        if((convPayerAccount.check_type_account("О")) and 
+          ((Acc_GetFreeAmountWithOverClaim(PaymentObj) - Acc_GetLimit(PaymentObj.PayerAccount))  < PaymentObj.PayerAmount) and
+          (Acc_GetFreeAmountWithOverClaim(PaymentObj) >= PaymentObj.PayerAmount))         
+           if (not isOprMultiExec()) msgBox(convErrMes); end;            
+           PaymentObj.PaymStatus = PM_REJECTED;
+           BC_SetPrimDocumentState( PaymentObj, PSBCORD_ST_REJECTED );
+           stat = УстановитьСтатусыПлатежа(OPR_BC_CONTROL, OPR_BC_ST_CTRL_REJECTED);                  
+           PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, convErrMes);
+        end;
+     else
+        ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования
+     end;
+  end;
+  /* <<< zmp 14.01.2014 C-20812*/
+  return stat;
+END;
+
+
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+
+    private var logquery;
+
+    //Jushmanov 2014-02-20 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+
+    /* -------------------------------------------------------------------------------------------------
+        02-04-2012 TAM I-00171465-2 Для поручений на покупку\продажу валюты важно, 
+        чтобы было заполнено поле "Наименование банка" - это поле участвует в отборе документов 
+        для выгрузки в АСВКБ. Оно не должно быть пустым.
+        18.07.2012 TAM I-00222132-2 - по конверсии из ИК иногда неверным выставляется поле t_basefiid
+    -------------------------------------------------------------------------------------------------*/
+                                
+    if ((message == OP_EXECUTE_STEP) and (PaymentObj.dockind == 200))
+        var cmd, rs, bank_name;
+        //TAM 18.07.2012 I-00222132-2
+        if((PaymentObj.BaseFiid != PaymentObj.PayerFIID) and (PaymentObj.PayerFIID != 0))
+            //PaymentObj.BaseFiid = PaymentObj.PayerFIID;
+            cmd = RsdCommand("UPDATE dpmpaym_dbt SET t_basefiid = ? WHERE t_paymentid = ?");
+            cmd.AddParam("BaseFiid", RSDBP_IN, PaymentObj.PayerFIID);
+            cmd.AddParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+            cmd.execute();
+        end;
+        cmd = RsdCommand("select t_name from dparty_dbt where t_partyid = ?");
+        cmd.AddParam("partyid", RSDBP_IN, PaymentObj.PayerBankId);
+        rs = RsdRecordSet( cmd );
+        if ( rs and rs.MoveNext() )
+            bank_name = rs.Value(0);
+            cmd = RsdCommand("UPDATE dpmrmprop_dbt SET t_payerbankname = ? , t_receiverbankname = ? WHERE t_paymentid = ?");
+            cmd.AddParam("payerbankname", RSDBP_IN, bank_name);
+            cmd.AddParam("recieverbankname", RSDBP_IN, bank_name);
+            cmd.AddParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+            cmd.execute();
+        end;
+        //zmp 14.01.2014 С-20812
+        if((PaymentObj.origin  == 2) and 
+           (CheckAutoExecut(PaymentObj.PaymentID)) and
+            (PaymentObj.PaymStatus == 100) and (inList(true,_bank.is_PRBB, _bank.is_VUZ, _bank.is_GEB, _bank.is_EXV)))
+            ExecMacroFile("SendStatus_IB.mac", "SendStatus_IB", PaymentObj.paymentid, PaymentObj.Dockind, 5 /*отказан*/, true);
+        end;         
+    end;
+return 0;
+end;

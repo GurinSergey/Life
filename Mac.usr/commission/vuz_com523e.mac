@@ -1,0 +1,199 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Банк ВУЗ
+
+       Макрос пользовательского алгоритма расчёта базовых сумм комиссии 5.2.3           // 5.8 для ИП
+       "Выдача наличных с оформлением заявки от 500001 до 1000000 рублей в день".
+
+       Тип комиссии - единовременная.
+       
+       13.04.2011 Согласно заявки С-234
+       CDS Переписан алгоритм комиссии, теперь комиссия считается 
+           нарастающим итогом с начала месяца. Используются глобальные параметры
+           объявленные в макросе рассчета комиссии 5.2.2. Параметры не разрушаются
+           т.к. еще нужны для передачи в макрос рассчета комиссии 5.2.4.
+   //21.01.2014 C-25244 VV         
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, cb_sql;
+import VuzComLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+record sfbassum( "sfbassum.str" );
+record paym(pmpaym);
+
+
+private CONST CommLimit_Min = $500000,
+      CommLimit_Max = $1000000;//
+
+
+/*
+    Расчет для единовременных комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+    var query, rs, stat, DrawSum = $0, PaymentSum = $0;
+    var CommQuont   = 0,
+        CommSum     = $0;
+
+    var {AccExist>1Yr} = false,
+        DrawSumPM    = $0; // Сумма по символам платежа не на зарплату
+
+    {AccExist>1Yr} = ( ( endDate - GetAccountOpenDate( sfcontr.Object ) ) > 365 );
+
+/********************************************************/
+    DrawSum =    GetGlobalParameter("DrawSum", false);     //Используем но не разрушаем
+    DrawSumPM =  GetGlobalParameter("DrawSumPM", false);   //Используем но не разрушаем
+    PaymentSum = GetGlobalParameter("PaymentSum", false);  //Используем но не разрушаем
+/********************************************************/
+
+    if ( DrawSumPM > $0 )
+       /* EVG Комиссия взимается прогрессивно: 
+          - сумма базы рассчитывается как общая сумма снятия, превышающая нижнюю границу лимита
+          - если сумма базы больше лимита, комиссия взимается с суммы верхней границы лимита. */
+
+       if ((PaymentSum > CommLimit_Min) and (PaymentSum <= CommLimit_Max))
+         if(DrawSum <= CommLimit_Max)
+           CommSum = DrawSumPM;
+         else
+           CommSum = CommLimit_Max - PaymentSum;
+         end;
+       elif(PaymentSum <= CommLimit_Min)
+         if (PaymentSum == $0)
+           if (DrawSumPM > CommLimit_Max)
+             CommSum = CommLimit_Max - CommLimit_Min;
+           elif ((DrawSumPM > CommLimit_Min) and (DrawSumPM <= CommLimit_Max))
+             CommSum = DrawSumPM - CommLimit_Min;
+           else
+             CommSum = $0;
+           end;
+         else
+           if(DrawSum > CommLimit_Max)
+             CommSum = CommLimit_Max - CommLimit_Min;
+           elif( (DrawSum > CommLimit_Min) and (DrawSum <= CommLimit_Max) )
+             CommSum = DrawSum - CommLimit_Min;
+           else
+             CommSum = $0;
+           end;
+         end;
+       else
+         CommSum = $0;
+       end;
+
+    end;
+//VV C-25244   
+    var  quer="SELECT   CAT.T_OBJECT "+
+            "FROM   dobjatcor_dbt cat "+
+            "WHERE   CAT.T_GROUPID = 1023 "+
+            " AND CAT.T_OBJECTTYPE = 501 "+
+            " and CAT.T_OBJECT=" +cashDoc.AutoKey ;
+    var  qrs=TRsbDataSet(quer);
+
+     if(qrs.movenext)
+     debugbreak;
+       CommSum=$0;
+     end;  
+//VV C-25244 
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType    = SF_BASETYPE_SUM;
+    sfbassum.baseSum     = CommSum;
+
+    sfbassum.baseType2   = SF_BASETYPE_SUM;
+    sfbassum.baseSum2    = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

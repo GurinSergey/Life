@@ -1,0 +1,158 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29057 - "Проведение исходящего платежа"
+// Шаг       : 10    - "Формирование проводки по корсчету"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+// Изменения:
+// 01.11.2012 - TAM C-14674
+// 2014-02-25 - UDA C-19151 Логгирование массово выполненных шагов
+//-----------------------------------------------------------------------------
+
+import PaymInter, WldInter, InsCarryDoc, OprInter, rsd, pm_tools;
+import oralib; //Jushmanov 2014-02-25 C-19151
+//TAM 01.11.2012 C-14674
+import "cbsttls.mac";
+private var fgBank = fg_life_subject({OurBank});
+//end TAM
+
+var PaymentObj:RsbPayment;
+
+
+macro ExecuteStep( doc, first, KindDoc )
+    DebugBreak;
+    var stat:integer = 0;
+    var paymtr:RsbPaymTransaction;
+    var cmd;
+    // KS 25.09.2012 РОБОТЫ-ПЛАНИРОВЩИКИ 24/7
+    if( ( IsOprMultiExec() ) and ({oper} != 20009) )
+        MsgBox("Выполнять шаг в массовом режиме может только Payments");
+        return 1;
+    end;
+
+ /*LAO пейментса уже нет 120216   //Gurin S. 27.01.2015 C-33995-7
+    if ((PaymentObj.OutTransport == 0) and (not PaymentObj.IsTransit))
+        MsgBox("Не указан транспорт исходящей схемы расчетов");
+        return 1;
+    end;
+*/
+    if(PaymentObj.Dockind == DLDOC_MULTYPM)
+        return 0;
+    end;
+    /*2029*/
+    PaymentObj.FreeReserve( PaymentObj.PayerAccount, 1, PaymentObj.PayerFIID );
+    if ( not CarryPlanDocuments(PaymentObj.PaymentID) )
+        MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+        return 1;
+    end;
+    
+    if (ПлатежЗачисленНаСНР(PaymentObj))
+        PaymentObj.ValueDate = PaymentObj.OutTransferDate;
+        paymtr = PaymentObj.MakeTransaction();
+        
+        if( paymtr == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+        
+        paymtr.Chapter         = PaymentObj.Chapter;
+        paymtr.Date_Carry      = {curdate};
+        //Gurin S. 14.03.2014 Ошибка wlCarryPaym.mac Строка 51 доступ к свойству или методу Date_Document
+        //paymtr.Date_Document   = {curdate};
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 1;
+        paymtr.Kind_Oper       = " 1";
+        
+        if (PaymentObj.ShifrOper != "")
+            paymtr.Shifr_Oper      = PaymentObj.ShifrOper;
+        else
+            paymtr.Shifr_Oper      = "09";
+        end;
+        
+        paymtr.Ground          = PaymentObj.Ground;
+        paymtr.Department      = PaymentObj.Department;
+        paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+        paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+        paymtr.SumPayer        = PaymentObj.FuturePayerAmount;
+        paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+        paymtr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+        paymtr.SumReceiver     = PaymentObj.FutureReceiverAmount;
+        paymtr.ClaimID         = PaymentObj.ClaimID;
+    
+        if( not paymtr.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;  
+    end;
+    
+    if (PaymentObj.OutCorschem != 1)
+        /*      Установить статус свойств платежа для платежей не на РКЦ*/
+        //TAM 22.10.2012 C-14674 только для ПРББ
+        debugbreak;
+        if((fgBank.is_PRBB or fgBank.is_EXV or fgBank.is_GEB) and 
+           (PaymentObj.basefiid != 0) and 
+           (PaymentObj.Dockind == 202) and 
+           (PaymentObj.isExternal) and 
+           (not(CompareStrWithMasks ("426*, 40820*, 40913*", PaymentObj.PayerAccount))))
+        
+            if(strLen(PaymentObj.ReceiverAccount) != 20)
+                stat = УстановитьСтатусыПлатежа(378,1);
+            else
+                if(substr(PaymentObj.ReceiverBankCode,5,2) != "RU")
+                    stat = УстановитьСтатусыПлатежа(378,1);
+                else
+                    if(not(CompareStrWithMasks ("30111*, 30231*", PaymentObj.ReceiverAccount)))
+                        stat = УстановитьСтатусыПлатежа(378,1);
+                    end;
+                end;
+            end;
+        else
+            if( not InsertPaymentPropStat( PaymentObj.PaymentID, 32000 /*PM_FINISHED*/ ) )
+                msgbox("Ошибка при вставке статуса платежа");
+                return 1;
+            end;
+            
+            cmd = RSDCommand("update dwlpm_dbt set t_propstatus = 32000 where t_paymentid = ?");
+            cmd.addparam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+            cmd.execute();
+        end;
+    end;
+    return stat;
+end;
+
+
+macro CheckStepAction(message)
+    if( message == OP_BACKOUT_STEP )
+        if (gettrue(false,"Документ уже был выгружен в Payments|Вы уверены что его следует откатить?"))
+            return 0;
+        else
+            return 1;
+        end;
+    end;
+    return 0;
+end;
+
+
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    //Jushmanov 2014-02-25 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

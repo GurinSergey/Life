@@ -1,0 +1,1514 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29016 - "Предобработка клиентского платежа"
+// Описание : "Проверка остатков по счетам"
+//-----------------------------------------------------------------------------
+// KS       24.05.2012 I-00181441
+// KS       22.06.2012 R-74894
+// TAM      24.05.2013 слияние версии Life и PS
+// TAM      30.04.13 C-19427 
+// Gurin S. 05.08.13 C-17880 
+// VV       09.09.13 C-22956 
+// Gurin S. 23.10.13 C-24064-6
+// Gurin S. 13.11.13 R-283396-2 Перенес C-17880 на ГЕБ
+// TAM      14.01.14 R-313123 Перенос С-19427 на все банки
+// Gurin S. 23.01.14 R-317985-2 (проверялись очередности документов 5 и 6, теперь 4 и 5, 
+//                               в связи с внесением изменений в статью 855 ГК)
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// VV 23.01.2014 C-23920
+// zmp 13.02.2014 R-329540
+// SDA 04.07.2014 - ЕРЦ - однотипная обработка документов по 365-П и "Выставлен банком получателя" для ВУЗ-а и Солидарности
+// Gurin S. 14.07.14 R-409824-2 Перенес C-17880 на Солидарность
+//-----------------------------------------------------------------------------
+
+import pm_chkrst, cbsttls, BankInter, SfInter, pm_tools, lib_pm_check, lib_account, lib_const;//TAM 30.04.2013 C-19427
+import "fg_Life_parm.mac", "autoKOR_K2_common.mac", bnk_common;
+private const fgBank = fg_life_subject( {ourbank} );
+
+// EVG 22/03/2012 Функции проверки и корректировки претензий 
+import acs_func;
+
+const   PSPM_NOTHING             = -1;
+const   PSPM_K2CHOICE_K2         = 0; //"В картотеку №2"
+const   PSPM_K2CHOICE_REJECT     = 1; //"Отвергнуть"
+const   PSPM_IWPCHOICE_IWP       = 0; // В картотеку ОР
+const   PSPM_IWPCHOICE_REJECT    = 1; // Отвергнуть
+//SDA 19.04.2012 - добалено для исключения направления БО на КОР - в пакетном режиме идут на К2
+const   PSPM_IWPCHOICE_I2        = 2; //"В картотеку №2"
+const   PSPM_IWPI2CHOICE_WP      = 0; //"В картотеку ОР"
+const   PSPM_PWPCHOICE_WAIT      = 0; //"На ожидание поступлений"
+const   PSPM_PWPCHOICE_I2        = 1; //"В картотеку №2"
+const   PSPM_PWPCHOICE_REJECT    = 2; //"Отвергнуть"
+const   PSPM_IWPI2CHOICE_I2      = 1; //"В картотеку №2"
+const   PSPM_IWPI2CHOICE_REJECT  = 2; //"Отвергнуть"
+
+//zmp 13.10.2014 C-30537-7 >>>
+
+private macro getI2PLACEDATE(account :string, priority:string)
+   var sql = " SELECT   PM.T_I2PLACEDATE, RM.T_PRIORITY        "+  
+             " FROM   dpmpaym_dbt pm, dpmrmprop_dbt rm         "+
+             " WHERE       PM.T_PAYMSTATUS = 2000              "+
+             "        AND RM.T_PAYMENTID = PM.T_PAYMENTID      "+
+             "        AND PM.T_PAYERACCOUNT = '" + account + "'"+
+             "        AND RM.T_PRIORITY <=     " + priority     +
+             "        AND PM.T_DEFCOMID != 0                   "+
+             "        AND ROWNUM = 1                           "+
+             " ORDER BY   RM.T_PRIORITY, PM.T_I2PLACEDATe      ";
+       sql = RsdRecordset(sql);
+   if(sql and sql.movenext()) return sql.value(0, null, v_date); end;
+   return date(0,0,0);
+onError
+   return date(0,0,0);
+end;
+
+macro insertNote40inTable(pid)
+   RsdCommand("insert into usr_paym_note40 values ("+ pid +")").execute;
+onError
+end;
+
+private macro addNote40(payment)
+   macro insertNote40inTable(pid)
+      RsdCommand("insert into usr_paym_note40 values ("+ pid +")").execute;
+   onError
+   end;
+
+   if((Payment.DocKind == 201) and (fgBank.is_VUZ or fgBank.is_GEB or fgBank.is_SLD or fgBank.is_EXV or fgBank.is_prbb)) //TAM 05.11.2014 // zmp 22.02.2015 R-529397-2 add prbb
+
+      var I2PLACEDATE = getI2PLACEDATE(payment.PayerAccount, payment.PRIORITY);
+      if(I2PLACEDATE != date(0,0,0)) 
+         if(not ((substr(payment.ReceiverAccount, 1, 5) == "40101") and (payment.PRIORITY != 5)))
+            insertNote40inTable(payment.paymentid);
+            Payment.Notes.AddNote(40, date(I2PLACEDATE) - 1);
+         end;
+      else                            
+         if(payment.PRIORITY == 5)  
+            insertNote40inTable(payment.paymentid);
+            Payment.Notes.AddNote(40, {curdate});
+         end;
+      end;
+   end;   
+onError
+end;
+//<<< zmp 13.10.2014 C-30537-7 
+
+private var MadeReserve: bool = false;//резерв был создан на текущем шаге операции(т.к. нет возможности его найти)
+
+
+//Этапы "Проверка остатков по счетам" для блока "Предобработка клиентского платежа"
+private const Проверки_пройдены                                = 0,
+              Определение_реальных_владельцев_счетов           = 1,
+              Направление_в_К1_или_К2                          = 2,
+              Направление_в_КОР                                = 3,
+              Проверка_очередности_и_наличия_КОР               = 4,
+              Проверка_очередности_и_наличия_К2                = 5,
+              Проверка_наличия_док_ожидающих_поступлений       = 6,
+              Проверка_остатка_на_счете_получателя             = 7,
+              Проверка_свободного_остатка_на_счете_плательщика = 8,
+              Направление_в_невыясненные                       = 9,
+              Определение_способа_обработки                    = 10,
+              Проверка_межфилиальности_платежа                 = 11,
+              Проверка_наличия_изменений_реквизитов            = 12,
+              Заполнение_даты_приема                           = 13;
+
+// Этапы "Проверка остатков по счетам" для блока "Предобработка банковского ордера"
+const БО_Проверки_пройдены                                  = 0,
+      БО_Определение_реальных_владельцев_счетов             = 1,
+      БО_Направление_в_КОР                                  = 2,
+      БО_Проверка_очередности_и_наличия_КОР                 = 3,
+      БО_Проверка_очередности_и_наличия_К2                  = 4,
+      БО_Проверка_наличия_документов_ожидающих_поступлений  = 5,
+      БО_Проверка_наличия_документов_в_очереди_к_КЛОРО      = 6,
+      БО_Проверка_остатка_на_счете_получателя               = 7,
+      БО_Проверка_свободного_остатка_на_счете_плательщика   = 8,
+      БО_Направление_в_невыясненные                         = 9,
+      БО_Проверка_свободного_остатка_на_счете_плательщика_2 = 10,
+      БО_Проверка_остатка_на_счете_получателя_2             = 11,
+      БО_Определение_статусов                               = 12;
+
+private macro IsBO( Payment:RsbPayment )
+  return Payment.DocKind == DLDOC_BANKORDER;
+end;
+
+class ParmStage(_ID_Operation, _ID_Step, FirstStage)
+  
+  var INDEX_Segment:integer = GetOprStatus(OPR_PAYM_INDEX);
+  var ID_Operation = _ID_Operation;
+  var ID_Step = _ID_Step;
+  
+  var Next_Stage = FirstStage;
+  var SkipStages:TArray = TArray(); // Этапы, которые необходимо пропустить
+
+  // Пропустить этап
+  macro SkipStage(Stage)
+    SkipStages[SkipStages.size] = Stage;
+  end;
+  
+  // Этот этап пропущен?
+  macro IsSkipStage(Stage)
+    var i = 0;
+    while(i < SkipStages.size)
+      if(SkipStages[i] == Stage)
+        return true;
+      end;
+      i = i + 1;
+    end;
+    return false;
+  end;
+  
+  // Установить следующий этап
+  macro NextStage(p1, p2)
+
+    if(ValType(p1) == V_UNDEF) // Если ничего не передали, то просто увеличиваем на 1
+      Next_Stage = Next_Stage + 1;
+    elif((ValType(p1) == V_BOOL) and (ValType(p2) == V_INTEGER)) // Установка этапа с условием
+      if(p1)
+        Next_Stage = p2;
+      end;
+    elif(ValType(p1) == V_INTEGER)
+      Next_Stage = p1;
+    end;
+  end;
+  
+  // Следующий этап Stage?
+  macro IsNextStage(Stage)
+    return Next_Stage == Stage;
+  end;
+end;
+
+// Варианты ответов PmWaitOrRejectQuestion
+var Dlg_Ans_Wait       = " На ожидание поступлений ";
+var Dlg_Ans_Carry      = " Провести ";
+var Dlg_Ans_Reject     = " Отвергнуть ";
+var Dlg_Ans_Cancel     = " Отмена ";
+//SDA  - пока не использована но очень может быть...
+var Dlg_Ans_K2         = " В картотеку 2";
+
+
+const Dlg_Var_Wait       :integer = 0;
+const Dlg_Var_Reject     :integer = 1;
+const Dlg_Var_Carry      :integer = 2;
+const Dlg_Var_Cancel     :integer = 3;
+//SDA - использована для возвращения в пакетном режиме
+const Dlg_Var_K2         :integer = 4;
+
+//-----------------------------------------------------------------------------
+// Выбрать "на ожидание поступлений" или "отвергнуть"
+//-----------------------------------------------------------------------------
+// :bool       EVG 13/12/2011 Убрал тип возвращаемого значения
+// SDA 15/12/2011 добавил входной параметр Payment для определения                                                      
+// selectRes по-умолчанию в соответствии с требованиями банка
+macro PmWaitOrRejectQuestion( Account:string, isExistWait:bool /*, Payment*/) 
+  Array Text;
+  Array Buttons;
+
+  var selectRes    :integer = Dlg_Var_Wait;
+   var OldDialogFlag = TSetDialogFlag(1);
+
+   //SDA 15.12.2011 - определение значения "по - умолчанию " для переменной selectRes  
+   var PayOrder:object = NULL;
+   var PO_DocKind = 0;
+   var PO_Origin  = 0;
+   private var Payment;
+
+   if (( GetParm(2, Payment)) and (valtype(Payment) != v_undef)) 
+      if ( Payment.DocKind == PS_PAYORDER )
+         PayOrder   = GenObject( "RsbPSPayOrder", Payment.DocumentID );     
+      elif ( Payment.DocKind == 286 ) //банковский ордер
+         PayOrder   = GenObject( "RsbBankOrder", Payment.DocumentID );     
+         //TAM I-00267440-2 15.10.2012
+      elif (Payment.DocKind == 203)
+         PayOrder   = GenObject( "RsbRequestOrder", Payment.DocumentID );
+      end;
+
+      //TAM I-00267440-2 15.10.2012
+      if (Payment.DocKind == 203)
+         PO_DocKind = PayOrder.Payment.DocKind; 
+         PO_Origin  = PayOrder.Payment.Origin; 
+      else
+         PO_DocKind = PayOrder.DocKind; 
+         PO_Origin  = PayOrder.Origin; 
+      end;
+      
+      if ( Payment.Origin == 3 )       // Происхождение платежа "Комиссия за обслуживание"
+      // EVG 8/08/2011 Платежи оплаты комиссии сразу отправляются в картотеку 2, минуя список ожидающих поступлений. 
+        selectRes = Dlg_Var_K2;
+      //SDA 19.04.2012 - Все БО идут на К2 без ожидания поступлений 
+      elif (Payment.DocKind == 286)
+         selectRes = Dlg_Var_K2;
+      // EVG 13/02/2012 Сделал такую инициализацию и для документов из ожидающих поступлений 
+      elif ( isExistWait and not IsOprMultiExec() )
+         selectRes = Dlg_Var_K2;
+      elif (PO_Origin == 2) // Полученные по системе Клиент-банк
+         selectRes = Dlg_Var_Wait;
+      //SDA 11.03.2012 - По требованию И.К. Ивановой - обязательно согласовать изменения. 
+      elif (fgBank.IS_GO) // Отсканированные документы или Пойдем!
+         if (int(Payment.ShifrOper) == 6 ) // сканированные инкассовые сразу идут на картотеку.
+            selectRes = Dlg_Var_K2;
+         end;
+      // 25.03.2013 zmp C-17511 Для документов картотеки - сразу на к2
+      elif(fgBank.is_PRBB and PM_IsPaymentERC(Payment)) //TAM 24.05.2013 слияние версий PS и Life 
+         selectRes = Dlg_Var_K2;
+         
+//      elif( (fgBank.is_VUZ)  and  
+// SDA 04.07.2014 - ЕРЦ - однотипная обработка документов по 365-П и "Выставлен банком получателя" для ВУЗ-а и Солидарности
+      elif( ((fgBank.is_VUZ) or (fgBank.is_SLD) ) and   
+             ( (Payment.Origin == 3300)   or
+               (Payment.Origin == 2100  ) or
+               (Payment.Origin == 19  ) ) and
+            (  (Payment.ShifrOper=="02") or 
+               (Payment.ShifrOper=="06") ) )//VV C-22956 09.09.13 
+         selectRes = Dlg_Var_K2; 
+         if( not IsOprMultiExec() )
+         MsgBox( "На счете плательщика недостаточно средств. Платеж будет помещен на Картотеку 2");
+         end;
+         return selectRes;    //сразу на К2     
+      end;
+   end; 
+  
+   if( not IsOprMultiExec() )
+
+    if( isExistWait )
+      Text(0) = "К счету плательщика " + Account + " есть неоплаченные документы, ожидающие поступлений. Что сделать с документом? ";
+    else
+      Text(0) = "На счете плательщика " + Account + " недостаточно средств для оплаты документа. Поместить его в список ожидающих поступлений? ";
+    end;
+    
+    Buttons(0) = Dlg_Ans_Wait;
+    Buttons(1) = Dlg_Ans_Reject;
+      // EVG 13/12/2011 Добавляются кнопки - "Провести" (когда из ожидающих поступлений) и "Отмена" 
+      Buttons(2) = Dlg_Ans_Carry;
+      Buttons(3) = Dlg_Ans_Cancel;
+
+      if (selectRes == Dlg_Var_K2) //SDA если значение переопределено НА К2
+         Buttons(1) = Dlg_Ans_K2;
+    end;
+
+      selectRes = ConfWin( Text, Buttons );
+      // SDA если было переопределение реджекта на К2 
+      if ((Buttons(1) == Dlg_Ans_K2) and (selectRes == Dlg_Var_Reject))
+         selectRes = Dlg_Var_K2;
+  end;
+
+   end;
+  return selectRes;
+end;
+
+//-----------------------------------------------------------------------------
+// Выбрать "В картотеку ОР", "В картотеку 2" или "Отвергнуть"
+//-----------------------------------------------------------------------------
+macro PmIWPorI2orRejectQuestion( Account:string, cachedvar:string ):integer
+
+  Array Text;
+  Array Buttons;
+
+  var DialogFlag = TSetDialogFlag(1);
+
+  var ChoiceIWPI2 = GetCachedVar( cachedvar + Account );
+  if( ValType( ChoiceIWPI2 ) == V_UNDEF )
+    Text[0] = "На счете плательщика " + Account + " недостаточно средств, свободных от наложенных запретов на проведение операций.";
+    Buttons[PSPM_IWPI2CHOICE_WP    ] = "В картотеку ОР";
+    Buttons[PSPM_IWPI2CHOICE_I2    ] = "В картотеку №2";
+    Buttons[PSPM_IWPI2CHOICE_REJECT] = "Отвергнуть";
+
+    ChoiceIWPI2 = ConfWin( Text, Buttons );
+
+    if( IsOprMultiExec() )
+      SetCachedVar( cachedvar + Account, ChoiceIWPI2 );
+    end;
+  end;
+  return ChoiceIWPI2;
+
+end;
+
+
+//проверить в списке документов, ожидающих поступлений, наличие документов с тем 
+//же счетом плательщика и с более высокой (или такой же) очередностью
+//  Account    - номер счёта
+//  FIID       - валюта счёта
+//  Priority   - очерёдность
+//  CheckDate  - дата поступления документа
+macro CheckPmWaitPlacedAccPr( Account:string, FIID:integer, Priority:integer, CheckDate:date ):bool
+
+  var  params:TArray;
+  var  rs:object;
+
+  params = makeArray( 
+                      SQLParam( "p_Account"   , Account   ),
+                      SQLParam( "p_FIID"      , FIID      ),
+                      SQLParam( "p_Priority"  , Priority  ),
+                      SQLParam( "p_Date"      , CheckDate ),
+                      SQLParam( "p_Strong"    , 1         )
+                    );
+
+  if(execStoredFunc( "PM_RESTFUN.CheckWaitingWithPriority", V_INTEGER, params ) > 0)
+    return true;
+  end;
+  
+  return false;
+
+end;
+
+//Получить символ предыдущего шага
+private macro GetSymbolPrevStep( ID_Operation:integer, ID_Step:integer, Symbol ):bool
+
+  var query:string = "SELECT prevs.t_symbol " +
+                     "FROM doprstep_dbt nows, doprstep_dbt prevs " +
+                     "WHERE nows.t_id_operation = :ID_Operation " +
+                       "AND nows.t_id_step = :ID_Step " +
+                       "AND prevs.t_id_operation = nows.t_id_operation " +
+                       "AND prevs.t_id_step = nows.t_previous_step ";
+
+  var params:TArray = TArray();
+  params[params.size] = SQLParam( "ID_Operation", ID_Operation );
+  params[params.size] = SQLParam( "ID_Step", ID_Step );
+
+  var rs:RsdRecordset = execSQLselect( query, params, true );
+  if( rs and rs.moveNext() )
+    SetParm( 2, rs.value(0) );
+    return true;
+  end;
+
+  return false;
+
+onerror(x)
+  MsgBox( "Ошибка получения шага операции|" + x.Message );
+  return false;
+end;
+
+macro ПлатежИзОжидающихПоступления( ID_Operation:integer, ID_Step:integer ):bool
+
+  var Symbol;
+
+  if(GetSymbolPrevStep( ID_Operation, ID_Step, Symbol ) and (Symbol == "Й")) 
+    return true;
+  end;
+
+  return false;
+end;
+
+private macro CheckPmWaitPlacedAccPr_ByObj(Payment:RsbPayment, ID_Operation, ID_Step, Account:@string )
+  
+  if( not InList(Payment.DocKind, PS_PAYORDER, DLDOC_BANKORDER, PS_INRQ) )
+    return false;
+  end;
+
+  var IsExists : bool = false;
+  var IsNext = 0;
+  var pi:TRecHandler = TRecHandler( "pmaddpi.dbt" );
+  var Priority = 0;
+  var StrongCond:bool = ПлатежИзОжидающихПоступления(ID_Operation, ID_Step);
+  var CheckDate:date = IfThenElse( Payment.PayerBankEnterDate == date(0,0,0), Payment.ValueDate, Payment.PayerBankEnterDate );
+  
+  Priority = Payment.Priority;    
+
+  if( (Payment.DocKind == DLDOC_BANKORDER) and (Payment.PIList(PRT_Debet).Size > 0) and (Payment.PIList(PRT_Debet).First() == 0) )
+    
+    while( (not IsExists) and (IsNext == 0) and (Payment.PIList(PRT_Debet).Current(pi) == 0) )
+      
+      IsExists = CheckPmWaitPlacedAccPr( pi.rec.Account, pi.rec.FIID, Priority, CheckDate );
+      if(IsExists)
+        Account = pi.rec.Account;
+      end;
+      IsNext = Payment.PIList(PRT_Debet).Next;
+    end;
+
+  else
+    IsExists = CheckPmWaitPlacedAccPr( Payment.PayerAccount, Payment.PayerFIID, Priority, CheckDate );
+    if(IsExists)
+      Account = Payment.PayerAccount;
+    end;
+  end;
+
+  return IsExists;
+
+
+end;
+
+
+PRIVATE MACRO ДокументПретензииНаСумму( ClaimID ):bool
+  VAR params:TArray = TArray();
+  VAR rs:RsdRecordset;
+  VAR query:string = "SELECT CL.T_CLAIMKIND, CL.T_RESTKIND " +
+                     "  FROM DACCLAIM_DBT CL  " +
+                     " WHERE CL.T_CLAIMID = :CLAIMID";
+  params[params.size] = SQLParam( "CLAIMID", ClaimID );
+  rs = execSQLselect( query, params, TRUE );
+  IF( rs and rs.moveNext() )
+    return ( (( rs.value(0) == ACCLAIM_KIND_ARREST ) or (rs.value(0) == ACCLAIM_KIND_SPECIAL))
+            AND ( rs.value(1) == ACCLAIM_TYPE_AMOUNT ) );
+  ELSE
+    return FALSE;
+  END;
+
+ONERROR(x)
+  
+  MsgBox( "Ошибка при поиске документа претензии|" + x.Message );
+  return FALSE;
+
+END;
+
+private macro ПолучитьСуммуПретензии( ClaimID )
+
+  VAR query:string = "SELECT clstate.t_CurrentAmount  " +
+                     "  FROM dacclaimstate_dbt clstate" +
+                     " WHERE clstate.t_ClaimID   = :ClaimID " + 
+                     "   AND clstate.t_StateDate = (SELECT max(t.t_StateDate)  " +
+                     "                                FROM dacclaimstate_dbt t " +
+                     "                               WHERE t.t_ClaimID    =  :ClaimID_t " + 
+                     "                                 AND t.t_StateDate <=  :StartDate ) ";
+
+  VAR params:TArray = makeArray( SQLParam( "ClaimID", ClaimID     ),
+                                 SQLParam( "ClaimID_t", ClaimID   ),
+                                 SQLParam( "StartDate", {curdate} ));
+
+  VAR rs:RsdRecordset = execSQLselect( query, params, TRUE );
+
+  IF( rs and rs.moveNext() )
+    return rs.value(0);
+  ELSE
+    return $0;
+  END;
+
+ONERROR(x)
+  
+  MsgBox( "Ошибка при поиске документа претензии|" + x.Message );
+  return $0;
+
+end;
+
+macro ЗарезервированыСредства( Payment:RsbPayment ):bool
+
+  var ClaimID    :integer =  0; /* ID претензии      */
+  var ClaimAmount:money   = $0; /* сумма претензии   */
+  var ClaimStatus:integer =  0; /* статус претензии  */
+  
+  return IfThenElse( GetReserveInfo( Payment.DocKind, Payment.PaymentID, Payment.ValueDate, 
+                     @ClaimID, @ClaimAmount, @ClaimStatus ) == 1, false, true );
+end;
+
+private macro СчетСвязанС_КУ_НевПоступления( Account:string, FIID:integer, Chapter:integer )
+  
+  var query:string ="SELECT 1        " +
+                    "  FROM DUAL     " +
+                    " WHERE EXISTS ( " +
+                                     "SELECT /*+FIRST_ROWS(1)*/ 1                " +
+                                     "  FROM dmccateg_dbt cat, dmcaccdoc_dbt doc " +
+                                     " WHERE cat.t_number   =  1005              " +
+                                     "   AND doc.t_catid    =  cat.t_id          " +
+                                     "   AND doc.t_account  = :Account           " +
+                                     "   AND doc.t_currency = :FIID              " +
+                                     "   AND doc.t_chapter  = :Chapter           " +
+                                     "   AND ROWNUM <= 1 )                       " ;
+
+  var params:TArray = makeArray( SQLParam( "Account", Account    ),
+                                 SQLParam( "FIID"   , FIID       ),
+                                 SQLParam( "Chapter", Chapter    ) );
+
+  var rs:RsdRecordset = execSQLselect( query, params, TRUE );
+
+  if( rs and rs.moveNext() )
+    return true;
+  elif( rs )
+    return false;
+  end;
+
+end;
+
+private macro GetDepID( Code )
+
+  var dp_dep = Tbfile("dp_dep.dbt", "r");
+
+  dp_dep.rec.Code = Code;
+
+  if(getEQ(dp_dep))
+    return dp_dep.rec.PartyID;
+  end;
+  return 0;
+end;
+
+private macro CalculateSumInSfInvLinkDoc( Payment:RsbPayment )
+
+  var InvoiceID:integer;
+  var SfPayFIID:integer;
+  var SfDirection:integer;
+  var SfInvParm:TArray;
+
+  var first_pi  :TRecHandler = TRecHandler( "pmaddpi.dbt", "bank.def");
+  var second_pi :TRecHandler = TRecHandler( "pmaddpi.dbt", "bank.def");
+  var pi        :TRecHandler;
+
+  var i:integer = 0;
+  var stat_get;
+
+  var PayOrderObj:RsbPsPayOrder;
+  var CpOrderObj :RsbCpOrder;
+  var BankOrderObj:RsbBankOrder;
+
+  /* новый платеж на разницу сумм и его реквизиты */
+  var NewPayOrderObj:RsbPsPayOrder;
+  var NewCpOrderObj :RsbPsCpOrder;
+
+  file NewReceiverPt( party ) key 0;
+
+  var RestPayerAmount:money = $0;
+  var NewAccount  = "";
+  var NewReceiver =  0;
+  var NewReceiverBankCode = 0;
+  var isAddPIPayment = Payment.PIList(PRT_Credit).Size != 0;
+  var NewAmount  :money = $0,
+      NewPmAmount:money = $0;
+
+  /* условия выполнения алгоритма */
+  if( ( Payment.DocKind == PS_PAYORDER ) or ( Payment.DocKind == PS_CPORDER ) or ( Payment.DocKind == DLDOC_BANKORDER ) ) /*платеж - только клиентский или БО*/
+    if( not FindSfInvLnkByPaymentID( Payment.PaymentID, @InvoiceID ) ) /*имеет привязку к ТО ПЗО*/
+      if(   ( Payment.PIList(PRT_Credit).Size <= 2 ) or      /* разноска по кредиту не более 2-х уточняющих записей */
+          ( ( Payment.PIList(PRT_Credit).Size == 0 ) and     /* или без расноски, но с реальным счетом получателя   */
+            ( Payment.PIList(PRT_Debet).Size == 0 ) and 
+            ( Payment.FuturePayerAccount != "" ) ) )
+        /* запрашиваем ПЗО о сумме зачисления */
+        GetInvoiceRest( InvoiceID, Payment.ValueDate, SfPayFIID, SfDirection, SfInvParm ); 
+
+        if( SfPayFIID == Payment.BaseFIID ) /* возвращаемая из ПЗО сумма - в валюте документа */
+          
+          if( isAddPIPayment )
+            if( Payment.PIList(PRT_Credit).First() or Payment.PIList(PRT_Credit).Current(first_pi) or
+                Payment.PIList(PRT_Credit).Next() or Payment.PIList(PRT_Credit).Current(second_pi) )
+              MsgBox("Ошибка при получении уточняющих записей платежа");
+              return 1;
+            end;
+          end;
+
+          while( i < SfInvParm.Size() )
+
+            if( isAddPIPayment ) /* для платежа с разноской надо проверить счета и пересчитать суммы в разноске */
+
+              if  ( SfInvParm[i].rec.Account == first_pi.rec.Account )
+                pi = first_pi;
+              elif( SfInvParm[i].rec.Account == second_pi.rec.Account )
+                pi = second_pi;
+              else
+                MsgBox("Счета для ПЗО не соответствуют уточняющим записям платежа");
+                return 1;
+              end;
+
+              // Сумма приходит в валюте оплаты, её надо сконвертировать в валюты счёта плательщика и счёта получателя
+              if( SfPayFIID == pi.rec.FIID )
+                NewAmount = SfInvParm[i].rec.Amount;
+              else
+                if( ConvSum( NewAmount, SfInvParm[i].rec.Amount, {curdate}, SfPayFIID, pi.rec.FIID ) )
+                  MsgBox( "Ошибка конверсии суммы оплаты ПЗО в валюту счёта " + pi.rec.Account );
+                  return 1;
+                end;
+              end;
+              if( SfPayFIID == pi.rec.PmFIID )
+                NewPmAmount = SfInvParm[i].rec.Amount
+              else
+                if( ConvSum( NewPmAmount, SfInvParm[i].rec.Amount, {curdate}, SfPayFIID, pi.rec.PmFIID ) )
+                  MsgBox( "Ошибка конверсии суммы оплаты ПЗО в валюту счёта " + Payment.PayerAccount );
+                  return 1;
+                end;
+              end;
+
+              if( SfInvParm[i].rec.Amount == 0 )  /* записи с нулевой суммой удаляем */
+                Payment.PIList(PRT_Credit).Delete( pi );
+              elif( NewPmAmount < pi.rec.FuturePayerAmount )
+                /* для записей с суммой больше суммы зачисления изменим сумму на сумму зачисления */
+                pi.rec.FuturePayerAmount    = NewPmAmount;
+                pi.rec.FutureReceiverAmount = NewAmount;
+                Payment.PIList(PRT_Credit).Update( pi );
+              end;             
+            else /* для платежа без разноски просто проверяем счета */
+              if( SfInvParm[i].rec.Account != Payment.FutureReceiverAccount )
+                MsgBox("Счет ПЗО не соответствует счету получателя из платежа");
+                return 1;
+              end;
+              if( SfPayFIID == Payment.PayerFIID )
+                NewPmAmount = SfInvParm[i].rec.Amount;
+              else
+                if( ConvSum( NewPmAmount, SfInvParm[i].rec.Amount, {curdate}, SfPayFIID, Payment.PayerFIID ) )
+                  MsgBox( "Ошибка конверсии суммы оплаты ПЗО в валюту счёта " + pi.rec.Account );
+                  return 1;
+                end;
+              end;
+            end;
+            RestPayerAmount = RestPayerAmount + NewPmAmount;
+            i = i + 1;
+          end;
+
+          if( RestPayerAmount < Payment.FuturePayerAmount ) /* создаем новый документ на сумму разницы*/
+
+            NewAccount = Unkn_GetAccountPassive( Payment.Department, Payment.PayerFIID );
+            if( NewAccount == "" )
+              MsgBox("Ошибка при определении счета невыясненных ");
+              return 1;
+            end;
+            NewReceiver = GetDepID( Payment.Department );
+            if( СчетСуществуетИОткрыт( Payment.ReceiverFIID, NewAccount, CHAPT1, NULL, NULL, NewReceiver, NULL ) )
+              if( ПолучитьСубъекта( NewReceiver, NewReceiverPt ) != 0 )
+                MsgBox("Ошибка при поиске субъекта");
+                return 1;
+              end;
+            end;
+
+            NewReceiverBankCode = ПолучитьКодСубъекта( NewReceiver, Payment.ReceiverBankCodeKind, stat_get );
+
+            if( Payment.DocKind == PS_PAYORDER ) /* рублевый платеж */
+
+              PayOrderObj    = GenObject( "RsbPsPayOrder", Payment.PaymentID );
+              NewPayOrderObj = PayOrderObj.MakeCopyPayOrder();
+              NewPayOrderObj.DocKind = PSPOKIND_ORDER;
+              /* заполняем реквизиты нового платежа */
+              NewPayOrderObj.Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                                    NewReceiver,                   /*ReceiverBankID*/
+                                                    Payment.ReceiverBankCodeKind,  /*PaymentObj.ReceiverBankCodeKind*/
+                                                    NewReceiverBankCode,           /*ReceiverBankCode, */
+                                                    NewReceiverPt.Name,            /*ReceiverBankName*/
+                                                    "",
+                                                    Payment.PayerFIID, 
+                                                    1/*CHAPT1*/, 
+                                                    NewAccount, 
+                                                    NewReceiver, 
+                                                    NewReceiverPt.Name, 
+                                                    "" );
+              NewPayOrderObj.Payment.PayerAmount    = 
+              NewPayOrderObj.Payment.ReceiverAmount = Payment.FuturePayerAmount - RestPayerAmount;
+
+              /* связываем с исходным и запускаем операцию */
+              PayOrderObj.Payment.LinkPayment( NewPayOrderObj.Payment, PMLINK_KIND_KVITING );
+              NewPayOrderObj.LaunchOper = true;
+
+            else  if ( Payment.DocKind == DLDOC_BANKORDER )
+           
+              BankOrderObj = GenObject( "RsbBankOrder", Payment.PaymentID );
+              NewPayOrderObj = GenObject( "RsbPsPayOrder", 0 );
+              NewPayOrderObj.DocKind = PSPOKIND_ORDER;
+              /* заполняем реквизиты нового платежа */
+              NewPayOrderObj.Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                                    NewReceiver,                   /*ReceiverBankID*/
+                                                    Payment.ReceiverBankCodeKind,  /*PaymentObj.ReceiverBankCodeKind*/
+                                                    NewReceiverBankCode,           /*ReceiverBankCode, */
+                                                    NewReceiverPt.Name,            /*ReceiverBankName*/
+                                                    "",
+                                                    Payment.PayerFIID, 
+                                                    1/*CHAPT1*/, 
+                                                    NewAccount, 
+                                                    NewReceiver, 
+                                                    NewReceiverPt.Name, 
+                                                    "" );
+              NewPayOrderObj.Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                                                    Payment.Payer,                   /*ReceiverBankID*/
+                                                    Payment.PayerBankCodeKind,  /*PaymentObj.ReceiverBankCodeKind*/
+                                                    Payment.PayerBankCode,           /*ReceiverBankCode, */
+                                                    Payment.PayerBankName,            /*ReceiverBankName*/
+                                                    "",
+                                                    Payment.PayerFIID, 
+                                                    1/*CHAPT1*/, 
+                                                    Payment.PayerAccount, 
+                                                    Payment.Payer, 
+                                                    Payment.PayerBankName, 
+                                                    "" );
+              NewPayOrderObj.Payment.PayerAmount    = 
+              NewPayOrderObj.Payment.ReceiverAmount = Payment.FuturePayerAmount - RestPayerAmount;
+              NewPayOrderObj.Payment.Number = BankOrderObj.Number;
+              NewPayOrderObj.Payment.Ground = BankOrderObj.Ground;
+
+              /* связываем с исходным и запускаем операцию */
+              BankOrderObj.LinkPayment( NewPayOrderObj.Payment, PMLINK_KIND_KVITING );
+              NewPayOrderObj.LaunchOper = true;
+           
+            else /* валютный платеж */
+
+              CpOrderObj    = GenObject( "RsbPsCpOrder", Payment.PaymentID );
+              NewCpOrderObj = CpOrderObj.MakeCopyCPOrder();
+              /* заполняем реквизиты нового платежа */
+              NewCpOrderObj.Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                                   NewReceiver,                   /*ReceiverBankID*/
+                                                   Payment.ReceiverBankCodeKind,  /*PaymentObj.ReceiverBankCodeKind*/
+                                                   NewReceiverBankCode,           /*ReceiverBankCode, */
+                                                   NewReceiverPt.Name,            /*ReceiverBankName*/
+                                                   "",
+                                                   Payment.PayerFIID, 
+                                                   1/*CHAPT1*/, 
+                                                   NewAccount, 
+                                                   NewReceiver, 
+                                                   NewReceiverPt.Name, 
+                                                   "" );
+              NewCpOrderObj.Payment.BaseFIID = Payment.PayerFIID;
+              NewCpOrderObj.Payment.BaseAmount     = 
+              NewCpOrderObj.Payment.PayerAmount    = 
+              NewCpOrderObj.Payment.ReceiverAmount = Payment.FuturePayerAmount - RestPayerAmount;
+              /* связываем с исходным и запускаем операцию */
+              CpOrderObj.Payment.LinkPayment( NewCpOrderObj.Payment, PMLINK_KIND_KVITING );
+              NewCpOrderObj.LaunchOper = true;
+
+            end;
+            end;
+          end; /*if( RestAmount < Payment.FuturePayerAmount )*/ 
+        end; /* возвращаемая из ПЗО сумма - в валюте документа */
+      end; /* разноска по кредиту не более 2-х уточняющих записей */  
+    end; /*имеет привязку к ТО ПЗО*/    
+  end; /*платеж - только клиентский*/      
+  return stat_get;
+end;
+
+
+// Этап 1 Определение реальных владельцев счетов
+private macro Stage_DefinitionRealOwnerAcc(Payment:RsbPayment, PrmStage:ParmStage):integer
+  return PM_CheckAccRestCommon( Payment );
+end;
+
+// Этап 2 Направление в картотеку 1 или 2
+private macro Stage_GoToI1orI2(Payment:RsbPayment, PrmStage:ParmStage):integer
+  
+  var PayOrder:object = NULL;
+  var RegVal, error;
+
+  if( Payment.DocKind == PS_PAYORDER )
+
+    PayOrder = GenObject( "RsbPSPayOrder", Payment.DocumentID );
+        
+    if( ( PayOrder.DocKind    == PSPOKIND_DEMAND      ) and
+           ( PayOrder.AcceptTerm == PSPAYDEM_TERM_ACCEPT ) and
+           ( PayOrder.Accept     == PSPAYDEM_ST_WAIT     ) and 
+           //TAM 11.03.2014
+           /*( PayOrder.AcceptTerm != PM_DEMAND_TERM_WITHOUTACCEPT ) and
+           ( (PayOrder.Accept == PSPAYDEM_ST_WAIT) or (PayOrder.Accept == PSPAYDEM_ST_AUTOREJECT) ) and */
+        ( PayOrder.AcceptDate > {curdate}) )
+      //TAM 11.03.2014 ЗДА системные ещё не используются
+      /*GetREgistryValue("PS\\PAYORDER\\K1_AutoAccept", V_BOOL, RegVal, error);
+      if(( PayOrder.PreAcptID == 0) and (PayOrder.Accept == PSPAYDEM_ST_WAIT) and (RegVal ))
+        PM_LinkPreAcptAuto( Payment.DocumentID );
+        if( PayOrder.Accept == PSPAYDEM_ST_AUTOREJECT )
+          Payment.PaymStatus = PM_REJECTED;
+          PM_SetPrimDocumentState( Payment, DOCUMENT_ST_REJECTED );
+          УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_REJECT );
+        end;
+      end;
+
+      if( PayOrder.Accept != PSPAYDEM_ST_AUTOACCEPT )*/
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_1, OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;
+        PrmStage.NextStage(Определение_способа_обработки);
+      //end;
+    end;
+    //Gurin S. 23.10.2013 C-24064-6
+    var pmlog = ExecSqlSelect ("select 1 from usr_ipptfromsogl_log where t_paymentid = :id",  makeArray (SQLParam ("id", Payment.PaymentID)));
+    if(pmlog.movenext())
+       if (not GetTrue(true,"Проводить за счет овердрафта?"))
+           if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2, 
+                                         OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                         OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+               msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+               return 1;
+           end;
+           Payment.FreeReserve( Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID );
+           PrmStage.NextStage(Проверки_пройдены);
+       else
+           execSQL ("delete from usr_ipptfromsogl_log where t_paymentid = :id", makeArray (SQLParam ("id", Payment.PaymentID)));
+       end;
+     end;
+  end;
+  return 0;
+end;
+
+// Этап 3 Направление в картотеку ожидания разрешения
+macro Stage_GoToIWP(Payment:RsbPayment, PrmStage:ParmStage):integer
+  var ChoiceIWP = PSPM_NOTHING;
+   if((not ЗарезервированыСредства(Payment) ) and IsGotoIWP(Payment, false) and (GetOprStatus(OPR_PAYM_PERMISSION) == OPR_PAYM_ST_PERMISSION_NO))
+      ChoiceIWP = PSPM_IWPCHOICE_IWP;
+      //SDA 19.04.2012 - добалено для исключения направления БО на КОР - в пакетном режиме идут на К2
+      if (Payment.DocKind == DLDOC_BANKORDER)
+         ChoiceIWP = PSPM_IWPCHOICE_I2;
+    end;
+    if(ChoiceIWP == PSPM_IWPCHOICE_IWP)
+         if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WP) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+
+      PrmStage.NextStage(Определение_способа_обработки);
+
+    elif(ChoiceIWP == PSPM_IWPCHOICE_REJECT)
+      
+      if( (Payment.DocKind == DLDOC_BANKORDER) and (Payment.PIList(PRT_Debet).Size > 0) )
+        RejectPayment( Payment, "На счет плательщика наложен запрет на проведение операций" );
+      else
+        RejectPayment( Payment, "На счет плательщика "+ Payment.PayerAccount + " наложен запрет на проведение операций" );
+      end;
+      PrmStage.NextStage(Проверки_пройдены);
+    //SDA 19.04.2012 - добалено для исключения направления БО на КОР - в пакетном режиме идут на К2
+    elif(ChoiceIWP == PSPM_IWPCHOICE_I2)
+       if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2 , 
+                                     OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                     OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+       end;
+    else
+      msgbox("Ошибка при выборе действия над документом");
+      return 1;
+    end;
+
+    // для банковского ордера (если проверка не пройдена - то на последний этап)
+    PrmStage.NextStage(IsBO(Payment), БО_Определение_статусов);
+  end;
+
+  return 0;
+end;
+
+// 05.08.13 C-17880 Gurin S. 
+macro Stage_GoToIWP_new(Payment:RsbPayment, PrmStage:ParmStage):integer
+   var ChoiceIWP = PSPM_NOTHING;
+   //VV C-23920
+    if( BO_PaymCOM(Payment) 
+       and (not ЗарезервированыСредства(Payment) ) 
+      ) 
+     
+     ChoiceIWP = PSPM_IWPCHOICE_IWP;
+     if(ChoiceIWP == PSPM_IWPCHOICE_IWP)
+            if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WP) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+            PrmStage.NextStage(БО_Направление_в_КОР);
+     else
+            msgbox("Ошибка при выборе действия над документом");
+            return 1;
+     end;
+        // для банковского ордера (если проверка не пройдена - то на последний этап)    
+    // PrmStage.NextStage(IsBO(Payment), 11/*БО_Определение_статусов*/); 
+   elif ((fgBank.is_EXV) or (fgBank.is_VUZ) or (fgBank.is_GEB) or (fgBank.is_SLD))
+   //Gurin S. 23.01.14 R-317985-2
+   if((not ЗарезервированыСредства(Payment) ) and IsGotoIWP(Payment, false) and (GetOprStatus(OPR_PAYM_PERMISSION) == OPR_PAYM_ST_PERMISSION_NO) 
+       and IsAccWithNalogAcclaim(Payment.PayerAccount) and /*InList(Payment.Priority,5,6)*/InList(Payment.Priority,4,5) and (Payment.Origin != 2))
+      LogProcedure(Payment.PaymentID, "X", null, null, "X");
+      //zmp 28.07.2014 R-420298-2
+      if (substr(Payment.ReceiverAccount,1,5) == "40101")
+          ChoiceIWP = PSPM_IWPCHOICE_I2;
+      else
+         if (GetTrue (true, "Если приостановления по счету налоговый органов. | Поместить документ документ в КОР?"))
+            ChoiceIWP = PSPM_IWPCHOICE_IWP;
+         else
+            ChoiceIWP = PSPM_IWPCHOICE_REJECT;
+         end;
+      end;
+      if(ChoiceIWP == PSPM_IWPCHOICE_IWP)
+         if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WP) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+         end;
+         PrmStage.NextStage(Определение_способа_обработки);
+      elif(ChoiceIWP == PSPM_IWPCHOICE_REJECT)
+          RejectPayment( Payment, "Нужно в КОР" );
+          debugbreak;
+          PrmStage.NextStage(Проверки_пройдены);
+      elif(ChoiceIWP == PSPM_IWPCHOICE_I2)
+         if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+         end;
+         //PrmStage.NextStage(Определение_способа_обработки);
+      else
+         msgbox("Ошибка при выборе действия над документом");
+         return 1;
+      end;
+      // для банковского ордера (если проверка не пройдена - то на последний этап)
+      //PrmStage.NextStage(IsBO(Payment), БО_Определение_статусов);
+   end;
+   end;
+   return 0;
+end;
+
+// Этап 4 Проверка очередности и наличия КОР
+macro Stage_CheckPriorityAndIWP(Payment:RsbPayment, PrmStage:ParmStage):integer
+  
+  Array Text;
+  Array Buttons;
+  var choiceIWP = PSPM_NOTHING;
+  var CheckIndexDate = IfThenElse( Payment.PayerBankEnterDate == date(0,0,0), Payment.ValueDate, Payment.PayerBankEnterDate );
+   var OldDialogFlag = TSetDialogFlag(1);
+   var msgtext = "К счету плательщика " + Payment.PayerAccount + " есть картотека ожидающих разрешения. Запрет на проведение операций отменен";
+  if( ( Payment.DocKind != PS_PAYORDER ) and ( Payment.DocKind != DLDOC_BANKORDER ) )
+    return 0;
+  end;
+  
+  if( PaymentIsLetterOfCredit(Payment) or  Payment.PartPaymNumber or ПлатежИзОжидающихПоступления( PrmStage.ID_Operation, PrmStage.ID_Step ) )
+    if( Payment.DocKind == PS_PAYORDER )
+      PrmStage.NextStage(Проверка_свободного_остатка_на_счете_плательщика);
+    else
+      PrmStage.NextStage(БО_Проверка_свободного_остатка_на_счете_плательщика);
+    end;
+  end;
+
+  if( (not ЗарезервированыСредства(Payment) ) and 
+      CheckPmIWPPlaced( Payment.FuturePayerAccount, Payment.FuturePayerFIID, Payment.Priority, CheckIndexDate, 1 ) )
+
+    choiceIWP = GetCachedVar( "PmIWPPriority" + Payment.FuturePayerAccount );
+    if( ValType( choiceIWP ) == V_UNDEF )
+         // EVG 05/12/2011 В массовом режиме вопроса не задаём, сразу ставим в К2
+         if( not IsOprMultiExec() )
+            Text[0] = msgtext + ".|Что сделать с документом?";
+      Buttons[PSPM_PWPCHOICE_WAIT  ] = "На ожидание поступлений";
+            Buttons[PSPM_PWPCHOICE_I2    ] = "Провести";
+            Buttons[PSPM_PWPCHOICE_REJECT] = "Отказ";
+      choiceIWP = ConfWin( Text, Buttons );
+         else
+            choiceIWP = PSPM_PWPCHOICE_WAIT;
+         end;
+      if( IsOprMultiExec() )
+        SetCachedVar( "PmIWPPriority" + Payment.FuturePayerAccount, choiceIWP );
+      end;
+    end;
+      if  ( choiceIWP == PSPM_PWPCHOICE_WAIT )                        
+         //zmp 13.10.2014 C-30537-7
+         addNote40(payment);
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WAIT ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    elif( choiceIWP == PSPM_PWPCHOICE_I2   )
+         if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_NO ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    else 
+        return 1;
+      end;
+    PrmStage.NextStage(Проверки_пройдены);
+  else
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_NO ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;        
+  return 0;
+end;
+
+// Этап 5 Проверка очередности и наличия К2
+macro Stage_CheckPriorityAndI2(Payment:RsbPayment, PrmStage:ParmStage):integer
+  
+  var msgtext:string = "К счету плательщика " + Payment.PayerAccount + " есть картотека №2";
+  var choiceI2 = PSPM_NOTHING;
+          
+  var PayOrder:object = NULL;
+   var PO_DocKind =Payment.DocKind;
+   Array Text;
+   Array Buttons;
+   private var ИзОжидающих = false;
+   private var RestDebet; // KS 22.06.2012 R-74894
+  if( Payment.DocKind == PS_PAYORDER )
+    PayOrder   = GenObject( "RsbPSPayOrder", Payment.DocumentID );     
+    PO_DocKind = PayOrder.DocKind; 
+   elif ( Payment.DocKind == 286 ) //SDA банковский ордер
+      PayOrder   = GenObject( "RsbBankOrder", Payment.DocumentID );     
+      PO_DocKind = PayOrder.DocKind; 
+  end;
+   // TAM 30.04.2013 C-19427 - если документ с очередностью меньше чем в К2 по счету плательщика и счет не банкрот и нет ключевых слов,
+   // то платеж  в ожидающие поступлений. Оттуда: массово не проводим, если по-одному - то предлагаем выбор операционисту.
+   // TAM 14.01.2014 R-313123
+   if((Payment.DocKind == PS_PAYORDER) and ((Payment.Origin == PSPO_OR_CLB)))
+      //or (Payment.Origin == USR_PAYMENT_OR_ABBYY_FC))) TAM 23.07.2013
+      var min_i2_prior =  Acc_GetMinPriorityI2(Payment.PayerAccount);
+      //если есть К2 и очередность платежа меньше чем в К2
+      if((min_i2_prior != -1) and (Payment.priority < min_i2_prior) and (not Acc_IsBankrupt(Payment.PayerAccount)))
+         if(not CheckStopPhraseInGround(Payment.PaymentId))
+            GetParm( 2, ИзОжидающих);
+            if(ИзОжидающих == true)
+               if(IsOprMultiExec()) //при массовом проведении из ОП не проводим
+                  //Анализируем свободные средства на счете 23.07.2013
+                  AccGetFreeAmount( RestDebet, null, Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID, {curdate}, Payment.Priority, Payment.ClaimID);
+                  if ( RestDebet > Payment.PayerAmount ) //если их хватает
+                     msgtext = "Платеж с приоритетной очередностью. По счету имеется картотека 2. Необходима проверка назначения платежа."; 
+                     msgbox(msgtext);
+                     return 1;
+                  end;
+               else //провести можно единично документ
+                  if(GetTrue(true,"По счету имеется картотека 2. Необходима проверка назначения платежа. Документ провести? "))
+                     return 0;
+                  else
+                     msgtext = "Платеж с приоритетной очередностью. По счету имеется картотека 2. Необходима проверка назначения платежа."; 
+                     msgbox(msgtext);
+                     return 1;
+                  end;
+               end;
+            else 
+               //документ не был в К2
+               if(Payment.I2PlaceDate == date(0,0,0)) //TAM 23.07.2013
+                  addNote40(payment); //zmp 13.10.2014 C-30537-7 
+                  if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WAIT ) )
+                     msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                     return 1;
+                  end;
+               end;
+            end;
+         end;
+      end;
+   end;//end TAM C-19427
+   //VV C-23920
+    if( BO_PaymCOM(Payment))       
+          choiceI2=PSPM_IWPCHOICE_IWP; 
+        УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WP) ; 
+
+   elif(( PO_DocKind == PSPOKIND_CASH_REQUEST ) or ( Payment.PlaceToIndex == "X" ))
+    PrmStage.NextStage(Проверка_остатка_на_счете_получателя);
+    PrmStage.SkipStage(Проверка_свободного_остатка_на_счете_плательщика);
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2, OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+   elif(( (Payment.DocKind == PS_PAYORDER) or (Payment.DocKind == PS_INRQ) or 
+       ((Payment.DocKind == DLDOC_BANKORDER) and (Payment.Purpose != PM_PURP_CBANKORDER)) ) and
+       (not PaymentIsLetterOfCredit(Payment)) and
+       (not Payment.PartPaymNumber) and
+        not ЗарезервированыСредства( Payment ) and CheckPmI2Placed_ByObj( Payment, 1 ) )
+    PrmStage.SkipStage(Проверка_свободного_остатка_на_счете_плательщика);
+      GetParm( 2, ИзОжидающих);
+    if(ПлатежИзОжидающихПоступления(PrmStage.ID_Operation, PrmStage.ID_Step))
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2, OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL))
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+      msgtext = msgtext + "Документ будет помещен в картотеку.";
+    else
+      if( Payment.PIList(PRT_Debet).Size > 0 )
+            choiceI2 = Dlg_Var_Reject;
+      else
+            choiceI2 = PmWaitOrRejectQuestion( Payment.PayerAccount, ИзОжидающих, Payment );
+      end;
+      
+         if (( choiceI2 == Dlg_Var_Wait ) and ИзОжидающих)
+            // KS 22.06.2012 R-74894
+            AccGetFreeAmount( RestDebet, null, Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID, {curdate}, Payment.Priority, Payment.ClaimID);
+            if ( RestDebet < Payment.PayerAmount )
+               msgtext = "На счете плательщика недостаточно средств  для оплаты";
+            end;
+            msgbox(msgtext);
+          return 1;
+        end;
+
+         if (( choiceI2 == Dlg_Var_Wait ))                        
+            addNote40(payment); //zmp 13.10.2014 C-30537-7
+        
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WAIT ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;
+         elif( choiceI2 == Dlg_Var_K2 )                                    
+      
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2 , 
+                                         OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                         OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+               msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+               return 1;
+            end;
+            PrmStage.SkipStage( Проверка_наличия_док_ожидающих_поступлений );
+         elif(choiceI2 == Dlg_Var_Reject)          
+            return 1;
+         elif(choiceI2 == Dlg_Var_Cancel)          
+            return 1;
+         elif(choiceI2 == Dlg_Var_Carry )          
+      else
+        msgbox("Ошибка при выборе действия над документом");
+        return 1;
+      end;
+
+    end;
+
+    // Заполнить примечание
+    if( Payment.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, msgtext) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return false;
+    end;
+
+    // для банковского ордера (если проверка не пройдена - то на последний этап)
+    PrmStage.NextStage(IsBO(Payment), БО_Определение_статусов);
+  else
+     if (GetOprStatus(OPR_PAYM_INDEX) != OPR_PAYM_ST_INDEX_WAIT) 
+     // KS 22.02.2012 I-00156112 Если сегмент статуса уже инициализирован "на ожидание поступлений"
+       if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_NO ) )
+         msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+         return 1;
+       end;
+     end;        
+  end;        
+  return 0;
+end;
+
+// Этап 6(5 для БО) Проверка очередности и наличия документов в списке ожидающих поступлений 
+macro Stage_CheckPriorityAndPmWait(Payment:RsbPayment, PrmStage:ParmStage):integer
+  
+  var IsToPmWait = false;
+  var Account:string = "";
+   // Для БО.Если документ является валютным (pmpaym.purpose = PM_PURP_CBANKORDER), перейти к следующему этапу.
+   // Для клиентского. Аккридитив или частичная оплата, то перейти к следующему этапу..
+   if(  ((Payment.DocKind == DLDOC_BANKORDER) and (Payment.Purpose != PM_PURP_CBANKORDER))
+      or (InList(Payment.DocKind, PS_PAYORDER, PS_INRQ) and (not PaymentIsLetterOfCredit(Payment)) and (not Payment.PartPaymNumber)))
+    if( CheckPmWaitPlacedAccPr_ByObj(Payment, PrmStage.ID_Operation, PrmStage.ID_Step, @Account ))
+      if( IsBO(Payment) and (Payment.PIList(PRT_Debet).Size > 0) )
+            RejectPayment( Payment, "К счету плательщика " + Account + " есть неоплаченные документы, ожидающие поступления средств" );
+      else
+            var MenuChoice :integer = PmWaitOrRejectQuestion( Payment.PayerAccount, true ,Payment );
+            // В ожидающие
+            if( MenuChoice == Dlg_Var_Wait )               
+               addNote40(payment); //zmp 13.10.2014 C-30537-7
+          if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WAIT ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+          end;
+               // Отвергнуть
+            elif( MenuChoice == Dlg_Var_Reject )
+               RejectPayment( Payment, "К счету плательщика " + Payment.PayerAccount + " есть неоплаченные документы, ожидающие поступления средств" );
+            // Провести
+            elif( MenuChoice == Dlg_Var_Carry )
+               if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_NO ) )
+                  msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                  return 1;
+               end;
+            // в картотеку 2
+            elif( MenuChoice == Dlg_Var_K2 )
+               if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2 , 
+                                         OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                         OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+                  msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                  return 1;
+               end;
+            // Отказаться
+        else
+               return 1;
+        end;
+      end;
+
+      if(IsBO(Payment))
+        PrmStage.NextStage(БО_Определение_статусов);
+      else
+        PrmStage.SkipStage(Проверка_свободного_остатка_на_счете_плательщика);
+      end;
+    end;
+
+  end;
+
+  return 0;
+
+end;
+
+// Этап 7 Проверка остатка на счете получателя
+macro Stage_CheckRestReceiverAcc(Payment:RsbPayment, PrmStage:ParmStage):integer
+   var RestCredit, Rest;
+  var pi:TRecHandler = TRecHandler( "pmaddpi.dbt" );
+
+  IF( CalculateSumInSfInvLinkDoc( Payment ) == 0 )
+    
+    IF( Payment.FuturePayerAmount == 0 ) /* если сумма к оплате стала нулевой, закроем платеж */
+      IF( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      END;
+      Payment.FreeReserve( Payment.PayerAccount, CHAPT1, Payment.PayerFIID );
+      PrmStage.NextStage(Проверки_пройдены);
+      return 0;
+    END;
+
+    IF( Payment.PIList(PRT_Credit).Size > 0 )/* проверим остаток по каждой записи */
+      IF( ( Payment.PIList(PRT_Credit).First() == 0 ) and ( Payment.PIList(PRT_Credit).Current( pi ) == 0 ) )
+            IF( СчетАктивный( pi.rec.Account, CHAPT1, pi.rec.FIID ) and ( not ЕстьПарныйСчет( pi.rec.Account, CHAPT1, pi.rec.FIID ) ) )
+               IF( ПолучитьОстаток( pi.rec.Account, CHAPT1, pi.rec.FIID ) + pi.rec.Amount > 0 )
+                  if( IsBO(Payment) )
+                     RejectPayment(Payment, "Остаток активного счета становится пассивным");
+                     PrmStage.NextStage(БО_Определение_статусов);
+                  else
+              msgbox( "Недостаточно средств для зачисления" );
+                     return 1;
+                  end;
+               END;
+          END;
+        END;
+      END;
+    END;
+
+   IF( ( Payment.PIList(PRT_Credit).Size == 0 ) )
+      IF( ( ( Payment.ToBackOffice == "" ) or ( Payment.NotForBackOffice == "X" ) ) and 
+        ( not ПлатежВнешний( Payment ) ) and (СчетСуществуетИОткрыт( Payment.PayerFIID, Payment.PayerAccount, CHAPT1 )) )
+         IF( СчетАктивный( Payment.ReceiverAccount, CHAPT1, Payment.ReceiverFIID ) and
+            ( not ЕстьПарныйСчет( Payment.ReceiverAccount, CHAPT1, Payment.ReceiverFIID ) ) )
+            RestCredit = ПолучитьОстаток( Payment.ReceiverAccount, CHAPT1, Payment.ReceiverFIID );
+            Rest = RestCredit + Payment.FutureReceiverAmount;
+            IF( Rest > 0 )
+               if( IsBO(Payment) )
+                  RejectPayment(Payment, "Остаток активного счета становится пассивным");
+                  PrmStage.NextStage(БО_Определение_статусов);
+               else
+                  msgbox( "Недостаточно средств для зачисления" );
+                  return 1;
+               end;
+            END;
+         END;
+     END;
+  END;
+
+  return 0;
+end;
+
+macro Stage_CheckRestReceiverAcc_ForBank(Payment:RsbPayment, PrmStage:ParmStage):integer
+
+  var pi:TRecHandler = TRecHandler( "pmaddpi.dbt" );
+
+  IF( Payment.PIList(PRT_Credit).Size > 0 )/* проверим остаток по каждой записи */
+    IF( ( Payment.PIList(PRT_Credit).First() == 0 ) and ( Payment.PIList(PRT_Credit).Current( pi ) == 0 ) )
+      IF( not CheckReceiverAccount( pi.rec.Account, pi.rec.FIID, pi.rec.Amount, pi.rec.ValueDate ) )
+            RejectPayment(Payment, "Остаток активного счета становится пассивным");
+        msgbox( "Остаток активного счета становится пассивным" );
+      END;
+        END;
+      END;
+
+  IF( ( Payment.PIList(PRT_Credit).Size == 0 ) and 
+      (СчетСуществуетИОткрыт( Payment.FutureReceiverFIID, Payment.FutureReceiverAccount, CHAPT1 )) )
+    IF( not CheckReceiverAccount( Payment.FutureReceiverAccount, Payment.FutureReceiverFIID, Payment.FutureReceiverAmount, Payment.ValueDate ) )
+      RejectPayment(Payment, "Недостаточно средств для зачисления");
+      msgbox( "Остаток активного счета становится пассивным" );
+    END;
+  END;
+
+  return 0;
+end;
+
+// Этап 8 Проверка свободного остатка на счете плательщика                  
+private macro Stage_CheckFreeRestPayerAcc(Payment:RsbPayment, PrmStage:ParmStage):integer
+  var ReasonID = 0;
+   var ChoiceIWP = PSPM_NOTHING;
+  var ChoiceWait = PSPM_NOTHING;
+  //Проверим возможность дебетования счета и создадим резерв
+   var OldDialogFlag = TSetDialogFlag(0);// ошибки CheckRestAndMakeR72eserve здесь выводить не надо
+   if( CheckRestAndMakeReserve(Payment, true, false, false, true, GetOprStatus(OPR_PAYM_PERMISSION), NULL, true, NULL, ReasonID, false) )
+       OldDialogFlag.Destructor();
+    // Денег мало 
+      if( (Payment.DocKind == PS_CPORDER) or PaymentIsLetterOfCredit(Payment) )
+      RejectPayment(Payment, "На счете плательщика недостаточно средств для оплаты документа");
+      return 0;
+    elif( Payment.PartPaymNumber )
+      msgbox("На счете плательщика недостаточно средств для оплаты документа");
+      return 1;
+    elif( ( ReasonID > 0 ) and (GetOprStatus(OPR_PAYM_PERMISSION) == OPR_PAYM_ST_PERMISSION_NO) )
+         ChoiceIWP = GetChoiceIWPorREJECT(Payment.PayerAccount, Payment.PayerFIID);
+         if(ChoiceIWP == PSPM_IWPCHOICE_IWP)
+            if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WP) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;
+        PrmStage.NextStage(Определение_способа_обработки);
+         elif(ChoiceIWP == PSPM_IWPCHOICE_REJECT)
+            RejectPayment( Payment, "На счет плательщика "+ Payment.PayerAccount + " наложен запрет на проведение операций" );
+        PrmStage.NextStage(Проверки_пройдены);
+      else
+        msgbox("Ошибка при выборе действия над документом");
+        return 1;
+      end;
+    else // в ожидающие поступлений
+         var ИзОжидающих = false;
+         if( GetParm( 2, ИзОжидающих) and ИзОжидающих )
+            msgbox( "На счете плательщика " + Payment.PayerAccount + " недостаточно средств для оплаты документа." );
+          return 1;
+        end;
+         if (IsOprMultiExec())  
+            OldDialogFlag = TSetDialogFlag(0); 
+         else 
+            OldDialogFlag = TSetDialogFlag(1);  
+         end; 
+         var MenuChoice :integer = PmWaitOrRejectQuestion( Payment.PayerAccount, false, Payment );
+         // В ожидающие
+         if( MenuChoice == Dlg_Var_Wait )            
+            addNote40(payment); //zmp 13.10.2014 C-30537-7
+        
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_WAIT , 
+                                          OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL));
+               msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+               return 1;
+            end;
+         // Отвергнуть
+         elif( MenuChoice == Dlg_Var_Reject )
+            // Golovkin 10.09.2014 R-445716-2, R-445574-2, R-445522-2, R-448021-2 Если выбрали отвергнуть, то отвергаем
+            RejectPayment( Payment, "На счете плательщика недостаточно средств для оплаты документа" );
+
+         // Провести
+         elif( MenuChoice == Dlg_Var_Carry )
+            msgbox( "На счете плательщика " + Payment.PayerAccount + " недостаточно средств для оплаты документа." );
+            return 1;
+         // Отказаться
+         elif( MenuChoice == Dlg_Var_K2 )
+          
+            msgbox ("На счете плательщика недостаточно средств для оплаты (К2)");
+         
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX,  PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_2 , 
+                                       OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                       OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+               msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+               return 1;
+            end;
+         // в картотеку 2
+      else
+           return 1;
+      end;
+         // EVG 27/12/2011 При недостаточности средств на счёте наличие ожидающих поступлений уже не проверяем. 
+         PrmStage.SkipStage(Проверка_наличия_док_ожидающих_поступлений);
+    end;
+  end;
+   OldDialogFlag.Destructor();
+  MadeReserve = true; //Создали резерв на данной операции
+  return 0;
+end;
+
+// Этап 9 Направление в невыясненные
+macro Stage_GoToInIndexUnknown(Payment:RsbPayment, PrmStage:ParmStage):integer
+  PrmStage.NextStage( IsBO(Payment), БО_Определение_статусов );
+   IF( (Payment.PIList(PRT_Credit).Size <= 0) and  //нет разноски по кредиту
+       Payment.ReceiverAccount and СчетСвязанС_КУ_НевПоступления(Payment.ReceiverAccount, Payment.ReceiverFIID, Payment.Chapter) )
+    IF( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, PrmStage.INDEX_Segment = OPR_PAYM_ST_INDEX_UNKNOWN ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    END;
+  END;
+
+  return 0;
+end;
+
+// Этап 10 Определение способа обработки - стандартный или ИПВС
+private macro Stage_DefinitionMethodProcessing(Payment:RsbPayment, PrmStage:ParmStage):integer
+  var DO_Segment;
+  if( PrmStage.INDEX_Segment != OPR_PAYM_ST_INDEX_WAIT)
+      if( Payment.DocKind == PS_INRQ )
+      DO_Segment = OPR_PM_ST_EXEC_IPVS;
+    else
+      DO_Segment = OPR_PM_ST_ENTER;
+    end;
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, DO_Segment ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+  end;
+
+  return 0;
+end;
+
+// Этап 11 Проверка межфилиальности платежа
+private macro Stage_CheckBranchPayment(Payment:RsbPayment, PrmStage:ParmStage):integer
+  
+  var CABS_Segment;
+
+  if( GetOprStatus( OPR_PAYM_BRANCH ) == OPR_PAYM_ST_BRANCH_NO )
+    CABS_Segment = OPR_PM_ST_MFR_YES;
+  else
+    CABS_Segment = OPR_PM_ST_MFR_NO;
+  end;
+
+  if( УстановитьСтатусыПлатежа( OPR_PAYM_CABS, CABS_Segment ) )
+    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+    return 1;
+  end;
+
+  return 0;
+end;
+
+// Этап 12 Проверка наличия изменений реквизитов
+private macro Stage_CheckPropsChange(Payment:RsbPayment, PrmStage:ParmStage):integer
+  file inhist(pminhist) key 1;
+  var CABS_Segment;
+
+  inhist.PaymentID = Payment.PaymentID;
+  inhist.HistoryNum = 0;
+
+  if( GetEQ(inhist) )
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_CHANGE, OPR_PAYM_ST_CHANGE_YES ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+//Этап 13 Заполнение даты приема
+private macro Stage_SetDateAcceptance(Payment:RsbPayment, PrmStage:ParmStage):integer
+  var obj: Object = NULL;
+  if (Payment.DocKind == PS_PAYORDER)
+    obj = RsbPSPayOrder(Payment.PaymentID);
+  end;
+  var ReasonID: integer;
+  if ( ( ( IsExistsClaimReserve(Payment.DocKind, Payment.PaymentID) == 0 ) or MadeReserve ) // есть претензия
+      and (GetOprStatus( OPR_PAYM_CONTROL ) == OPR_PAYM_ST_CTRL_CONTROL) //проконтролирован
+      and (Payment.Notes.ReadNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, {curdate}) == "") //примечание не заполнено
+      and ( (Payment.DocKind != PS_PAYORDER) or (obj.DocKind != 2) //не платежное требование
+            or (obj.AcceptTerm == PSPAYDEM_TERM_WITHOUTACCEPT) or (obj.Accept == PSPAYDEM_ST_ACCEPT) or (obj.Accept == PSPAYDEM_ST_AUTOACCEPT) ) ) //акцепт есть или не нужен
+    if (Payment.Notes.AddNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, GetCurrentDateTimeUTC({curdate})))
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return 1;
+    end;
+  end;
+
+  PrmStage.NextStage(Проверки_пройдены);
+  return 0;
+end;
+
+
+// EVG 12/12/2011 Добавил приём параметра Parm0 
+macro ExecStages(Payment:RsbPayment, Stages:TArray, PrmStage:ParmStage, Parm0)
+  var i = 0;
+  
+  while(i < Stages.size)
+    
+    if( PrmStage.IsNextStage( Stages[i].num ) )
+      if(i + 1 < Stages.size)
+        PrmStage.NextStage(Stages[i+1].num);
+      end;
+         if((not PrmStage.IsSkipStage(Stages[i].num)) and ExecMacro2( Stages[i].fun, Payment, PrmStage, Parm0 ))
+        return 1;
+      end;
+
+    end;
+
+    i = i + 1;
+  end;
+  
+  return 0;
+end;
+
+
+class TStage(_num:integer, _fun:variant)
+  var num = _num;
+  var fun = _fun;
+end;
+
+MACRO PS_CheckAccRest( Payment:RsbPayment, ID_Operation, ID_Step  ):integer
+
+  var PrmStage = ParmStage(ID_Operation, ID_Step, Определение_реальных_владельцев_счетов);
+
+  var Stages:TArray = MakeArray( TStage( Определение_реальных_владельцев_счетов,           @Stage_DefinitionRealOwnerAcc ),
+                                 TStage( Направление_в_К1_или_К2,                          @Stage_GoToI1orI2 ),
+                                  TStage( Направление_в_КОР,                                @Stage_GoToIWP_new ),
+//SDA - по решению Ивановой И.К.  TStage( Направление_в_КОР,                                @Stage_GoToIWP ),
+//SDA - надоело бороться со злом TStage( Проверка_очередности_и_наличия_КОР,               @Stage_CheckPriorityAndIWP ),
+                                 TStage( Проверка_очередности_и_наличия_К2,                @Stage_CheckPriorityAndI2 ),
+//                               TStage( Проверка_свободного_остатка_на_счете_плательщика, @Stage_CheckFreeRestPayerAcc ),
+                                 TStage( Проверка_наличия_док_ожидающих_поступлений,       @Stage_CheckPriorityAndPmWait ),
+//SDA 16/12/2011                 TStage( Проверка_остатка_на_счете_получателя,             @Stage_CheckRestReceiverAcc ),
+                                 TStage( Проверка_свободного_остатка_на_счете_плательщика, @Stage_CheckFreeRestPayerAcc ),
+                                 TStage( Направление_в_невыясненные,                       @Stage_GoToInIndexUnknown  ),
+                                 TStage( Определение_способа_обработки,                    @Stage_DefinitionMethodProcessing ),
+                                 TStage( Проверка_межфилиальности_платежа,                 @Stage_CheckBranchPayment ),
+                                 TStage( Проверка_наличия_изменений_реквизитов,            @Stage_CheckPropsChange ),
+                                 TStage( Заполнение_даты_приема,                           @Stage_SetDateAcceptance ) );
+  MadeReserve = false;
+  var Result = ExecStages(Payment, Stages, PrmStage);
+  MadeReserve = false;
+  return Result;
+
+END;
+
+// EVG 12/12/2011 Добавил параметр isFromWait - признак вызова процедуры из шага "Ожидание поступлений" (из макроса pswaitmn.mac). 
+MACRO PS_CheckDebAccRest( Payment:RsbPayment, ID_Operation, ID_Step, isFromWait:bool  ):integer
+   var PrmStage = ParmStage(ID_Operation, ID_Step, Проверка_очередности_и_наличия_К2);
+   var Stages:TArray = MakeArray( TStage( Проверка_очередности_и_наличия_К2,                @Stage_CheckPriorityAndI2 ),
+                                  TStage( Проверка_свободного_остатка_на_счете_плательщика, @Stage_CheckFreeRestPayerAcc ) );
+   return ExecStages(Payment, Stages, PrmStage, isFromWait);
+END;

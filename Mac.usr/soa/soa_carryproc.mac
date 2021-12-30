@@ -1,0 +1,453 @@
+/*LAO адаптация  для 2031*/
+
+import BankInter, PaymInter, CTInter;
+import soa_core, lib_pm_check, soa_const;
+
+
+var g_carrynum,
+    g_errortext,
+    g_paymentid, 
+    g_dockind;
+    
+//LAO Блокируем счет и остатки по нему, возвращает  0 -успешно заблокировали, 1- счет/остаток не найден, 2 - не удалось заблокировать
+//LAO 2031 адаптировал is_acc_Locked
+private macro lock_acc_rest(v_accp,v_accr,v_chapt,v_date)
+ var cmd_trn;
+
+    cmd_trn = rsdcommand("begin  ? := is_acc_Locked (?,?,?,?); end;");
+        cmd_trn.addParam( "state",  RSDBP_RETVAL, V_STRING  ); 
+        cmd_trn.addParam( "accp"  ,  RSDBP_IN,     v_accp   );
+        cmd_trn.addParam( "accr"  ,  RSDBP_IN,     v_accr   );          
+        cmd_trn.addParam( "chapt",  RSDBP_IN,     v_chapt );  
+        cmd_trn.addParam( "date" ,  RSDBP_IN,     v_date); 
+     //LAO 2031 убрал   cmd_trn.addParam( "curr" ,  RSDBP_IN,     v_curr);  
+    cmd_trn.execute;
+    
+    return cmd_trn.Param(0).value;
+
+end;
+
+
+private macro del_temp_symbol(v_key,v_id)
+    var del_symb; 
+    if (v_id  == 0)
+        del_symb = rsdCommand( "delete from dsymbcash_dbt where t_applicationkey = lpad(?,34,0)" );
+        del_symb.addParam( "paymentid",  RSDBP_IN, v_key );
+   // del_symb.addParam( "carrynum",   RSDBP_IN, v_id  );
+        del_symb.Execute;
+    else
+        del_symb = rsdCommand( "delete from dsymbcash_dbt where t_applicationkey = lpad(?,34,0) and T_RECID = ?" );
+        del_symb.addParam( "paymentid",  RSDBP_IN, v_key );
+        del_symb.addParam( "carrynum",   RSDBP_IN, v_id  );
+        del_symb.Execute;
+    end;
+end; 
+
+//LAO 2031 адаптация проверки фазы
+private macro checkphacc (curp,curr, acc_rec, acc_pay, carry_date, oper, msg)
+
+    if (date(carry_date) != {curdate})
+
+        var cmd = RSDCommand (
+          " select max(ph.t_phase) " +
+          "   from daccount_dbt ac, dopdphase_dbt ph " +
+          "  where     (ac.t_account = ? or ac.t_account = ?)" +
+          "        and ac.t_chapter = usr_common.get_chapter (ac.t_account) " +
+          "        and (ac.t_code_currency = ?  or ac.t_code_currency = ? )" +
+          "        and ph.t_account = ac.t_account " +
+          "        and ph.t_chapter = ac.t_chapter " +
+          "        and ph.t_currency = ac.t_code_currency " +
+          "        and ph.t_phasedate >= (select max (t_phasedate) " +
+          "                                 from dopdphase_dbt " +
+          "                                where     t_account = ac.t_account " +
+          "                                      and t_chapter = ac.t_chapter " +
+          "                                      and t_currency = ac.t_code_currency " +
+          "                                      and t_phasedate <= ? )" 
+        );
+    
+        cmd.addparam("acc_pay", RSDBP_IN, acc_pay);
+        cmd.addparam("acc_rec", RSDBP_IN, acc_rec);
+        cmd.addparam("fiidp", RSDBP_IN, curp);
+        cmd.addparam("fiidr", RSDBP_IN, curr);
+        cmd.addparam("carry_date", RSDBP_IN, date(carry_date));
+    
+        var rs = RSDRecordset(cmd);
+    
+        if ((rs.movenext) and (valtype(rs.value(0)) != V_SPECIAL_VALUE /*null*/))
+            if( not( CheckObjectRestriction(92, 0, 0,"dphases_dbt" ,  "t_Phase = "+int(rs.value(0)), "", null, int(oper)) ));
+                setparm(6,"Нет доступа к счету находящемуся в фазе "+int(rs.value(0)));
+                return false;   
+            end;
+            return true;
+        else
+            return true; //если не записи в dopdphase_dbt то значит оба счета - покрытие, фазу не проверяем
+        end;
+        
+    else
+        return true; //если дата совпадает, пропускаем
+    end;
+end;
+
+
+
+macro SOA_RunMakeCarryAll(p_dockind,p_paymentid,err_txt,p_real_count_carry)
+    private var ret     = -1;
+    private var stat    = 0;
+    private var handled = false;
+    private var i;
+    private var rs;
+    private var rs_symbols;
+    private var rs_carry;
+    private var cmd;
+    private var errm;
+    private var docTabClause;
+    private var trn_stat = false;
+    private var count_trn = 50;
+    private var acc_TRN = 0;
+    private var st_carry;
+    private  var paym_origin; //USR_PAYMENT_OR_FRONT_DEAL
+    g_dockind   = p_dockind;
+    g_paymentid = p_paymentid;
+    var real_count_carry = 0;  //обнуляем кол-во проводок
+    var SUMCONVP,SUMCONVR,STATE_CONV; //LAO 09.04.2014 определяем сумму в нац валюте для мультивалюток
+    
+    setparm( 3,real_count_carry );
+    
+    cmd = RSDCommand("select t_origin from dpmpaym_dbt where t_paymentid = ?");
+    cmd.addparam("pmid", RSDBP_IN,g_paymentid);
+    rs = RSDRecordset(cmd);
+    if (not(rs.movenext))
+         setparm( 2,"Платеж с id = "+g_paymentid+" не найден");
+         return -580;
+    else
+        paym_origin =  rs.value("t_origin");
+    end;
+    
+     cmd = RSDCommand(
+      " select ACCTRNID " +
+      "       ,paymentid " +
+      "       ,operationid " +
+      "       ,carrynum " +
+      "       ,FIID_PAYER " +
+      "       ,FIID_RECEIVER " +
+      "       ,chapter " +
+      "       ,payer_account " +
+      "       ,receiver_account " +
+      "       ,sum " +
+      "       ,SUM_PAYER " +
+      "       ,SUM_RECEIVER " +
+      "       ,date_carry " +
+      "       ,oper " +
+      "       ,pack " +
+      "       ,num_doc " +
+      "       ,ground " +
+      "       ,department " +
+      "       ,vsp " +
+      "       ,kind_oper " +
+      "       ,shifr_oper " +
+      "   from usr_pmdocs " +
+      "  where paymentid = ? "
+     );
+    cmd.addparam( "pmid", RSDBP_IN, g_paymentid );
+
+    rs = RSDRecordset( cmd );
+
+    var operationId = PM_Opr_GetIdOperation( g_paymentid, g_dockind );
+    var pvt_idStep;
+    
+    if( not PM_FindOperation_Step( g_paymentid, "6", OPR_STEP_READYFOREXEC, operationId, pvt_idStep ) )
+        setparm( 2, "Шаг операции не найден, платеж c id:" + g_paymentid );
+        return -500;
+    end;//if
+   
+    while (rs.MoveNext)
+        var trn_carry = RSBAccTransaction();
+        var symb      = 0;
+
+        g_carrynum = rs.value("carrynum");
+
+        trn_carry.Chapter         = rs.value( "chapter" );
+        trn_carry.FIIDReceiver    = rs.value("FIID_RECEIVER");//this.fiid;
+        trn_carry.FIIDPayer       = rs.value("FIID_PAYER");//this.fiid;
+       // trn_carry.FIID            = rs.value( "fiid" );
+        trn_carry.AccountPayer    = rs.value( "payer_account" );
+        trn_carry.AccountReceiver = rs.value( "receiver_account" );
+        trn_carry.SumPayer          = rs.value("SUM_PAYER", null, V_MONEY); 
+        trn_carry.SumReceiver       = rs.value("SUM_RECEIVER", null, V_MONEY); 
+    //  trn_carry.Sum               = rs.value("SUM_PAYER", null, V_MONEY);//написано в доке Core_RSLprc_1.pdf  -- это  сумма дебета проводки
+        trn_carry.Ground          = rs.value( "ground" );
+        trn_carry.Date_Carry      = rs.value( "date_Carry" );
+        trn_carry.Numb_Document   = rs.value( "num_doc" );
+        trn_carry.Number_Pack     = rs.value( "pack" );
+        trn_carry.Shifr_Oper      = rs.value( "shifr_oper" );
+        trn_carry.Kind_Oper       = rs.value( "kind_oper" );
+        trn_carry.Oper            = rs.value( "oper" );
+        trn_carry.Department      = rs.value( "department" );
+        trn_carry.userfield3      = "ik_paymid|" + g_paymentid + "|"; //LAO для сообщений по остаткам в ИК. необходимо сразу знать ид платежа, поэтому  фиксирую его тут.
+        trn_carry.ID_Operation    = operationId;
+        trn_carry.ID_Step         = pvt_idStep;
+         //Если  один счет в валютном документе рублевый, тогда нужно заполнить SumEquivalentCarry для него
+        if (trn_carry.FIIDPayer != trn_carry.FIIDReceiver)
+            if (trn_carry.FIIDPayer == 0)
+                trn_carry.SumEquivalentCarry= rs.value("SUM_PAYER", null, V_MONEY); // LAO без него не считает курс Core_RSLprc_1.pdf 
+            elif (trn_carry.FIIDReceiver == 0)
+                trn_carry.SumEquivalentCarry= rs.value("SUM_RECEIVER", null, V_MONEY); // LAO без него не считает курс Core_RSLprc_1.pdf 
+            else
+               //LAO 09.04.2014 определяем сумму в нац валюте для мультика, это нужно что бы не формировалась проводка курсовой разницы
+               
+                if (paym_origin==USR_PAYMENT_OR_FRONT_DEAL)//25.12.2014 Фронт-диллинг определяет сумму нац.валюты самостоятельно LAO
+                    trn_carry.SumEquivalentCarry=rs.value("SUM", null, V_MONEY);
+                else
+                    if ((ConvSum(SUMCONVP,trn_carry.SumPayer,trn_carry.Date_Carry ,trn_carry.FIIDPayer)!=0) or 
+                        (ConvSum(SUMCONVR,trn_carry.SumReceiver,trn_carry.Date_Carry ,trn_carry.FIIDReceiver)!=0))
+                        setparm( 2, "Для МВП  невозможно определить сумму в нац. валюте" );
+                        return -455;
+                    end;
+                    //LAO для поля T_SUM_NATCUR в dacctrn_dbt выбирается наименьшая сумма  после конвертации
+                    if (SUMCONVP>SUMCONVR) 
+                        trn_carry.SumEquivalentCarry=SUMCONVR;
+                    else
+                        trn_carry.SumEquivalentCarry=SUMCONVP;
+                    end;
+                end;
+            end;
+        end;
+        
+        if (g_dockind == 15)
+            trn_carry.TypeDocument = "Ц"; // LAO 2031 не делать дополнительные проводки по переоценки.
+        end;
+        
+        // LAO проверка на допустимость фазы идет через FOR UPDATE NOWAIT, делаем повтор транзакции при ошибке
+        
+        trn_stat = false;
+        count_trn = 10000;
+        while (not trn_stat)
+        
+        //LAO 2031 добавил недостающие параметры
+            stat = trn_stat = checkphacc (trn_carry.FIIDPayer,trn_carry.FIIDReceiver , trn_carry.AccountReceiver,trn_carry.AccountPayer, trn_carry.Date_Carry , trn_carry.Oper, errm);
+            
+            if (not stat)
+                if (index(errm,"Запись захвачена")!=0) 
+                    if (count_trn > 0)
+                        testevent(Random(1000)); //ждем рандомное время, в любом случае меньше секунды
+                        count_trn= count_trn -1;
+                     else 
+                        trn_stat = true;
+                    end;
+                else
+                    trn_stat = true;
+                end;
+            end;
+        end;
+        
+        if (not stat)
+            setparm( 2, errm );
+            return -400;
+        end;
+        
+          //привязка символов к проводке для прочих документов, проверяется сумма на символе
+        if    ( (g_dockind == 15 ) or
+                (g_dockind == 286) or
+                (g_dockind == 70 ) )
+            if  ((trn_carry.FIIDPayer == 0)  or   (trn_carry.FIIDReceiver== 0))
+                cmd = RSDCommand(
+                  " Select T_SYMBOL, round(T_SUM,2) T_SUM , T_RECID from dsymbcash_dbt "+
+                  "  where t_applicationkey = lpad(?,34,0) "+
+                  "    and exists (select 1 "+
+                  "                  from daccount_dbt "+
+                  "                 where t_chapter = ? "+
+                  "                   and (t_account = ? or t_account = ?) "+
+                  "                   and instr (t_type_account, 'А') > 0) ");
+              //  cmd.addParam("old_applicationkey", RSDBP_IN, LZ_(g_paymentid,34));
+                cmd.addParam("old_applicationkey", RSDBP_IN, g_paymentid);
+                cmd.addParam("chapter", RSDBP_IN, trn_carry.Chapter );
+                cmd.addParam("acc_payer", RSDBP_IN, trn_carry.AccountPayer);
+                cmd.addParam("acc_receiver", RSDBP_IN, trn_carry.AccountReceiver);
+                rs_symbols=RSDRecordset(cmd);
+                // для прочих документов символ крепится согласно сумме на проводке
+                // Смотрим на сумму плательшика
+                // нет, смотреть нужно на сумму по рублевому счету LAO
+                
+                while (rs_symbols.MoveNext)
+                    if (trn_carry.FIIDPayer == 0) 
+                        if (trn_carry.SumPayer == rs_symbols.value("T_SUM")) 
+                            trn_carry.AddCashSymbol(rs_symbols.value("T_SYMBOL"),rs_symbols.value("T_SUM"));
+                         //   del_temp_symbol(g_paymentid,rs_symbols.value("T_RECID"));
+                        end;
+                    elif (trn_carry.FIIDReceiver == 0) 
+                        if (trn_carry.SumReceiver == rs_symbols.value("T_SUM")) 
+                            trn_carry.AddCashSymbol(rs_symbols.value("T_SYMBOL"),rs_symbols.value("T_SUM"));
+                            //LAO 24.03.2014 временно отключил
+                            //  del_temp_symbol(g_paymentid,rs_symbols.value("T_RECID"));
+                        end;
+                    end;    
+                end;
+            end;
+        end;    
+       
+        //LAO ProcessTrn не оправдал надежд, ошибки "запись конкурентно изменена"
+        //rslDefCon не поддерживает повторов транзакции, делаем свою эмуляцию.
+        acc_TRN = 0;
+        trn_stat = false;
+        count_trn = 5000;
+       
+        
+       /* while (not trn_stat)
+       // 2031 Убрал как бы не нужный параметр валюты.
+            acc_TRN = lock_acc_rest(trn_carry.AccountPayer,trn_carry.AccountReceiver,trn_carry.Chapter ,trn_carry.Date_Carry  );
+            if (acc_TRN > 1)
+                if (count_trn > 0)
+                    testevent(Random(700)+300); //ждем рандомное время, в любом случае не больше секунды LAO 
+                 //поставил большее рандомное чсисло, что бы было больше возможности для длительной паузы
+                    count_trn= count_trn -1;
+                 //       cmd = rsdcommand( " begin insert_into_log_LAO (?,? ,?); end;");
+                 //        cmd.addParam( "rec", RSDBP_IN,     trn_carry.AccountReceiver  );  
+                 //        cmd.addParam( "pay",  RSDBP_IN,     trn_carry.AccountPayer );  
+                 //        cmd.addParam( "cnt",     RSDBP_IN, count_trn  );  
+                 //        cmd.execute;
+                else 
+                    setparm( 2, "Запись заблокирована, повторите проводку позже" );
+                    return -555; 
+                end;
+            else
+                trn_stat = true;
+            end;
+        end;*/
+        
+         // Проверяем куда проводится проводка закрытые или планируемые?
+        if (trn_carry.Date_Carry > {curdate}) 
+            st_carry = ACCTRN_STATUS_PLAN;
+        else
+            st_carry = ACCTRN_STATUS_DATE_CARRY;
+        end;
+        
+        //проверка на кассовый документ(подставляем вид операциии = 3 (кассовый))
+        if ((acc_isCash (trn_carry.AccountPayer)) or (acc_isCash (trn_carry.AccountReceiver)))
+            trn_carry.Kind_Oper=" 3";
+        end;
+        
+         stat = trn_carry.carry( st_carry, errm );
+         
+        if( not stat )
+            cmd = rsdCommand( "update usr_pmdocs set error_text = ? where paymentid = ? and carrynum = ?" );
+            cmd.addParam( "error_text", RSDBP_IN, errm        );
+            cmd.addParam( "paymentid",  RSDBP_IN, g_paymentid );
+            cmd.addParam( "carrynum",   RSDBP_IN, g_carrynum  );
+            cmd.Execute;
+
+            setparm( 2, errm );
+            return -600;
+        else   
+            real_count_carry = real_count_carry +1;
+            setparm( 3,real_count_carry );
+                          
+        //привязка символов к проводке для кассовых документов
+        
+        if ((g_dockind == 410) or 
+                (g_dockind == 420) or 
+                (g_dockind == 430) or 
+                (g_dockind == 440) or 
+                (g_dockind == 400)   )
+            if  ((trn_carry.FIIDPayer == 0)  or   (trn_carry.FIIDReceiver== 0))
+                cmd = RSDCommand(
+                  " Select T_SYMBOL,round(T_SUM,2) T_SUM, T_RECID from dsymbcash_dbt "+
+                  "  where t_applicationkey = lpad(?,34,0) "+
+                  "    and exists (select 1 "+
+                  "                  from daccount_dbt "+
+                  "                 where t_chapter = ? "+
+                  "                   and (t_account = ? or t_account = ?) "+
+                  "                   and instr (t_type_account, 'А') > 0) ");
+              //  cmd.addParam("old_applicationkey", RSDBP_IN, LZ_(g_paymentid,34));
+                cmd.addParam("old_applicationkey", RSDBP_IN, g_paymentid);
+                cmd.addParam("chapter", RSDBP_IN, trn_carry.Chapter );
+                cmd.addParam("acc_payer", RSDBP_IN, trn_carry.AccountPayer);
+                cmd.addParam("acc_receiver", RSDBP_IN, trn_carry.AccountReceiver);
+                rs_symbols=RSDRecordset(cmd);
+                //temp_symbol=0;
+                //Кассовые символа всегда крепятся только к проводке где есть счет кассы(Тип А) и это рубли
+                //Важно! Считается что кассовая проводка в документе только одна! 
+                /*while (rs_symbols.MoveNext)
+                  //  if ((trn_carry.Sum ==rs_symbols.value("T_SUM")) and (symb==0)) 
+                        trn_carry.AddCashSymbol(rs_symbols.value("T_SYMBOL"),rs_symbols.value("T_SUM"));
+                        symb=1;
+                 //   end;
+                end;*/
+                while (rs_symbols.MoveNext)
+                 //   if (trn_carry.SumPayer == rs_symbols.value("T_SUM")) 
+                     //LAO  пока не починят запрос 208209
+                   /* if (g_dockind != 440) 
+                        trn_carry.AddCashSymbol(rs_symbols.value("T_SYMBOL"),rs_symbols.value("T_SUM"));
+                        symb=1;
+                    else*/
+                         cmd = RSDCommand(
+                        " update dsymbcash_dbt "+
+                        "    set T_ACCTRNID = ?, "+
+                        " t_applicationkey =  chr(1) "+
+                        "  where t_applicationkey = lpad(?,34,0)"+
+                        "    and exists (select 1 "+
+                        "                  from daccount_dbt "+
+                        "                 where t_chapter = ? "+
+                        "                   and (t_account = ? or t_account = ?) "+
+                        "                   and instr (t_type_account, 'А') > 0) ");
+                        cmd.addParam("payid", RSDBP_IN,trn_carry.ACCTRNID);
+                        cmd.addParam("old_applicationkey", RSDBP_IN,g_paymentid);
+                        cmd.addParam("chapter", RSDBP_IN, trn_carry.Chapter );
+                        cmd.addParam("acc_payer", RSDBP_IN, trn_carry.AccountPayer);
+                        cmd.addParam("acc_receiver", RSDBP_IN, trn_carry.AccountReceiver);
+                        cmd.Execute();
+                   // end;
+                    
+                end;
+            end;
+         end;    
+            
+            //привязка проводки к платежу - системная работает медленно.
+            //LAO адаптировал для 2031
+            cmd = RSDCommand(
+            " insert into dpmdocs_dbt "+
+            " (t_paymentid,t_autokey,t_keeptechfields,t_pmaddpiid,t_reason,T_ACCTRNID) "+
+            " values (?,0, chr(88), 0, ?, ?)" );
+            cmd.addParam("paymentid", RSDBP_IN, g_paymentid);
+            cmd.addParam("reason", RSDBP_IN, trn_carry.ResultCarry );
+            cmd.addParam("trnid", RSDBP_IN, trn_carry.ACCTRNID);
+
+            cmd.Execute();
+            
+            //LAO адаптировал для 2031
+             // обновление пользовательской таблицы регистрации проводок
+            cmd = RSDCommand("update usr_pmdocs set ACCTRNID = ?, "+
+                             " error_text = 'no_error' where paymentid = ? and carrynum = ?");
+            cmd.addParam("ACC_TRNID", RSDBP_IN, trn_carry.ACCTRNID);
+            cmd.addParam("paymentid", RSDBP_IN, g_paymentid);
+            cmd.addParam("carrynum", RSDBP_IN, g_carrynum);
+            cmd.Execute();
+            
+            //LAO адаптировал для 2031
+              //привязка смены статуса к записи регистрации проводок к шагу операции
+            cmd = RSDCommand(
+            " insert into doprdocs_dbt "+
+            "   (t_dockind, t_documentid, t_id_operation, t_id_step, t_part, t_status, t_origin, "+
+            "    t_servdockind, t_servdocid, t_autokey, t_launchoper, t_fmtblobdata_xxxx,T_ACCTRNID) "+
+            " values (1005, chr (1), ?, ?, 1, 0, 0, 0, 0, 0, chr (0), "+
+            "         utl_raw.cast_to_raw ('update usr_pmdocs set ACCTRNID = null, error_text = ''проводка ожидает выполнения'' "+
+            "                               where paymentid = "+g_paymentid+" and carrynum ="+g_carrynum+"'),? )");
+            cmd.addParam("operid", RSDBP_IN, operationId);
+            cmd.addParam("step", RSDBP_IN, pvt_idStep);
+          //  cmd.addParam("pid", RSDBP_IN, g_paymentid); я_лох
+          //  cmd.addParam("num", RSDBP_IN, g_carrynum);
+            cmd.addParam("acctrn", RSDBP_IN, trn_carry.ACCTRNID);
+            cmd.Execute();
+        end;//if
+
+    end;//while
+    
+      //проверяем на наличие проводок
+     if (real_count_carry==0)
+        setparm( 2, "Для документа не привязаны проводки!" );
+        return -911;
+     end;
+
+    setparm( 2, "no_error" );
+    return 0;     
+end;//SOA_RunMakeCarryAll
+

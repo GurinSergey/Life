@@ -1,0 +1,117 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: com3131p.mac
+// @author  : 2012-04-14 zip_z. C-10090, C-11436
+// @desc    : Макрос расчета периодической комиссии 3.13.1 "За платежи сверх лимита по комиссиям 3.12.х"
+// @changes : 2012-05-18 zip_z. * изменения в алгоритме расчета комиссии за превышение документооборота 
+//                                (анализируется отметка времени Интербанк: если дата списания со счета 
+//                                 плательщика не равна дате поступления из ИБ, то отбираем платеж как пакетный.
+//                                Если дата списания со счета плательщика равна дате поступления из ИБ,  
+//                                то анализируем отметку времени: если она < времени окончания операционного дня 
+//                                (настройка реестра), платеж пакетный
+//            2012-07-27 zip_z  * изменения согласно ТЗ на C-11436: для расчета базовой суммы комиссии 
+//                                выделяем общее количество платежей вида 3.4.1 - 3.4.5 за период, среди последних
+//                                k или (n - x) платежей, в зависимости от условий (см. ТЗ)
+// -------------------------------------------------------------------------------------------------
+
+import sfinter, ctinter, lib_packetCommission, lib_sqltools;
+
+macro calcServiceSum (sfcontr_addr, beginDate, endDate, sAddr, sfcontrStruc)
+    debugbreak;
+    private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+    private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+    record sfcontr (sfcontr);
+    record sfbassum ("sfbassum.str");
+
+    var sql = execSQLSelect ("select 1 from dcurdate_dbt where t_branch = 1 and t_curdate >= :d", makeArray (SQLParam ("d", endDate)));
+    if (not sql.moveNext)
+        return; // мы пытаемся начислить комиссию "вперед". 
+                // Это некорректно - выбрасываемся из макроса.
+    end;
+    
+    if (valType (sfcontr_addr) != V_UNDEF)
+        setBuff (sfcontr, sfcontr_addr);
+    else
+        copy (sfcontr, sfcontrStruc);
+    end;
+    
+    // X - количество платежей в пакете клиента. Система анализирует состояние комиссий 3.12.x
+    //     и возвращает количество платежей той комиссии, состояние которой <Начисляется>;
+    var x = 0;
+    
+    // Проанализируем комиссии договора: смотрим на комиссии с привязкой к пакетам и возвращаем параметры той
+    // комиссии, состояние которой = "Начисляется". Одновременно начисляться может только одна
+    // (если по договору начисляются несколько таких комиссий - это ошибка настройки и нужно бить в колокол.
+    sql = "SELECT /*+leading (nt com cc)*/ cc.t_feetype, com.t_code, com.t_number, cc.t_status, UTL_RAW.cast_to_binary_integer (nt.t_text, 2) m_payment_count"
+          "  FROM dsfconcom_dbt cc, dsfcomiss_dbt com, dnotetext_dbt nt"
+          " WHERE com.t_feetype = 1 AND com.t_feetype = cc.t_feetype AND com.t_number = cc.t_commnumber"
+          "   AND com.t_code IN (SELECT REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullname, '<objattr:id>\\d+.\\d+.\\d+</objattr:id>'), '\\d+.\\d+.\\d+')"
+          "                        FROM dobjattr_dbt"
+          "                       WHERE t_objecttype = 3 AND t_groupId = 200)"
+          "   AND cc.t_status = 0 AND cc.t_objectid = :contrid AND cc.t_objecttype = 659 AND nt.t_objectType = 650 AND nt.t_noteKind = 200"
+          "   AND nt.t_documentID = CONCAT (LPAD (TO_CHAR (com.t_feetype), 5, '0'), LPAD (TO_CHAR (com.t_number), 5, '0'))"
+          "   AND nt.t_validToDate = TO_DATE ('31.12.9999', 'dd.mm.yyyy')";
+    sql = execSQLSelect (sql, makeArray (SQLParam ("contrid", sfcontr.id)));
+    if (sql.moveNext ())
+        x = sql.value ("m_payment_count", null, V_INTEGER);
+    end;
+
+    // N - общее количество платежей видов 3.4.1-3.4.5, 3.4.7 с начала текущего месяца 
+    //     по endDate включительно
+    // K - общее количество платежей видов 3.4.1-3.4.5, 3.4.7 за endDate
+    var n = 0;
+    var k = 0;
+    
+    var dd, mm, yyyy;
+    dateSplit (beginDate, dd, mm, yyyy);
+    var firstday = date (1, mm, yyyy);
+    
+    debugbreak ();
+    
+    // Базу для расчета комиссии берем, исходя из даты простановки категории на клиенте.
+    // Категория 200 - исключительная, поэтому запрос на выборку можно упростить донельзя.
+    sql = "select t_validfromdate from dobjatcor_dbt where t_objecttype = 3 and t_groupid = 200 and t_object = lpad (to_char (:partyid), 10, '0')";
+    sql = execSQLSelect (sql, makeArray (SQLParam ("partyid", sfcontr.partyid)));
+    if (sql.moveNext)
+        // 2012-11-07 zip_z. если категория начала действовать посреди месяца, считаем количество платежей с даты начала действия категории
+        if (sql.value ("t_validfromdate", null, V_DATE) >= firstday)
+            firstday = sql.value ("t_validfromdate", null, V_DATE);
+        end;
+    else
+        return; // пакетность вообще не проставлена, считать нечего
+    end;
+    
+    sql = getCom313xRSD (sfcontr.object, firstday, endDate);
+    if (sql.moveNext ())
+        n = sql.value ("n", null, V_INTEGER);     
+        k = sql.value ("k", null, V_INTEGER);
+    end;
+    
+   
+    // по ТЗ:
+    var CommQuont = 0;
+    if (n > x)
+        debugbreak ();
+        if ((n - k) < x) 
+            // выделяем общее количество платежей вида 3.4.1 - 3.4.5 за период, среди последних (n - x) платежей
+            CommQuont = PC_countExternalPaymentsNew (sfcontr.object, endDate, 1, (n - x));
+        else             
+            // выделяем общее количество платежей вида 3.4.1 - 3.4.5 за период, среди последних k платежей
+            CommQuont = PC_countExternalPaymentsNew (sfcontr.object, endDate, 1, k);
+        end;
+    end;
+    
+    if ( valType (sfcontrStruc) != V_UNDEF )
+        return (CommQuont > 0);
+    end;
+    clearRecord(sfbassum);
+
+    sfbassum.baseType   = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont  = CommQuont;
+    sfbassum.baseType2  = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont2 = CommQuont;
+
+    if( insertSumList(sfbassum) )
+        msgBox("Ошибка при вставке базовой суммы");
+    end;
+end;

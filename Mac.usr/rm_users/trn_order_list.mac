@@ -1,0 +1,689 @@
+/*
+Seleznev 
+распоряжение по транзитному счету
+макрос списка
+*/
+/*********************************************************
+1. TAM 26.10.11 I-00100929-2 - зачисление с транзитных сч на текущие должно быть и для валютных платежей РКО
+*********************************************************/
+import PaymInter, BankInter, PTinter, FIInter, PSInter, OprInter, rsd, globals, rslx;
+
+import "trn_order_common.mac";
+import "trnsf_word.mac";
+import "KeyCodes.mac", oralib;
+import "fg_Life_parm.mac"; //Lavrenov 31.10.11
+
+var path;
+
+private var fgBank = fg_life_subject({OurBank});
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+
+var filen = "trnsord.lbr";
+var pathfile = FindPath(filen,path);
+
+var dlg_fltr  = TRecHandler("dt_filtr",pathfile,True);
+var dlg_order = TRecHandler("trns_ord",pathfile,True);
+
+record party(party);
+record account(account);
+record RateDef(RateDef);
+record ps_bcord(ps_bcord);
+
+array FlgPM, FlgRM, FlgCP;
+var column_notify = TArray(), i, ColumnValue, ColumnName, ind = 0, stat, df, query_notify;
+var column_orders = TArray();
+
+var Payment:RSBPayment, rs:RSDRecordset, rs1:RSDRecordset, rsdcmd:RSDCommand, rsdcmd1:RSDCommand;
+var sell_fiid, trn_acc, list_mode;
+
+var ntfy_date, ntfy_num, doc_sum;
+
+var restart_notify_scroll = true;
+var restart_orders_scroll = true;
+var trnfs_panel_mode = 0/*0=ввод, 1=редактирование 2=просмотр*/;
+var rs_panel_data:rsdrecordset;
+
+/* EVG 06/06/2011 */
+var GLOB_PaymentId;
+
+/* атрибуты полей */
+macro AddColumn( col, fld, head, width )
+   Col.value( ind * 6 + 0 ) = fld;  // fieldName
+   Col.value( ind * 6 + 1 ) = head; // header 
+   Col.value( ind * 6 + 2 ) = width; // width
+   Col.value( ind * 6 + 3 ) = 2;    // fldType (2 = FBT)
+   Col.value( ind * 6 + 4 ) = null; // decPoint
+   Col.value( ind * 6 + 5 ) = 0;    // reserv
+   ind = ind + 1;
+end;
+
+
+macro EvProc_orders( rs, cmd, id, key )
+
+   var rsdcmd,rsdrs;
+
+   if ((cmd == DLG_KEY) and (key == KEY_F9) and (trnfs_panel_mode!=2))
+
+      rs_panel_data = rs;
+      trnfs_panel_mode = 0;//ввод
+
+      if (RunDialog(dlg_order, "EvProc_trnf_ord"))
+         restart_orders_scroll = true;
+         return CM_CANCEL;
+      end;
+
+   elif ((cmd==DLG_KEY) and (key == KEY_F8) and (trnfs_panel_mode!=2) and (gettrue(false,"Удалить распоряжение?")))
+
+      if ((rs.value("sell_docid") == 0) and (rs.value("transf_docid") == 0) )
+         rsdcmd = RSDCommand("delete from usr_trnsf_comiss where order_num = ? and notify_num = ?" +
+                             // EVG 3/02/2012 Проверка на год даты комиссии.
+                             "                              and to_char(comdate, 'YYYY') = to_char(?, 'YYYY') " );
+         rsdcmd.addparam("order_num", RSDBP_IN, rs.value("order_num"));
+         rsdcmd.addparam("notify_num", RSDBP_IN, rs.value("notify_num"));
+         rsdcmd.addparam( "notify_date", RSDBP_IN, rs.value("date_value") );  // EVG 3/02/2012
+         rsdcmd.execute;                  
+           
+         rsdcmd = RSDCommand("delete from usr_trnsf_order where order_num = ? and PaymentID = ?");
+         rsdcmd.addparam("order_num", RSDBP_IN, rs.value("order_num"));
+         rsdcmd.addparam("PaymentID", RSDBP_IN, GLOB_PaymentId);
+         
+         rsdcmd.execute;
+         
+         restart_orders_scroll = true;
+         return CM_CANCEL;
+
+      elif ((rs.value("sell_docid") != 0) or (rs.value("transf_docid") != 0))
+         MsgBox("По распоряжению создан документ исполнения|для удаления распоряжения нужно откатить шаг исполнения распоряжения");
+         return CM_IGNORE;
+      end;
+ 
+   elif ((cmd == DLG_KEY) and (key == KEY_ENTER) and (valtype(rs.value("order_num"))!=26))
+
+     rs_panel_data = rs;
+     if (trnfs_panel_mode != 2)
+        trnfs_panel_mode = 1;//редактирование
+     end;
+     if (RunDialog(dlg_order, "EvProc_trnf_ord"))
+        restart_orders_scroll = true;
+        return CM_CANCEL;
+     end;
+
+   elif ((cmd == DLG_KEY) and (key ==KEY_ESC))
+     restart_orders_scroll = false;
+     return CM_CANCEL;
+     
+   elif ((cmd == DLG_KEY)  and ((key == KEY_SHIFT_UP ) or (key == KEY_SHIFT_DWN) or (key ==KEY_ALT_PLUS)))
+        return CM_IGNORE;
+
+   elif ((cmd == DLG_KEY) and (key == KEY_CTRL_R))// or (key == KEY_CTRPGUP) or (key == KEY_CTRL_PGDOWN)))
+
+     restart_orders_scroll = true;
+     return CM_CANCEL;
+
+   elif (((cmd == DLG_KEY) and (key == KEY_F7)) and (valtype(rs.value("order_num"))!=26))
+
+     PrintOrder(rs.value("order_num"));
+     return CM_IGNORE;
+
+   end;
+
+   return CM_DEFAULT;
+
+end;
+
+
+macro run_orders_scroll()
+   
+   var promt, str;
+   while (restart_orders_scroll)
+
+      if (trnfs_panel_mode != 2);
+         ntfy_num  = rs.value("notify_num");
+         ntfy_date = rs.value("notify_date");
+         sell_fiid = rs.value("t_fiid");
+         trn_acc   = rs.value(10);         
+         
+         doc_sum   = rs.value("t_amount") - getusedsum( rs.value("t_PaymentID") );
+         
+         promt     = "Esc Выход  Enter Просмотр  F4 Поиск  F7 Печать  F8 Удалить  F9 Создать";
+      else
+         /* EVG 4/04/2012 Добавлено для корректного вызова по Ctrl-Z */
+         ntfy_num  = rs.value("notify_num");
+         promt     = "Esc Выход  Enter Просмотр  F4 Поиск  F7 Печать";
+      end;
+      ind = 0;
+      str = "select   notify_num,  " +
+            "         order_num,  " +
+            "         date_value,  " +
+            "         sell_sum,  " +
+            "         sell_rate,  " +
+            "         sell_scale,  " +
+            "         sell_account,  " +
+            "         sell_bik,  " +
+            "         nvl(sell_docid,0) sell_docid,  " +
+            "         nvl(transf_docid,0) transf_docid,  " +
+            "         transf_sum, " +
+            "         decode(sell_sum,0,'', nvl((select   t_shortname  " +
+            "            from   dpmpaym_dbt pm, dpmstatus_dbt st  " +
+            "           where   pm.t_paymstatus = st.t_paymstatus and st.t_type = 0 and pm.t_paymentid = sell_docid),'Не создан'))  " +
+            "            sell_state,  " +
+            "         decode(transf_sum,0 , '', nvl((select   t_shortname  " +
+            "            from   dpmpaym_dbt pm, dpmstatus_dbt st  " +
+            "           where   pm.t_paymstatus = st.t_paymstatus and st.t_type = 0 and pm.t_paymentid = transf_docid),'Не создан'))  " +
+            "            transf_state,  " +
+            "         transf_account,  " +
+            "         origin  " +
+            "  from   (select   order_num,  " +
+            "                   date_value,  " +
+            "                   sell_sum,  " +
+            "                   sell_rate,  " +
+            "                   sell_account,  " +
+            "                   nvl(sell_bik, '"+{MFO_BANK}+"') sell_bik,  " +
+            "                   transf_sum, " +
+            "                   (select   pmr.t_paymentid from doprdocs_dbt st, dpmrmprop_dbt pmr  " +
+            "                     where  st.t_id_operation = op.t_id_operation " +
+            "                             and t_dockind = 200 " +
+            "                             and pmr.t_paymentid = st.t_documentid " +
+            "                             and pmr.t_number = order_num and rownum = 1" +
+            "                             )  " +
+            "                      sell_docid,  " +
+            "                   (select   pmr.t_paymentid from doprdocs_dbt st, dpmrmprop_dbt pmr  " +
+            "                     where  st.t_id_operation = op.t_id_operation " +
+            "                             and t_dockind = 202 " +
+            "                             and pmr.t_paymentid = st.t_documentid " +
+            "                             and pmr.t_number = order_num and rownum = 1)  " +
+            "                      transf_docid,  " +
+            "                   transf_account,  " +
+            "                   decode (origin, 0, 'Создан вручную', 1, 'Интербанк', 'Неизвестно') orig_name,  " +
+            "                   o.notify_num,  " +
+            "                   origin,  " +
+            "                   sell_scale  "+            
+            "  from   usr_trnsf_order o,  doproper_dbt op " +
+            "           where   o.PaymentId  = ? " ;         
+       if(fgBank.is_PRBB)
+          str = str + "  and   op.t_documentid = lpad(o.paymentid, 34 , '0')  and t_dockind in (320, 202, 27))  ";  
+       else
+          str = str + "  and   op.t_documentid = lpad(o.PaymentId, 34 , '0')  and t_dockind = 320)  ";
+       end;     
+     
+      
+      rsdcmd = RSDCommand  (str);      
+      rsdcmd.AddParam("PaymentId", RSDBP_IN, rs.value("t_PaymentID"));
+      GLOB_PaymentId = rs.value("t_PaymentID");
+      
+
+      AddColumn(column_orders, "order_num"     , "№ Распоряжения", 8); 
+      AddColumn(column_orders, "date_value"    , "Дата", 6);
+      AddColumn(column_orders, "sell_sum"      , "Сумма продажи", 10);
+      AddColumn(column_orders, "sell_rate"     , "Курс продажи", 6);
+      AddColumn(column_orders, "sell_account"  , "Расчетный счет", 18);
+      AddColumn(column_orders, "sell_bik"      , "БИК получателя", 6);
+      AddColumn(column_orders, "sell_state"    , "Документ продажи", 6);
+      AddColumn(column_orders, "transf_sum"    , "Сумма зачисления",10);
+      AddColumn(column_orders, "transf_account", "Текущий счет",18);
+      AddColumn(column_orders, "transf_state"  , "Документ зачисления", 6);
+      AddColumn(column_orders, "orig_name"     , "Происхождение", 5); 
+
+      rs1 = RSDRecordset(rsdcmd, null, RSDVAL_STATIC);
+
+      RunScroll( rs1, ind, column_orders, "orders_scroll", @EvProc_orders, "Список распоряжений по транзитному счету: "+trn_acc, promt, true, /*X*/null, /*Y*/null, null, null );
+
+   end;   
+
+   restart_orders_scroll = true;
+
+   onerror(x)
+   catch(x);
+
+
+end;
+
+macro run_notify_scroll 
+   
+   var list_dockind;
+   if (list_mode == TRN_ARM)
+      list_dockind = "320,322";
+   elif(list_mode == TRN_BB)
+      if (( fgBank.is_GEB ) or ( fgBank.is_EXV )) 
+        list_dockind = "27";
+      else
+        list_dockind = "27,202";
+      end;
+   end;
+
+   while (restart_notify_scroll)
+
+      query_notify =  "select /*+ORDERED*/ " +
+                      "         nt.notify_num,  " +
+                      "         pm.t_valuedate,  " +
+                      "         nt.notify_date,  " +
+                      "         fi.t_fi_code,  " +
+                      "         pmr.t_number, " +
+                      "         pr.t_corschem,  " +
+                      "         pr.t_bankcode,  " +
+                      "         pm.t_payamount t_amount,  " +
+                      "         replace(pm.t_payeraccount,chr(1),'') t_payeraccount,  " +
+                      "         pm.t_receiveraccount,  " +
+                      "         nvl(pm.t_futurereceiveraccount, pi.t_account) frecacc, " +
+                      "         fi.t_fiid,  " +
+                      /* EVG 11/03/2011 Добавил t_PaymentID */
+                      "         pr.t_PaymentID " +
+                      "  from   usr_trnsf_notify nt,  " +
+                      "         dpmpaym_dbt pm,  " +
+                      "         doproper_dbt opr,  " +
+                      "         doprstep_dbt st,  " +
+                      "         daccount_dbt ac,  " +
+                      "         dpmaddpi_dbt pi, " +
+                      "         dfininstr_dbt fi,  " +
+                      "         dpmrmprop_dbt pmr,  " +
+                      "         dpmprop_dbt pr          " +
+                      " where   pm.t_FIID_FutureRecAcc <> 0 " +
+                      "         and pm.t_dockind in ("+list_dockind+")   " +
+                      "         and nt.notify_date between ? and ?  " +
+                      "         and nt.payment_id = pm.t_paymentid  " +
+                      "         and pm.t_paymentid = pmr.t_paymentid  " +
+                      "         and pm.t_paymentid = pr.t_paymentid  " +
+                      "         and pr.t_debetcredit = 0 " +
+                      "         and PI.T_PAYMENTID(+) = PM.T_PAYMENTID  " +
+                      "         and (ac.t_account = pm.t_futurereceiveraccount or ac.t_account = pi.t_account)  " +
+                      "         and ac.t_code_currency = pm.t_FIID_FutureRecAcc  " +
+                      "         and ac.t_chapter = 1  " +
+                      "         and ac.t_type_account like '%Y%'  " +
+                      "         and fi.t_fiid = pm.t_FIID_FutureRecAcc  " +
+                      "         and opr.t_dockind = pm.t_primdockind  " +
+                      "         and opr.t_documentid = lpad (pm.t_paymentid, 34, '0')  " +
+                      "         and st.t_id_operation = opr.t_id_operation  " +
+                      "         and ST.T_ISEXECUTE = 'R'  " +
+                      "         and ST.T_SYMBOL = 'г' ";
+
+      rsdcmd1 = RSDCommand(query_notify);
+      rsdcmd1.addparam("d_begin", RSDBP_IN, dlg_fltr.rec.d_begin);
+      rsdcmd1.addparam("d_end",   RSDBP_IN, dlg_fltr.rec.d_end);
+
+      rs = RsdRecordset(rsdcmd1, null, RSDVAL_STATIC );
+
+      AddColumn(column_notify, "notify_num",        "№ Уведомления");
+      AddColumn(column_notify, "t_valuedate",       "Дата платежа");
+      AddColumn(column_notify, "notify_date",       "Дата уведомления");
+      AddColumn(column_notify, "t_fi_code"  ,       "Валюта");
+      AddColumn(column_notify, "t_number"  ,        "№ платежа");
+      AddColumn(column_notify, "t_corschem",        "Корсхема");
+      AddColumn(column_notify, "t_bankcode",        "Банк плательщика");
+      AddColumn(column_notify, "t_amount",          "Сумма");
+      AddColumn(column_notify, "t_payeraccount",    "Счет плательщика");
+      AddColumn(column_notify, "t_receiveraccount", "Счет получателя");
+      AddColumn(column_notify, "frecacc",           "Зачислен на счет");
+
+
+      RunScroll(rs, ind, column_notify, "notify_scroll", "EvProc_notify", "Список платежей готовых к исполнению распоряжений по транзитному счету", "Esc Выход Enter Просмотр F2 передать на ВК  F4 Поиск  F5 Список распоряжений ", true, /*X*/null, /*Y*/null, null, null );
+   end;
+   restart_notify_scroll = true;
+
+end;
+
+
+macro EvProc_notify( rs, cmd, id, key )
+
+  var rscmd, rsrset, sum = $0, msg = "";
+
+  if( (cmd == DLG_KEY) and (key == KEY_ENTER) )
+
+     if (rs.value(0))
+
+        Payment = RSBPayment( rs.value("t_PaymentID") );
+
+
+        FlgRM[PNRMPM_PACK]=1; //нужно открыть хотя бы одно поле для разблокировки меню
+        stat = PM_ProcessPanel( Payment, 1, FlgPM, FlgRM, FlgCP );
+
+        if((stat) and (stat) == 4704 )
+          //msgbox( "Выполнение процедуры прервано пользователем" );
+        else
+          msgbox( "Ошибка при создании панели редактирования платежа" );
+        end;
+     else
+        return CM_IGNORE;
+     end;
+
+  elif ((cmd == DLG_KEY) and (key == KEY_F2))
+
+     sum = rs.value("t_amount") - getusedsum( rs.value("t_PaymentID") );
+
+     if (sum > 0 )
+        if (not(gettrue(false,"По платежу зарегистрированы не все распоряжения, не распределенная сумма "+sum+"| продолжить?")));
+           return CM_IGNORE;
+        end;
+     end;
+
+
+     Payment = RSBPayment( rs.value("t_PaymentID") );
+
+
+     PM_ExecuteOperation(Payment.PaymentID, Payment.DocKind);
+
+     restart_orders_scroll = true;
+
+     restart_notify_scroll = true;
+     return CM_CANCEL;
+
+  elif ((cmd == DLG_KEY) and (key == KEY_F5))
+
+     if (rs.value(0))
+        restart_orders_scroll = true;
+        run_orders_scroll;
+        restart_notify_scroll = true;
+        return CM_CANCEL;
+     else
+        return CM_IGNORE;
+     end;
+  elif ((cmd == DLG_KEY) and (key == KEY_CTRL_R))// or (key == KEY_CTRPGUP) or (key == KEY_CTRL_PGDOWN)))
+
+     restart_notify_scroll = true;
+     return CM_CANCEL;
+
+  elif ((cmd == DLG_KEY) and (key ==KEY_ESC))
+     restart_notify_scroll = false;
+     return CM_CANCEL;
+  elif ((cmd == DLG_KEY)  and ((key == KEY_SHIFT_UP ) or (key == KEY_SHIFT_DWN) or (key ==KEY_ALT_PLUS)))
+        return CM_IGNORE;
+  elif (cmd == DLG_KEY)                            
+
+  end;
+
+  return CM_DEFAULT;
+
+end;
+
+
+macro EvProc_trnf_ord (dlg, cmd, id, key) 
+
+   var mess = "~F2~ Продолжить ~F3~ Список ~ESC~ Выход ";
+   var rate, stat;
+   var code_kind, code, acc, rsdcmd, rsdrs;
+
+   macro getsellacc
+      acc = dlg.rec.transf_account;
+      if (listaccount(account, 1, sell_fiid, acc, null, null, null, true))
+         dlg.rec.transf_account = account.account;
+         UpdateFields(dlg);
+      end;
+   end;
+
+   macro gettrnsfacc
+      acc = dlg.rec.sell_acc;
+      if (listaccount(account, 1, NATCUR, acc, null, null, null, true))
+         dlg.rec.sell_acc = account.account;
+         UpdateFields(dlg);
+      end;
+   end;
+
+  private macro getNotifyDate(id)
+      var SQL, cmd, rs;
+      cmd = RsdCommand( " SELECT   ad.t_date_carry d" +
+                        " FROM   dacctrn_dbt ad, dpmdocs_dbt pm, daccount_dbt acnt " +
+                        " WHERE       pm.t_paymentid = ? AND AD.T_ACCTRNID = PM.T_ACCTRNID AND ad.t_account_receiver = acnt.t_account " +
+                        "         AND acnt.t_chapter = 1 AND INSTR (UPPER (acnt.t_type_account), 'Y') != 0  ");
+      cmd.AddParam("pm", RSDBP_IN, id);
+      rs = RsdRecordSet(cmd);
+      if(rs.MoveNext())
+          return sqlDate2date(rs.value("d"));
+      end;
+  end;
+
+   macro initpanel
+      if (trnfs_panel_mode == 0)
+
+         dlg.rec.ntfy_num  = ntfy_num;
+         //Gurin S. 20.10.2015 R-624649-2
+         //dlg.rec.ntfy_date = ntfy_date;
+         dlg.rec.ntfy_date = getNotifyDate(rs.value("t_PaymentID"));
+         dlg.rec.trnfs_date= {curdate};
+         dlg.rec.trnfs_num = 0;
+         dlg.rec.sell_bik  = {MFO_BANK};
+         dlg.rec.sell_ks = {CORAC_Bank};
+         dlg.rec.sell_bankname = {NAME_BANK};
+
+         if(ПолучитьКурс( RateDef, NATCUR, sell_fiid ))
+           MsgBox("Ошибка при определении курса");
+         else
+            dlg.rec.rate =  RateDef.Rate / pow( 10, RateDef.Point );
+            dlg.rec.scale = RateDef.scale;
+         end;
+
+         dlg.rec.sell_sum = doc_sum;
+         dlg.rec.sell_acc = "";
+         dlg.rec.transf_sum = $0;
+         dlg.rec.transf_account = "";
+
+      elif ((trnfs_panel_mode == 1) or (trnfs_panel_mode == 2))
+
+         dlg.rec.ntfy_num  = ntfy_num;
+         //Gurin S. 16.11.2015 R-627914-2
+         //dlg.rec.ntfy_date = ntfy_date;
+         dlg.rec.ntfy_date = getNotifyDate(rs.value("t_PaymentID")); 
+         dlg.rec.trnfs_num = 0;
+         dlg.rec.trnfs_num = rs_panel_data.value("order_num");
+         dlg.rec.trnfs_date= rs_panel_data.value("date_value");
+         dlg.rec.sell_bik  = rs_panel_data.value("sell_bik");
+         getbankparm(dlg.rec.sell_bik, dlg.rec.sell_ks, dlg.rec.sell_bankname);
+         dlg.rec.sell_sum  = rs_panel_data.value("sell_sum");
+         dlg.rec.rate      = rs_panel_data.value("sell_rate");
+         /* EVG 20/04/2012 Исправлено.
+         dlg.rec.scale     = 1;*/
+         dlg.rec.scale     = rs_panel_data.value("sell_scale");;
+         dlg.rec.sell_acc  = rs_nvl(rs_panel_data.value("sell_account"),"");
+         dlg.rec.transf_sum= rs_panel_data.value("transf_sum");
+         dlg.rec.transf_account = rs_nvl(rs_panel_data.value("transf_account"), "");
+
+         if ((rs_panel_data.value("sell_docid") == 0) and (rs_panel_data.value("transf_docid") == 0))
+            EnableFields(dlg);
+            DisableFields(dlg,0);
+         else
+            DisableFields(dlg);
+         end;
+      end;
+
+      if ((trnfs_panel_mode == 2) or ((trnfs_panel_mode == 1) and ( rs_panel_data.value("origin")!=0)))
+         DisableFields(dlg);
+      end;
+
+      UpdateFields(dlg);
+
+   end;
+
+   if(cmd == DLG_INIT)
+      initpanel;
+   end;
+
+   if ((cmd==DLG_KEY) and (key == KEY_ENTER))
+      if (id == 1)
+         SetFocus(dlg,id+3);
+      elif (id == 5)
+         SetFocus(dlg,id+2);
+      elif ((trnfs_panel_mode == 0) and (id == 12))
+         SetFocus(dlg,0);
+      elif ((trnfs_panel_mode == 1) and (id == 12))
+         SetFocus(dlg,1);
+      elif ((id == 7) and (dlg.rec.sell_bik == {MFO_BANK}) and (index(dlg.rec.sell_acc, "*")))
+         gettrnsfacc;
+      elif ((id == 11) and (index(dlg.rec.transf_account, "*")))
+         getsellacc;
+      else
+         SetFocus(dlg,id+1);
+      end;
+
+
+      return CM_IGNORE;
+   end;
+
+   if ((cmd==DLG_KEY) and (key == KEY_F3))
+      if (id == 4)
+         if (ListPT(party, code_kind=PTCK_BIC, code, PTLIST_ALLBANK, {OurBank}, PTCK_BIC))
+            dlg.rec.sell_bik  = code;
+            getbankparm(code, dlg.rec.sell_ks, dlg.rec.sell_bankname);
+            UpdateFields(dlg); 
+         end;
+      elif ((id == 7) and (dlg.rec.sell_bik == {MFO_BANK}))
+         gettrnsfacc;
+      elif (id == 11)
+         getsellacc;
+      end;
+   end;
+
+   if (cmd == DLG_REMFOCUS)
+      if ((id == 9) and (trnfs_panel_mode == 0))
+         if (dlg.rec.sell_sum != doc_sum);
+            dlg.rec.transf_sum = doc_sum - dlg.rec.sell_sum;
+            UpdateFields(dlg);
+         end;
+      elif (id == 4)
+         getbankparm(dlg.rec.sell_bik, dlg.rec.sell_ks, dlg.rec.sell_bankname);
+         UpdateFields(dlg);
+      elif ((id == 12) and (trnfs_panel_mode == 0))
+         dlg.rec.sell_sum = doc_sum - dlg.rec.transf_sum;
+         UpdateFields(dlg);
+      end;
+   end;
+
+   if ((cmd==DLG_KEY) and (key == KEY_F9) and (trnfs_panel_mode != 2))
+      debugbreak;
+      if (dlg.rec.sell_bankname == "")
+         Msgbox("Банк получателя не найден");
+      end;
+
+      if((dlg.rec.sell_acc == dlg.rec.transf_account) and (dlg.rec.sell_acc== ""))
+         Msgbox("Текущий или расчетный счет должен быть задан!");
+         return CM_IGNORE;
+      end;
+
+      if ((trnfs_panel_mode == 0) and (doc_sum < dlg.rec.sell_sum+dlg.rec.transf_sum))
+         Msgbox("Сумма распоряжений превышает сумму платежа");
+         return CM_IGNORE;
+      end;
+
+      if (dlg.rec.scale <= 0)
+         Msgbox("Масштаб курса должен быть больше нуля");
+         return CM_IGNORE;
+      end;
+
+      if (trnfs_panel_mode == 0) //ввод нового распоряжения
+         
+         rsdcmd = RSDCommand("select 1 from usr_trnsf_order where order_num = ? and PaymentId = ?");
+         rsdcmd.addparam("order_num"  ,RSDBP_IN, dlg.rec.trnfs_num);
+         rsdcmd.addparam("PaymentId" ,RSDBP_IN, rs.value("t_PaymentID"));
+         
+         rsdrs=RSDRecordset(rsdcmd);
+
+         if (rsdrs.MoveNext)
+            msgbox("Распоряжение с номером "+dlg.rec.trnfs_num+" уже существует");
+            SetFocus(dlg,0);
+            return CM_IGNORE;
+         end;
+
+         
+         rsdcmd = RSDCommand("insert into usr_trnsf_order (ORDER_NUM,NOTIFY_NUM,DATE_VALUE,SELL_SUM,SELL_RATE,SELL_SCALE,"+
+                          "SELL_ACCOUNT,SELL_BIK,TRANSF_SUM,TRANSF_ACCOUNT,ORIGIN, SYS_TIME, PAYMENTID)"+
+                          "values (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+
+         rsdcmd.addparam("ORDER_NUM"       ,RSDBP_IN, dlg.rec.trnfs_num);
+         rsdcmd.addparam("NOTIFY_NUM"      ,RSDBP_IN, dlg.rec.ntfy_num);
+         rsdcmd.addparam("DATE_VALUE"      ,RSDBP_IN, dlg.rec.trnfs_date);      
+         rsdcmd.addparam("SELL_SUM"        ,RSDBP_IN, dlg.rec.sell_sum);   
+         rsdcmd.addparam("SELL_RATE"       ,RSDBP_IN, dlg.rec.rate);
+         rsdcmd.addparam("SELL_SCALE"      ,RSDBP_IN, dlg.rec.scale);
+         rsdcmd.addparam("SELL_ACCOUNT"    ,RSDBP_IN, dlg.rec.sell_acc);
+         rsdcmd.addparam("SELL_BIK"        ,RSDBP_IN, dlg.rec.sell_bik);
+         rsdcmd.addparam("TRANSF_SUM"      ,RSDBP_IN, dlg.rec.transf_sum);
+         rsdcmd.addparam("TRANSF_ACCOUNT"  ,RSDBP_IN, dlg.rec.transf_account);
+         rsdcmd.addparam("ORIGIN"          ,RSDBP_IN, 0 /*введен вручную*/);
+         rsdcmd.addparam("SYS_TIME"        ,RSDBP_IN, time());
+         rsdcmd.addparam("PAYMENTID"       ,RSDBP_IN, rs.value("t_PaymentID"));
+         
+         rsdcmd.execute;
+
+         restart_orders_scroll = true;
+
+         return CM_SAVE;
+
+      elif (trnfs_panel_mode == 1)
+         rsdcmd = RSDCommand("update usr_trnsf_order set DATE_VALUE = ?, SELL_SUM = ?, SELL_RATE = ?, SELL_SCALE = ?,"+
+                          "SELL_ACCOUNT = ?, SELL_BIK =?, TRANSF_SUM = ?, TRANSF_ACCOUNT= ? where ORDER_NUM = ? and PAYMENTID = ?");
+
+
+         rsdcmd.addparam("DATE_VALUE"      ,RSDBP_IN, dlg.rec.trnfs_date);      
+         rsdcmd.addparam("SELL_SUM"        ,RSDBP_IN, dlg.rec.sell_sum);   
+         rsdcmd.addparam("SELL_RATE"       ,RSDBP_IN, dlg.rec.rate);
+         rsdcmd.addparam("SELL_SCALE"      ,RSDBP_IN, dlg.rec.scale);
+         rsdcmd.addparam("SELL_ACCOUNT"    ,RSDBP_IN, dlg.rec.sell_acc);
+         rsdcmd.addparam("SELL_BIK"        ,RSDBP_IN, dlg.rec.sell_bik);
+         rsdcmd.addparam("TRANSF_SUM"      ,RSDBP_IN, dlg.rec.transf_sum);
+         rsdcmd.addparam("TRANSF_ACCOUNT"  ,RSDBP_IN, dlg.rec.transf_account);
+         rsdcmd.addparam("ORDER_NUM"       ,RSDBP_IN, dlg.rec.trnfs_num);
+         rsdcmd.addparam("PAYMENTID"       ,RSDBP_IN, rs.value("t_PaymentID"));
+         
+         rsdcmd.execute;
+
+         restart_orders_scroll = true;
+         return CM_SAVE;
+      end;
+   end;
+
+   return CM_DEFAULT;
+
+END;
+
+
+macro EvProc_dt_filter (dlg, cmd, id, key) 
+
+   var mess = "~F2~ Продолжить ~F3~ Список ~ESC~ Выход ";
+   var OrgDate:date = {curdate} + 1;
+   var NoChangeDate:bool = false;
+   
+   if(cmd == DLG_INIT)
+      dlg.rec.d_begin  = {curdate};
+      dlg.rec.d_end    = {curdate};
+      UpdateFields(dlg); 
+   end;
+
+   if ((cmd==DLG_KEY) and (KEY==KEY_F2))
+      return CM_SAVE;
+   end;
+
+   if ((cmd==DLG_KEY) and (key == KEY_ENTER))
+         SetFocus(dlg,id+1);
+      return CM_IGNORE;
+   end;
+
+   return CM_DEFAULT;
+
+end;
+
+macro show_list(mode)
+
+   list_mode = mode;
+   if (RunDialog(dlg_fltr, "EvProc_dt_filter"))
+      run_notify_scroll 
+   end;
+
+end;
+
+macro show_orders_list(paymentid, freceiveracc)
+
+   /* EVG 4/04/2012 Это показ распоряжений по Ctrl-Z Нужна небольшая доработка
+          для обеспечения работоспособности режима.
+   var cmd = RSDCommand("select notify_date from usr_trnsf_notify where payment_id = ?");*/
+   var cmd = RSDCommand("select notify_date, payment_id as t_PaymentID, notify_num from usr_trnsf_notify where payment_id = ?");
+   cmd.addparam("pmid", RSDBP_IN, paymentid);
+   /* EVG 4/04/2012 rs не нужно переопределять.
+   var*/ rs = RSDRecordset(cmd);
+   if (not(rs.MoveNext))
+      MsgBox("По платежу не было напечатано/отправлено уведомление");
+   else
+      trnfs_panel_mode = 2;
+      ntfy_num = paymentid;
+      ntfy_date= rs.value("notify_date");
+      trn_acc  = freceiveracc;
+      run_orders_scroll();
+   end;
+end;

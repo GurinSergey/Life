@@ -1,0 +1,642 @@
+/* г==================================================================┐ */
+/*         Автоматизированная банковская система RS-Bank v5.0           */
+/*                 Copyright (c) R-Style Software Lab 1998              */
+/*                                                                      */
+/*  Имя файла        : payminit.mac                                     */
+/*                                                                      */
+/*  Описание         : Макрос инициализации операции Платеж             */
+/*                                                                      */
+/*  Программист      : Копачев Д.В.                                     */
+/*                                                                      */
+/*  Создан           : 19.12.2005                                       */
+/*                                                                      */
+/* ==================================================================== */
+
+// KS 16.08.2012 C-12522 контроль за правильностью наименования получателя средств в платежных документах внутрибанковских
+/*LAO 30.08.2012 Распаралеливание загрузки рейсов МЦИ */
+/*LAO 11.09.2012 Обернул отправку 320 платежей, добавил условия на платежи БЭСП*/
+/*zmp 30.10.2012 I-00277403 Сделана проверка на проведение 202 документа будующей датой*/
+//SDA 27.09.2012 см. комментарии по дате
+//Gurin S. N. 16.10.2012 C-13488 
+/*LAO 18.12.2012 если ИК платежи толкают руками паралельно с роботом, может произойти deadlock, крушение сегментов статуса и т.д. Наш робот не робот, он круглосуточный воин */
+//TAM 09.01.13 Исправлены числовые константы 
+/* VV С-13995 Предупреждение о наличии К2 или претензий на счетах юрид.лиц при проведении кассовых документов из отложенных в RS-Bank V6. 17.01.2013*/
+// zip_z. адский рефакторинг
+/* EVG 17/03/2014 Сделал корректировку для документов оплаты ПЗО с НДС (заполнение t_Receiver, корректировка t_ReceiverBankCodeKind и некоторых других полей) */
+// 08.09.2015 Чесноков Д.С. Документы ABBYY теперь всегда идут на определение выгрузки во фронт
+
+import globals, FIInter, PaymInter, PSInter, PTInter, OprInter, CashInter, oralib, likepy, pmprops, pmprepromass, CTInter, InsCarryDoc, pm_tools, BankInter;
+import lib_account, lib_const, lib_access, lib_pm_check;
+import pm_setst, FrontRoute, op_lib, check_rec_lib, cb_sql, laa_lib, fg_Life_parm, OperationsProc, lib_fg;
+
+var PaymentObj:RsbPayment;
+private var fgBank = fg_life_subject({OurBank});
+
+PRIVATE const PAYMENT_KIND_MAIL = "П";  // почтой
+PRIVATE const PAYMENT_KIND_TELG = "T";  // телеграф
+PRIVATE const PAYMENT_KIND_ELEC = "Э";  // электронно
+PRIVATE const PAYMENT_KIND_INST = "С";  // срочно
+
+PRIVATE const CHOICE_BUTTON_CARRY  = 1; // "Провести"
+PRIVATE const CHOICE_BUTTON_CANCEL = 0; // "Отменить"
+
+PRIVATE const CHOICE_BUTTON_YES = 0; // "Да"
+PRIVATE const CHOICE_BUTTON_NO  = 1; // "Нет"
+PRIVATE const CHOICE_BUTTON_REFUSE  = 2; // "Отказаться"
+
+//------------------------------------------------------------------------------
+// Банк - подразделение ЦБ?
+//------------------------------------------------------------------------------
+PRIVATE MACRO BankIsCB( BankCode:string ):bool
+    VAR code:string = SubStr( BankCode, 7 );
+    return ( ( code == "001" ) OR
+                     ( code == "002" ) OR
+                     ( code == "000" ) );
+END;
+
+//------------------------------------------------------------------------------
+// Платеж исходящий
+//------------------------------------------------------------------------------
+PRIVATE MACRO IsOutgoingPayment( Payment:RsbPayment ):bool
+ return ( ((Payment.PayerGroup == PAYMENTS_GROUP_EXTERNAL) AND (Payment.PayerIsSender != "X") AND (Payment.ReceiverGroup != PAYMENTS_GROUP_EXTERNAL)) OR
+                    ((Payment.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL) AND (Payment.ReceiverIsSender != "X") AND (Payment.PayerGroup != PAYMENTS_GROUP_EXTERNAL)) );
+END;
+
+//------------------------------------------------------------------------------
+// Платеж внутрирегиональный
+//------------------------------------------------------------------------------
+PRIVATE MACRO BanksInOneRegion( bic1:string, bic2:string ):bool
+     return ( SubStr( bic1, 3, 2 ) == SubStr( bic2, 3, 2 ) );
+END;
+
+//------------------------------------------------------------------------------
+// Предупреждение об отличии даты значения от текущего curdate
+//------------------------------------------------------------------------------
+PRIVATE MACRO GetChoiceAboutNotEQValueDateAndCurDate(Payment:RsbPayment)
+
+    Array Text;
+    Array Buttons;
+    
+    var DialogFlag;
+    if(IsOprMultiExec())
+      DialogFlag  = TSetDialogFlag(1);
+    end;
+
+    Text(0) = string( "В документе " + Payment.Number + " дата значения " + Payment.ValueDate + " отличается от даты текущего операционного дня " + {curdate} + ".|Провести документ текущим операционным днем?" );
+
+    Buttons(CHOICE_BUTTON_YES)    = "Да"; 
+    Buttons(CHOICE_BUTTON_NO)     = "Нет"; 
+    Buttons(CHOICE_BUTTON_REFUSE) = "Отказаться"; 
+
+    var Choise = ConfWin(Text,Buttons);
+
+    return Choise;
+END;
+
+//Проверка подключения субъекта к БЭСП - по заполненности соответствующей категории
+macro IsConnectBESPByCateg( PartyID:integer )
+    var select:string = " select *"
+                        " from dobjatcor_dbt oac1"
+                        " where oac1.t_ObjectType = :objtype_party"
+                        " and oac1.t_Object = lpad(:PartyID, 10, '0')"
+                        " and oac1.t_GroupID = :GroupID1"
+                        " and not exists ( select *"
+                                            " from dobjatcor_dbt oac2"
+                                            " where oac2.t_ObjectType = oac1.t_ObjectType"
+                                            " and oac2.t_Object     = oac1.t_Object"
+                                            " and oac2.t_GroupID    = :GroupID2"
+                                            " and oac2.t_AttrID     = 1"
+                                            " and oac2.t_ValidToDate >= :curdate"
+                                            " and oac2.t_ValidFromDate <= :curdate )"
+                        " and oac1.t_ValidToDate >= :curdate"
+                        " and oac1.t_ValidFromDate <= :curdate";
+
+    var params:TArray   = makeArray( SQLParam( "objtype_party", OBJTYPE_PARTY ),
+                                     SQLParam( "PartyID",       PartyID),
+                                     SQLParam( "GroupID1",      PARTY_ATTR_GROUP_BESP),
+                                     SQLParam( "GroupID2",      PARTY_ATTR_GROUP_DISCONNECTBESP),
+                                     SQLParam( "curdate",       {curdate}));
+    var rs:RsdRecordset = execSQLselect( select, params );
+    return rs.moveNext();
+END;
+
+// Полная проверка подключения субъекта к БЭСП - для неРКЦ проверяются категории, для РКЦ проверяются категории вышестоящего ГРКЦ
+macro IsConnectBESP( PartyID:integer )
+    if( not IsBankType( PartyID, PT_KIND_PAYM_CASH_CENTRE ) )
+        return IsConnectBESPByCateg( PartyID ); 
+    end;
+    var rs:RsdRecordset = execSQLselect( "select code.t_partyid "+
+                                         "  from dpartcode_dbt code, dbankdprt_dbt dp "+
+                                         " where dp.t_partyid       = :partyid "+
+                                         "   and code.t_codekind    = 3 "+
+                                         "   and ( code.t_code      = dp.t_bic_rcc "+
+                                         "       or dp.t_bic_rcc    = chr(1) "+
+                                         "      and code.t_code     like ( select substr( bic.t_code, 1, 4 ) || '%001' "+
+                                                                        "    from dpartcode_dbt bic "+
+                                                                        "   where bic.t_codekind = 3 "+
+                                                                        "     and bic.t_partyid  = :partyid "+
+                                                                        "     and bic.t_state = 0 "+
+                                                                        "     and rownum = 1 ) ) "+
+                                         "   and code.t_state       = 0 ", makeArray( SQLParam( "partyid", PartyID ) ) );
+    
+    if( rs.moveNext() )            
+        return IsConnectBESPByCateg( rs.value(0) );
+    end;
+    return false;
+END;
+
+//Проверка возможности исполнения платежа через БЭСП
+private macro CheckPaymentExecByBESP(Payment:RsbPayment)
+    var select:string = " select dp.t_PartyID"
+                        " from ddp_dep_dbt dp, dcorschem_dbt cors"
+                        " where dp.t_Code = cors.t_Department"
+                        " and cors.t_Number = :corschem"
+                        " and cors.t_FIID = :FIID";
+
+    var params:TArray   = makeArray( SQLParam( "corschem", Payment.OutCorschem ),
+                                     SQLParam( "FIID",     Payment.OutCorschemFIID));
+    var rs:RsdRecordset = execSQLselect( select, params );
+    Array Text;
+    Array Buttons;
+    var choise;
+
+    rs.moveNext();
+
+    if( ((Payment.DocKind == DLDOC_BANKPAYMENT) OR (Payment.DocKind == PS_PAYORDER)) AND IsOutgoingPayment(Payment) )
+        if(Payment.PaymentKind == PAYMENT_KIND_INST)      
+            if((not IsConnectBESP( Payment.ReceiverBankID )) OR (not IsConnectBESP( rs.value(0) )) )
+                if( GetDialogFlag() )
+                    Text(0) = string( "Платеж № ",Payment.Number," от ",Payment.Date," с видом 'срочный' не может быть проведен по БЭСП. Всё равно исполнить платеж?" );
+
+                    Buttons(CHOICE_BUTTON_CARRY ) = " Провести "; 
+                    Buttons(CHOICE_BUTTON_CANCEL) = " Отменить "; 
+
+                    choise = ConfWin(Text,Buttons);
+                    if(choise==CHOICE_BUTTON_CANCEL)
+                        return false;
+                    end;
+                else
+                    MsgBox( string("Платеж № ",Payment.Number," от ",Payment.Date," с видом 'срочный' не может быть проведен по БЭСП"));
+                    return false;
+                end;
+            end;
+        end;
+    end;
+    return true;
+end;
+
+
+
+//-----------------------------------------------------------------------------
+// Является ли субъект резидентом
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsResident( PartyID ):bool
+    VAR select:string = " select party.T_NotResident " +
+                        " from   dparty_dbt party "+
+                        " where  party.T_PARTYID = :PartyID";
+    VAR params:TArray = makeArray( SQLParam( "PartyID", PartyID ) );
+    VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+    if( rset and rset.moveNext() )
+        if( rset.value("T_NotResident") == "X" )
+            return false;
+        end;
+    end;     
+
+    return true;
+END;
+
+private macro getOperationIDbyPaymentID(PID :integer)
+    var sql  = " SELECT OPR.T_ID_OPERATION                               "
+               " FROM DOPROPER_DBT OPR, DPMPAYM_DBT PM                   "
+               " WHERE OPR.T_DOCUMENTID = LPAD (PM.T_PAYMENTID, 34, 0)   "
+               " AND PM.T_DOCKIND = OPR.T_DOCKIND                        "
+               " AND PM.T_PAYMENTID = :pid                               ";
+    sql = execSQLselect(sql, makeArray(SQLParam(":pid", PID)));
+    if (sql and sql.moveNext())  
+        return int(sql.value(0));
+    end;                                                               
+    return 0;
+end;
+
+private const ACC_MASK_CHECKCLAIM = "405-407,40802*,40807*,40821*"; // 2vv: вынести в реестр для всех банков
+
+private macro haveNotFreeRest(pid)                                                        
+   var sql = " SELECT   nvl(max(1), 0)                                                                                                      "+
+             "  FROM   dpmpaym_dbt pm, dpmrmprop_dbt pr                                                                                     "+
+             " WHERE   PM.T_PAYMENTID = " + pid + " AND PM.T_PAYMENTID = PR.T_PAYMENTID                                                     "+
+             "         AND PM.T_baseAMOUNT <                                                                                                "+
+             "               ( (SELECT   usr_get_rest (PM.T_PAYERACCOUNT,   rsbsessiondata.curdate - 1)  FROM   DUAL)                       "+
+             "                + (SELECT   NVL (SUM (trn1.T_SUM_NATCUR), 0)                                                                  "+
+             "                     FROM   dacctrn_dbt trn1                                                                                  "+
+             "                    WHERE   trn1.T_ACCOUNT_RECEIVER = PM.T_PAYERACCOUNT                                                       "+
+             "                            AND trn1.t_date_carry = rsbsessiondata.curdate                                                    "+
+             "                            AND NOT SUBSTR (trn1.T_ACCOUNT_PAYER, 1, 3) BETWEEN '452' AND  '458')                             "+
+             "                - (SELECT   NVL (SUM (trn2.T_SUM_NATCUR), 0)                                                                  "+
+             "                     FROM   dpmdocs_dbt docs,                                                                                 "+
+             "                            usr_over_comiss com,                                                                              "+
+             "                            dacctrn_dbt trn2                                                                                  "+
+             "                    WHERE       DOCS.T_PAYMENTID = COM.T_PAYMENTID                                                            "+
+             "                            AND trn2.T_ACCTRNID = DOCS.T_ACCTRNID                                                             "+
+             "                            AND trn2.T_ACCOUNT_PAYER = PM.T_PAYERACCOUNT                                                      "+
+             "                            AND trn2.T_DATE_CARRY = rsbsessiondata.curdate)                                                   "+
+             "                - (SELECT   USR_ACCREST.GET_CLAIMS (PM.T_PAYERACCOUNT, rsbsessiondata.curdate, PR.T_PRIORITY) FROM   DUAL))   ";
+                                                                                                                                             
+   sql = rsdrecordset(sql);                                                                                    
+   sql.movenext();                                                                      
+   return sql.value(0, null, v_integer) == 0;
+onError
+   return false;
+end;
+
+
+//------------------------------------------------------------------------------
+// Старт операции
+//------------------------------------------------------------------------------
+MACRO InitOperation( KindOp, KindDoc, pspayord )
+    debugbreak;
+    var stat = 0;
+    record objattr ( "objattr" );
+
+
+    //TAM 26.06.2013 доработка для HF_81
+    if (paymentObj.dockind != DLDOC_MULTYPM)
+      var obj = GetPrimObj(paymentObj); 
+    end;
+    //zmp 11.03.2014 I-00470982
+    //Gurin S. 06.11.2014 Для входящих не надо
+    if (not PaymentObj.IsExternalIncoming)
+       var OperationID = getOperationIDbyPaymentID(paymentObj.paymentid) ;   
+       if (OperationID != 0) 
+           if (PaymentObj.DocKind == 200)
+              execSQL("update doprcurst_dbt  set T_NUMVALUE = 1  where T_ID_OPERATION =  :OID  and T_STATUSKINDID = 9801", makeArray(SQLParam("OID", OperationID)));
+           else
+              execSQL("update doprcurst_dbt  set T_NUMVALUE = 1  where T_ID_OPERATION =  :OID  and T_STATUSKINDID = 291", makeArray(SQLParam("OID", OperationID)));
+           end;
+       end;
+    end;
+
+    // zmp 15.09.2014 C-32626
+    if((paymentObj.dockind  == 286) and
+       (paymentObj.defcomid !=   0) and inList(paymentobj.feetype, 1, 3) and _bank.is_vuz)
+
+       var paymentrs = rsdRecordset("select 1 from USR_OPR_COMISS_TMP where T_PAYMENTID = " + paymentObj.paymentid );
+       if(not paymentrs.movenext()) // если есть запись, значит операция выполняется процедурой         
+
+          var bankOrder = GetPrimObj (paymentObj); 
+          var PayerAcc  = RSL_Account(paymentObj.PayerAccount);       
+
+          if((haveNotFreeRest(paymentObj.paymentid)) and (PayerAcc.check_type_account("О")))            
+              BankOrder.Categories.GetFirst( 1051, {curdate}, objattr );       
+                             
+              if  (0 == objattr.attrid)               
+
+                  PM_InsertOverComiss(paymentObj.paymentid);
+
+                  BankOrder.Categories.ConnectAttr(1051, 1, null, null, {curdate});
+                  BankOrder.Categories.save();
+                  return 1;
+              elif(1 == objattr.attrid)                  
+                  msgBox("Документ комиссии неразрешено проводить за счет овердрафта");
+                  return 1;           
+              end;                    
+          end;
+       end;
+    end; 
+
+   /*VV 20.05.13 Исключена проверка из payminit.mac для объявлений на взнос при проведении по F2. Реализовано по задаче С-19927 в ps_cash.mac*/ 
+    // *** проверки для кассовых документов
+  /*  if (PaymentObj.DocKind == CASH_PS_INCORDER) 
+        // VV С-13995 Предупреждение о наличии К2 или претензий на счетах юрид.лиц при проведении кассовых документов из отложенных
+        // zip_z. Слишком медленно из-за проверки для всего и вся. Переписал нафиг.
+        if (not CompareStrWithMasks(ACC_MASK_CHECKCLAIM,PaymentObj.ReceiverAccount))
+            var acI=RSL_Account(PaymentObj.ReceiverAccount,0);
+            // 1. Проверка на наличие активных претензий
+            if (acI.check_claims)
+                if (IsOprMultiExec())
+                    msgbox("К счету получателя имеются претензии");
+                    return RSL_EXIT_FAILURE; 
+                else
+                    if(not gettrue(false,"Внимание! К счету получателя имеются Претензии. Продолжить операцию?"))
+                        return RSL_EXIT_FAILURE; 
+                    end;
+                end;
+            end;  
+            // 2. Проверка на наличие картотеки
+            if(acI.check_index2)
+                if (IsOprMultiExec())
+                    msgbox("К счету получателя имеется Картотека 2");
+                    return RSL_EXIT_FAILURE; 
+                else
+                    if(not gettrue(false,"Внимание! К счету получателя имеется Картотека 2. Продолжить операцию?"))
+                        return RSL_EXIT_FAILURE; 
+                    end;
+                end;
+            end; 
+        end; */
+    
+    // *** проверки исходящих (выдача) кассовых
+    if (PaymentObj.DocKind == CASH_PS_OUTORDER) 
+        // VV С-13995 Предупреждение о наличии К2 или претензий на счетах юрид.лиц при проведении кассовых документов из отложенных
+        // zip_z. Слишком медленно из-за проверки для всего и вся. Переписал нафиг.
+        if (not CompareStrWithMasks(ACC_MASK_CHECKCLAIM,PaymentObj.PayerAccount))
+            var acO=RSL_Account(PaymentObj.PayerAccount,0);
+            // 1. Проверка на наличие активных претензий
+            if (acO.check_claims)
+                if (IsOprMultiExec())
+                    msgbox("К счету плательщика имеются претензии");
+                    return RSL_EXIT_FAILURE; 
+                else
+                    if(not gettrue(false,"Внимание! К счету плательщика имеются Претензии. Продолжить операцию?"))
+                        return RSL_EXIT_FAILURE; 
+                    end;
+                end;
+            end;  
+            
+            // 2. Проверка на наличие картотеки
+            if(acO.check_index2)
+                if (IsOprMultiExec())
+                    msgbox("К счету плательщика имеется Картотека 2");
+                    return RSL_EXIT_FAILURE; 
+                else
+                    if(not gettrue(false,"Внимание! К счету плательщика имеется Картотека 2. Продолжить операцию?"))
+                        return RSL_EXIT_FAILURE; 
+                    end;
+                end;
+            end; 
+        end; 
+    end;
+
+    // *** общее для платежей (проверки, маршрутизация, свободный остаток)
+    
+    //TAM 26.06.2013
+    if (paymentObj.dockind != DLDOC_MULTYPM)
+        if (obj.Origin == 19 )  //PSPO_OR_PAYEEBANK
+            if (not ACS_CheckGroupOper (ACS_GRP_PM_PAYEEBANK, null, true))
+                return RSL_EXIT_FAILURE;
+            end;
+        end;
+    end;
+        
+    // Если платеж ИК, его может подхватить кругл. робот и вызвать деадлок или сбой в установке сегментов статуса
+    if (paymentObj.origin == PSPO_OR_CLB)
+        if (PM_IsOwnedByNightlyRobot (PaymentObj.PaymentID))
+            msgbox ("В данный момент платеж: "+paymentObj.paymentID+", начал обрабатывать круглосуточный робот!\n  Откатите платеж, и повторите изменение в платеже еще раз");
+            return RSL_EXIT_FAILURE;
+        end;
+    end;
+        
+    if (PM_IsBPTaxPayment (PaymentObj))
+        PaymentObj.PayType = BPT_TAX;
+    end;
+
+    // Антон - монстр !!
+    if ( (fgBank.is_PRBB) and (PaymentObj.PaymentKind != PAYMENT_KIND_INST) and (GetIdentProgram() == RSB_MOD_WLD) and (IsOprMultiExec())) 
+        set_pipe_server (pipe_server_mci);
+        RsbExecuteStep(PaymentObj.PaymentID,Paymentobj.DocKind);
+        msgbox("Платеж отправлен обработчику");
+        return RSL_EXIT_FAILURE;
+    end;
+
+
+    // KS 09.04.2012 Ицициализация операции только по сохранённым документам
+    // Seleznev из-за ввода платежа в список "открытых" не работает маршрутизация
+    //TAM 26.06.2013    
+    if ((paymentObj.paymentid <= 0) and (paymentObj.dockind != DLDOC_MULTYPM))
+        msgbox("Сохраните документ в списке отложенных!");
+        return RSL_EXIT_FAILURE;
+    end; 
+
+    /*SDA 06.04.2012 - платежи будущей датой значения остаются в отложенных */
+    if ( paymentObj.ValueDate > {curdate} )
+        msgbox("Дата значения документа больше текущей!");
+        return RSL_EXIT_FAILURE;
+    end;
+      /*SDA номер операциониста на первичке по номеру инициатора операции*/
+      //17.04.2012 SDA - Нигде кроме пойдема изменения номера опера по первичке не требуется - сдаюсь.
+    if (fgBank.is_GO)
+        if (({oper} != 10001) and ({oper} < 20000)) // KS 10.01.2011 По аналогии с outsidecarry. ЗАмена операциониста, только если это делает не робот
+            paymentObj.oper = {oper};
+        end;
+    end;
+    /*SDA корректировки по первичке */
+    PM_SetPrimDocumentState(paymentObj,null);
+    WL_FixBadManualPayment (paymentObj);
+
+    //08.09.2015 Чесноков Д.С. Чудо-костыль для документов ABBYY
+    if ((Obj.Origin == USR_PAYMENT_OR_ABBYY_FC) and (fgBank.is_PRBB))
+      SetFrontRoute(PaymentObj,string(paymentObj.dockind)+string(obj.dockind), obj.origin); 
+    end;
+
+    /*SDA - только для документов не полученных из внешних систем  */
+    // zip_z. упарился читать условие
+    if (((PaymentObj.origin < 1000) and 
+            ( not ((PaymentObj.DocKind == DLDOC_BANKORDER ) and   // для банковских ордеров 
+                        (( PaymentObj.FeeType == USR_SF_FEE_TYPE_SINGLE ) or    // SDA 20/03/2012  единовременной 
+                         ( PaymentObj.FeeType == USR_SF_FEE_TYPE_PERIOD )))))   // и периодической коммиссиий в рамках оптимизации быстродействия 
+                or ((PaymentObj.origin == USR_PAYMENT_OR_DIASOFT) and (PaymentObj.DocKind == DLDOC_MEMORIALORDER)) //zmp 14.05.2012 I-00185813 
+         )    
+
+        // проверка существования сообщения
+
+        //Gurin S. 09.10.2015 R-623427-2 Это уже не нужно, нет RS-Payments
+        //if (((paymentObj.DocKind == PS_CPORDER) or (paymentObj.DocKind == BBANK_CPORDER)) and (paymentObj.IsExternal) and (not fgBank.is_GEB)) //Gurin S. 08.10.2015 R-623151-2
+        //    if (not WL_IsExistsMessage (PaymentObj.PaymentID))
+        //        msgbox("По платежу не создано сообщение SWIFT! | Выполните генерацию сообщения (Ctrl+G)");
+        //        return RSL_EXIT_FAILURE;
+        //    end;
+        //end;
+
+        // Проверить, что дата pmpaym.ValueDate открыта в филиале StartDepartment
+        var select:string = " select 1 " +
+                                    " from dcurdate_dbt " +
+                                   " where t_Branch = :StartDepartment " +
+                                     " and t_CurDate = :ValueDate ";
+
+        var params:TArray = makeArray( SQLParam( "StartDepartment", PaymentObj.StartDepartment ),
+                                       SQLParam( "ValueDate"     , PaymentObj.ValueDate ) );
+        var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+        var query:string, param:TArray, rs:RsdRecordset;
+
+        if( not rset )
+            MsgBox("Нет операционного дня с указанной в документе датой значения");
+            return RSL_EXIT_FAILURE;
+        end;
+
+        //Проверка возможности выполнения платежа через БЭСП
+        if( not CheckPaymentExecByBESP(PaymentObj) )
+            return RSL_EXIT_FAILURE;
+        end;
+
+     
+        /*zmp 30.10.2012 I-00277403 добавил проверку для 202 дока*/
+        if( ((PaymentObj.dockind == PS_PAYORDER) and (PaymentObj.ShifrOper !="02")) or (PaymentObj.dockind == PS_CPORDER)) 
+            if ((PaymentObj.Date > {curdate}) or (PaymentObj.PayDate > {curdate}))
+                MsgBox("Дата документа или срока платежа не наступила");
+                return RSL_EXIT_FAILURE;
+            end;
+        end;
+
+        if (PaymentObj.dockind == PS_PAYORDER)
+            //для КЛБ маршрутизация на предобработке
+            if ((Obj.Origin != PSPO_OR_CLB) and (Obj.Origin != PSPO_OR_FINEREADER)) 
+                SetFrontRoute(PaymentObj,string(paymentObj.dockind)+string(obj.dockind), obj.origin); 
+            end;
+        
+        else
+            //TAM 26.06.2013 
+            if(paymentObj.dockind != DLDOC_MULTYPM)
+               SetFrontRoute(PaymentObj,string(paymentObj.dockind),obj.origin);
+            end;
+        end;
+
+         /*  EVG Процедура проверки остатка на счёте плательщика. 
+          *      Проверка остатков также есть на шаге предобработки (psprepro.mac), но данная процедура сделана для
+          *      того, чтобы в случае недостатка средств платёж мог оставаться в отложенных. 
+          */
+        var accRest = $0;
+        var vReceiverFIID;
+
+        //!!!Seleznev для корректного формирования платежа с конверсией из Payments
+        //Gurin S. 24.06.32014 R-399975-2
+        if ( (not PaymentObj.istransit) and (( paymentObj.Dockind == WL_INDOC ) or ( paymentObj.Dockind == WL_WIPM ) or (paymentObj.BaseFIID !=0)) 
+              and (paymentObj.DocKind != PS_CPORDER) )
+            /* EVG Выдёргивание валюты из 6-8 разряда счёта-получателя возможно только для счетов, открытых в банках-резидентах. */
+            if (IsResident(PaymentObj.ReceiverBankID))
+                vReceiverFIID = Acc_GetFiidByAccount(paymentObj.ReceiverAccount);
+                if ((vReceiverFIID != -1) and (paymentObj.receiverfiid != vReceiverFIID))
+                    paymentObj.receiverfiid = vReceiverFIID;
+                end;
+            end;
+        end;
+
+        if(( paymentObj.Dockind != WL_INDOC ) and ( paymentObj.Dockind != WL_WIPM) and (paymentObj.BaseFIID != 0))
+            if( (stat == 0) and not Acc_IsActive(PaymentObj.PayerAccount) )
+                accRest = Acc_GetFreeAmountWithOverClaim( PaymentObj );
+                if ( accRest < PaymentObj.PayerAmount )
+                    if ( GetTrue ( false, "Внимание! Свободный остаток(с учетом овердрафта) на счёте плательщика (" + string(accRest:a) + " " + ПолучитьКодФинИн(PaymentObj.PayerFIID, null, FICK_ISOSTRING) + 
+                                          ") меньше суммы документа (" + string(PaymentObj.PayerAmount:a) +  " " + ПолучитьКодФинИн(PaymentObj.PayerFIID, null, FICK_ISOSTRING) + ").|" +
+                                          "Стартовать операцию по документу?" ) )
+                        return RSL_EXIT_SUCCESS;
+                    else
+                        return RSL_EXIT_FAILURE;
+                    end;
+                end;
+             end;
+        end;
+    end;  // if(PaymentObj.origin < 10000)
+
+    // KS 16.08.2012 C-12522 контроль за  правильностью наименования получателя средств  в платежных  
+    //                       документах  внутрибанковских
+    //LAO 18.02.13  так как переделан механизм  кр. робота, платежи ИК стартуют с отложенных, проверка тут не нужна
+    if ( (paymentObj.origin != PSPO_OR_CLB) and (need_check_recname(PaymentObj)) and (not check_recname(PaymentObj)) )
+        if (IsOprMultiExec()) // По-умолчанию оставляем в отложенных
+            stat = CHECK_REC_CANCEL;
+        else
+            stat = diag_recname(PaymentObj, false);
+        end;
+        if   (stat == CHECK_REC_CANCEL) // В отложенные
+            return RSL_EXIT_FAILURE;
+        elif (stat == CHECK_REC_CARRY)  // Зачислить
+        elif (stat == CHECK_REC_REJECT) // Отвергнуть
+            return RSL_EXIT_FAILURE;
+        end;
+    end;
+    // KS End 16.08.2012
+
+    //Лавренов: если счет есть в банке и получатель не определен то определяем его.
+    if ((PaymentObj.Receiver == -1) and (accountexists(PaymentObj.Receiveraccount))) 
+        PaymentObj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                  PaymentObj.ReceiverBankID, 
+                                  PaymentObj.ReceiverBankCodeKind, 
+                                  PaymentObj.ReceiverBankCode, 
+                                  PaymentObj.ReceiverBankName,
+                                  PaymentObj.ReceiverBankCorrAcc,
+                                  PaymentObj.ReceiverFIID, 
+                                  PaymentObj.chapter,
+                                  PaymentObj.ReceiverAccount, 
+                                  GetPartyByAccount(PaymentObj.Receiveraccount), 
+                                  PaymentObj.ReceiverName, 
+                                  PaymentObj.ReceiverINN );
+    end;
+
+    /* EVG 17/03/2014 Заплатка для документов оплаты ПЗО с НДС. Они формируются с незаполненным Receiver-ом
+       и кодом SWIFT вместо БИК-а, из-за чего отвергаются на предобработке. Поправим это здесь */
+    if( obj.Origin == PSPO_OR_SF )
+
+       /* EVG 21/03/2014 По идее, исправили в хот-фиксе 
+       if( ( PaymentObj.Receiver == -1 ) and ( PaymentObj.ReceiverBankCodeKind == PTCK_SWIFT ) )
+
+          EVG 21/03/2014 Но выявилась ещё одна проблема: при выполнении частичной оплаты оказывается незаполненным
+          наименование получателя. */
+       if( ( PaymentObj.Receiver == -1 ) and ( PaymentObj.ReceiverName == "" ) )
+
+          PaymentObj.SetReceiverPI( PaymentObj.ReceiverGroup, 
+                                    PaymentObj.ReceiverBankID, 
+                                    PTCK_BIC,
+                                    {MFO_BANK},
+                                    {NAME_BANK},
+                                    {CORAC_Bank},
+                                    PaymentObj.ReceiverFIID, 
+                                    PaymentObj.Chapter,
+                                    PaymentObj.ReceiverAccount, 
+                                    {OurBank}, 
+                                    {NAME_BANK}, 
+                                    {INN_Bank} );
+
+       end;
+    end;
+
+
+/*SDA 18.03.2014 R-329674 запретить проведение документов с корреспонденцией Дт-401* по 408*  Кт 707*, т.к клиентские счета не могут корреспондировать с фин. разультатом. */
+   if ((CompareStrWithMasks("401* - 408*",  PaymentObj.PayerAccount)==0)and
+      (CompareStrWithMasks("707*", PaymentObj.ReceiverAccount)==0))
+     msgbox("Запрещенная корреспонденция счетов");
+     return RSL_EXIT_FAILURE;
+   end;
+   /*VDN 11.08.2015 Операция запрещения*/
+   if ( (fgBank.is_PRBB) and
+        ( ( CompareStrWithMasks("405*,406*,407*,40802*,40821*", PaymentObj.PayerAccount ) == 0 ) and
+          ( CompareStrWithMasks("47405*", PaymentObj.ReceiverAccount ) == 0 ) and
+          ( PaymentObj.DocKind == 200 )
+        )
+        OR 
+        ( ( CompareStrWithMasks("405*,406*,407*,40802*,40807*,40821*,423*,426*,40817*,40820*", PaymentObj.PayerAccount ) == 0 ) and
+          ( CompareStrWithMasks("306*", PaymentObj.ReceiverAccount ) == 0 ) and
+          ( PaymentObj.PayerBankCode = PaymentObj.ReceiverBankCode )
+        )
+      )
+     msgbox("Операция запрещения");
+     return RSL_EXIT_FAILURE;
+   end;
+
+    return RSL_EXIT_SUCCESS;
+END;
+
+//-----------------------------------------------------
+//             Массовый старт операции
+//-----------------------------------------------------
+//Предтранзакционные действия
+MACRO PrepMassInitOperation()
+    
+    var stat:integer = execStoredFunc( "PM_OPRINIT.MassInitOperationPrepare", V_INTEGER );
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+onerror(x)
+    msgbox( x.Message );
+    return RSL_EXIT_FAILURE;
+END;
+
+// Транзакционные действия
+MACRO ExecMassInitOperation()  
+    return RSL_EXIT_SUCCESS;
+END;
+
+    
+

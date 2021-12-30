@@ -1,0 +1,502 @@
+/************************************************************************/
+/*          Автоматизированная банковская система RS-Bank v6.0          */
+/*                                                                      */
+/*               Copyright (c) R-Style Softlab Kiev                     */
+/*                                                                      */
+/*  Имя файла        : newcarry.mac                                     */
+/*                                                                      */
+/*  Описание         : Создание недостающей проводки по конверсионным   */
+/*                     операциям ББ                                     */
+/*  Программист      : Опанасенко Ю.Ф. (ОЮФ)                            */
+/*                                                                      */
+/*  Создан           : 25.12.2009                                       */
+/*                                                                      */
+/*  Модифицирован    :                                                  */
+/*                                                                      */
+/************************************************************************/
+//12.07.2012 vihrov I-00220315-2
+//25.08.2014 LVV R-436897-2
+import globals, oralib, likepy, FIInter, "KeyCodes.mac"; 
+
+
+/*ОЮФ 15.07.2009 Получить кол-во знаков по идентификатору*/
+private macro GetRatePoint(PointId)
+   var mult = 0;
+
+   if (PointId == 0)
+      mult = 1;
+   elif (PointId == 1)
+      mult = 10;
+   elif (PointId == 2)
+      mult = 100;
+   elif (PointId == 3)
+      mult = 1000;
+   elif (PointId == 4)
+      mult = 10000;
+   elif (Pointid == 5)
+      mult = 100000;
+
+   /* EVG 20/04/2012 Остальные */
+   else
+      mult = pow( 10, PointId );
+   end;
+
+   return mult;
+end;
+
+/*ОЮФ Проверим поля платежей на нулы*/
+macro CheckPaymNull (rset)
+   if ( (ValType(rset.Value("T_RATE")) != 26) AND
+        (ValType(rset.Value("T_SCALE")) != 26) AND
+        (ValType(rset.Value("T_POINT")) != 26) AND
+        (ValType(rset.Value("T_AMOUNT")) != 26) AND
+        (ValType(rset.Value("T_PAYAMOUNT")) != 26) AND 
+        (ValType(rset.Value("T_FIID")) != 26) AND
+        (ValType(rset.Value("T_PAYFIID")) != 26)
+      )
+      Return True;
+   else
+      Return False;
+   end;
+end;
+
+/*ОЮФ Процедура получения счетов из категорий учета*/
+Private macro GetAccCatCur (Code:string, Branch, Chapter, fiid, val, err);
+/* Code   - строчный код категории,
+   Depart - номер филиала ТС в справочнике */
+private   var select:string;
+private   var params:TArray;
+private   var rs:object;
+private   var Count=0;
+
+array AccCatCur;
+
+  
+  select = "select DMCACCDOC.T_ACCOUNT, DMCACCDOC.T_CURRENCY, DMCACCDOC.T_DEPARTMENTID, DMCACCDOC.T_BRANCH, DMCACCDOC.T_CHAPTER, DMCCATEG.t_name "+ 
+           "from DMCACCDOC_DBT DMCACCDOC left join DMCCATEG_DBT DMCCATEG on DMCACCDOC.T_CATID=DMCCATEG.t_id                                      " +  
+           "where DMCCATEG.t_code          = :Name              " +  
+           "  AND DMCACCDOC.t_currency     = :Code_Currency     " + 
+           "  AND DMCACCDOC.T_CHAPTER      = :CHAPTER" + 
+           "  AND DMCACCDOC.T_DEPARTMENTID = :Branch" ;
+
+  
+  params = makeArray( SQLParam( "Name"   , Code          ),
+                      SQLParam( "Code_Currency", fiid    ),
+                      SQLParam( "CHAPTER"      , CHAPTER ),
+                      SQLParam( "Branch"       , Branch  ));
+
+  rs = execSQLselect( select, params, FALSE );
+
+   asize(AccCatCur, 0);
+   if( rs )
+   while( rs.moveNext() )
+     AccCatCur(Count) = rs.value(0);
+     Count = Count + 1;
+   end;
+   end;
+
+   if (Count==0)
+     setparm (5,"Не найдено значение Параметра:|"+
+                 string(Code)+" Подразделение:"+string(Branch)+" Глава:"+string(Chapter));
+     return False;
+   end;
+
+   if (Count>1)
+
+      setParm (4, AccCatCur (0));
+      return true;
+   else
+      setParm (4, AccCatCur (0));
+      return true;
+   end;
+
+   setparm (5,"Ошибка поиска значения");
+   return False;
+end;
+
+
+Private macro PrintHead(BeginDate, EndDate)
+[
+                                         Мультивалютные документы требующие проводки на финансовый результат
+                                                      за период с ########## по ########## г.
+   
+┌───────────┬─────────┬────────────────────────────────────────────┬────────────────────────────────────────────┬──────────┬────────────────────────────┬─────────┐
+│     N     │         │                 ДЕБЕТ                      │                 КРЕДИТ                     │   Дата   │     Назначение платежа     │ Статус  │
+│ документа │  Курс   │Валюта│  Счет плательщика  │     Сумма      │Валюта│  Счет получателя   │      Сумма     │валютир-ия│                            │документа│
+├───────────┼─────────┼──────┼────────────────────┼────────────────┼──────┼────────────────────┼────────────────┼──────────┼────────────────────────────┼─────────┤
+│     1     │    2    │   3  │          4         │        5       │   6  │         7          │        8       │     9    │             10             │   11    │
+├───────────┼─────────┼──────┼────────────────────┼────────────────┼──────┼────────────────────┼────────────────┼──────────┼────────────────────────────┼─────────┤
+](BeginDate, EndDate);                                                                                           
+end;
+
+Private macro PrintLine(_numDoc, _rate, _fiid, _acc, _amount, _payfiid, _payacc, _payamount, _valuedate, _ground, _status)                                           
+[│###########│#########│######│####################│################│######│####################│################│##########│############################│#########│
+](_numDoc:l, _rate:c, _fiid:c, _acc, _amount:l, _payfiid:c, _payacc, _payamount:l, string(date(_valuedate)):c, _ground:l, _status:l);
+
+end;
+
+Private macro PrintDelim()
+[│           │         │      │                    │                │      │                    │                │          │                            │         │
+];
+end;
+
+Private macro PrintErrLine(_err)
+[│#################################################################################################################################################################│
+](_err:l);
+end;
+
+Private macro PrintBottom()
+[└───────────┴─────────┴──────┴────────────────────┴────────────────┴──────┴────────────────────┴────────────────┴──────────┴────────────────────────────┴─────────┘
+]
+end;
+
+/*Вставляем 3-ю проводку для необходимых мультивалютных платежей*/
+Private macro MakeCarry (rset, PayerAcc, ReceiverAcc, Sum )
+
+   var rs:RsdRecordset;
+   var params:TArray;
+   var err:string = "";
+   
+   params = makeArray( SQLParam (":1", rset.Value("T_PAYMENTID")),
+                       SQLParam (":2", rset.Value("T_DOCKIND")), 
+                       SQLParam (":3", rset.Value("T_DOCUMENTID")),
+                       SQLParam (":4", rset.Value("T_CHAPTER")),
+                       SQLParam (":5", PayerAcc),
+                       SQLParam (":6", ReceiverAcc),
+                       SQLParam (":7", Sum),
+                       SQLParam (":8", rset.Value("T_VALUEDATE")),
+                       SQLParam (":9", {Oper}),
+                       SQLParam (":10", {OperDprtNode}),
+                       SQLParam (":11", rset.Value("T_NUMBER")),
+                       SQLParam (":12", rset.Value("T_GROUND")),
+                       SQLParam (":13", rset.Value("T_DEPARTMENT")) );
+   err = execStoredFunc ("RSU_NEWCARRY.MakeCarry", V_STRING, params);
+   
+   if (err != "no_error")
+      return err;
+   else
+      return "";
+   end;
+
+end;
+
+/*Проверяем наличие ошибок при попытке вставки проводки*/
+macro GetErrFromPmDocs(PaymentID)
+  var rs:object = null,
+      SQLstr:string = "",
+      ErrStr:string = "";
+
+      SQLstr = "SELECT upm.error_text FROM usr_pmdocs upm WHERE upm.carrynum = 3 AND upm.fiid = 0 AND upm.paymentid = "+PaymentID+"; ";
+      rs = execSQLselect(SQLstr);
+      while(rs.moveNext())
+         if ( (ValType(rs.Value(0)) != 26) AND (rs.Value(0) != "no_error") )
+            ErrStr = string(rs.Value(0));
+         end;
+      end;
+  Return ErrStr; 
+end;
+
+/*Выборка мультивалютных платежей, по которым понадобится вставить проводку*/
+macro GetRequiredPayments (BeginDate, EndDate, PrintReport, MakeCurr)
+  var rs:object = null,
+      SQLstr:string = "",
+      nrec = 0,
+      msg_text = "Обработка мультивалютных платежей";
+  var PayAmount = $0,
+      Amount = $0;
+  var ErrStr = "";    
+
+  var AccDohod = "", AccRashod = "";
+
+  /*Определяем счета доходов и расходов банка по категориям учета*/
+  GetAccCatCur  ("+Валюта", 1, 1, 0, AccDohod, ErrStr);  
+  GetAccCatCur  ("-Валюта", 1, 1, 0, AccRashod, ErrStr);
+
+  if (PrintReport)
+     PrintHead(BeginDate, EndDate);
+  end;
+
+  SQLstr = "SELECT pm.*, rm.* FROM dpmpaym_dbt pm INNER JOIN dpmrmprop_dbt rm ON pm.t_paymentid = rm.t_paymentid "+
+           "WHERE pm.t_valuedate BETWEEN TO_DATE('"+BeginDate+"', 'DD.MM.YYYY') AND TO_DATE('"+EndDate+"', 'DD.MM.YYYY') "+
+           "AND NOT (pm.t_fiid = 0 AND pm.t_payfiid = 0) AND NOT (pm.t_fiid != 0 AND pm.t_payfiid != 0)"+
+           "AND pm.t_paymentid NOT IN "+
+           "(SELECT upm.paymentid FROM usr_pmdocs upm WHERE upm.carrynum = 3 AND UPM.FIID_PAYER = 0 AND UPM.FIID_RECEIVER = 0 AND upm.pack = 888 "+
+           "AND upm.error_text = 'no_error' ) "+
+           "ORDER BY pm.t_valuedate;";
+  
+  rs = execSQLselect(SQLstr);
+
+  InitProgress(-1, msg_text, msg_text);
+  while (rs.moveNext())
+     if ( CheckPaymNull(rs) AND
+          (int(rs.Value("T_FIID")) == 0) AND 
+          (int(rs.Value("T_PAYFIID")) != 0) AND 
+          (rs.Value("T_RATE") != 0) 
+        )
+//        PayAmount = money(rs.Value("T_PAYAMOUNT")) *  ((rs.Value("T_RATE") / GetRatePoint(rs.Value("T_POINT")) ) * rs.Value("T_SCALE")) ;  ()
+        PayAmount = money(rs.Value("T_PAYAMOUNT") *  rs.Value("T_RATE") / GetRatePoint(rs.Value("T_POINT") ) * rs.Value("T_SCALE")) ;  //12.07.2012 vihrov I-00220315-2 почему-то если такой порядок действий то потом он округляет вниз 8-(). убрал все лишние скобки
+//        if (Round(money(rs.Value("T_AMOUNT"))) > Round(PayAmount)) 
+        if (Round(money(rs.Value("T_AMOUNT"))) != Round(PayAmount)) //12.07.2012 vihrov а если курс в другую сторону неверен? это тоже плохо.
+           if (PrintReport)
+               PrintLine(rs.Value("T_NUMBER"),
+                         string((rs.Value("T_RATE") / GetRatePoint(rs.Value("T_POINT")) ) * rs.Value("T_SCALE")),
+                         ПолучитьКодФинИн(rs.Value("T_FIID")),
+                         rs.Value("T_PAYERACCOUNT"),
+                         rs.Value("T_AMOUNT"),
+                         ПолучитьКодФинИн(rs.Value("T_PAYFIID")), 
+                         rs.Value("T_RECEIVERACCOUNT"),
+                         rs.Value("T_PAYAMOUNT"),
+                         rs.Value("T_VALUEDATE"),
+                         rs.Value("T_GROUND"),
+                         IfThenElse( (int(rs.Value("T_PAYMSTATUS")) != 32000), "НЕ ЗАКРЫТ", "") 
+                        );
+                        println("недостающая разница "+Round(money(rs.Value("T_AMOUNT")-PayAmount)));
+           end;
+           if (MakeCurr AND (ErrStr == "") )
+              if (int(rs.Value("T_PAYMSTATUS")) != 32000)   
+                 if (GetTrue(False, "Документ не закрыт! Выполнять проводку?"))
+                    ErrStr = MakeCarry (rs, 
+                                        AccRashod, 
+                                        rs.Value("T_RECEIVERACCOUNT"), 
+                                        (Round(money(rs.Value("T_AMOUNT")))-Round(PayAmount)) 
+                                       );
+
+                    if ( ErrStr == "")
+                       ErrStr = GetErrFromPmDocs(rs.Value("T_PAYMENTID"));
+                       if (ErrStr == "")
+                          PrintDelim();
+                       else
+                          PrintErrLine("Проводка не выполнена: "+ErrStr);
+                          ExecSQL("DELETE * FROM usr_pmdocs WHERE carrynum = 3 AND fiid = 0 AND pack = 888"+
+                                  " AND paymentid = "+rs.Value("T_PAYMENTID")+"; ");
+                       end;
+                    else
+                       PrintErrLine("Проводка не выполнена: "+ErrStr);
+                    end;
+
+                 else
+                    PrintErrLine("Проводка не выполнена: отказ пользователя от выполнения");
+                 end;
+              else
+                 ErrStr = MakeCarry (rs, 
+                                     AccRashod, 
+                                     rs.Value("T_RECEIVERACCOUNT"), 
+                                     (Round(money(rs.Value("T_AMOUNT")))-Round(PayAmount)) 
+                                    );
+                 if ( ErrStr == "")
+                    ErrStr = GetErrFromPmDocs(rs.Value("T_PAYMENTID"));
+                    if (ErrStr == "")
+                       PrintDelim();
+                    else
+                       PrintErrLine("Проводка не выполнена: "+ErrStr);
+                       ExecSQL("DELETE * FROM usr_pmdocs WHERE carrynum = 3 AND fiid = 0 AND pack = 888"+
+                               " AND paymentid = "+rs.Value("T_PAYMENTID")+"; ");
+                    end;
+                 else
+                    PrintErrLine("Проводка не выполнена: "+ErrStr);
+                 end;
+              end;
+           end;
+        end; 
+     elif ( CheckPaymNull(rs) AND
+            (int(rs.Value("T_FIID")) != 0) AND 
+            (int(rs.Value("T_PAYFIID")) == 0) AND 
+            (rs.Value("T_RATE") != 0) AND 
+            /* EVG 20/04/2012 Для исключения деления на ноль. */
+            (rs.Value("T_POINT") != 0) AND
+            (rs.Value("T_SCALE") != 0)
+          ) 
+		  //25.08.2014 LVV R-436897-2 Вернул часть скобок, убранных Вихровым: взял в скобки "GetRatePoint(rs.Value("T_POINT")) * rs.Value("T_SCALE"))", чтобы корректно считало размер по курсам типа: за 1 рубль 302 (t_scale = 302) белорусских рубля
+        Amount = money(rs.Value("T_AMOUNT") *  rs.Value("T_RATE") / (GetRatePoint(rs.Value("T_POINT")) * rs.Value("T_SCALE"))); //12.07.2012 vihrov I-00220315-2 почему-то если такой порядок действий то потом он округляет вниз 8-(). убрал все лишние скобки
+//        if (Round(money(rs.Value("T_PAYAMOUNT"))) > Round(Amount)) 
+        if (Round(money(rs.Value("T_PAYAMOUNT"))) != Round(Amount))     //12.07.2012 vihrov а если курс в другую сторону неверен? это тоже плохо.
+           if (PrintReport)
+               PrintLine(rs.Value("T_NUMBER"),
+                         string((rs.Value("T_RATE") / GetRatePoint(rs.Value("T_POINT")) ) * rs.Value("T_SCALE")),
+                         ПолучитьКодФинИн(rs.Value("T_FIID")),
+                         rs.Value("T_PAYERACCOUNT"),
+                         rs.Value("T_AMOUNT"),
+                         ПолучитьКодФинИн(rs.Value("T_PAYFIID")), 
+                         rs.Value("T_RECEIVERACCOUNT"),
+                         rs.Value("T_PAYAMOUNT"),
+                         rs.Value("T_VALUEDATE"),
+                         rs.Value("T_GROUND"),
+                         IfThenElse( (int(rs.Value("T_PAYMSTATUS")) != 32000), "НЕ ЗАКРЫТ", "") 
+                        ); 
+                        println("недостающая разница "+money(rs.Value("T_PAYAMOUNT")-amount));
+           end;
+           if (MakeCurr AND (ErrStr == ""))
+              if (int(rs.Value("T_PAYMSTATUS")) != 32000)   
+                 if (GetTrue(False, "Документ не закрыт! Выполнять проводку?"))
+                    ErrStr = MakeCarry (rs, 
+                                        rs.Value("T_PAYERACCOUNT"), 
+                                        AccDohod,
+                                        (Round(money(rs.Value("T_PAYAMOUNT")))-Round(Amount)) 
+                                       );
+
+                    if ( ErrStr == "")
+                       ErrStr = GetErrFromPmDocs(rs.Value("T_PAYMENTID"));
+                       if (ErrStr == "")
+                          PrintDelim();
+                       else
+                          PrintErrLine("Проводка не выполнена: "+ErrStr);
+                          ExecSQL("DELETE * FROM usr_pmdocs WHERE carrynum = 3 AND fiid = 0 AND pack = 888"+
+                                  " AND paymentid = "+rs.Value("T_PAYMENTID")+"; ");
+                       end;
+                    else
+                       PrintErrLine(ErrStr);
+                    end;
+                 else
+                    PrintErrLine("Проводка не выполнена: отказ пользователя от выполнения");
+                 end;
+              else
+                 ErrStr = MakeCarry (rs, 
+                                     rs.Value("T_PAYERACCOUNT"), 
+                                     AccDohod,
+                                     (Round(money(rs.Value("T_PAYAMOUNT")))-Round(Amount)) 
+                                    );
+                 if ( ErrStr == "")
+                    ErrStr = GetErrFromPmDocs(rs.Value("T_PAYMENTID"));
+                    if (ErrStr == "")
+                       PrintDelim();
+                    else
+                       PrintErrLine("Проводка не выполнена: "+ErrStr);
+                       ExecSQL("DELETE * FROM usr_pmdocs WHERE carrynum = 3 AND fiid = 0 AND pack = 888"+
+                               " AND paymentid = "+rs.Value("T_PAYMENTID")+"; ");
+                    end;
+                 else
+                    PrintErrLine("Проводка не выполнена: "+ErrStr);
+                 end;
+              end;
+           end;
+        end;
+     end;
+     nrec = nrec + 1;
+     UseProgress(nrec);
+  end;
+  RemProgress();
+  if (PrintReport)
+     PrintBottom();
+     Println;
+     Println("  Операционист: "+{Oper}+" / "+{Name_Oper}); 
+  end;
+
+end;
+
+
+macro NewCarryDialog()
+   var path = "",
+   pathfile = "",
+   filen = "RSU.lbr";
+
+   var BeginDate,
+       EndDate,
+       Report = False,
+       MakeCurr = False;    
+
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+   pathfile = FindPath(filen,path);
+        if (not pathfile)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+   var dlg = TRecHandler("new_curr",pathfile,True);
+
+   /*Обработчик диалоговой панели ввода исходных данных для печати*/
+   MACRO Event (dlg, cmd, id, key) 
+
+      var mess = "~F2~ Продолжить  ~ESC~ Выход ";
+
+      if(cmd == DLG_INIT)
+         dlg.rec.BeginDate = {curdate};
+         dlg.rec.EndDate   = {curdate};
+         dlg.rec.onlyrep = "X";
+         dlg.rec.makecurr = "";
+
+         UpdateFields(dlg); 
+      end;
+      
+      if (cmd==DLG_SETFOCUS)
+        if (FldName(dlg,id)=="onlyrep") 
+           message("~Пробел~ Отметить  "+mess);        
+        elif (FldName(dlg,id)=="makecurr") 
+           message("~Пробел~ Отметить  "+mess);        
+        end;
+      end;
+      
+      if (cmd == DLG_REMFOCUS)
+        if (FldName(dlg,id)=="BeginDate")
+           if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+              MsgBox("Дата начала больше даты окончания отчетного периода");
+              return CM_CANCEL;
+           elif ( dlg.rec.BeginDate > {curdate} )
+              MsgBox("Дата начала больше даты текущего операционного дня"); 
+              return CM_CANCEL;
+           end;
+        elif (FldName(dlg,id)=="EndDate") 
+           if (dlg.rec.EndDate < dlg.rec.BeginDate )
+              MsgBox("Дата окончания меньше даты начала отчетного периода"); 
+              return CM_CANCEL;
+           elif ( dlg.rec.EndDate > {curdate} )
+              MsgBox("Дата окончания больше даты текущего операционного дня");
+              return CM_CANCEL;
+           end;
+        end;
+        UpdateFields(dlg); 
+      end; 
+   
+      if (cmd==DLG_KEY)
+        if (KEY==KEY_ESC)
+           return CM_CANCEL;
+        elif ( KEY==KEY_F2 )
+              BeginDate = dlg.rec.BeginDate; 
+              EndDate = dlg.rec.EndDate;
+              if (dlg.rec.onlyrep == "X")
+                  Report = True;
+              else
+                  Report = False;
+              end;
+              if (dlg.rec.makecurr == "X")
+                  MakeCurr = True;
+              else
+                  MakeCurr = False;
+              end;
+
+              if ((dlg.rec.BeginDate <= dlg.rec.EndDate) and (dlg.rec.BeginDate <= {curdate}) and (dlg.rec.EndDate >= dlg.rec.BeginDate) and (dlg.rec.EndDate <= {curdate})) 
+                Return CM_SAVE;
+              else
+                MsgBox("Не все поля корректны!");
+              end;
+
+        elif ( (KEY==KEY_ENTER) and (FldName(dlg,id)=="makecurr") )
+            SetFocus(dlg, 0);
+            Return CM_IGNORE;
+
+        elif (KEY==KEY_SPACE)
+            if(FldName(dlg,id)=="onlyrep")
+                if (dlg.rec.onlyrep == "")
+                    dlg.rec.onlyrep = "X";
+                else
+                    dlg.rec.onlyrep = "";
+                end;
+            elif(FldName(dlg,id)=="makecurr")
+                if (dlg.rec.makecurr == "")
+                    dlg.rec.makecurr = "X";
+                else
+                    dlg.rec.makecurr = "";
+                end;
+            end;
+        end;
+      end;
+   END;
+
+   if (RunDialog(dlg, "Event"))
+      GetRequiredPayments (BeginDate, EndDate, Report, MakeCurr);
+   else
+      Exit(1);
+   end;
+
+end;
+
+NewCarryDialog;

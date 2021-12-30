@@ -1,0 +1,193 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Банк "Газэнергобанк" (ГЭБ)
+   
+       Макрос пользовательского алгоритма расчёта базовых сумм комиссии 2.2.0
+       "Единая комиссия за ведение счетов клиентов".
+
+       Тип комиссии - периодическая.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+//Гуцу Е. 14.01.2013 Добавлена проверка даты регистрации клиента (заявка C-16619).
+//Гуцу Е. 15.01.2013 Добавлена проверка оборотов по счетам клиента (заявка C-16619).
+//Жаворонкова Н. (joy) 09.09.2013 C-23141 Добавлена проверка на авансовые комиссии
+// joy 16.02.2015 C-36721 заменила CheckClientRegistration на CheckClientRegistration_new
+
+import sfinter, ctinter, currinter, fiinter, cb_sql, rsd, GebComLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+record sfcontr( sfcontr );
+record calcal (sfcalcal);
+
+
+/* EVG 14/01/2013 id тарифного плана, по которому 
+   будет проверяться дата регистрации и дата, с которой 
+   начинает действовать эта проверка. */
+const CheckRegDate_Plan = "1|31",                       // ТР № 1 "Стартовый", № 16 "Мой город"
+      CheckRegDate_Date = date(1,1,2013);               // 1.01.2013
+
+
+/* EVG 15/01/2013 Константы тарифных планов, по которым
+   нужно проверять обороты:
+      - 6  Персональный        (id = 5);
+      - 12 Партнер             (id = 15);
+*/
+const CheckTurnover_Plan = "5, 15";
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcal_addr /* EVG Адрес алгоритма (sfcalcal) */, sfcontrStruc /*Cтруктура sfcontr*/, CommNumber_sfacrpay )
+debugbreak;
+    var stat,
+        CommNumber,
+        rrstat,
+        CommQuont = 0,
+        flg       = true;
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+       SetBuff( calcal, sfcalcal_addr );
+       CommNumber = calcal.CommNumber;               // CommNumber берём из алгоритма
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       CommNumber = CommNumber_sfacrpay;             // CommNumber берём тот, который пришёл из sfacrpay.mac
+    end;
+
+    
+  rrstat = ExecMacroFile ("Commisslib.mac", "CheckCatOnAcc", sfcontr.PARTYID);
+    
+  if ((rrstat == 1) or (rrstat == 3) or (rrstat == 4) or (rrstat == 222) or (rrstat == 223) or (rrstat == 224)) /*09.09.2013 C-23141 Добавлена проверка на авансов. комиссии*/
+    flg = false;
+  end;
+  
+  if (flg)
+    
+    if ( CheckClientRegistration_new( EndDate, sfcontr, CheckRegDate_Plan, CheckRegDate_Date ) or           // EVG 14/01/2013 Добавлена проверка на дату регистрации клиента
+         GEB_CheckRestricted( sfcontr ) or
+         GEB_CheckArrested( EndDate, sfcontr ) or
+         GEB_CheckIndex2( EndDate, sfcontr ) or
+         CheckTurnover_ForTP( BeginDate, EndDate, sfcontr, CommNumber, CheckTurnover_Plan )             // EVG 15/01/2013 Добавлена проверка оборотов 
+       )
+
+       CommQuont = 0;
+    else
+    CommQuont = 1;
+    end;   
+    //msgbox  (CommQuont, "|", GEB_CheckRestricted( sfcontr ), " - ", GEB_CheckArrested(EndDate, sfcontr), " - ", GEB_CheckIndex2(EndDate, sfcontr));
+    
+  end;
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommQuont > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont  = CommQuont;
+
+    sfbassum.baseType2 = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont2  = CommQuont;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+
+
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

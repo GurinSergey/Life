@@ -1,0 +1,474 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: ContrProcPanel.mac v.1
+// @author  : 2013-06-03 TeleshovaAM C-17621
+// @desc    : Обработка панели договора на постоянные перечисления
+// @changes : 24.07.2013 TeleshovaAM C-22139
+//            21.08.2013 TeleshovaAM C-22284
+// -------------------------------------------------------------------------------------------------
+
+import Календарь, globals, RSD, BankInter, "KeyCodes.mac";
+import "likepy.mac";    // EVG 26/4/2016 Для возможности вызова извне
+
+//Глобальные переменные
+var g_saveCurField; //текущее поле в панели
+var g_Contragent_Id, g_ContragentBankId; //идентификаторы субъектов: контрагента по договору и его банка 
+var g_party_info; //информация о субъекте для заполнения полей формы
+
+const ORA_ZERO_DATE = date(1,1,2) - 365;
+
+// Параметры формы договора для передачи в БД
+class ContrProcParm()
+   var ContrNumber:string, 
+       ContrDate:date, 
+       PartnerID:integer,
+       PartnerAcc:string,
+       PartnerName:string,
+       PartnerInn:string, //TAM 24.07.2013 C-22139
+       PartnerKPP:string, //TAM 24.07.2013 C-22139
+       PartnerBankId:integer,
+       ContrEnterDate:date,
+       ContrValidity:date,
+       ContrMaxSum:double,
+       ContrSumByOblig:double,
+       ContrSumByOnce:double,
+       ContrPeriod:integer,
+       ContrPayDay:date,
+       ContrLastDayPay:integer, //0 - нет, 1 - да
+       ContrGetAccRest:integer, //0 - нет, 1 - да
+       ContrSum:double,
+       ContrPaidAmount:double,
+       ContrFormPay:integer,
+       ContrPaymentPriority:integer, //TAM 21.08.2013 C-22284
+       ContrBoundAccount:string,
+       ContrGround:string,
+       ContrAddInfo:string;
+end;
+
+private class (TRecHandler) ContrPanelParm(fulloutputlbr)
+
+   InitTRecHandler ("constant", fulloutputlbr, TRUE);
+   var exitKey  = 0;
+   var mode     = 0; // 0 - ввод 1 - редактирование
+   var contr_id = 0; // 0 - при создании нового
+end;
+
+private array TypeContrFormPay; // Виды форм оплат 
+TypeContrFormPay(0) = "ПП - Платежное поручение"; 
+TypeContrFormPay(1) = "ИП - Инкассовое поручение"; 
+
+
+private array TypePeriod; // Виды периодичности ( день, неделя, месяц, год)
+TypePeriod(0) = "День";
+TypePeriod(1) = "Неделя";
+TypePeriod(2) = "Месяц";
+TypePeriod(3) = "Год";
+
+//Поиск контрагента по перечислениям на основе кода ИНН
+macro GetContragentByInn(inn_code:string)
+    var sqlstring, cmd, data;
+    sqlstring = " SELECT   PT.T_PARTYID pt_id, PT.T_NAME pt_name, USR_UF_GETINN (COD.T_CODE) pt_inn, USR_UF_GETKPP (cod.t_code) pt_kpp" +
+                " FROM   dobjcode_dbt cod, dparty_dbt pt, dpartyown_dbt ow " +
+                " WHERE       COD.T_OBJECTTYPE = 3 " +
+                        " AND COD.T_CODEKIND = 16 " +
+                        " AND COD.T_CODE like '%" + inn_code + "%' " +
+                        " AND COD.T_OBJECTID = PT.T_PARTYID " +
+                        " and COD.T_OBJECTID = OW.T_PARTYID " +
+                        " and OW.T_PARTYKIND = 116 ";
+    cmd = RsdCommand(sqlstring);
+    //cmd.AddParam("code", RSDBP_IN, inn_code);
+    cmd.execute();
+    data = RsdRecordset(cmd);
+    return data;
+end;
+
+//Поиск банка по БИКу
+macro GetBankByBic(bic_code:string)
+    var sqlstring, cmd, data;
+    sqlstring = " SELECT   PT.T_PARTYID pt_id, PT.T_NAME pt_name, BNK.T_CORACC pt_acc " +
+                " FROM   dparty_dbt pt, dbankdprt_dbt bnk " +
+                   " WHERE PT.T_PARTYID = " +
+                         " (SELECT   BIC.T_OBJECTID " +
+                         " FROM   dobjcode_dbt bic " +
+                         " WHERE       BIC.T_OBJECTTYPE = 3 " +
+                                 " AND BIC.T_CODEKIND = 3 " +
+                                 " AND BIC.T_STATE = 0 " +
+                                 " AND BIC.T_CODE = ?) " +
+                   " AND BNK.T_PARTYID = PT.T_PARTYID ";
+    cmd = RsdCommand(sqlstring);
+    cmd.AddParam("code", RSDBP_IN, bic_code);
+    cmd.execute();
+    data = RsdRecordset(cmd);
+    return data;
+end;
+
+//Получение информации о договоре по его идентификатору
+macro GetContractInfo(cntr_id:integer)
+   var sqlstring, cmd, data;
+   sqlstring = " SELECT   cntr.t_contr_number contr_number, " +
+                            " cntr.t_contr_date contr_date, " +
+                            " cntr.t_contragent_id contragent_id, " +
+                            " NVL (pt_c.t_name, cntr_c.t_contragent_name) partner_name, " +
+                            " NVL (cntr.t_contragent_acc, ' ') partner_account, " +
+                            " NVL (cntr.t_contragent_inn, ' ') partner_inn, " +
+                            " NVL (cntr.t_contragent_KPP, ' ') partner_kpp, " +
+                            " cntr.t_contrbank_id contrbank_id, " +
+                            " PT_B.T_NAME partner_bank, " +
+                            " BIC.T_CODE partner_bank_bic, " +
+                            " BNK.T_CORACC partner_bank_account, " +
+                            " cntr.t_enter_date enter_date, " +
+                            " cntr.t_contr_end_date contr_validity, " +
+                            " cntr.t_max_contr_amount contr_max_sum, " +
+                            " cntr.t_sum_by_oblig contr_sum_by_oblig, " +
+                            " cntr.t_sum_by_once contr_sum_by_once, " +
+                            " cntr.t_periodical_basis contr_period, " +
+                            " cntr.t_pay_day contr_pay_day, " +
+                            " NVL (cntr.t_last_day_pay, ' ') contr_last_day_pay, " +
+                            " cntr.t_sum contr_sum, " +
+                            " cntr.t_paid_amount contr_paid_amount," +
+                            " cntr.t_form_pay contr_form_pay, " +
+                            " cntr.t_payment_priority contr_pm_priority, " + //TAM 21.08.2013 C-22284
+                            " NVL (cntr.t_bound_account, ' ') contr_bound_account, " +
+                            " cntr.t_ground contr_ground, " +
+                            " NVL (cntr.t_add_info, ' ') contr_add_info, " +
+                            " cntr.t_last_pay contr_last_pay, " +
+                            " NVL (cntr.t_get_acc_rest, ' ') contr_get_acc_rest " +
+                   " FROM usr_regular_contr_dbt cntr, dparty_dbt pt_b, dbankdprt_dbt bnk, dobjcode_dbt bic, " +
+                   " usr_regular_contr_dbt cntr_c LEFT JOIN dparty_dbt pt_c ON (cntr_c.t_contragent_id = pt_c.t_partyid) " +
+                   " WHERE cntr.t_contr_id = ? " +
+                     " AND CNTR.T_CONTR_ID = CNTR_C.T_CONTR_ID " +
+                     " AND CNTR.T_CONTRBANK_ID = PT_B.T_PARTYID " +
+                     " AND BIC.T_OBJECTID = PT_B.T_PARTYID " +
+                     " AND BIC.T_OBJECTTYPE = 3 " +
+                     " AND BIC.T_CODEKIND = 3 " +
+                     " AND BNK.T_PARTYID = PT_B.T_PARTYID";
+    cmd = RsdCommand(sqlstring);
+    cmd.AddParam("id", RSDBP_IN, cntr_id);
+    cmd.execute();
+    data = RsdRecordset(cmd);
+    return data;
+end;
+
+//Инициализация панели
+private macro InitContrPanel(dlg:ContrPanelParm):bool
+   if(dlg.mode == 0)
+      dlg.rec.contr_date = 
+      dlg.rec.contr_enter_date = 
+      dlg.rec.contr_pay_day = {curdate}; 
+      dlg.rec.link_to_partner = "X"; //TAM 24.07.2013 C-22139
+      dlg.rec.contr_priority = 5; //TAM 21.08.2013 C-22284
+   elif (dlg.mode == 1)
+      g_party_info = GetContractInfo(dlg.contr_id);
+      if(g_party_info.movenext())
+         dlg.rec.contr_number = g_party_info.value("contr_number");
+         dlg.rec.contr_date = g_party_info.value("contr_date");
+         //TAM 24.07.2013 C-22139
+         if(g_party_info.value("contragent_id") != 0)
+            dlg.rec.link_to_partner = "X";
+         end;
+         dlg.rec.partner_name = g_party_info.value("partner_name");
+         //TAM 24.07.2013 C-22139
+         dlg.rec.partner_inn = ifthenelse(g_party_info.value("contragent_id") == 0, 
+                                          g_party_info.value("partner_inn"), 
+                                          GetPartyINN(g_party_info.value("contragent_id"),0));
+         dlg.rec.partner_kpp = g_party_info.value("partner_kpp");
+         g_Contragent_Id  = g_party_info.value("contragent_id");
+         dlg.rec.partner_account = trim(g_party_info.value("partner_account"));
+         dlg.rec.partner_bank = g_party_info.value("partner_bank");
+         dlg.rec.partner_bank_inn = GetPartyINN(g_party_info.value("contrbank_id"),1);
+         g_ContragentBankId = g_party_info.value("contrbank_id");
+         dlg.rec.partner_bank_bic = g_party_info.value("partner_bank_bic");
+         dlg.rec.partner_bank_account = g_party_info.value("partner_bank_account");
+         dlg.rec.contr_enter_date = g_party_info.value("enter_date");
+         dlg.rec.contr_validity = ifthenelse(
+                                       (g_party_info.value("contr_validity") == ORA_ZERO_DATE),
+                                       date(0,0,0),
+                                       g_party_info.value("contr_validity"));
+         dlg.rec.contr_max_sum = g_party_info.value("contr_max_sum");
+         dlg.rec.contr_sum_by_oblig = g_party_info.value("contr_sum_by_oblig");
+         dlg.rec.contr_sum_by_once = g_party_info.value("contr_sum_by_once");
+         if(g_party_info.value("contr_period") == 0)
+            dlg.rec.contr_period = "день";
+         elif(g_party_info.value("contr_period") == 1)
+            dlg.rec.contr_period = "неделю";
+         elif(g_party_info.value("contr_period") == 2)
+            dlg.rec.contr_period = "месяц";
+         elif(g_party_info.value("contr_period") == 3)
+            dlg.rec.contr_period = "год";
+         end;
+         dlg.rec.contr_pay_day = g_party_info.value("contr_pay_day");
+         dlg.rec.contr_last_day_pay = trim(g_party_info.value("contr_last_day_pay"));
+         dlg.rec.contr_acc_rest = trim(g_party_info.value("contr_get_acc_rest"));
+         dlg.rec.contr_last_pay = ifthenelse(g_party_info.value("contr_last_pay") == ORA_ZERO_DATE, date(0,0,0),g_party_info.value("contr_last_pay")) ;
+         dlg.rec.contr_sum = g_party_info.value("contr_sum");
+         dlg.rec.contr_paid_amount = g_party_info.value("contr_paid_amount");
+         if(g_party_info.value("contr_form_pay") == "0")
+            dlg.rec.contr_form_pay = "Платежное поручение";
+         elif(g_party_info.value("contr_form_pay") == "1")
+            dlg.rec.contr_form_pay = "Инкассовое поручение";
+         end;
+         dlg.rec.contr_priority = g_party_info.value("contr_pm_priority"); //TAM 21.08.2013 C-22284
+         dlg.rec.contr_bound_account = trim(g_party_info.value("contr_bound_account"));
+         dlg.rec.contr_ground = g_party_info.value("contr_ground");
+         dlg.rec.contr_add_info = g_party_info.value("contr_add_info");
+      end;
+   end;
+end;
+
+// Проверить параметры панели
+private macro CheckPanel( dlg:ContrPanelParm ):bool
+   // Проверяем заданность всех обязательных полей
+   var emptyField = "", gotoField = "";
+   if( dlg.rec.contr_number == "" ) 
+      gotoField = "contr_number";
+      emptyField = "Номер договора";
+   elif(dlg.rec.contr_date == date(0, 0, 0)) 
+      gotoField = "contr_date";
+      emptyField = "Дата договора";
+   elif(dlg.rec.partner_name == "") 
+      gotoField = "partner_name";
+      emptyField = "Наименование контрагента";
+   elif(dlg.rec.partner_inn == "") 
+      gotoField = "partner_inn";
+      emptyField = "ИНН контрагента";
+   elif(dlg.rec.partner_account == "") 
+      if(dlg.rec.partner_inn != dlg.rec.partner_bank_inn) //если сам банк не выступает контрагентом
+         gotoField = "partner_account";
+         emptyField = "Счет контрагента";
+      end;
+   elif(dlg.rec.partner_bank == "") 
+      gotoField = "partner_bank";
+      emptyField = "Наименование банка контрагента";
+   elif(dlg.rec.partner_bank_bic == "") 
+      gotoField = "partner_bank_bic";
+      emptyField = "БИК банка контрагента";
+   elif(dlg.rec.partner_bank_account == "") 
+      gotoField = "partner_bank_account";
+      emptyField = "Кор. счет банка контрагента";
+   elif(dlg.rec.contr_enter_date == date(0, 0, 0)) 
+      gotoField = "contr_enter_date";
+      emptyField = "Дата предоставления договора";
+   elif(dlg.rec.contr_validity == date(0, 0, 0))
+      dlg.rec.contr_validity = (date(1,1,2) - 365);
+      //TAM 26.04.2013 Если срок действия не указан - договор бессрочный
+      //gotoField = "contr_validity";
+      //emptyField = "Срок действия договора";
+   elif(dlg.rec.contr_period == "") 
+      gotoField = "contr_period";
+      emptyField = "Периодичность выплат";
+   elif(dlg.rec.contr_sum == 0)
+      if(dlg.rec.contr_acc_rest == "")
+         gotoField = "contr_sum";
+         emptyField = "Сумма единовременной выплаты";
+      end;
+   elif(dlg.rec.contr_form_pay == "") 
+      gotoField = "contr_form_pay";
+      emptyField = "Форма оплаты";
+   elif(dlg.rec.contr_ground == "") 
+      gotoField = "contr_ground";
+      emptyField = "Условие договора";
+   end;
+   
+   if( emptyField != "" )
+      SetFocus(dlg, FldIndex(dlg,gotoField));
+      msgbox("Для формирования договора необходимо заполнить поле <" + emptyField + ">.");
+      return false;
+   end;
+  
+  return true;
+end; 
+
+// Обработчик панели
+private macro EvenPanel(dlg, cmd, id, key)
+   var curFld = FldName (dlg, id);
+   var res;
+   var MenuChoice;
+   if(cmd == DLG_INIT)
+      InitContrPanel(dlg);
+      UpdateFields(dlg); 
+   elif( cmd == DLG_SETFOCUS )
+      g_saveCurField = dlg.item(id);
+   elif( cmd == DLG_REMFOCUS )
+      UpdateFields(dlg); 
+   elif( cmd == DLG_KEY )
+      if ( key == KEY_F3 )
+         if(curFld == "contr_period")
+            res = menu(TypePeriod,"Периодичность выплат",10,35);
+               if (res == 0)
+                  dlg.rec.contr_period = "день";
+                  UpdateFields(dlg);
+               elif (res == 1)
+                  dlg.rec.contr_period = "неделю";
+                  UpdateFields(dlg);
+               elif (res == 2)
+                  dlg.rec.contr_period = "месяц";
+                  UpdateFields(dlg);
+               elif (res == 3)
+                  dlg.rec.contr_period = "год";
+                  UpdateFields(dlg);
+               else 
+                  UpdateFields(dlg);
+               end;
+         elif( curFld == "contr_form_pay" )
+            res = menu(TypeContrFormPay,"Виды оплаты",50,35);
+               if (res == 0)
+                  dlg.rec.contr_form_pay = "Платежное поручение";
+                  UpdateFields(dlg);
+               elif (res == 1)
+                  dlg.rec.contr_form_pay = "Инкассовое поручение";
+                  UpdateFields(dlg);
+               else 
+                  UpdateFields(dlg);
+               end;
+         elif (curFld == "contr_date") 
+            dlg.rec.contr_date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         elif (curFld == "contr_enter_date") 
+            dlg.rec.contr_enter_date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         elif (curFld == "contr_validity") 
+            dlg.rec.contr_validity = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         elif (curFld == "contr_pay_day") 
+            dlg.rec.contr_pay_day = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         end;
+      elif ( key == KEY_SPACE )
+         //TAM 24.07.2013 C-22139
+         if( curFld == "link_to_partner" )
+            if(dlg.rec.link_to_partner == "X")
+               dlg.rec.link_to_partner = "";
+            else
+               dlg.rec.link_to_partner = "X";
+            end;
+         elif( curFld == "contr_last_day_pay" )
+            if(dlg.rec.contr_last_day_pay == "X")
+               dlg.rec.contr_last_day_pay = "";
+            else
+               dlg.rec.contr_last_day_pay = "X";
+            end;
+         elif (curFld == "contr_acc_rest")
+            if( dlg.rec.contr_acc_rest == "X")
+               dlg.rec.contr_acc_rest = "";
+            else
+               dlg.rec.contr_acc_rest = "X";
+            end;
+         end;
+         UpdateFields(dlg);
+      elif ( key == KEY_ENTER )
+         if( curFld == "partner_inn" )
+            //TAM 24.07.2013 C-22139
+            if(dlg.rec.link_to_partner == "X") //ссылаемся на справочник контрагентов
+               g_party_info = GetContragentByInn(dlg.rec.partner_inn); 
+               if(g_party_info.movenext())
+                  dlg.rec.partner_name = g_party_info.value("pt_name");
+                  dlg.rec.partner_inn = g_party_info.value("pt_inn");
+                  dlg.rec.partner_kpp = g_party_info.value("pt_kpp");
+                  g_Contragent_Id = g_party_info.value("pt_id");
+               else
+                  msgbox("Контрагент с таким ИНН в списке контрагентов отсутствует!");
+                  dlg.rec.partner_inn = "";
+               end;
+            else
+               msgbox("В заявлении отключена привязка на справочник контрагентов!");
+               dlg.rec.partner_inn = "";
+            end;
+         elif( curFld == "partner_bank_bic" )
+            g_party_info = GetBankByBic(dlg.rec.partner_bank_bic); 
+            if(g_party_info.movenext())
+               dlg.rec.partner_bank = g_party_info.value("pt_name");
+               dlg.rec.partner_bank_account = g_party_info.value("pt_acc");
+               g_ContragentBankId = g_party_info.value("pt_id");
+               dlg.rec.partner_bank_inn = GetPartyINN(g_ContragentBankId, 1);
+            else
+               msgbox("Банк с таким БИК нет среди банков!");
+               dlg.rec.partner_bank_bic = "";
+            end;
+         elif(curFld == "contr_ground")
+            dlg.rec.contr_ground = "По договору № " + string(dlg.rec.contr_number) + 
+                                   " от " + string(dlg.rec.contr_date);
+         end;
+      elif ( key == KEY_F9 )
+         if( CheckPanel( dlg ) ) //проверки перед сохранением, чтобы были заполнены обязательные поля
+            dlg.exitKey = key;
+            return CM_SAVE;
+         end;
+         return CM_IGNORE;
+      elif ( key == KEY_ESC )
+         dlg.exitKey = key;
+         return CM_SAVE;
+      end;
+      UpdateFields( dlg ); 
+   end;   
+end;
+
+//заполнение параметров для передачи в БД
+private macro FillProcParm(dlg:ContrPanelParm, procParm:@ContrProcParm)
+   procParm.ContrNumber = dlg.rec.contr_number;
+   procParm.ContrDate = dlg.rec.contr_date;
+   //TAM 24.07.2013 C-22139
+   if(dlg.rec.link_to_partner == "X")
+      procParm.PartnerId = g_Contragent_Id;
+   else
+      procParm.PartnerId = 0;
+   end;
+   procParm.PartnerName = dlg.rec.partner_name;
+   procParm.PartnerAcc = dlg.rec.partner_account;
+   procParm.PartnerKPP = dlg.rec.partner_kpp;
+   procParm.PartnerInn = dlg.rec.partner_inn;//TAM 24.07.2013 C-22139
+   procParm.PartnerBankId = g_ContragentBankId;
+   procParm.ContrEnterDate = dlg.rec.contr_enter_date;
+   procParm.ContrValidity = dlg.rec.contr_validity;
+   procParm.ContrMaxSum = dlg.rec.contr_max_sum;
+   procParm.ContrSumByOblig = dlg.rec.contr_sum_by_oblig;
+   procParm.ContrSumByOnce = dlg.rec.contr_sum_by_once;
+   if (trim(dlg.rec.contr_period) == "день")
+      procParm.ContrPeriod = 0;
+   elif (trim(dlg.rec.contr_period) == "неделю")
+      procParm.ContrPeriod = 1;
+   elif (trim(dlg.rec.contr_period) == "месяц")
+      procParm.ContrPeriod = 2;
+   elif (trim(dlg.rec.contr_period) == "год")
+      procParm.ContrPeriod = 3;
+   end;
+   procParm.ContrPayDay = dlg.rec.contr_pay_day;
+   if(dlg.rec.contr_last_day_pay == "")
+      procParm.ContrLastDayPay = 0;
+   else
+      procParm.ContrLastDayPay = 1;
+   end;
+   if(dlg.rec.contr_acc_rest == "")
+      procParm.ContrGetAccRest = 0;
+   else
+      procParm.ContrGetAccRest = 1;
+   end;
+   procParm.ContrSum = dlg.rec.contr_sum;
+   procParm.ContrPaidAmount = dlg.rec.contr_paid_amount;
+   if (trim(dlg.rec.contr_form_pay) == "Платежное поручение")
+      procParm.ContrFormPay = 0;
+   elif (trim(dlg.rec.contr_form_pay) == "Инкассовое поручение")
+      procParm.ContrFormPay = 1;
+   end;
+   procParm.ContrPaymentPriority = dlg.rec.contr_priority;
+   procParm.ContrBoundAccount = dlg.rec.contr_bound_account;
+   procParm.ContrGround = dlg.rec.contr_ground;
+   procParm.ContrAddInfo = dlg.rec.contr_add_info;
+end;
+
+macro ContrParmPanel( PanelParm:@ContrProcParm, panel_mode, contract_id ):integer
+   debugbreak;
+   var Fulloutputlbr, outlbr, outputlbr="constatnt_contr.lbr";                    
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outlbr);
+   Fulloutputlbr = FindPath(outputlbr, outlbr);
+   if (not Fulloutputlbr)
+      msgbox("Не найдена LBR");
+      exit();
+   end;
+   var dlg:ContrPanelParm = ContrPanelParm(Fulloutputlbr);
+   dlg.mode = panel_mode;
+   dlg.contr_id = contract_id;
+   RunDialog(dlg, @EvenPanel);
+   if( dlg.exitKey == KEY_F9 )
+      FillProcParm( dlg, @PanelParm );
+   end;
+   return dlg.exitKey;
+end;

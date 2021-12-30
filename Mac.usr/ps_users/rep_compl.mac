@@ -1,0 +1,510 @@
+/************************************************************************
+Отчет по операциям валютного контроля текущего дня
+Исполнитель: Лещев Вячеслав 21.08.2014 По заявке C-32185
+************************************************************************/
+
+
+import rcw, rslx, Календарь, oralib, likepy, bankinter, globals, "lib_str.mac";
+var 
+ ex, ob, obbook, obsheet, 
+flag = "X", //в эксель или в текст, в этом отчете реализован только Excel
+rezhim = 1, //режим отчета: 1 - по всем документам, 2 -только документы шага ВК, 3 - только проведенные документы
+DateBegin,DateEnd, DprtCode, 
+CntDoc, SumDoc,    //общее кол-во и сумма документов
+CntDocR, SumDocR,  //общее кол-во и сумма документов на шаге ВК
+CntDocX, SumDocX;  //общее кол-во и сумма проведенных документов
+
+const  KEY_F1      =315;
+const  KEY_F2      =316;
+const  KEY_F3      =317;
+const KEY_ESC      = 27;
+const KEY_SPACE    = 32;
+const KEY_ENTER    = 13;
+
+
+private Class TBranchParam ( dprt_code )
+var  Code = "";
+var  Name = "";
+var  Id;
+
+
+
+ macro GetDepartName(dprt_code);
+ Var
+  Query :string = "",
+  Params :TArray,
+  DataSet :RsdRecordset;
+
+  Id = dprt_code;
+  Query = "SELECT A.T_NAME, B.T_NAME FROM dparty_dbt A, ddp_dep_dbt B WHERE B.T_CODE = :dprt_code AND A.T_PARTYID = B.T_PARTYID";
+  Params = makeArray( SQLParam( "dprt_code" , dprt_code ));
+  DataSet = execSQLselect( Query, Params , true  );
+  if (DataSet.MoveNext())
+   Code = DataSet.value(1);
+   Name = DataSet.value(0);
+   return 0;
+  else
+   Code = "";
+   Name = "";
+   return 1;
+  end;
+ end;
+
+ macro GetDepartName_(dprt_code);
+ Var
+  Query :string = "",
+  Params :TArray,
+  DataSet :RsdRecordset;
+
+  if ( dprt_code == "Все")
+   Code = "";
+   Name = "";
+   Id = 0;
+   return 0
+  end;
+  Query = "SELECT A.T_NAME, B.T_NAME, B.T_CODE FROM dparty_dbt A, ddp_dep_dbt B " +
+          " WHERE DECODE(LTRIM(B.T_NAME,'0'),'','0',LTRIM(B.T_NAME,'0')) = DECODE(LTRIM(:dprt_code_1,'0'),'','0',LTRIM(:dprt_code_2,'0'))  " +
+          " AND A.T_PARTYID = B.T_PARTYID ";
+  Params = makeArray( SQLParam( "dprt_code_1" , dprt_code ), SQLParam( "dprt_code_2" , dprt_code ) );
+  DataSet = execSQLselect( Query, Params , true  );
+  if (DataSet.MoveNext())
+   Code = DataSet.value(1);
+   Name = DataSet.value(0);
+   Id = DataSet.value(2);
+   return 0;
+  else
+   Code = "";
+   Name = "";
+   Id = 0;
+   return 1;
+  end;
+ end;
+
+
+end;
+
+macro GetOfficer(Oper_Id) :string
+Var
+ Query :string = "",
+ Params :TArray,
+ DataSet :RsdRecordset;
+
+ Query = "SELECT T_NAME FROM dperson_dbt WHERE T_OPER = :Oper_Id ";
+ Params = makeArray( SQLParam( "Oper_Id" , Oper_Id ));
+ DataSet = execSQLselect( Query, Params , true  );
+ if (DataSet.MoveNext())
+  return DataSet.value(0);
+ else
+  return "";
+ end;
+end;
+
+
+record Department ("dp_dep.dbt");
+var Fulloutput_lbr, out_lbr, output_lbr="blif.lbr";                    
+//var Fulloutputt = GetTxtFileName("blif");
+var out_templ, output_templ = "rep_compl.xls", Fulloutput_templ;
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,out_lbr);
+Fulloutput_lbr = FindPath(output_lbr, out_lbr);
+var dlgRep = TRecHandler("compl", Fulloutput_lbr, TRUE); 
+
+
+
+
+private macro MakeRep()
+var in;
+Var
+ Query :string = "",
+ StrSelBranch,
+ Params :TArray,
+ DataSet_1 :RsdRecordset,
+
+ CntDoc = 0; SumDoc = 0.00; CntDocR = 0; SumDocR = 0.00; CntDocX = 0; SumDocX = 0.00;
+
+ if (DprtCode != 0)
+  StrSelBranch = " AND EXISTS( SELECT 1 FROM dperson_dbt M " +
+                 " WHERE M.T_OPER = Z.T_OPER " +
+                 " AND M.T_CODEDEPART = " + string(DprtCode) + " ) ";
+ else
+  StrSelBranch = "";
+ end;
+ 
+ //LVV 20.01.2015 полностью переписал свой запрос, убрал глюченную параметризацию, оптимизировал
+ Query = ""+
+ "  SELECT DECODE (os.t_isexecute, 'R', 'нет', 'да') ISEXECUTE,   "+
+ "          party.t_shortname PAYERNAME,  "+
+ "          SUBSTR (objcode.t_code, 3, 10) rscode,  "+
+ "          PM_SCRHLP.GetNodeName (pm.t_OperNode) DEPARTMENT,  "+
+ "          PM_SCRHLP.GetFICode (pm.t_baseFIID, 0) basefi,   "+
+ "          NVL (co.t_amount, pm.t_baseamount) amount,   "+
+ "          RSB_FIINSTR.CONVSUM (NVL (co.t_amount, pm.t_baseamount), pm.t_baseFIID, 0,pm.t_valuedate,1) NATSUM,   "+
+ "          NVL (val.T_code, DECODE (INSTR (rm.t_ground, '{VO'), 0, 'не указан',SUBSTR (rm.t_ground, INSTR (rm.t_ground, '{VO') + 3, 5))) VCODE,   "+
+ "          pm.t_valuedate,   "+
+ "          CO.T_PASSPORTNUMBER,   "+
+ "          DECODE (OS.T_OPER, 135, '', PARTY1.T_NAME) MANAGER,   "+
+ "          (SELECT DECODE (C.T_SERVICEKIND,   "+
+ "                          1001, 'ДКБ',   "+
+ "                          1002, 'ДМСБ',   "+
+ "                          1003, 'ДФР',   "+
+ "                          C.T_SERVICEKIND)   "+
+ "             FROM dclient_dbt C   "+
+ "            WHERE     C.T_PARTYID = pm.t_payer   "+
+ "                  AND C.t_servicekind IN (1001, 1002, 1003)   "+
+ "                  AND DECODE (C.T_FINISHDATE,    "+
+ "                              TO_DATE (' 01.01.0001', 'DD.MM.YYYY'), TO_DATE (' 31.12.9999','DD.MM.YYYY'),   "+
+ "                              C.T_FINISHDATE)    "+
+ "                              >  TO_DATE ('"+DateEnd+"', 'DD-MM-YYYY')   "+
+ "                  AND C.T_STARTDATE <=  TO_DATE ('"+DateEnd+"', 'DD-MM-YYYY')   "+
+ "                  AND ROWNUM < 2)  deps_list   "+
+ "     FROM dpmpaym_dbt pm,   "+
+ "          doproper_dbt oo,   "+
+ "          doprstep_dbt os,   "+
+ "          dparty_dbt party,   "+
+ "          dpmrmprop_dbt rm,   "+
+ "          dpmco_dbt co,   "+
+ "          dobjcode_dbt objcode,   "+
+ "          dperson_dbt pers,   "+
+ "          dparty_dbt party1,   "+
+ "          DLLVALUES_DBT val   "+
+ "    WHERE     pm.t_valuedate BETWEEN  TO_DATE ('"+datebegin+"', 'DD-MM-YYYY')  AND  TO_DATE ('"+DateEnd+"', 'DD-MM-YYYY')     "+
+ "          AND pm.t_dockind IN (201, 202)    "+
+ "          AND oo.t_documentid = LPAD (pm.t_documentid, 34, '0')   "+
+ "          AND os.t_id_operation = oo.t_id_operation   "+
+ "          AND os.t_symbol = '7' ";
+  if (rezhim == 1)
+    Query = Query +  
+ "        AND (os.t_isexecute = CHR (82) OR os.t_isexecute = chr(88))   ";
+
+  elif (rezhim == 2)
+    Query = Query +  
+ "        AND os.t_isexecute = CHR (82)   ";
+  else 
+    Query = Query +
+ "        AND os.t_isexecute = CHR (88)   ";
+  end;
+    Query = Query + 
+ "          AND party.T_PARTYID = pm.t_payer   "+
+ "          AND rm.t_paymentid = pm.t_paymentid   "+
+ "          AND CO.T_PAYMENTID(+) = pm.t_paymentid   "+
+ "          AND OBJCODE.T_OBJECTTYPE = 3   "+
+ "          AND OBJCODE.T_OBJECTID = pm.t_payer   "+
+ "          AND OBJCODE.T_CODEKIND = 1   "+
+ "          AND objcode.t_state = 0   "+
+ "          AND PERS.T_OPER = os.t_oper   "+
+ "          AND party1.t_partyid = PERS.T_PARTYID   "+
+ "          AND val.t_list(+) = 1805   "+
+ "          AND val.t_element(+) = CO.T_VO_CODE   "+
+ "          AND pm.t_payer NOT IN (21633, 23004)   "+
+ " ORDER BY ISEXECUTE DESC, payername  ";
+
+// Params = makeArray( SQLParam( "ActualDate",  DateEnd), SQLParam( "ActualDate2",  DateEnd), SQLParam( "DateBegin" , DateBegin ), SQLParam( "DateEnd" , DateEnd ) );
+ debugbreak;
+ DataSet_1 = execSQLselect( Query );
+
+   if (IsStandAlone()) // Двухзвенка
+     if ((ValType(ex)!=V_UNDEF) and (ex.Visible==False))
+       ex = ActiveX("Excel.Application",NULL,false); 
+     else
+       ex = ActiveX("Excel.Application",NULL,true);
+     end;
+   else // Трехзвенка
+     ob = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+     ex = ob.CreateComObject ("Excel.Application",true);
+   end; 
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,out_templ);
+   Fulloutput_templ = FindPath(output_templ, out_templ);                    
+
+debugbreak;
+
+   obBook = ex.Workbooks.open(Fulloutput_templ); 
+   obSheet = obBook.ActiveSheet();  
+
+   obSheet.Range("B"+1).Value=string("Протокол контроля выполнения операций валютного контроля: за период с  ",DateBegin," по ",DateEnd);
+   obSheet.Range("B"+2).Value=string("Дата выпуска отчета ", Date,",  ",time());
+
+   if ((rezhim == 1) or (rezhim == 2))
+     obSheet.Range("A"+4).Value="Документы шага валютный контроль (ожидающие акцепта):";
+   else 
+     obSheet.Range("A"+4).Value="Проведенные документы:";
+   end;
+
+   obSheet.Range("A"+5).Value="Исп.?";
+   obSheet.Range("B"+5).Value="Наименование клиента";
+   obSheet.Range("C"+5).Value="Код RS";
+   obSheet.Range("D"+5).Value="Подразд.";
+   obSheet.Range("E"+5).Value="Дивизион";
+   obSheet.Range("F"+5).Value="Валюта";
+   obSheet.Range("G"+5).Value="Сумма в валюте";
+   obSheet.Range("H"+5).Value="Руб. эквивалент";
+   obSheet.Range("I"+5).Value="Код ВО";
+   obSheet.Range("J"+5).Value="Дата платежа";
+   obSheet.Range("K"+5).Value="Номер паспорта";
+   obSheet.Range("L"+5).Value="Менеджер, выполнивший акцепт";
+  
+   while ( DataSet_1.MoveNext())
+    CntDoc = CntDoc+1;
+    SumDoc = SumDoc+DataSet_1.value("NATSUM");   
+    if ((rezhim == 1) or (rezhim == 2))
+      if (DataSet_1.value("isexecute") == "нет") 
+        CntDocR = CntDocR+1; 
+        SumDocR = SumDocR+DataSet_1.value("NATSUM"); 
+          
+        obSheet.Range("A"+(5+CntDocR)).Value = DataSet_1.value("isexecute");
+        obSheet.Range("B"+(5+CntDocR)).Value = DataSet_1.value("PAYERNAME");
+        obSheet.Range("C"+(5+CntDocR)).Value = DataSet_1.value("RSCODE");
+        obSheet.Range("D"+(5+CntDocR)).Value = DataSet_1.value("DEPARTMENT");
+        obSheet.Range("E"+(5+CntDocR)).Value = DataSet_1.value("deps_list"); 
+        obSheet.Range("F"+(5+CntDocR)).Value = DataSet_1.value("basefi");
+        obSheet.Range("G"+(5+CntDocR)).Value = DataSet_1.value("amount");
+        obSheet.Range("H"+(5+CntDocR)).Value = DataSet_1.value("NATSUM");
+        obSheet.Range("I"+(5+CntDocR)).Value = DataSet_1.value("VCODE");
+		obSheet.Range("J"+(5+CntDocR)).Value = DataSet_1.value("T_VALUEDATE");
+        obSheet.Range("K"+(5+CntDocR)).Value = DataSet_1.value("T_PASSPORTNUMBER");
+        obSheet.Range("L"+(5+CntDocR)).Value = DataSet_1.value("MANAGER"); 
+      else
+        CntDocX = CntDocX+1; 
+        SumDocX = SumDocX+DataSet_1.value("NATSUM"); 
+
+        obSheet.Range("A"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("isexecute");
+        obSheet.Range("B"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("PAYERNAME");
+        obSheet.Range("C"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("RSCODE");
+        obSheet.Range("D"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("DEPARTMENT");
+        obSheet.Range("E"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("deps_list"); 
+        obSheet.Range("F"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("basefi");
+        obSheet.Range("G"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("amount");
+        obSheet.Range("H"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("NATSUM");
+        obSheet.Range("I"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("VCODE");
+		obSheet.Range("J"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("T_VALUEDATE");
+        obSheet.Range("K"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("T_PASSPORTNUMBER");
+        obSheet.Range("L"+(5+CntDocR+CntDocX+5)).Value = DataSet_1.value("MANAGER");
+
+      end;
+
+    else
+        obSheet.Range("A"+(5+CntDoc)).Value = DataSet_1.value("isexecute");
+        obSheet.Range("B"+(5+CntDoc)).Value = DataSet_1.value("PAYERNAME");
+        obSheet.Range("C"+(5+CntDoc)).Value = DataSet_1.value("RSCODE");
+        obSheet.Range("D"+(5+CntDoc)).Value = DataSet_1.value("DEPARTMENT");
+        obSheet.Range("E"+(5+CntDoc)).Value = DataSet_1.value("deps_list"); 
+        obSheet.Range("F"+(5+CntDoc)).Value = DataSet_1.value("basefi");
+        obSheet.Range("G"+(5+CntDoc)).Value = DataSet_1.value("amount");
+        obSheet.Range("H"+(5+CntDoc)).Value = DataSet_1.value("NATSUM");
+        obSheet.Range("I"+(5+CntDoc)).Value = DataSet_1.value("VCODE");
+		obSheet.Range("J"+(5+CntDoc)).Value = DataSet_1.value("T_VALUEDATE");
+        obSheet.Range("K"+(5+CntDoc)).Value = DataSet_1.value("T_PASSPORTNUMBER");
+        obSheet.Range("L"+(5+CntDoc)).Value = DataSet_1.value("MANAGER");
+ 
+    end;
+   
+  end;  //конец while
+
+// RemProgress(CntDoc); 
+
+ if(rezhim ==1 )
+   obSheet.Range("A"+(CntDocR+9)).Value="Проведенные документы:";
+   obSheet.Range("A"+(CntDocR+9)).font.FontStyle = "bold";
+   obSheet.Range("A" + (cntDocR+10) + ":L"+(cntDocR+10)).font.FontStyle = "bold";
+   obSheet.Range("A" + (cntDocR+10) + ":L"+(cntDocR+10)).interior.color=4035000;
+
+   obSheet.Range("A"+(5+CntDocR+5)).Value="Исп.?";
+   obSheet.Range("B"+(5+CntDocR+5)).Value="Наименование клиента";
+   obSheet.Range("C"+(5+CntDocR+5)).Value="Код RS";
+   obSheet.Range("D"+(5+CntDocR+5)).Value="Подразд.";
+   obSheet.Range("E"+(5+CntDocR+5)).Value="Дивизион";
+   obSheet.Range("F"+(5+CntDocR+5)).Value="Валюта";
+   obSheet.Range("G"+(5+CntDocR+5)).Value="Сумма в валюте";
+   obSheet.Range("H"+(5+CntDocR+5)).Value="Руб. эквивалент";
+   obSheet.Range("I"+(5+CntDocR+5)).Value="Код ВО";
+   obSheet.Range("J"+(5+CntDocR+5)).Value="Дата платежа";
+   obSheet.Range("K"+(5+CntDocR+5)).Value="Номер паспорта";
+   obSheet.Range("L"+(5+CntDocR+5)).Value="Менеджер, выполнивший акцепт";
+
+   obSheet.Range("B"+(6+CntDocR+1)).Value = "Итого документов, ожидающих акцепта ";
+   obSheet.Range("D"+(6+CntDocR+1)).Value = CntDocR;
+   obSheet.Range("E"+(6+CntDocR+1)).Value = " на сумму ";
+   obSheet.Range("H"+(6+CntDocR+1)).Value = SumDocR;
+   obSheet.Range("I"+(6+CntDocR+1)).Value = " рублей";
+
+   obSheet.Range("B"+(6+CntDocR+CntDocX+6)).Value = "Итого проведенных документов ";
+   obSheet.Range("D"+(6+CntDocR+CntDocX+6)).Value = CntDocX;
+   obSheet.Range("E"+(6+CntDocR+CntDocX+6)).Value = " на сумму ";
+   obSheet.Range("H"+(6+CntDocR+CntDocX+6)).Value = SumDocX;
+   obSheet.Range("I"+(6+CntDocR+CntDocX+6)).Value = " рублей";
+
+   obSheet.Range("B"+(6+CntDocR+CntDocX+8)).Value = "Всего документов ";
+   obSheet.Range("D"+(6+CntDocR+CntDocX+8)).Value = CntDoc;
+   obSheet.Range("E"+(6+CntDocR+CntDocX+8)).Value = " на сумму ";
+   obSheet.Range("H"+(6+CntDocR+CntDocX+8)).Value = SumDoc;
+   obSheet.Range("I"+(6+CntDocR+CntDocX+8)).Value = " рублей";
+
+ elif (rezhim == 2)
+   obSheet.Range("B"+(6+CntDoc+1)).Value = "Итого документов, ожидающих акцепта ";
+   obSheet.Range("D"+(6+CntDoc+1)).Value = CntDoc;
+   obSheet.Range("E"+(6+CntDoc+1)).Value = " на сумму ";
+   obSheet.Range("H"+(6+CntDoc+1)).Value = SumDoc;
+   obSheet.Range("I"+(6+CntDoc+1)).Value = " рублей";
+ else
+   obSheet.Range("B"+(6+CntDoc+1)).Value = "Итого проведенных документов ";
+   obSheet.Range("D"+(6+CntDoc+1)).Value = CntDoc;
+   obSheet.Range("E"+(6+CntDoc+1)).Value = " на сумму ";
+   obSheet.Range("H"+(6+CntDoc+1)).Value = SumDoc;
+   obSheet.Range("I"+(6+CntDoc+1)).Value = " рублей";
+ end;
+
+//  obSheet.Range("A5:L"+(7)).Borders.Weight=2;
+
+//  obSheet.Range("A5:L"+(5+CntDoc)).Borders.Weight=2;
+  obSheet.Range("A5:L"+5).interior.color=4035000;
+  ex.visible = true;       
+
+end;
+
+
+ macro Event (dlg, cmd, id, key) 
+
+ var mn, const_mess = "~F2~ Продолжить ~ESC~ Выход ";
+ var const_mess2 = "~F2~ Продолжить ~SPACE~ ~ESC~ Выход ";
+ var BranchParam = TBranchParam;
+
+  if(cmd == DLG_INIT)
+     DprtCode = {OperDprtNode};
+     dlg.rec.dep = "все документы";
+     rezhim = 1;
+     dlg.rec.flag  = "X";
+     dlg.rec.Datebegin = {curDate};
+     dlg.rec.Dateend = {curDate};
+ //  BranchParam.GetDepartName({OperDprtNode});
+     BranchParam.GetDepartName(1); //зашил намертво, этот отчет формируется по всем подразделениям
+
+     dlg.rec.Branch = BranchParam.Code;
+     dlg.rec.branchname = BranchParam.Name; //неактивно
+     UpdateFields(dlg); 
+  end;
+  
+  /*Установка подсказок в строке состояния*/
+  if (cmd==DLG_SETFOCUS)
+    if (FldName(dlg,id)=="Flag") 
+      message(const_mess2);
+    elif ((FldName(dlg,id)=="DateBegin") or (FldName(dlg,id)=="DateEnd"))
+      message(" ~F3~ Выбор даты из календаря "+const_mess);
+    elif (FldName(dlg,id)=="Branch")
+      message(" Выбор филиала не предусмотрен "+const_mess);
+    elif (FldName(dlg,id)=="dep")
+      message(" ~SPASE~ Выбор режима отчета "+const_mess);
+   end;
+  end;
+  
+  if (cmd == DLG_REMFOCUS)
+    if (FldName(dlg,id) == "DateEnd")
+      if ( dlg.rec.DateEnd > {curdate} )
+        MsgBox("Дата конца периода не может быть больше даты последнего открытого операционного дня");
+       return CM_CANCEL;
+      end;
+      if ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+        MsgBox("Дата начала периода не может быть больше даты конца периода");
+       return CM_CANCEL;
+      end;
+    elif (FldName(dlg,id) == "DateBegin")
+      if ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+        MsgBox("Дата начала периода не может быть больше даты конца периода");
+       return CM_CANCEL;
+      end;
+      if ( dlg.rec.DateBegin > {curdate} )
+        MsgBox("Дата начала периода не может быть больше даты последнего открытого операционного дня");
+       return CM_CANCEL;
+      end;
+    elif (FldName(dlg,id) == "Branch")
+     if (Trim(dlg.rec.Branch) != "")
+      if( not BranchParam.GetDepartName_(dlg.rec.Branch) ) 
+       dlg.rec.Branch = BranchParam.Code;
+       dlg.rec.Branchname = BranchParam.Name;
+       DprtCode = BranchParam.Id;
+      else
+       MsgBox("Не найдено подразделение с номером " + dlg.rec.Branch);
+       dlg.rec.Branchname = "";
+      end;
+     else
+      dlg.rec.BranchName = "Все";
+      DprtCode = 0;
+     end;
+    end;
+    UpdateFields(dlg); 
+  end;
+
+  if (cmd == DLG_KEY)
+    if (KEY == KEY_ESC)
+      return exit(1);//CM_CANCEL;
+    elif ( KEY == KEY_F3)
+     if (FldName(dlg,id) == "DateBegin")
+       dlg.rec.DateBegin = GetDateByCalendar ({curDate});
+     end;
+     if (FldName(dlg,id) == "DateEnd")
+       dlg.rec.DateEnd = GetDateByCalendar ({curDate});
+     end;
+/*   if (FldName(dlg,id) == "Branch")
+        if (ListDepartment (Department))
+           DprtCode = department.code;
+           BranchParam.GetDepartName(department.code);
+           dlg.rec.Branch = BranchParam.Code;
+           dlg.rec.Branchname = BranchParam.Name;
+           message(" ~F3~ Список подразделений "+const_mess);
+           UpdateFields(dlg);
+        end;
+     end;  */
+    elif (KEY == KEY_SPACE)
+     if (FldName(dlg,id) == "Flag")     //в этом отчете используем только Excel, зашиваем прибиваем намертво
+//      if (dlg.rec.flag == "")
+//       dlg.rec.flag = "X";
+//       UpdateFields(dlg);
+//      else
+//       dlg.rec.flag="";
+//       UpdateFields(dlg);
+//      end;
+     elif  (FldName(dlg,id) == "dep") 
+       if (dlg.rec.dep == "все документы")
+           dlg.rec.dep = "документы шага ВК";
+           rezhim = 2;
+           UpdateFields(dlg);
+       elif (dlg.rec.dep == "документы шага ВК")
+           dlg.rec.dep = "проведенные документы";
+           rezhim = 3;
+           UpdateFields(dlg);
+       else
+           dlg.rec.dep = "все документы";
+           rezhim = 1;
+           UpdateFields(dlg);
+       end;
+  
+     end;
+    elif ( KEY == KEY_F2)        //Проверки при вводе
+     if ( dlg.rec.DateBegin > {curdate} )
+       MsgBox("Дата начала периода не может быть больше даты последнего открытого операционного дня");
+       return CM_IGNORE;
+     end;
+     if ( dlg.rec.DateEnd > {curdate} )
+       MsgBox("Дата конца периода не может быть больше даты последнего открытого операционного дня");
+       return CM_IGNORE;
+     end;
+     if ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+       MsgBox("Дата начала периода не может быть больше даты конца периода");
+       return CM_IGNORE;
+     end;
+     DateBegin  = dlg.rec.DateBegin;
+     if (DateBegin == "")
+      DateBegin = "01.01.0001";
+     end;  
+     DateEnd  = dlg.rec.DateEnd;
+     Flag = dlg.rec.Flag;
+     Return CM_SAVE;
+    end;     
+  end;
+ end;
+
+//private macro total
+ if (RunDialog(dlgRep, "Event"))                  
+  MakeRep();
+ end;
+END;
+
+

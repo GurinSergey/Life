@@ -1,0 +1,927 @@
+/*Платежи по счетам физических лиц                                     */
+/*                                                                     */
+/*                                                                     */
+/*Тихомиров А.Н. 27.02.2009                           Версия 1.1       */
+
+import globals, oralib, bankinter, likePy, lib_lang, rsexts;
+
+import RSD,rcw, rslx, Календарь, rsbdataset, payminter;
+
+record Dep ("dp_dep.dbt");
+var Fulloutputl, outl, outputl="paym.lbr", dprt_v;                    
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+//record dlg (paym, "..\\lbr\\paym.lbr") dialog;
+var dlg = TRecHandler("paym", fulloutputl, TRUE); 
+
+//var out, fulloutput, output = "\\paymIE.txt";
+var fulloutput = GetTxtFileName("paym");
+
+const  KEY_F1      =315;
+const  KEY_F2      =316;
+const  KEY_F3      =317;
+const KEY_ESC      = 27;
+const KEY_SPACE    = 32;
+const KEY_ENTER    = 13;
+
+var i, gr, flag, obrp, acc, Datebegin, Dateend, f1, f2, f3, minsum, kredP, sum=0, branchcode, n:integer, maxs:integer;
+
+
+/*Найдем имя по коду*/
+private macro GetClientNameID(id)
+var  sl=" select dep.t_name from  ddp_dep_dbt dep where dep.t_code="+id;
+var  DataS=TRsbDataSet(sl);
+  if( DataS.moveNext())
+    return DataS.name;
+  else
+    if (id !=0)
+       msgbox("Субъект не найден в party.dbt");
+       return 0;
+    else
+      return "ОАО АКБ Пробизнесбанк";
+    end;
+  end;
+END;
+
+
+/*Найдем имя по Partyid*/
+private macro GetClientName(id)
+var  sl=" select part.t_name from dparty_dbt part, ddp_dep_dbt dep where dep.t_code="+id+" and dep.t_partyid=part.t_partyid";
+var  DataS=TRsbDataSet(sl);
+  if( DataS.moveNext())
+    return DataS.name;
+  else
+    if (id !=0)
+       msgbox("Субъект не найден в party.dbt");
+       return 0;
+    else
+      return "ОАО АКБ Пробизнесбанк";
+    end;
+  end;
+END;
+
+/*Счет из основания*/
+private macro accfromground(ground)
+var pos, acc;
+ground = strlwr(ground);
+  if (index(ground,"40817")>0)
+    pos = index(ground,"40817");
+    ground = substr(ground,pos);
+     if (index (ground," ")!=0)
+       pos = index (ground," ");
+       acc = substr(ground,pos);
+     else
+       acc=ground;
+     end;
+     if ((strlen(acc)<10) or (strlen(acc)>35))
+        return "Счет определить не удалось";
+     else
+        return acc;
+     end;
+  elif (index(ground,"423")>0)
+    pos = index(ground,"423");
+    ground = substr(ground,pos);
+      if (index (ground," ")!=0)
+        pos = index (ground," ");
+        acc = substr(ground,pos);
+      else
+        acc=ground;
+      end;
+      if ((acc<18) or (acc>25))
+        return "Счет определить не удалось";
+      else
+        return acc;
+      end;
+   else 
+    return "Счет определить не удалось";
+   end;
+end;
+
+/*Принадлежность банка к терр структуре*/
+private macro bank(id)
+var sq = "select * from ddp_dep_dbt where t_partyid="+id;
+var DataSq = TRsbDataSet(sq);
+ if (datasq.movenext())
+   return false;
+ end;
+return true;
+end;
+
+private macro statusoper(paym)
+var sq = "SELECT * "+
+  "FROM dpmpaym_dbt, doproper_dbt, doprstep_dbt "+
+ "WHERE dpmpaym_dbt.t_documentid = doproper_dbt.t_documentid "+
+   "AND doprstep_dbt.t_id_operation = doproper_dbt.t_id_operation "+
+   "AND dpmpaym_dbt.t_paymentid = "+paym+" "+
+   "AND t_symbol = 'W' "+
+   "AND t_isexecute = CHR(88)";
+var DataSq = TRsbDataSet(sq);
+ if (datasq.movenext())
+   return false;
+ else
+   return true;
+ end;
+end;
+
+private macro ground(ground)
+ground = strlwr(ground);
+ if ((index(ground,"40817")>0) or (index(ground,"423")) or (index(ground,"на счет 40817")) or (index(ground,"на счет 423"))
+    or (index(ground,"на лицевой счет 40817")) or (index(ground,"на лицевой счет 423")) or (index(ground,"п.карта"))
+    or (index(ground,"п/карта")) or (index(ground,"visa")) or (index(ground,"карточный счет")))
+  gr=1;
+  return false;
+ else
+  return true;
+ end;
+end;
+
+
+private macro payer(paym)
+var Sq : string;
+var rs ;
+/*Это физ лицо*/
+sq = "select t_isemployer from dpersn_dbt "+
+     "where t_personid=(select T_PARTYID from dparty_dbt where T_PARTYID="+paym+")";
+    rs = TRsbDataSet( Sq );
+
+    if( rs.MoveNext() )
+      return false;
+    end;
+/*Дальше юр.лицо*/
+sq = "select * from dparty_dbt "+
+     "where t_partyid="+paym;
+    rs = TRsbDataSet( Sq );
+
+    if( rs.MoveNext() )
+      return false;
+    end;
+return true;    
+end;
+
+
+/*Вторичный документ*/
+private macro SECOND( PaymentID ):bool
+  var rs    :object;
+  var select:string;
+  var params:TArray;
+
+  select = " select 1 " + 
+           " from   doproper_dbt opr, doprdocs_dbt docs, doprstep_dbt step  " +
+           " where  To_Number(opr.t_DocumentID) = "+PaymentID +  
+           "   and  opr.T_DOCKIND = 320 " +
+           "   and  docs.T_ID_OPERATION = opr.T_ID_OPERATION " +
+           "   and  step.T_number_step in (160,165) " +
+           " and step.T_ISEXECUTE=chr(88) "+
+           " and step.T_ID_OPERATION = opr.T_ID_OPERATION";
+  rs = TRsbDataSet( select );
+  if ( rs.moveNext() )
+     return true;
+  end;
+
+  select = " select 1 " + 
+           " from   dpmlink_dbt link " +
+           " where  link.t_InitialPayment = "+PaymentID  +
+           "   and  link.t_linkKind In(7) ";
+
+
+  rs = TRsbDataSet( select );
+
+  if( rs.moveNext() )
+    return true;
+  end;
+       
+  return false;
+end;
+
+
+/*Не является вторичным*/
+private macro first( PaymentID ):bool
+
+  var rs    :object;
+  var select:string;
+  var params:TArray;
+
+  select = " select 1 " + 
+           " from   doproper_dbt opr, doprdocs_dbt docs, doprstep_dbt step, dpmpaym_dbt pm " +
+           " where  pm.t_paymentid = "+PaymentID +  
+           "   and  opr.T_DOCKIND = 320 " +
+           "   and  docs.T_ID_OPERATION = opr.T_ID_OPERATION " +
+           "   and  step.T_number_step in (160,165,53,150) " +
+           " and step.T_ISEXECUTE=chr(88) "+
+           " and step.T_ID_OPERATION = opr.T_ID_OPERATION"+
+           " and docs.t_documentid=lpad(pm.T_DOCUMENTID,34,0)";
+
+  rs = TRsbDataSet( select);
+  if ( rs.moveNext() )
+     return true;
+  end;
+
+  select = " select 1 " + 
+           " from   dpmlink_dbt link " +
+           " where  link.t_purposepayment = "+PaymentID  +
+           "   and  link.t_linkKind In(7, 10, 8) ";
+
+
+  rs = TRsbDataSet( select );
+
+  if( rs.moveNext() )
+    return true;
+  end;
+       
+  return false;
+end;
+
+
+/*Во вторичном счет*/
+private macro obr(paymentid, grnd)
+  
+  var rs,ds    :object;
+  var select, sl:string;
+  var params:TArray;
+
+  select = " select pm.t_paymentid as paym" + 
+           " from   doproper_dbt opr, doprdocs_dbt docs, doprstep_dbt step, dpmpaym_dbt pm  " +
+           " where  To_Number(opr.t_DocumentID) = "+PaymentID +  
+           "   and  opr.T_DOCKIND = 320 " +
+           "   and  docs.T_ID_OPERATION = opr.T_ID_OPERATION " +
+           "   and  step.T_number_step in (53) " +
+           " and step.T_ISEXECUTE=chr(88) "+
+           " and step.T_ID_OPERATION = opr.T_ID_OPERATION"+
+           " and docs.t_documentid=lpad(pm.T_DOCUMENTID,34,0)";
+
+  rs = TRsbDataSet( select );
+  if ( rs.moveNext() )
+sl = "select t_receiveraccount from dpmpaym_dbt where t_paymentid="+rs.paym;
+    ds = TRsbDataSet( Sl );
+
+   if( ds.MoveNext() )
+
+       if (not comparestrwithmasks("40817*, 423*",string(ds.receiveraccount)))
+           obrp=1;
+           return false;
+       end;
+       if (not comparestrwithmasks("30232*, 47422*",string(ds.receiveraccount)))
+        if (not ground(ground))
+         obrp=1;
+         return false;
+        end;
+       end;
+   end;
+  end;
+
+  select = " select link.t_purposepayment as paym" + 
+           " from   dpmlink_dbt link " +
+           " where  link.t_InitialPayment = "+PaymentID  +
+           "   and  link.t_linkKind In(10) ";
+
+  rs = TRsbDataSet( select );
+
+  if( rs.moveNext() )
+    sl = "select t_receiveraccount from dpmpaym_dbt where t_paymentid="+rs.paym;
+    ds = TRsbDataSet( Sl );
+     if( ds.MoveNext() )
+       if (not comparestrwithmasks("40817*, 423*",string(ds.receiveraccount)))
+          obrp=1;
+          return false;
+       end;
+       if (not comparestrwithmasks("30232*, 47422*",string(ds.receiveraccount)))
+         if (not ground(grnd))
+           obrp=1;
+           return false;
+         end;
+       end;
+    end;    
+end;
+       
+  return true;
+end;
+
+
+/*Выделяем счет из вторичного*/
+private macro obrpr(paymentid, grnd, acc)
+
+  var rs, ds    :object;
+  var select, sl:string;
+  var params:TArray;
+
+  select = " select pm.t_paymentid as paym " + 
+           " from   doproper_dbt opr, doprdocs_dbt docs, doprstep_dbt step, dpmpaym_dbt pm " +
+           " where  To_Number(opr.t_DocumentID) = "+PaymentID +  
+           "   and  opr.T_DOCKIND = 320 " +
+           "   and  docs.T_ID_OPERATION = opr.T_ID_OPERATION " +
+           "   and  step.T_number_step in (53) " +
+           " and step.T_ISEXECUTE=chr(88) "+
+           " and step.T_ID_OPERATION = opr.T_ID_OPERATION"+
+           " and docs.t_documentid=lpad(pm.T_DOCUMENTID,34,0)";
+  rs = TRsbDataSet( select );
+  if ( rs.moveNext() )
+    sl = "select t_receiveraccount from dpmpaym_dbt where t_paymentid="+rs.paym;
+    ds = TRsbDataSet( Sl );
+
+    if( ds.MoveNext() )
+
+      if (not comparestrwithmasks("40817*, 423*",string(ds.receiveraccount)))
+         return acc;
+        //return ds.account;
+      end;
+      if (not comparestrwithmasks("30232*, 47422*",string(ds.receiveraccount)))
+          if (not ground(grnd))
+             return acc;
+           //return accfromground(grnd);
+          end;
+      end;
+    end;
+  end;
+
+  select = " select link.t_purposepayment as paim" + 
+           " from   dpmlink_dbt link " +
+           " where  link.t_InitialPayment = "+PaymentID  +
+           "   and  link.t_linkKind In(10) ";
+
+
+  rs = TRsbDataSet( select );
+
+  if( rs.moveNext() )
+    sl = "select t_receiveraccount from dpmpaym_dbt where t_paymentid="+rs.paim;
+    ds = TRsbDataSet( Sl );
+     if( ds.MoveNext() )
+       if (not comparestrwithmasks("40817*, 423*",string(ds.receiveraccount)))
+          return ds.account;
+       end;
+       if (not comparestrwithmasks("30232*, 47422*",string(ds.receiveraccount)))
+          if (not ground(grnd))
+             return accfromground(grnd);
+          end;
+       end;
+     end;    
+  end;
+       
+ return true;
+end;
+
+
+/*Разноска по кредиту*/
+private macro kred(paym,grnd)
+var n=0;
+var sql = "SELECT * "+
+  "FROM dpmaddpi_dbt "+
+  "WHERE t_debetcredit = 1 "+
+   "AND t_paymentid = "+paym+" "+
+   "AND (   t_account LIKE '40817%' "+
+        "OR t_account LIKE '423%' "+
+        "OR t_account LIKE '47422%' "+
+        "OR t_account LIKE '47407%' "+
+        "OR t_account LIKE '30232%') ";
+var DataSet = TRsbDataSet(sql);
+ while (dataset.movenext());
+   n=n+1;
+    if ((not comparestrwithmasks("40817*, 423*",string(dataset.account))) and (dataset.pmamount>minsum))
+       kredP=1;
+       return false;
+    end;
+    if ((not comparestrwithmasks("30232*, 47422*",string(dataset.account))) and (dataset.pmamount>minsum))
+         if (not ground(dataset.ground))
+            kredP=1;
+            return false;
+         end;
+     end;
+ end;
+ if (n>0) return true;
+ end;
+return false;
+end;
+
+
+/*Печатаем счета из разноски*/
+private macro kredpr(paym,grnd)
+var gr;
+var sql = "SELECT * "+
+  "FROM dpmaddpi_dbt "+
+ "WHERE t_debetcredit = 1 "+
+   "AND t_paymentid = "+paym+" "+
+   "AND (   t_account LIKE '40817%' "+
+        "OR t_account LIKE '423%' "+
+        "OR t_account LIKE '47422%' "+
+        "OR t_account LIKE '47407%' "+
+        "OR t_account LIKE '30232%') ";
+var DataSet = TRsbDataSet(sql);
+ while (dataset.movenext());
+      if (dataset.ground!=grnd)
+        gr=dataset.ground;
+      else
+        gr="";
+      end;
+      if ((not comparestrwithmasks("40817*, 423*",string(dataset.account))) and (dataset.pmamount>minsum))
+        [│     │          │                    │           │           │                    │######################│################│#############################################│]
+        (dataset.account:c,dataset.pmamount,gr);
+        sum=sum+dataset.pmamount;
+      end;
+      if ((not comparestrwithmasks("30232*, 47422*",string(dataset.account))) and (dataset.pmamount>minsum))
+          if (not ground(dataset.ground))
+             [│     │          │                    │           │           │                    │######################│################│#############################################│]
+             (accfromground(dataset.ground):c,dataset.pmamount,gr);
+             sum=sum+dataset.pmamount;
+          end;
+      end;
+ end;
+end;
+
+
+/*Код банка*/
+private macro code(paym)
+var sql = "select * from dobjcode_dbt where t_codekind=1 and t_objectid="+paym;
+var DataSet = TRsbDataSet(sql);
+ if (dataset.movenext())
+   return dataset.code;
+ end;
+end;
+
+
+/*Исходящие*/
+private macro outF
+var sql = "SELECT count(*) as cnt "+
+  "FROM dwlpm_dbt wl, dpmpaym_dbt pm, dpmrmprop_dbt rm , dpmprop_dbt pr "+
+  "WHERE pm.t_paymentid = pr.t_paymentid "+
+  "AND pr.t_group=1 "+
+  "AND pr.t_issender=chr(0) "+ 
+  "AND pm.t_paymentid = wl.t_paymentid "+
+  "AND pm.t_startdepartment = "+branchcode+" "+
+  "AND pm.t_fiid = 0 "+
+  "AND pm.t_paymstatus = 32000 "+
+//  "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pm.t_paymentid =rm.t_paymentid  "+
+  "AND pm.t_amount >=  "+minsum+" "+
+  "AND (   pm.t_receiveraccount LIKE '40817%' "+
+       "OR pm.t_receiveraccount LIKE '423%' "+
+       "OR pm.t_receiveraccount LIKE '47422%' "+
+       "OR pm.t_receiveraccount LIKE '47407%' "+
+       "OR pm.t_receiveraccount LIKE '30232%' "+
+       "OR pm.t_receiveraccount LIKE '301%' "+
+       "OR pm.t_receiveraccount LIKE CHR (1)) ";
+var DataSet = TRsbDataSet(sql);
+ if (dataset.movenext())
+   maxS=dataset.cnt;
+ end;
+initprogress(maxs,"Производится расчет, ждите...", "Несоответствие проводок курсовой разницы");
+
+sql = "SELECT * "+
+  "FROM dwlpm_dbt wl, dpmpaym_dbt pm, dpmrmprop_dbt rm, dpmprop_dbt pr, dobjcode_dbt obj "+
+  " WHERE pm.t_paymentid = pr.t_paymentid "+
+  " AND  obj.t_codekind=1 "+
+  " AND obj.t_objectid=pm.t_payer "+  
+  " AND pr.t_group=1 "+
+  " AND pr.t_issender=chr(0) "+
+  "AND pm.t_paymentid = wl.t_paymentid "+
+  "AND pm.t_startdepartment = "+branchcode+" "+
+  "AND pm.t_fiid = 0 "+
+  "AND pm.t_paymstatus = 32000 "+
+//  "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pm.t_paymentid =rm.t_paymentid  "+
+  "AND pm.t_amount >=  "+minsum+" "+
+  "AND (   pm.t_receiveraccount LIKE '40817%' "+
+       "OR pm.t_receiveraccount LIKE '423%' "+
+       "OR pm.t_receiveraccount LIKE '47422%' "+
+       "OR pm.t_receiveraccount LIKE '47407%' "+
+       "OR pm.t_receiveraccount LIKE '30232%' "+
+       "OR pm.t_receiveraccount LIKE '301%' "+
+       "OR pm.t_receiveraccount LIKE CHR (1)) "+
+       " order by pr.t_transferdate, obj.t_code";
+DataSet = TRsbDataSet(sql);
+//GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",2,out);
+//Fulloutput = out + output;                    
+//setoutput(fulloutput,false);
+[                                            Безналичные внешние перечисления на физических лиц 
+                                   по подразделению ######################### за период с ########## по ##########  
+┌─────┬──────────┬────────────────────┬───────────┬────────────────────┬───────────┬───────────┬────────────────┬─────────────────────────────────────────────┐
+│№ п/п│   Дата   │    Наименование    │   RS-код  │     Наименование   │    ИНН    │ БИК банка │      Сумма     │                Назначение                   │
+│     │          │    плательщика     │плательщика│      получателя    │получателя │ получателя│                │                 платежа                     │
+├─────┼──────────┼────────────────────┼───────────┼────────────────────┼───────────┼───────────┼────────────────┼─────────────────────────────────────────────┤]
+(GetClientName(branchcode),date(datebegin),date(dateend));
+i=0;
+sum=0;
+n=0;
+  while (DataSet.movenext())
+    n=n+1;
+    useprogress(n);
+    gr=0;
+    flag=1;
+    gr=0;
+    /*Если в маске то печатаем из основания? и не отсекаем*/   
+      if ((not comparestrwithmasks("301*, 47422*, 47407*", string(dataset.receiveraccount))))
+        if (ground(dataset.ground))
+           flag=0;
+        end;
+      end;
+      if ((flag!=0) and (payer(dataset.payer)))
+         flag=0;
+      end;
+      if ((flag!=0) and (statusoper(dataset.paymentid)))
+        flag=0;
+      end; 
+      if ((flag!=0) and (first(dataset.paymentid)))
+        flag=0;
+      end;
+      if (flag!=0)
+        acc=dataset.receiveraccount;
+          if ((strlen(acc)<18) or (gr==1))
+             acc=accfromground(dataset.ground);
+          end;
+            i=i+1;
+           [│#####│##########│####################│###########│####################│###########│###########│################│#############################################│]
+           (i,date(dataset.transferdate),dataset.payername,dataset.payer, dataset.receivername, dataset.receiverinn,dataset.receiverbankid,dataset.amount,dataset.ground);
+           sum=sum+dataset.amount;
+           [├─────┼──────────┼────────────────────┼───────────┼────────────────────┼───────────┼───────────┼────────────────┼─────────────────────────────────────────────┤];
+       end;                                                                                                                                                            
+  end;
+remprogress(n);
+[│     │          │                    │           │                    │           │           │################│                                             │]
+(sum);
+
+[└─────┴──────────┴────────────────────┴───────────┴────────────────────┴───────────┴───────────┴────────────────┴─────────────────────────────────────────────┘];
+ setoutput(null,true);
+// viewfile(fulloutput);
+
+END;
+
+
+/*Внутренние*/
+private macro outS
+var sql = "SELECT count(*) as cnt "+
+  "FROM  dpmpaym_dbt pm, dpmrmprop_dbt rm "+
+ "WHERE (pm.t_startdepartment = "+branchcode+" or pm.T_ENDDEPARTMENT = "+branchcode+") "+
+   "AND pm.t_fiid = 0 "+
+   "AND pm.t_paymstatus = 32000 "+
+//   "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+   "AND pm.t_paymentid =rm.t_paymentid  "+
+   "AND pm.t_amount >=  "+minsum+" ";
+
+var DataSet = TRsbDataSet(sql);
+ if (dataset.movenext())
+  maxS=dataset.cnt;
+ end;
+initprogress(maxs,"Производится расчет, ждите...", "Несоответствие проводок курсовой разницы");
+
+sql = "SELECT * "+
+  "FROM  dpmpaym_dbt pm, dpmrmprop_dbt rm, dobjcode_dbt obj "+
+ "WHERE (pm.t_startdepartment = "+branchcode+" or pm.T_ENDDEPARTMENT = "+branchcode+") "+
+  " AND  obj.t_codekind=1 "+
+  " AND obj.t_objectid=pm.t_payer "+  
+   "AND pm.t_fiid = 0 "+
+   "AND pm.t_payerbankid=pm.t_receiverbankid "+
+   "AND pm.t_paymstatus = 32000 "+
+//   "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+   "AND pm.t_paymentid =rm.t_paymentid  "+
+   "AND pm.t_amount >=  "+minsum+" "+
+  " order by pm.t_valuedate, obj.t_code";
+       
+        DataSet = TRsbDataSet(sql);
+//GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",2,out);
+//Fulloutput = out + output;                    
+//setoutput(fulloutput,false);
+
+[                                    Безналичные внутренние платежи по подразделению ###############################, 
+                        поступившие на счета физических лиц за период с ########## по ########## 
+┌─────┬──────────┬────────────────────┬───────────┬───────────┬────────────────────┬──────────────────────┬────────────────┬─────────────────────────────────────────────┐
+│№ п/п│   Дата   │    Наименование    │    ИНН    │   RS-код  │     Наименование   │     Лицевой счет     │      Сумма     │                Назначение                   │
+│     │          │    плательщика     │плательщика│плательщика│      получателя    │      получателя      │                │                 платежа                     │
+├─────┼──────────┼────────────────────┼───────────┼───────────┼────────────────────┼──────────────────────┼────────────────┼─────────────────────────────────────────────┤]
+(GetClientName(branchcode),date(datebegin),date(dateend));
+
+i=0;
+n=0;
+ while (DataSet.movenext())
+  n=n+1;
+  useprogress(n);
+  flag=1;
+  kredP=0;
+  gr=0;
+   if ((bank(dataset.payerbankid)) or (bank(dataset.receiverbankid)))
+     flag=0;
+   end;
+   if ((flag!=0) and (kred(dataset.paymentid,dataset.ground)))
+     flag=0;
+   end;
+   if ((flag!=0) and (payer(dataset.payer)))
+     flag=0;
+   end;
+   if ((flag!=0) and (not comparestrwithmasks("30232*, 47422*", string(dataset.receiveraccount))) and (kredP!=1))
+      if (ground(dataset.ground))
+        flag=0;
+      end;
+   end;
+   if ((flag!=0) and (first(dataset.paymentid)))
+      flag=0;
+   end;
+
+   if (flag!=0)
+      acc=dataset.receiveraccount;
+       if ((strlen(acc)<18) or (gr==1))
+         acc=accfromground(dataset.ground);
+       end;
+       if ((kredP!=1) and (not comparestrwithmasks("40817*, 423*, 30232*, 47422*", string(dataset.receiveraccount))))
+         i=i+1;
+         [│#####│##########│####################│###########│###########│####################│######################│################│#############################################│]
+         (i,date(dataset.transferdate),dataset.payername,dataset.payerinn,code(dataset.payerbankid),dataset.receivername,acc,dataset.amount,dataset.ground);
+         sum=sum+dataset.amount;
+         [├─────┼──────────┼────────────────────┼───────────┼───────────┼────────────────────┼──────────────────────┼────────────────┼─────────────────────────────────────────────┤];
+       elif (kredp==1) 
+         i=i+1;
+        [│#####│##########│####################│###########│###########│####################│ Разноска по кредиту  │                │#############################################│]
+        (i,date(dataset.transferdate),dataset.payername,dataset.payerinn,code(dataset.payerbankid),dataset.receivername,dataset.ground);
+        sum=sum+dataset.amount;
+        [├─────┼──────────┼────────────────────┼───────────┼───────────┼────────────────────┼──────────────────────┼────────────────┼─────────────────────────────────────────────┤];
+       end;
+      if (kredP==1)
+         kredpr(dataset.paymentid, dataset.ground);
+      end;
+   end;                                                                                                                                                            
+ end;
+remprogress(n);
+[│     │          │                    │           │           │                    │                      │################│                                             │]
+(sum);
+
+[└─────┴──────────┴────────────────────┴───────────┴───────────┴────────────────────┴──────────────────────┴────────────────┴─────────────────────────────────────────────┘];
+ setoutput(null,true);
+// viewfile(fulloutput);
+
+END;
+
+
+/*Входящие*/
+private macro outt
+var sql = "SELECT  count(*) as cnt "+
+  "FROM dwlpm_dbt wl, dpmpaym_dbt pm, dpmrmprop_dbt rm , dpmprop_dbt pr "+
+  "WHERE wl.t_direct = chr(88) "+
+  "AND pr.t_issender=chr(88) "+
+  "AND pm.t_paymentid = wl.t_paymentid "+
+   "AND  pm.T_ENDDEPARTMENT = "+branchcode+" "+
+   "AND pm.t_fiid = 0 "+
+   "AND pm.t_paymstatus = 32000 "+
+//   "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+   "AND pm.t_paymentid =rm.t_paymentid  "+
+   "AND pm.t_amount >= "+minsum+" ";
+var DataSet = TRsbDataSet(sql);
+ if (dataset.movenext())
+  maxS=dataset.cnt;
+ end;
+initprogress(maxs,"Производится расчет, ждите...", "Несоответствие проводок курсовой разницы");
+
+ sql = "SELECT  * "+
+  "FROM dwlpm_dbt wl, dpmpaym_dbt pm, dpmrmprop_dbt rm , dpmprop_dbt pr, dobjcode_dbt obj "+
+  "WHERE wl.t_direct = chr(88) "+
+  "AND pm.t_paymentid = wl.t_paymentid "+
+   "AND  pm.T_ENDDEPARTMENT = "+branchcode+" "+
+  " AND  obj.t_codekind=1 "+
+  " AND obj.t_objectid=pm.t_payer "+  
+   "AND pr.t_issender=chr(88) "+
+   "AND pm.t_fiid = 0 "+
+   "AND pm.t_paymstatus = 32000 "+
+//   "AND pm.t_valuedate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+  "AND pr.t_transferdate BETWEEN TO_DATE ('"+datebegin+"', 'DD-MM-YYYY') AND TO_DATE ('"+dateend+"', 'DD-MM-YYYY') "+
+   "AND pm.t_paymentid =rm.t_paymentid  "+
+   "AND pm.t_amount >= "+minsum+" "+
+   " ORDER BY pm.t_valuedate, obj.t_code ";
+
+       DataSet = TRsbDataSet(sql);
+//GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",2,out);
+//Fulloutput = out + output;                    
+//setoutput(fulloutput,false);
+
+[                                       Безналичные платежи по подразделению #####################, 
+                                 поступившие на счета физических лиц за период с ########## по ########## 
+┌─────┬──────────┬────────────────────┬───────────┬───────────┬────────────────────┬──────────────────────┬────────────────┬─────────────────────────────────────────────┐
+│№ п/п│   Дата   │    Наименование    │    ИНН    │ БИК банка │     Наименование   │     Лицевой счет     │      Сумма     │                Назначение                   │
+│     │          │    плательщика     │плательщика│плательщика│      получателя    │      получателя      │                │                 платежа                     │
+├─────┼──────────┼────────────────────┼───────────┼───────────┼────────────────────┼──────────────────────┼────────────────┼─────────────────────────────────────────────┤]
+(GetClientName(branchcode),date(datebegin),date(dateend));
+
+i=0;
+n=0;
+ while (DataSet.movenext())
+   n=n+1;
+   useprogress(n);
+   obrP=0;
+   flag=1;
+   kredp=0;
+   gr=0;
+    if ((flag!=0) and (kred(dataset.paymentid, dataset.ground)))
+      flag=0;
+    end;
+    if ((flag!=0) and (kredP!=1) and (obr(dataset.paymentid, dataset.ground)))
+       if (comparestrwithmasks("40817*, 423*, 30232*, 47422*", string(dataset.receiveraccount)) and (strlen(dataset.receiveraccount)>18))
+          flag=0;
+       end;
+    end;
+    if ((flag!=0) and (second(dataset.paymentid)))
+      flag=0;
+    end;
+    if ((flag!=0) and ((not comparestrwithmasks("30232*, 47422*", string(dataset.receiveraccount))) or (strlen(dataset.receiveraccount)<18)) and (kredP!=1) and (obrp!=1))
+        if (ground(dataset.ground))
+           flag=0;
+        end;
+    end;
+    if (flag!=0)
+       acc=dataset.receiveraccount;
+        if ((strlen(acc)<18) or (gr==1))
+           acc=accfromground(dataset.ground);
+        end;
+        if ((kredP!=1) and (not comparestrwithmasks("40817*, 423*, 30232*, 47422*", string(dataset.receiveraccount))) and (obrp!=1))
+          i=i+1;
+         [│#####│##########│####################│###########│###########│####################│######################│################│#############################################│]
+         (i,date(dataset.transferdate),dataset.payername,dataset.payerinn,code(dataset.payerbankid),dataset.receivername,acc,dataset.amount,dataset.ground);
+         sum=sum+dataset.amount;
+        elif (kredP==1)
+         i=i+1;
+         [│#####│##########│####################│###########│###########│####################│ Разноска по кредиту  │                │#############################################│]
+         (i,date(dataset.transferdate),dataset.payername,dataset.payerinn,code(dataset.payerbankid),dataset.receivername,dataset.ground);
+        elif (obrp==1)
+         i=i+1;
+         [│#####│##########│####################│###########│###########│####################│######################│################│#############################################│]
+         (i,date(dataset.transferdate),dataset.payername,dataset.payerinn,code(dataset.payerbankid),dataset.receivername,obrpr(dataset.paymentid,dataset.ground, dataset.t_receiveraccount),dataset.amount,dataset.ground);
+         sum=sum+dataset.amount;
+        end;
+        if (kredP==1)
+          kredpr(dataset.paymentid, dataset.ground);
+        end;
+        [├─────┼──────────┼────────────────────┼───────────┼───────────┼────────────────────┼──────────────────────┼────────────────┼─────────────────────────────────────────────┤];
+    end;                                                                                                                                                            
+ end;
+remprogress(n);
+[│     │          │                    │           │           │                    │                      │################│                                             │]
+(sum);
+
+[└─────┴──────────┴────────────────────┴───────────┴───────────┴────────────────────┴──────────────────────┴────────────────┴─────────────────────────────────────────────┘];
+ setoutput(null,true);
+// viewfile(fulloutput);
+
+END;
+
+
+ /*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key) 
+
+   var const_mess = "~F2~ Продолжить ~ESC~ Выход ";
+   var const_mess2 = "~F2~ Продолжить ~SPACE~ ~ESC~ Выход ";
+
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dprt_v = 0;
+      dlg.rec.F1  = "X";
+      dlg.rec.F2  = "";
+      dlg.rec.F3  = "";
+      dlg.rec.MinSum =0;
+      dlg.rec.DateBegin = {curDate};
+      dlg.rec.DateEnd = {curDate};
+      dlg.rec.BranchCode = GetClientNameid({operdprt});
+      dlg.rec.branchname = GetClientName({operdprt});
+      UpdateFields(dlg); 
+   end;
+   
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+     if ((FldName(dlg,id)=="F1") or (FldName(dlg,id)=="F2") or (FldName(dlg,id)=="F3"))
+       message(const_mess2);
+     elif (FldName(dlg,id)=="DateBegin")
+       message(" ~F3~ Выбор даты из календаря "+const_mess);
+     elif (FldName(dlg,id)=="DateEnd")
+       message(" ~F3~ Выбор даты из календаря "+const_mess);
+     elif (FldName(dlg,id)=="BranchCode")
+       message(" ~F3~ Выбор филиала "+const_mess);
+    end;
+   end;
+   
+   if (cmd == DLG_REMFOCUS)
+     /*Проверка корректности дат отчета*/
+     if (FldName(dlg,id) == "DateBegin")
+       if ( dlg.rec.DateBegin > {curdate} )
+         MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+        return CM_CANCEL;
+       elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+         MsgBox("Дата начала периода не может быть больше даты окончания периода");
+        return CM_CANCEL;
+       end;
+     end;
+     if (FldName(dlg,id) == "DateEnd")
+       if ( dlg.rec.DateEnd > {curdate} )
+         MsgBox("Дата не может быть больше даты текущего операционного дня");
+        return CM_CANCEL;
+       elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+         MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+        return CM_CANCEL;
+       end;
+
+    end;
+      UpdateFields(dlg); 
+   end;
+
+   if (cmd == DLG_KEY)
+     /*Выход из диалогового окна формирования отчета*/
+     if (KEY == KEY_ESC)
+       return exit(1);//CM_CANCEL;
+     /*Выбор данных из списка*/
+     elif ( KEY == KEY_F3)
+        /*Выбор даты из календаря*/
+        if (FldName(dlg,id) == "DateBegin")
+          dlg.rec.datebegin = GetDateByCalendar ({curDate});
+        end;
+        if (FldName(dlg,id) == "DateEnd")
+          dlg.rec.dateend = GetDateByCalendar ({curDate});
+        end;
+        if (FldName(dlg,id) == "BranchCode")
+           if (ListDepartment (Dep))
+              if (dep.nodetype==1)
+              dlg.rec.branchcode = Dep.Name;
+              dprt_v = dep.code;
+              dlg.rec.branchname = GetClientName(Dep.PartyID);
+              message(" ~F3~ Список подразделений "+const_mess);
+              UpdateFields(dlg);
+              else
+              msgbox("Отчет можно выпускать только для Филиала");
+              dlg.rec.branchcode = GetClientNameID(Dep.parentcode);
+              dprt_v = dep.parentcode;
+              dlg.rec.branchname = GetClientName(dep.parentcode);
+              message(" ~F3~ Список подразделений "+const_mess);
+              UpdateFields(dlg);
+              end;
+           end;
+        end;
+
+        
+     elif (KEY == KEY_SPACE)
+          /*Сброс установок в поле офис банка*/
+           if (FldName(dlg,id) == "F1") 
+            if (dlg.rec.f1=="")
+            dlg.rec.f1="X";
+            dlg.rec.f2="";
+            dlg.rec.f3="";
+             UpdateFields(dlg);
+           end;
+           elif (FldName(dlg,id) == "F2")
+            if (dlg.rec.f2=="")
+            dlg.rec.f1="";
+            dlg.rec.f2="X";
+            dlg.rec.f3="";
+            UpdateFields(dlg);
+            end;
+           elif (FldName(dlg,id) == "F3")
+            if (dlg.rec.f3=="")
+            dlg.rec.f1="";
+            dlg.rec.f2="";
+            dlg.rec.f3="X";
+            UpdateFields(dlg);
+           end;
+          end;
+
+     elif (( KEY == KEY_F2 ) or (KEY == KEY_ENTER))         //Проверки при вводе
+         if ( dlg.rec.DateBegin > {curdate} )
+                MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+                return CM_IGNORE;
+          elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата начала периода не может быть больше даты окончания периода");
+                return CM_IGNORE;
+         end;
+          if ( dlg.rec.DateEnd > {curdate} )
+                MsgBox("Дата не может быть больше даты текущего операционного дня");
+                return CM_IGNORE;
+          elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+                return CM_IGNORE;
+          end;
+        Datebegin  = dlg.rec.Datebegin;
+        Dateend = dlg.rec.DateEnd;
+        f1=dlg.rec.f1;
+        f2=dlg.rec.f2;
+        f3=dlg.rec.f3;
+        minsum=dlg.rec.minsum;
+        branchcode=dprt_v;
+         if ((Datebegin < {curDate}))    
+           Return CM_SAVE;
+        elif (gettrue(true,"Дата равна текущему опрерационному дню. Продолжить?"))
+           Return CM_SAVE;
+           
+        end;
+      else
+           Return CM_IGNORE;
+     end;
+   end;
+        
+END;
+
+
+/*Точка входа в макрос*/
+ if (RunDialog(dlg, "Event"))                  
+   if (f1=="X")
+     OutF();
+   elif (f2=="X")
+     outS;
+   else
+     outT;
+   end;
+ end;
+END;

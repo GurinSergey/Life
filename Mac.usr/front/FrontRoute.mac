@@ -1,0 +1,383 @@
+/*
+21.05.2009 Seleznev
+функции и процедуры маршрутизации платежа во внешнюю систему
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+*/
+import rsd, Bankinter, PaymInter, CTInter, globals;
+import "fg_Life_parm.mac"; //Lavrenov 27.10.11
+
+
+const FRONT_CATEGORY_ID = 121; //ID категории "Внешняя система"
+ private var fgBank;
+
+private macro catch(x)
+
+   var err_count = 0;
+   var lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message+"\n";
+
+   while( err_count < RSLDefEnv.ErrorCount )
+
+      lasterror = lasterror +RSLDefEnv.error(err_count).descr;
+      err_count = err_count + 1;
+
+   end;
+
+   return lasterror;
+end;
+
+
+macro ReadFrontRule(paymentid)
+
+   var cmd, rs;
+   cmd = RSDCommand(
+                    "select   t1.t_codelist " +
+                    "  from   dobjatcor_dbt t, dobjattr_dbt t1 " +
+                    " where   t.t_objecttype = 501 and t.t_groupid = "+FRONT_CATEGORY_ID+" and t.t_object = lpad (?, 10, '0') "+
+                    " and t.t_objecttype = t1.t_objecttype and t.t_groupid = t1.t_groupid and t.t_attrid = t1.t_attrid and t.t_validtodate > trunc(sysdate)"
+//                    " and t.t_objecttype = t1.t_objecttype and t.t_groupid = t1.t_groupid and t.t_attrid = t1.t_attrid and t.t_validtodate = to_date('31129999','DDMMYYYY')"
+                   );
+
+   cmd.addparam ("pmid",RSDBP_IN, paymentid);
+   rs = RSDRecordset(cmd);
+
+   if (rs.movenext)
+      return rs.value(0);
+   end;
+
+  return -1;
+
+end;
+
+
+macro IsFrontPayment(pm:RSBPayment)
+
+//функция определяет был ли платеж опеределен для обработки во Фронт
+   if (ReadFrontRule(pm.paymentid) == -1)
+      return false
+   end;
+
+   var cmd = RSDCommand("select 1 from dobjatcor_dbt where t_groupid = 1002 and t_attrid = 1 and t_object = lpad (?, 10, '0')");
+   cmd.addparam ("pmid",RSDBP_IN, pm.paymentid);
+   var rs = RSDRecordset(cmd);
+
+   if (rs.movenext())
+      return false; //установлена категория 1002 Выгрузка во Фронт = не требуется
+   end;
+
+   //категория уже установлена
+   return true
+
+end;
+
+
+macro IsSend2Front (paymentid)
+
+//функция определяет был ли платеж выгружен во Фронт
+   var cmd = RSDCommand("select   1 " +
+                        "  from   doprstep_dbt st, doproper_dbt op, dpmpaym_dbt pm " +
+                        " where       st.t_id_operation = op.t_id_operation " +
+                        "         and st.t_isexecute = 'X' " +
+                        "         and st.t_symbol = 'f' " +
+                        "         and op.t_dockind = pm.t_primdockind " +
+                        "         and op.t_documentid = lpad (pm.t_paymentid, 34, '0') " +
+                        "         and pm.t_paymentid = ? "
+                       );
+   cmd.addparam("pmid", RSDBP_IN, paymentid);
+   var rs = RSDRecordset(cmd);
+
+   return rs.movenext
+
+
+end;
+
+
+macro GetFrontParm(pm:RSBPayment, //in: Объект платежа
+                          ruleid, //out: номер правила маршрутизации во Фронт
+                           state, //out: состояние Фронт'а 0 = on-line, 1 = off-line
+                      connstring, //out: строка соединения
+                        procname, //out: имя процедуры Фронт'а
+                        waitstat, //out: параметры выполнения шага зачисления 0 = шаг будет выполнен Фронт'ом
+                                  //                                          1 = шаг выполняется автоматически
+                            note, //out: название правила
+                             ask  //out: выгрузка по запросу
+                  )
+//процедура возвращает параметры интеграции с Фронтом по его номеру
+
+   private var cmd, rs;
+
+   private var frontn = ReadFrontRule(pm.paymentid);
+
+   cmd = RSDCommand(
+                    "select rule_id,  state, connstring, extprocname, execcarry_type, note, need_ask from usr_route_parm "+
+                    "where   rule_id = ?"
+                   );
+   cmd.addparam ("bo_id",RSDBP_IN, frontn);
+   rs = RSDRecordset(cmd);
+
+   if (rs.movenext)
+      setparm(1,frontn);
+      setparm(2,rs.value("state"));
+      setparm(3,rs.value("connstring"));
+      setparm(4,rs.value("extprocname"));
+      setparm(5,rs.value("execcarry_type"));
+      setparm(6,rs.value("note"));
+      setparm(7,rs.value("need_ask"));
+   else
+     msgbox("не определены параметры внешней системы ID="+frontn);
+   end;
+
+end;
+
+macro UpdateFrontRule (pm:RSBPayment, rule_num)
+
+     var cmd = RSDCommand("update dobjatcor_dbt set t_attrid = (select t_attrid from dobjattr_dbt where T_OBJECTTYPE = 501 and T_GROUPID = "
+                          +FRONT_CATEGORY_ID+" and t_codelist = ?), T_VALIDTODATE = ? where T_OBJECTTYPE = 501 and T_OBJECT = lpad (?, 10, '0') and T_GROUPID = "+FRONT_CATEGORY_ID);
+
+     cmd.addparam("t_codelist",   RSDBP_IN,rule_num);
+     cmd.addparam("T_VALIDTODATE", RSDBP_IN, date(31,12,9999));
+     cmd.addparam("T_OBJECT", RSDBP_IN,pm.paymentid);
+
+     cmd.execute();
+
+     onerror(er)
+        msgbox(catch(er));        
+   
+end;
+
+
+/* EVG Удаление категории, если она есть */
+macro DelFrontRule(pm:RSBPayment)
+
+     var cmd = RSDCommand(" delete from dobjatcor_dbt " +
+                          "    where T_OBJECTTYPE = 501 " +
+                          "    and T_OBJECT     = lpad (?, 10, '0') " +
+                          "    and T_GROUPID    = "+FRONT_CATEGORY_ID);
+     cmd.addparam("T_OBJECT", RSDBP_IN,pm.paymentid);
+     cmd.execute();
+
+     onerror(er)
+        msgbox(catch(er));        
+
+end;
+
+/*VDN В рамках C-30595 25.12.2014*/
+macro GetAccountFrontByPayment(paymentid, account)
+  var comm = RSDCommand(" SELECT (CASE WHEN SUBSTR (DECODE (T_USERFIELD4, CHR (1), NULL, CHR (0), NULL, TRIM (T_USERFIELD4)), 6, 3 ) <> '810' THEN NULL ELSE T_USERFIELD4 END) ACC FROM dpmpaym_dbt WHERE T_PAYMENTID = ?");
+      comm.addparam("id", RSDBP_IN, paymentid); debugbreak;
+  comm = RSDRecordSet (comm);
+  if ((comm.MoveNext()) and (StrLen(comm.Value("ACC")) == 20))
+    SetParm(1, comm.Value("ACC"));
+    return true;
+  end;
+  return false;
+end;
+/*VDN В рамках C-30595 25.12.2014*/
+Macro IsFrontRuleByPayment (payeracc, receiveracc, dockind, origin, connString, note)
+  var rs, cmd, str = "SELECT U.* FROM USR_ROUTE_PARM U "+ 
+                     "WHERE REGEXP_LIKE (NVL(?,' '), U.DEB_ACCMASK) " +
+                     "  AND NOT REGEXP_LIKE (NVL(?,' '), NVL (U.DEB_ACCMASK_SKIP, '^$')) " +
+                     "  AND REGEXP_LIKE (?, DOCKIND_CASE) " +
+                     "  AND REGEXP_LIKE (?, U.ORIGIN_CASE) "+
+                     "  AND U.STATE = 0 ";
+ 
+  if (receiveracc != "")
+    str = str + "AND REGEXP_LIKE (NVL(?,' '), U.KRED_ACCMASK) "+
+                "AND NOT REGEXP_LIKE (NVL(?,' '), NVL (U.KRED_ACCMASK_SKIP, '^$')) "+
+                "AND REGEXP_LIKE (?, U.KRED_SYS_ACCTYPE_CASE) "+
+                "AND REGEXP_LIKE (?, U.KRED_USER_ACCTYPE_CASE) ";
+  else
+    str = str + "AND U.DEB_ACCMASK <> '^' ";
+  end;
+
+  cmd = RsdCommand(str);
+  cmd.AddParam( "acc",      RSDBP_IN, payeracc );
+  cmd.AddParam( "acc_skip", RSDBP_IN, payeracc );
+  cmd.AddParam( "doc_kind", RSDBP_IN, dockind  );
+  cmd.AddParam( "origin",   RSDBP_IN, origin   );
+  if (receiveracc != "")
+    cmd.AddParam( "accr",      RSDBP_IN, receiveracc );
+    cmd.AddParam( "accr_skip", RSDBP_IN, receiveracc );
+    rs = RSDRecordSet(RSDCommand("SELECT T_TYPE_ACCOUNT TYPE, T_USERTYPEACCOUNT USR_TYPE FROM DACCOUNT_DBT WHERE T_CHAPTER = 1 AND T_ACCOUNT = '" + receiveracc + "'"));
+    if (rs and rs.MoveNext())
+      cmd.AddParam( "accr_type",    RSDBP_IN, rs.Value("TYPE")     );
+      cmd.AddParam( "accr_usrtype", RSDBP_IN, rs.Value("USR_TYPE") );
+    else
+      cmd.AddParam( "accr_type",    RSDBP_IN, StrFor(1) );
+      cmd.AddParam( "accr_usrtype", RSDBP_IN, StrFor(1) );
+    end; 
+  end;
+  rs = RSDRecordSet(cmd);
+  if (rs and rs.MoveNext())
+    SetParm(4, rs.Value("CONNSTRING"));
+    SetParm(5, rs.Value("NOTE"      ));
+    return true;
+  end;
+  return false;
+OnError(er)
+  msgbox (catch (er));
+  return false;
+end;
+
+macro SetFrontRoute (pm:RSBPayment, dockind, origin, newacc)
+
+//функция определяет id внешней системы по правилам, описанным в таблице usr_route_parm
+//присваивает соответствующее значение категории
+//если категория уже была установлена ранее, переопределения не происходит
+
+   var cmd, rs;
+   var frontcatnum;
+  /*SDA - Если передан отдельно счет получателя, то опрелеяем маршрут по нему */
+   var receiveraccount = pm.receiveraccount;   
+
+    if (valtype(newacc) != v_undef)
+        receiveraccount = newacc;
+    end;
+
+   macro SetFrontRule (rule_id, paymentid)
+
+     /*пока не исправят 141929*//*ConnectCategory(OBJTYPE_PAYMENT, FRONT_CATEGORY_ID, pm.paymentid, false, frontcatnum )*/
+     var cmd = RSDCommand("insert into dobjatcor_dbt (T_OBJECTTYPE, T_GROUPID, T_ATTRID, T_OBJECT, "+
+                          "T_GENERAL, T_VALIDFROMDATE, T_OPER, T_VALIDTODATE, T_ISAUTO) "+
+                          " values (?,?,(select t_attrid from dobjattr_dbt where T_OBJECTTYPE = 501 and T_GROUPID = "+FRONT_CATEGORY_ID+" and t_codelist = ?),lpad (?, 10, '0'),?,?,?,?,chr(88))");
+
+     cmd.addparam("T_OBJECTTYPE", RSDBP_IN, OBJTYPE_PAYMENT);
+     cmd.addparam("T_GROUPID", RSDBP_IN,FRONT_CATEGORY_ID);
+     cmd.addparam("T_ATTRID", RSDBP_IN,rule_id);
+     cmd.addparam("T_OBJECT", RSDBP_IN,paymentid);
+     cmd.addparam("T_GENERAL", RSDBP_IN, "X");
+     cmd.addparam("T_VALIDFROMDATE", RSDBP_IN, {curdate});
+     cmd.addparam("T_OPER", RSDBP_IN, {oper});
+     cmd.addparam("T_VALIDTODATE", RSDBP_IN, date(31,12,9999));
+
+     cmd.execute();
+
+     cmd = RSDCommand("update dpmpaym_dbt set t_ToBackOffice = 'Ъ' where t_paymentid = ?");
+     cmd.addparam("pmid", RSDBP_IN,paymentid);
+
+     cmd.execute();
+
+     onerror(er)
+        msgbox(catch(er));        
+
+   end;
+
+
+   macro DefineFrontRule(newacc)
+
+      var sqltext;
+      var pay_ac_type,pay_ac_utype,rec_ac_type,rec_ac_utype;
+      pay_ac_type=pay_ac_utype=rec_ac_type=rec_ac_utype=strfor(1);
+      /*SDA*/
+       debugbreak;
+      var accFront;
+      cmd = RSDCommand ("select t_account, t_type_account, t_usertypeaccount from daccount_dbt where t_chapter = 1 and t_account in (?,?)");
+      /*VDN C-30595 25.12.2014*/
+      if ((pm.dockind == 70) and (GetAccountFrontByPayment(pm.paymentid, accFront)))             
+        cmd.addparam("payacc", RSDBP_IN, accFront);
+      else
+        cmd.addparam("payacc", RSDBP_IN, pm.payeraccount);
+      end;
+      if ( fgBank.is_PRBB ) 
+         cmd.addparam("recacc", RSDBP_IN, pm.futurereceiveraccount);
+      else
+         cmd.addparam("recacc", RSDBP_IN, receiveraccount);
+      end;      
+
+      rs = RSDRecordset(cmd);
+
+      while (rs.movenext)
+         if (rs.value("t_account") == pm.payeraccount)
+
+            pay_ac_type  = rs.value("t_type_account");
+            pay_ac_utype = rs.value("t_usertypeaccount");
+
+/*         elif(rs.value("t_account") == pm.receiveraccount)*/
+         elif(rs.value("t_account") == receiveraccount)
+            rec_ac_type  = rs.value("t_type_account");
+            rec_ac_utype = rs.value("t_usertypeaccount");
+
+         end;
+      end;
+
+      cmd = RSDCommand (
+                        "select   u.* " +
+                        "  from   usr_route_parm u  " +
+                        " where       regexp_like (nvl(?,' '), u.deb_accmask) " +
+                        "         and regexp_like (nvl(?,' '), u.kred_accmask) " +
+                        "         and not regexp_like (nvl(?,' '), nvl (u.deb_accmask_skip, '^$')) " +
+                        "         and not regexp_like (nvl(?,' '), nvl (u.kred_accmask_skip, '^$')) " +
+                        "         and regexp_like (?, dockind_case)          " +
+                        "         and regexp_like (substr (?, 6, 3), u.cur_mask) " +
+                        "         and regexp_like (?, u.deb_sys_acctype_case) " +
+                        "         and regexp_like (?, u.deb_user_acctype_case) " +
+                        "         and regexp_like (?, u.kred_sys_acctype_case) " +
+                        "         and regexp_like (?, u.kred_user_acctype_case) "+
+                        "         and regexp_like (?, u.origin_case) "+
+                        "         and u.state = 0 order by 4 desc"
+                      );
+      /*VDN C-30595 25.12.2014*/
+      if ((pm.dockind == 70) and (GetAccountFrontByPayment(pm.paymentid, accFront)))
+        cmd.addparam("pay_ac", RSDBP_IN, accFront);
+      else
+        cmd.addparam("pay_ac", RSDBP_IN, pm.payeraccount);
+      end; 
+      cmd.addparam("rec_ac", RSDBP_IN, receiveraccount);
+/*      cmd.addparam("rec_ac", RSDBP_IN, pm.receiveraccount);*/
+      cmd.addparam("pay_ac1", RSDBP_IN, pm.payeraccount);
+      cmd.addparam("rec_ac1", RSDBP_IN, receiveraccount);
+/*      cmd.addparam("rec_ac1", RSDBP_IN, pm.receiveraccount);*/
+      cmd.addparam("dockind", RSDBP_IN, dockind);
+      cmd.addparam("pay_ac2", RSDBP_IN, receiveraccount);
+/*      cmd.addparam("pay_ac2", RSDBP_IN, pm.receiveraccount);*/
+      cmd.addparam("pay_ac_type",  RSDBP_IN, pay_ac_type);
+      cmd.addparam("pay_ac_utype", RSDBP_IN, pay_ac_utype);
+      cmd.addparam("rec_ac_type",  RSDBP_IN, rec_ac_type);
+      cmd.addparam("rec_ac_utype", RSDBP_IN, rec_ac_utype);
+      cmd.addparam("origin", RSDBP_IN, origin);
+      rs = RSDRecordset(cmd);
+
+      if (rs.movenext)
+         return rs.value("rule_id");
+      end;
+
+      onerror(er)
+        msgbox(catch(er));        
+
+   end;
+
+	//Lavrenov: 27.10.11
+	fgBank = fg_life_subject({OurBank});
+
+
+   /* EVG Заменил на pm.ReceiverBankID и {OurBank}, т.к. ReceiverBankCode не обязательно БИК,
+      может быть и BIC SWIFT.
+   if ((pm.IsTransit) or (not(pm.iscredit)) or (pm.ReceiverBankCode != {MFO_BANK}))*/
+   if ((pm.IsTransit) or (not(pm.iscredit)) or (pm.ReceiverBankID != {OurBank}))
+
+      /* EVG Удаление категории, если она есть */
+      DelFrontRule( pm );
+
+      return false;
+   end;
+
+   if(IsFrontPayment(pm))
+      //Фронт уже определен
+      return true;
+   end;
+
+   frontcatnum = DefineFrontRule(newacc);
+
+   if (frontcatnum)
+         SetFrontRule (frontcatnum, pm.paymentid);
+         return true //Фронт определен и назначен
+   end;
+   
+
+
+   return false //платеж не подлежит передачи во Фронт
+
+      onerror(er)
+        msgbox(catch(er));        
+        return false
+
+end;

@@ -1,0 +1,408 @@
+/*Отправка уведомления/извещения для валюты/нерезидента                */
+/*Тихомиров А.Н.  04.08.2009                               Версия 1.0  */
+//Gurin S. C-17745 06.03.2013
+//Gurin S. 13.03.2013 R-165219-2
+//Gurin S. 05.04.2013 I-00351969-2 (Ищем dpmpaym_dbt.r_receiver c dpmpaym_dbt.t_futurereceiveraccount для отправки уведомлений)
+// TAM 29.07.2013 R-223747-2
+
+
+import Календарь, iborwp, globals, rsd, payminter;
+import "print_vk_text.mac", "fg_Life_parm.mac", "lib_compare.mac", "lib_iclient.mac", "lib_account.mac";
+
+private const fgBank = fg_life_subject({OurBank});
+private var out, fulloutput, errcode;
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",2,out);
+    Fulloutput = out + "\\print_vk.txt";                    
+
+const desc_SUCCESS                  = "Отправлено";
+const decs_SUCCESS_with_unclarified = "Отправлено. Средства зачислены с 47416*";
+const desc_FAILURE_no_exist_client  = "Не отправлены. Нет клиента в базе ИК";
+const decs_FAILURE_invalid_message  = "Не отправлены. Ошибка в процедуре message в ИК";
+
+
+class NoticeRecord(_Account_Num, _description)
+    var m_Account_Num   = _Account_Num;
+    var m_description   = _description;
+end;
+
+var notice: TArray = TArray();
+
+macro Protocol(subject)
+    var reportName = getTxtFileName ("trn_order_send_notify");
+    var table = CTableReport();
+    var i=0;
+
+    setoutput(reportName,false);
+    println (string ("Отчет о выполнении процедуры \"", subject,"\""):c:100);
+    println (string ("                           Дата - ", date, ", время - ", time):c:70);
+
+    table.addColumn ("Номер счета",  22,  AL_LEFT);
+    table.addColumn ("Описание",     50, AL_LEFT);
+
+    table.printHead ();
+
+    while (i < notice.size ())
+        table.printStringTransferByWord(notice[i].m_Account_Num, notice[i].m_description);
+        i = i + 1;
+    end;
+
+    table.printSeparator ();
+    table.printStringTransferByWord ("Всего файлов:", i);
+    table.printBottom ();
+    SetOutput (NULL, true);
+    viewfile(reportName);
+end;
+
+Macro ISBorw(account_num)
+    private var cmd, rsd;
+    cmd = rsdcommand("select count(*) as cnt from daccount_dbt where t_usertypeaccount like '%Ё%' and t_account = ?");
+    cmd.addparam ("account",RSDBP_IN,account_num);
+    cmd.execute();
+
+    rsd = rsdrecordset(cmd);
+    if (rsd.movenext() and (rsd.value(0)>0)) return 1; end; 
+    return 0;
+end;
+
+Macro ISBorwS(account_num)
+    private var cmd, rsd;
+    //Gurin S. 30.01.2014 Адаптация 2031
+    //cmd = rsdcommand("select count(*) as cnt from daccount$_dbt where t_usertypeaccount like '%Ё%' and t_account = ?");
+    cmd = rsdcommand("select count(*) as cnt from daccount_dbt where t_usertypeaccount like '%Ё%' and t_account = ?");
+    cmd.addparam ("account",RSDBP_IN,account_num);
+    cmd.execute();
+ 
+    rsd = rsdrecordset(cmd);
+    if (rsd.movenext() and (rsd.value(0)>0)) return 1; end;
+    return 0;
+end;
+
+Private Macro GetAccClient(acc,fiid)
+    var cmd, rs;
+    cmd = RsdCommand("select t_client from daccount_dbt where t_account = :acc and t_code_currency = :fiid");
+    cmd.AddParam("acc",  RSDBP_IN, acc);
+    cmd.AddParam("fiid", RSDBP_IN, fiid);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext()) return rs.value("t_client"); else return -1; end;
+end;
+
+Macro ОтправкаУведомления(Doc_date,Account_num,Client_Name,Value,Currency_str,Value_str,Reply_date, BankName, paymentid, ismassprint, clientid, Account_payer, FutRecAcc)
+    private var oMessForm, oMess, oClient, oCurBank, oCl, cl, obj, Client, strtxt, rec_fiid, cmd, rsd;
+    
+    if (clientid == -1)
+        rec_fiid = Acc_GetFiidByAccount(FutRecAcc);
+        clientid = GetAccClient(FutRecAcc,rec_fiid);
+    end;
+        
+    cmd = rsdcommand("select t_code from dobjcode_dbt where t_objectid = ? and t_codekind = 1");
+    cmd.addparam("ID",RSDBP_IN,clientid);
+    cmd.execute();
+    rsd = rsdrecordset(cmd);
+
+    if (rsd.movenext()) cl = rsd.value("t_code"); else return 0; end;
+
+    /*Gurin S. 30.01.2014 Адаптация 2031
+    cmd = RSDCommand(
+                    "select   ad.t_date_carry      " +
+                    "  from   dpmpaym_dbt pm, " +
+                    "         dpmdocs_dbt pmd,  " +
+                    "         darhdoc$_dbt ad,  " +
+                    "         daccount$_dbt ac     " +
+                    " where       pm.t_dockind in (320, 322, 27, 202, 70)  " + //TAM 29.07.2013 R-223747-2
+                    "         and pm.t_FIID_FutureRecAcc <> 0 " +
+                    "         and ac.t_code_currency = pm.t_FIID_FutureRecAcc  " +
+                    "         and ac.t_chapter = 1  " +
+                    "         and ac.t_type_account like '%Y%' " +
+                    "         and pmd.t_paymentid = pm.t_paymentid  " +
+                    "         and ad.t_applicationkey = pmd.t_applicationkey  " +
+                    "         and ad.t_account_receiver = ac.t_account  " +
+                    "         and ad.t_chapter = 1  " +
+                    "         and ad.t_code_currency = pm.t_FIID_FutureRecAcc  " +
+                    "         and ad.t_sum = pm.t_payamount " +
+                    "         and  pm.t_paymentid = ? "
+                   );
+    */
+    cmd = RSDCommand(
+                    "select   trn.t_date_carry      " +
+                    "  from   dpmpaym_dbt pm, " +
+                    "         dpmdocs_dbt pmd, " +
+                    "         dacctrn_dbt trn, " +
+                    "         daccount_dbt ac " +
+                    " where       pm.t_dockind in (320, 322, 27, 202, 70)  " + //TAM 29.07.2013 R-223747-2
+                    "         and pm.t_FIID_FutureRecAcc <> 0 " +
+                    "         and ac.t_code_currency = pm.t_FIID_FutureRecAcc  " +
+                    "         and ac.t_chapter = 1  " +
+                    "         and ac.t_type_account like '%Y%' " +
+                    "         and pmd.t_paymentid = pm.t_paymentid  " +
+                    "         and trn.t_acctrnid = pmd.t_acctrnid " +
+                    "         and trn.t_account_receiver = ac.t_account  " +
+                    "         and trn.t_chapter = 1  " +
+                    "         and trn.t_fiid_receiver = pm.t_FIID_FutureRecAcc  " +
+                    "         and trn.t_sum_payer = pm.t_payamount " +
+                    "         and  pm.t_paymentid = ? "
+                   );
+    cmd.addparam("pmid",RSDBP_IN, paymentid);
+    rsd = RSDRecordset(cmd);
+    if (rsd.MoveNext())
+        Doc_date = date(rsd.value(0));
+        Reply_date = DateAfterWorkDays(date(Doc_date),15);
+    end;
+
+    if (IC_FindClientByPartyID(string(ClientId)) == true)
+        IC_SendMessage (clientid, "Уведомление", PutDoubleQoute(ТекстУведомления(Client_Name, paymentid, Currency_str, Value, Value_str, Account_Num, Doc_date, Reply_date, Doc_date)));
+        println(ТекстУведомления(Client_Name, paymentid, Currency_str, Value, Value_str, Account_Num, Doc_date, Reply_date, Doc_date));
+        if (stringEqMask(trim(Account_payer), "47416*"))          
+            notice(notice.size()) = NoticeRecord(Account_Num, decs_SUCCESS_with_unclarified);
+        else
+            notice(notice.size()) = NoticeRecord(Account_Num, desc_SUCCESS); 
+        end;
+    else
+        notice(notice.size()) = NoticeRecord(Account_Num, desc_FAILURE_no_exist_client);
+    end;
+
+    if (not ismassprint)
+        msgbox("Уведомление отправлено");
+    end;
+
+onError()
+    notice(notice.size()) = NoticeRecord(Account_Num, decs_FAILURE_invalid_message); 
+
+End;
+
+macro ОтправкаИзвещения(Account_num,Client_Name,Value,Currency_str,Value_str, paymentid, ismassprint, clientid, pdate, sclient, Account_payer)
+    private var oMessForm,oMess,oClient,oCurBank,oCl, cl,
+                obj,Client,strtxt, cmd, rsd;
+
+    cmd = rsdcommand("select t_code from dobjcode_dbt where t_objectid = ? and t_codekind = 1");
+    cmd.addparam("ID",RSDBP_IN,clientid);
+    cmd.execute();
+    rsd = rsdrecordset(cmd);
+    if (rsd.movenext()) cl = rsd.value("t_code"); else return 0; end;
+
+    if (IC_FindClientByPartyID(string(ClientId)) == true)
+        if ({oper} == 647)
+            clientid = 0000000;
+        end;
+        IC_SendMessage (clientid, "Извещение", PutDoubleQoute(ТекстИзвещения(strsubst(Client_Name,"'",strfor(22)), paymentid, value, currency_str, value_str, account_num, pdate, strsubst(sclient,"'",strfor(22)))));
+        println(ТекстИзвещения(Client_Name, paymentid, value, currency_str, value_str, account_num, pdate, sclient));
+        if (stringEqMask(trim(Account_payer), "47416*"))          
+            notice(notice.size()) = NoticeRecord(Account_Num, decs_SUCCESS_with_unclarified);
+        else
+            notice(notice.size()) = NoticeRecord(Account_Num, desc_SUCCESS); 
+        end;
+    else
+        notice(notice.size()) = NoticeRecord(Account_Num, desc_FAILURE_no_exist_client);
+    end;
+
+    if (not ismassprint)
+        msgbox("Извещение отправлено");
+    end;
+
+onError()
+    notice(notice.size()) = NoticeRecord(Account_Num, decs_FAILURE_invalid_message); 
+
+End;
+
+macro ОтправкаВсехУведомлений
+    var pdate = {curdate};
+    var rub, kop,CURtext;
+
+    var depi = "", rs1, cm1, dep = "0";
+
+    if (not(getDate(pdate,"Укажите дату зачисления на счет"))) exit(1); end;
+   
+    if (not(getstring(dep,"Укажите подразделение (0 - Весь банк)", 3)))
+        exit(1);
+    else
+        if (dep > 0)
+            cm1 = rsdcommand("select t_code from ddp_dep_dbt where t_name = ?");
+            cm1.addparam("name", RSDBP_IN, dep);
+            rs1 = rsdrecordset(cm1);
+            if (rs1.movenext())
+                depi = "and ac.t_branch = "+rs1.value(0);
+            end;
+        end;
+    end;
+
+    private var rs, cmd, srok;
+    /*Gurin S. 30.01.2014 Адаптация 2031
+    cmd = RSDCommand("select   pm.t_paymentid, ad.t_date_carry t_valuedate, " +
+                     "         ad.t_account_receiver t_receiveraccount, " +
+                     "         ad.t_account_payer t_payeraccount, " +
+                     "         pt.t_name as t_receivername, " +
+                     "         pm.t_payamount, " +
+                     "         pm.t_receiver, " +
+                     "         fi.t_iso_number, " +
+                     "         pmr.t_receiverbankname, " +
+                     "         pm.t_futurereceiveraccount futrecacc" +
+                     "  from   dpmpaym_dbt pm, " +
+                     "         dpmrmprop_dbt pmr, " +
+                     "         dpmdocs_dbt pmd, " +
+                     "         darhdoc$_dbt ad, " +
+                     "         daccount$_dbt ac, " +
+                     "         dparty_dbt pt, " +
+                     "         dfininstr_dbt fi " +
+                     " where       pm.t_dockind in (320, 322, 27, 202, 70) " + //TAM 29.07.2013 R-223747-2
+                     "         and pm.t_FIID_FutureRecAcc <> 0 " +
+                     "         and pm.t_paymentid = pmr.t_paymentid " +
+                     "         and ad.t_date_carry = ? " +
+                     "         and ac.t_code_currency = pm.t_FIID_FutureRecAcc " +
+                     "         and ac.t_chapter = 1 " +
+                     "         and ac.t_type_account like '%Y%' " +
+                     "         and fi.t_fiid = pm.t_FIID_FutureRecAcc " +
+                     "         and pt.t_partyid = ac.t_client " +depi +
+                     "         and pt.t_notresident = chr (0) " +
+                     "         and pmd.t_paymentid = pm.t_paymentid " +
+                     "         and ad.t_applicationkey = pmd.t_applicationkey " +
+                     "         and ad.t_account_receiver = ac.t_account " +
+                     "         and ad.t_chapter = 1 " +
+                     "         and ad.t_code_currency = pm.t_FIID_FutureRecAcc "
+                     ); 
+    */
+    cmd = RSDCommand("SELECT   pm.t_paymentid, " +
+                     "         trn.t_date_carry t_valuedate, " +
+                     "         trn.t_account_receiver t_receiveraccount, " +
+                     "         trn.t_account_payer t_payeraccount, " +
+                     "         pt.t_name AS t_receivername, " +
+                     "         pm.t_payamount, " +
+                     "         pm.t_receiver, " +
+                     "         fi.t_iso_number, " +
+                     "         pmr.t_receiverbankname, " +
+                     "         pm.t_futurereceiveraccount futrecacc " +
+                     "  FROM   dpmpaym_dbt pm, " +
+                     "         dpmrmprop_dbt pmr, " +
+                     "         dpmdocs_dbt pmd, " +
+                     "         dacctrn_dbt trn,          " +
+                     "         daccount_dbt ac, " +
+                     "         dparty_dbt pt, " +
+                     "         dfininstr_dbt fi " +
+                     " WHERE       pm.t_dockind IN (320, 322, 27, 202, 70) " +
+                     "         AND pm.t_FIID_FutureRecAcc <> 0 " +
+                     "         AND pm.t_paymentid = pmr.t_paymentid " +
+                     "         AND trn.t_date_carry = ? " +
+                     "         AND ac.t_code_currency = pm.t_FIID_FutureRecAcc " +
+                     "         AND ac.t_chapter = 1 " +
+                     "         AND ac.t_type_account LIKE '%Y%' " +
+                     "         AND fi.t_fiid = pm.t_FIID_FutureRecAcc " +
+                     "         AND pt.t_partyid = ac.t_client " +depi +
+                     "         AND pt.t_notresident = CHR (0) " +
+                     "         AND pmd.t_paymentid = pm.t_paymentid " +
+                     "         AND trn.t_acctrnid = pmd.t_acctrnid " +
+                     "         AND trn.t_account_receiver = ac.t_account " +
+                     "         AND trn.t_chapter = 1 " +
+                     "         AND trn.t_fiid_receiver = pm.t_FIID_FutureRecAcc"
+                     ); 
+    cmd.addparam("pdate", RSDBP_IN, pdate);
+    rs = RSDRecordset(cmd);
+
+    setoutput(fulloutput,false);
+    setoutput(null,true);
+
+    while (rs.moveNext())
+        srok = date(rs.value("t_valuedate"));
+        if ((srok > date("26.02.2011")) and (not fgBank.is_EXV))
+            srok = DateAfterWorkDays(srok, 16);
+        else
+            srok = DateAfterWorkDays(srok, 8);
+        end;
+         
+        CURtext    = CurToStrAlt(money(rs.value("t_payamount")), rub, kop, int(rs.value("t_iso_number")), false); 
+        ОтправкаУведомления(date(rs.value("t_valuedate")),rs.value("t_receiveraccount"),rs.value("t_receivername"),money(rs.value("t_payamount")),
+                            SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext,
+                            srok, rs.value("t_receiverBankname"), rs.value("t_paymentid"), true, rs.value("t_receiver"), rs.value("t_payeraccount"), rs.value("futrecacc")); 
+    end;
+end;
+
+macro ОтправкаВсехИзвещений
+    var pdate = {curdate};
+    var rub, kop,CURtext;
+    var depi = "", rs1, cm1, dep = "0";
+   
+    if (not(getDate(pdate,"Укажите дату зачисления на счет"))) exit(1); end;
+
+    if (not(getstring(dep,"Укажите подразделение (0 - Весь банк)", 3)))
+        exit(1);
+    else
+        if (dep > 0)
+            cm1 = rsdcommand("select t_code from ddp_dep_dbt where t_name = ?");
+            cm1.addparam("name", RSDBP_IN, dep);
+            rs1 = rsdrecordset(cm1);
+            if (rs1.movenext())
+                depi = "and ac.t_branch = "+rs1.value(0);
+            end;
+        end;
+    end;
+
+    private var rs, cmd;
+    /*Gurin S. 30.01.2014 Адаптация 2031
+    cmd = RSDCommand("select   pm.t_paymentid, ad.t_date_carry t_valuedate,  " +
+                     "         nvl(pm.t_payeraccount, ' ') t_payeraccount,  " +
+                     "         pm.t_receiveraccount,  " +
+                     "         pm.t_payeraccount,  " + 
+                     "         pmr.t_receivername,  " +
+                     "         pmr.t_payername,  " +
+                     "         pm.t_payamount,          " +
+                     "         pmr.t_receiverbankname,  " +
+                     "         pm.t_receiver  " +
+                     "  from   dpmpaym_dbt pm,  " +
+                     "         daccount_dbt ac, " +
+                     "         darhdoc_dbt ad, " +
+                     "         dpmrmprop_dbt pmr,  " +
+                     "         dpmdocs_dbt pmd       " +
+                     " where   pm.t_dockind in (320, 322, 16)  " +
+                     "         and pm.t_FIID_FutureRecAcc = 0  " +
+                     "         and ad.t_account_receiver = ac.t_account " +
+                     "         and pm.t_paymentid = pmr.t_paymentid  " +
+                     "         and ac.t_chapter = 1 " +depi +
+                     "         and pmd.t_paymentid = pm.t_paymentid " +
+                     "         and ad.t_applicationkey = pmd.t_applicationkey " +
+                     "         and ad.t_date_carry = ?  " +
+                     "         and pmd.t_paymentid = pm.t_paymentid  "
+                     );
+    */
+    cmd = RSDCommand("select   pm.t_paymentid, trn.t_date_carry t_valuedate,  " +
+                     "         nvl(pm.t_payeraccount, ' ') t_payeraccount,  " +
+                     "         pm.t_receiveraccount,  " +
+                     "         pm.t_payeraccount,  " + 
+                     "         pmr.t_receivername,  " +
+                     "         pmr.t_payername,  " +
+                     "         pm.t_payamount,          " +
+                     "         pmr.t_receiverbankname,  " +
+                     "         pm.t_receiver  " +
+                     "  from   dpmpaym_dbt pm,  " +
+                     "         daccount_dbt ac, " +
+                     "         dacctrn_dbt trn, " +
+                     "         dpmrmprop_dbt pmr,  " +
+                     "         dpmdocs_dbt pmd       " +
+                     " where   pm.t_dockind in (320, 322, 16)  " +
+                     "         and pm.t_FIID_FutureRecAcc = 0  " +
+                     "         and trn.t_account_receiver = ac.t_account " +
+                     "         and pm.t_paymentid = pmr.t_paymentid  " +
+                     "         and ac.t_chapter = 1 " +depi +
+                     "         and pmd.t_paymentid = pm.t_paymentid " +
+                     "         and trn.t_acctrnid = pmd.t_acctrnid " +
+                     "         and trn.t_date_carry = ?  " +
+                     "         and pmd.t_paymentid = pm.t_paymentid  "
+                     );
+    cmd.addparam("pdate", RSDBP_IN, pdate);
+    rs = RSDRecordset(cmd);
+
+    setoutput(fulloutput,false);
+    setoutput(null,true);
+    //Gurin S. 05.08.2015 R-611413-3
+    private var  RecMask = "401*-407*, 40802*";
+
+    while (rs.moveNext())
+        if ((CompareStrWithMasks (RecMask, rs.value("t_receiveraccount")) == 0))
+            if (ISPayerNerezAcc(rs.value("t_payeraccount")))
+                CURtext    = CurToStrAlt(money(rs.value("t_payamount")), rub, kop, 810); 
+                ОтправкаИзвещения(rs.value("t_receiveraccount"),rs.value("t_receivername"),money(rs.value("t_payamount")), 
+                                  SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext, rs.value("t_paymentid"), true, 
+                                  rs.value("t_receiver"), pdate,rs.value("t_payername"), rs.value("t_payeraccount"));
+            end;
+        end;
+    end;
+end;
+
+

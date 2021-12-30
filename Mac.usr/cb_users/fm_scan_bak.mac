@@ -1,0 +1,1325 @@
+/*
+ * "Финансовый мониторинг"
+ *  Дополнительные проверки при отборе операций, подлежащих контролю
+ */
+
+Import rsd, FMInter, FIInter, PaymInter, Календарь, "fm_ground.mac", "globals.mac";
+Import OprInter, CTInter, cb_sql, "fm_pmexecs.mac";
+
+private record Payment("pmpaym.dbt");
+
+private record PmRMProp("pmrmprop.dbt");
+
+private record PmAddPI("pmaddpi.dbt");
+private var SumForOK : money;
+
+MACRO GetChapter(acc)
+  var balacc, chapter;
+
+  if(strbrk(acc, "ОВП") > 0)
+     return 1;
+  else
+     balacc = int(SUBSTR (acc, 1, 5));
+  end;
+
+  IF ((balacc >= 98000) AND (balacc <= 98090))
+      chapter = 5;
+  ELIF ((balacc >= 93001) AND (balacc <= 97001))
+      chapter = 4;
+  ELIF (   ((balacc >= 90601) AND (balacc <= 91904))
+        OR (balacc == 99999) OR (balacc == 99998))
+      chapter = 3;
+  ELIF ((balacc >= 80101) AND (balacc <= 85501))
+      chapter = 2;
+  ELSE
+     chapter = 1;
+  END;
+
+ return chapter;
+END;
+
+MACRO AccountExists(acc)
+  var rs, str;
+  str = "SELECT t_account " +
+        "  FROM daccount_dbt " +
+        " WHERE t_account = '"+acc+"' " + 
+        " and t_chapter = "+ getchapter(acc);
+
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     return true;
+  else
+     return false;
+  end;
+END;
+
+MACRO IsCorrAccount(acc)
+  var rs, str;
+  str = "SELECT t_type_account " +
+        "  FROM daccount_dbt " +
+        " WHERE t_account = '"+acc+"' " + 
+        " and t_chapter = "+ getchapter(acc);
+
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     if (index(rs.t_type_account,"К")> 0)
+        return true;
+     else
+        return false;
+     end;
+  else
+     return false;
+  end;
+END;
+
+macro USR_GetPartyReg(ptid, ListKind_Ref, DocKindID)
+var rs, str;
+str = "SELECT objrgdoc.*, " +
+      "       (SELECT partcode.t_code " +
+      "        FROM dpartcode_dbt partcode " +
+      "        WHERE partcode.t_codekind = objalreg.t_codekind " +
+      "              AND partcode.t_partyid = objrgdoc.t_objectid) t_code " +
+      "FROM dobjrgdoc_dbt objrgdoc, dobjalreg_dbt objalreg " +
+      "WHERE     objrgdoc.t_objecttype = 3 " +
+      "      AND objrgdoc.t_objectid = " + ptid +
+      "      AND objrgdoc.t_regpartykind =  " + ListKind_Ref +
+      "      AND objrgdoc.t_regdockind = " + DocKindID +
+      "      AND objrgdoc.t_isclosed = CHR (0) " +
+      "      AND objrgdoc.t_docdate = " +
+      "            (SELECT MAX (t.t_docdate) " +
+      "             FROM dobjrgdoc_dbt t " +
+      "             WHERE     t.t_objecttype = 3 " +
+      "                   AND t.t_objectid = " + ptid +
+      "                   AND t.t_regpartykind = " + ListKind_Ref +
+      "                   AND t.t_regdockind = " + DocKindID +
+      "                   AND t.t_isclosed = CHR (0)) " +
+      "      AND objalreg.t_objecttype = objrgdoc.t_objecttype " +
+      "      AND objalreg.t_regpartykind = objrgdoc.t_regpartykind " +
+      "      AND objalreg.t_regdockind = objrgdoc.t_regdockind " +
+      "      AND objalreg.t_partyid = 0 " +
+      "      AND ROWNUM = 1 ";
+  rs = trsbdataset(str);
+ 
+  return rs;
+END;
+
+MACRO GetPartyByAccount(acc)
+  var rs, str;
+  str = "SELECT t_client " +
+        "  FROM daccount_dbt " +
+        " WHERE t_account = '"+acc+"' " + 
+        " and t_chapter = "+ getchapter(acc);
+
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     return rs.client;
+  else
+     return -1;
+  end;
+END;
+
+MACRO GetPartyType(ptid)
+  var rs, str;
+  str = "SELECT pt.t_legalform, ps.t_isemployer " +
+        "  FROM dparty_dbt pt, dpersn_dbt ps " +
+        " WHERE pt.t_partyid = " + ptid + 
+        "   AND ps.t_personid(+) = pt.t_partyid " ;
+
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     if(rs.legalform == 1)
+        return "Ю";
+     else
+        if(rs.t_isemployer == "X")
+           return "П";
+        else
+           return "Ф";
+        end;         
+     end;      
+  else
+     return "Н";
+  end;
+END;
+
+
+
+private macro GetAccountRecord( accRec, Account : string, Code_Currency : integer, Chapter : integer ) : bool
+  file acc ("account.dbt" ) key 0;
+  file accC("account$.dbt") key 0;
+  var file_acc;
+  
+  if( Code_Currency == NATCUR ) file_acc = acc ;
+  else                          file_acc = accC; end;
+
+  if( Chapter == NULL ) file_acc.Chapter = 1;
+  else                  file_acc.Chapter = Chapter;
+  end;
+
+  file_acc.Account       = Account;
+  file_acc.Code_Currency = Code_Currency;
+  if( getEQ( file_acc ) )
+    Copy( accRec, file_acc );
+    return true;
+  end;
+  return false;
+end;
+
+private macro CheckDocumentAccount( Chapter : integer ) : bool
+
+  var AccMask = "91312*, 91412*, 915*";
+
+  return (Chapter == 1)
+     or ((Chapter == 3) and ((CompareStrWithMasks(AccMask, Payment.PayerAccount) == 0) or (CompareStrWithMasks(AccMask, Payment.ReceiverAccount) == 0)));
+
+end;
+
+
+/* Дополнительная проверка мультивалютного документа */
+private macro CheckMutydoc( Chapter : @integer ) : integer
+  
+  var rs : RsdRecordset;
+  var sqlString : string;
+
+  var stat : integer;
+
+  stat = 1;
+
+  sqlString = "SELECT t_Chapter FROM dmultydoc_dbt WHERE t_AutoKey = " + Payment.PaymentID;
+
+  rs = RsdRecordset(sqlString);
+
+  if( rs.moveNext() )
+
+    Chapter = int(rs.value(0));
+
+    if( CheckDocumentAccount(Chapter) )
+      stat = 0;
+    end;
+
+  end;
+  
+  return stat;
+
+end;
+
+/* Дополнительная проверка мемордера */
+private macro CheckMemorder( Chapter : @integer ) : integer
+  
+  var rs : RsdRecordset;
+  var sqlString : string;
+
+  var stat : integer;
+
+  stat = 1;
+
+  sqlString = "SELECT t_Chapter FROM dcb_doc_dbt WHERE t_DocumentID = " + Payment.PaymentID;
+
+  rs = RsdRecordset(sqlString);
+
+  if( rs.moveNext() )
+
+    Chapter = int(rs.value(0));
+
+    if( CheckDocumentAccount(Chapter) )
+      stat = 0;
+    end;
+
+  end;
+  
+  return stat;
+
+end;
+
+/* Дозаполнении операций, связанных с драгметаллами */
+private macro CheckMetal( FMOperation : RsbFMOperation )
+
+  if( FMOperation.Metal > 0 )
+    SetOperationCode( FMOperation, "5005" );
+  end;
+
+end;
+
+/* Дополнительная проверка кассовых платежей */
+private macro CheckCashPayment( FMOperation : RsbFMOperation )
+
+  if( Payment.Purpose == PM_PURP_CASHBAL )
+
+    if( CompareStrWithMasks("40906*", Payment.ReceiverAccount) == 0 )
+
+      /* инкассация */
+
+      /* плательщик - клиент счета получателя */
+      FMOperation.OprParty(_FM_PARTY_Payer).PartyID = Payment.Receiver;
+
+      /* получатель - банк */
+      FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID = FMOperation.BankID;
+
+    end;
+
+  end;
+
+end;
+
+/* Дополнительное заполнение параметров операции */
+private macro FillOperation( FMOperation : RsbFMOperation )
+
+  var DocKind = Payment.DocKind;
+
+  if(
+     (Payment.DocKind == DLDOC_BANKPAYMENT)
+  or (Payment.DocKind == DLDOC_BANKCLAIM  )
+  or (Payment.DocKind == BBANK_CPORDER    )
+  or (Payment.DocKind == PS_PAYORDER      )
+  or (Payment.DocKind == PS_CPORDER       )
+  or (Payment.DocKind == PS_INRQ          )
+  or (Payment.DocKind == WL_WIPM          )
+  or (Payment.DocKind == WL_INDOC         )
+  or (Payment.DocKind == CASH_PS_INCORDER )
+  or (Payment.DocKind == CASH_PS_OUTORDER )
+  or (Payment.DocKind == CASH_BOF_INCORDER)
+  or (Payment.DocKind == CASH_BOF_OUTORDER)
+    )
+
+    FMOperation.PaymDocDate   = Payment.ValueDate;
+    FMOperation.PaymDocNumber = PmRMProp.Number;
+
+  end;
+  if((accountexists(Payment.Receiveraccount)) and (Payment.Receiver == -1))
+      FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyId   = GetPartyByAccount(Payment.Receiveraccount);
+      FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyType = GetPartyType(FMOperation.OprParty(_FM_PARTY_RECEIVER).partyid);
+  end;
+end;
+
+
+/* проверить, подпадает ли участник операции под код из группы 3000 */
+private macro _checkPartyCode3000( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty ) : bool
+  
+  var SetCode = false;
+
+  if( FMOprParty.PartyID != FMOperation.BankID )
+    SetCode = FMOprParty.CheckCountry();
+  end;
+
+  return SetCode;
+
+end;
+
+/* Проверка на простановку кода из группы 3000 */
+private macro CheckCode3000( FMOperation : RsbFMOperation ) : bool
+  
+  var NeedSetCode : bool;
+  var CountrySign : bool;
+
+  CountrySign = NeedSetCode = false;
+
+  NeedSetCode = _checkPartyCode3000(FMOperation, FMOperation.OprParty(_FM_PARTY_PAYER) );
+  if( NeedSetCode ) CountrySign = true; end;
+
+  NeedSetCode = _checkPartyCode3000(FMOperation, FMOperation.OprParty(_FM_PARTY_RECEIVER) );
+  if( NeedSetCode ) CountrySign = true; end;
+
+  return CountrySign;
+
+end;
+
+/* проверить, подпадает ли участник операции под код 4005 */
+private macro _checkPartyCode4005( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty ) : bool
+  
+  var SetCode = false;
+  var _3MonthsCalcType, DaysInMon, stat;  
+  var TmpDt, PeriodEndDate;
+  var Day, Mon, Year;
+  var v_partyid, v_startdate, v_rs;
+
+  if( (FMOperation.IsInternalParty(FMOprParty.FMPartyKind)) and (FMOprParty.BankID != FMOprParty.PartyID) )
+
+    if( IsClientAccount(FMOprParty.Account) )
+
+      if( ((FMOprParty.PartyType == "Ю") or (FMOprParty.PartyType == "П")) and (FMOprParty.RegDate != date(0,0,0)) )
+
+        /*Для каждого документа регистрации определяем: */
+        _3MonthsCalcType = Get_3MonthsCalcType();
+         
+        /*1.  Если настройка = 1, то: */
+        if( _3MonthsCalcType == 1 )
+
+          /*Если "Дата платежа" (pmpaym.ValueDate) минус "Дата госрегистрации" 
+                  <= 3х календарных месяцев, добавить код 4005.*/          
+        if( DateAfterCalenMonths(FMOprParty.RegDate, 3) >= FMOperation.DateCarry )
+          SetCode = true;
+
+          SetOperationCode( FMOperation, "4005" );
+        end;
+
+        elif( _3MonthsCalcType == 0 )
+        /*2.  Если настройка = 0, то определяем дату окончания периода по следующему правилу:
+        - Берем дату, следующую за датой госрегистрации - это будет дата начала периода.
+        - Прибавляем к этой дате 3 месяца, число месяца при этом остается тоже. */
+          TmpDt = DateAfterCalenDays( FMOprParty.RegDate, 1 );        
+          TmpDt = DateAfterCalenMonths( TmpDt, 3 );          
+          /* - Если полученная дата есть в месяце и является рабочим днем по календарю, то считаем ее 
+            датой окончания периода.*/
+          DaysInMon = GetDaysInMonth( TmpDt );
+          DateSplit( TmpDt, Day, Mon, Year );
+          if( Day <= DaysInMon )
+            if( IsWorkDay( TmpDt ) )
+              PeriodEndDate = TmpDt;
+            else
+          /* - Если полученная дата есть в месяце, но она не является рабочим днем по календарю, 
+               то берем ближайший следующий за ней рабочий день - это и будет дата окончания периода.*/
+              TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              while( IsWorkDay( TmpDt ) == 0 )                  
+                TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              end;
+              PeriodEndDate = TmpDt;
+            end;
+          
+          else
+          /* - Если в месяце нет полученной даты (например, дата начала - 30.11.06, дата окончания 
+            должна быть - 30.02.07, но 30 числа нет в феврале), то берем последний день этого 
+            месяца (в нашем примере - 28 февраля).*/                     
+            TmpDt = date( DaysInMon, Mon, Year );            
+            /*  Проверяем по календарю - является он рабочим или нет:*/
+            if( IsWorkDay( TmpDt ) )
+              PeriodEndDate = TmpDt; /* - Если ДА - то это дата окончания периода.*/
+            else
+            /*  - Если НЕТ - то берем ближайший следующий за ней рабочий день, и это будет дата 
+                  окончания периода. */
+              TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              while( IsWorkDay( TmpDt ) == 0 )                  
+                TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              end;
+              PeriodEndDate = TmpDt;              
+            end;
+                          
+          end;
+                    
+          /*  Если "Дата платежа" (pmpaym.ValueDate) <= полученной даты окончания периода, 
+              добавить код 4005.*/
+          if( PeriodEndDate >= FMOperation.DateCarry )
+            SetCode = true;
+            SetOperationCode( FMOperation, "4005" );
+          end;
+                    
+        end;              
+       //Лавренов: Провярем данные для счетов Лоро
+      elif( (FMOprParty.PartyType == "Ю") and (IsCorrAccount(FMOprParty.Account) == true) and ((GetPartyByAccount(FMOprParty.Account) != {selfid}) and (GetPartyByAccount(FMOprParty.Account) != -1)) )
+        debugbreak;
+        v_partyid = GetPartyByAccount(FMOprParty.Account);
+        v_rs = USR_GetPartyReg(v_partyid, 7,4);
+        
+        if(v_rs and v_rs.movenext)
+        v_startdate = date(v_rs.t_startdate);
+       /*Для каждого документа регистрации определяем: */
+        _3MonthsCalcType = Get_3MonthsCalcType();
+         
+        /*1.  Если настройка = 1, то: */
+        if( _3MonthsCalcType == 1 )
+
+          /*Если "Дата платежа" (pmpaym.ValueDate) минус "Дата госрегистрации" 
+                  <= 3х календарных месяцев, добавить код 4005.*/          
+        if( DateAfterCalenMonths(v_startdate, 3) >= FMOperation.DateCarry )
+          SetCode = true;
+
+          SetOperationCode( FMOperation, "4005" );
+        end;
+
+        elif( _3MonthsCalcType == 0 )
+        /*2.  Если настройка = 0, то определяем дату окончания периода по следующему правилу:
+        - Берем дату, следующую за датой госрегистрации - это будет дата начала периода.
+        - Прибавляем к этой дате 3 месяца, число месяца при этом остается тоже. */
+          TmpDt = DateAfterCalenDays( v_startdate, 1 );        
+          TmpDt = DateAfterCalenMonths( TmpDt, 3 );          
+          /* - Если полученная дата есть в месяце и является рабочим днем по календарю, то считаем ее 
+            датой окончания периода.*/
+          DaysInMon = GetDaysInMonth( TmpDt );
+          DateSplit( TmpDt, Day, Mon, Year );
+          if( Day <= DaysInMon )
+            if( IsWorkDay( TmpDt ) )
+              PeriodEndDate = TmpDt;
+            else
+          /* - Если полученная дата есть в месяце, но она не является рабочим днем по календарю, 
+               то берем ближайший следующий за ней рабочий день - это и будет дата окончания периода.*/
+              TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              while( IsWorkDay( TmpDt ) == 0 )                  
+                TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              end;
+              PeriodEndDate = TmpDt;
+            end;
+          
+          else
+          /* - Если в месяце нет полученной даты (например, дата начала - 30.11.06, дата окончания 
+            должна быть - 30.02.07, но 30 числа нет в феврале), то берем последний день этого 
+            месяца (в нашем примере - 28 февраля).*/                     
+            TmpDt = date( DaysInMon, Mon, Year );            
+            /*  Проверяем по календарю - является он рабочим или нет:*/
+            if( IsWorkDay( TmpDt ) )
+              PeriodEndDate = TmpDt; /* - Если ДА - то это дата окончания периода.*/
+            else
+            /*  - Если НЕТ - то берем ближайший следующий за ней рабочий день, и это будет дата 
+                  окончания периода. */
+              TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              while( IsWorkDay( TmpDt ) == 0 )                  
+                TmpDt = DateAfterCalenDays( TmpDt, 1 );
+              end;
+              PeriodEndDate = TmpDt;              
+            end;
+                          
+          end;
+                    
+          /*  Если "Дата платежа" (pmpaym.ValueDate) <= полученной даты окончания периода, 
+              добавить код 4005.*/
+          if( PeriodEndDate >= FMOperation.DateCarry )
+            SetCode = true;
+            SetOperationCode( FMOperation, "4005" );
+          end;
+                    
+        end;              
+        end;
+       //Лавренов: Если дата регистрации не указана ставим код
+       //Чесноков: По заявке I-102749 добавил предпринимателей
+      elif( (FMOprParty.PartyType == "Ю") or (FMOprParty.PartyType == "П") and (FMOprParty.RegDate == date(0,0,0)) and (FMOprParty.PartyID != 23004) )
+         SetCode = true;
+         SetOperationCode( FMOperation, "4005" );
+      end;
+
+    end;
+
+  end;
+
+  return SetCode;
+
+end;
+
+
+/* Установить, если требуется, код 4005 */
+private macro CheckCode4005( FMOperation : RsbFMOperation )
+  
+  var SetCode = false;
+
+  if( not SetCode )
+
+    SetCode = _checkPartyCode4005( FMOperation, FMOperation.OprParty(_FM_PARTY_PAYER) );
+  
+  end;
+
+  if( not SetCode )
+
+    SetCode = _checkPartyCode4005( FMOperation, FMOperation.OprParty(_FM_PARTY_RECEIVER) );
+  
+  end;
+
+end;
+
+
+/*private macro _checkPartyCode4006_Ex( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty, Account : string, FIID : integer ) : bool
+  var sqlString : string;
+  var SetCode = false;
+
+  if( Payment.Amount >= SumForOK )
+    if( FIID != NATCUR )
+      sqlString = "SELECT * FROM darhdoc$_dbt arh WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID
+                + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                + "') AND t_Date_Carry = TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23"
+                + " AND TO_DATE(TO_CHAR(t_systemdate, 'dd.mm.yyyy') ||' '|| TO_CHAR(t_systemtime, 'HH24:MI:SS'), 'DD.MM.YYYY HH24:MI:SS') < "
+                + " (SELECT min(TO_DATE(TO_CHAR(t_systemdate, 'dd.mm.yyyy') ||' '|| TO_CHAR(t_systemtime, 'HH24:MI:SS'), 'DD.MM.YYYY HH24:MI:SS')) "
+                + " FROM darhdoc$_dbt arh WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID
+                + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                + "') AND t_Date_Carry = TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23"
+                + " AND EXISTS( select doc.t_PaymentID  from   dpmdocs_dbt doc where doc.t_PaymentID = " + Payment.PaymentID + " and doc.t_LinkKindID = 1 " 
+                + " and  doc.t_ApplicationKind = arh.t_iApplicationKind and  doc.t_ApplicationKey  = arh.t_ApplicationKey )) ";
+    else 
+      sqlString = "SELECT * FROM darhdoc_dbt  arh WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID 
+                + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                + "') AND t_Date_Carry = TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23"
+                + " AND TO_DATE(TO_CHAR(t_systemdate, 'dd.mm.yyyy') ||' '|| TO_CHAR(t_systemtime, 'HH24:MI:SS'), 'DD.MM.YYYY HH24:MI:SS') < "              
+                + " (SELECT min(TO_DATE(TO_CHAR(t_systemdate, 'dd.mm.yyyy') ||' '|| TO_CHAR(t_systemtime, 'HH24:MI:SS'), 'DD.MM.YYYY HH24:MI:SS')) "
+                + " FROM darhdoc_dbt arh WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID
+                + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                + "') AND t_Date_Carry = TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23"
+                + " AND EXISTS( select doc.t_PaymentID  from   dpmdocs_dbt doc where doc.t_PaymentID = " + Payment.PaymentID + " and doc.t_LinkKindID = 1 "
+                + " and  doc.t_ApplicationKind = arh.t_iApplicationKind and  doc.t_ApplicationKey  = arh.t_ApplicationKey )) ";
+       
+    end;
+    
+      /* Если же на дату платежа есть другие проводки, то проверяем время их выполнения (arhDoc.SystemTime). 
+         Если все они исполнены после заданного платежа, то добавляем код операции для контроля 4006. Иначе - нет. */
+    if( not RsdRecordset(sqlString).moveNext() ) 
+      SetCode = true;
+    end;
+  end;
+  return SetCode;
+end;*/
+
+private macro _checkPartyCode4006_Ex( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty, Account : string, FIID : integer ) : bool
+  
+  var cmd : RsdCommand;
+
+  var sqlString : string;
+  var SetCode = false;
+  var max_num = 2147483647;
+
+  if( FMOperation.SumEquivalent >= SumForOK )
+  
+    sqlString = "SELECT 1 FROM";
+
+    if( FIID != NATCUR ) sqlString = sqlString + " darhdoc$_dbt ";
+    else                 sqlString = sqlString + " darhdoc_dbt " ;
+    end;
+    
+    sqlString = sqlString + "WHERE t_Chapter = ? AND t_Code_Currency = ? AND (t_Account_Payer = ? OR t_Account_Receiver = ?) AND t_Date_Carry = ?";
+    sqlString = sqlString + " AND t_Result_Carry <> ? AND t_AutoKey";
+    sqlString = sqlString + " < ";
+
+    sqlString = sqlString + "(";
+
+    sqlString = sqlString + "SELECT NVL(min(t_AutoKey), ?) FROM";
+
+    if( FIID != NATCUR ) sqlString = sqlString + " darhdoc$_dbt arh ";
+    else                 sqlString = sqlString + " darhdoc_dbt arh " ;
+    end;
+
+    sqlString = sqlString + "WHERE t_Chapter = ? AND t_Code_Currency = ? AND (t_Account_Payer = ? OR t_Account_Receiver = ?) AND t_Date_Carry = ?";
+
+    sqlString = sqlString + " AND t_Result_Carry <> ? AND EXISTS ";
+
+    sqlString = sqlString + "(";
+
+    sqlString = sqlString + "SELECT 1 FROM dpmdocs_dbt doc WHERE doc.t_PaymentID = ? AND doc.t_LinkKindID = ?";
+
+    sqlString = sqlString + " AND doc.t_ApplicationKind = arh.t_iApplicationKind and  doc.t_ApplicationKey  = arh.t_ApplicationKey";
+
+    sqlString = sqlString + ")";
+  
+    sqlString = sqlString + ")";
+
+    cmd = RsdCommand( sqlString );
+
+    cmd.addParam( "", RSDBP_IN, 1       );               /* Глава счета   */
+    cmd.addParam( "", RSDBP_IN, FIID    );               /* Валюта счета  */
+    cmd.addParam( "", RSDBP_IN, Account );               /* Номер счета   */
+    cmd.addParam( "", RSDBP_IN, Account );               /* Номер счета   */
+    cmd.addParam( "", RSDBP_IN, FMOperation.DateCarry ); /* Дата операции */
+    cmd.addParam( "", RSDBP_IN, 23 );                    /* Признак следа архивной проводки */
+
+    cmd.addParam( "", RSDBP_IN, max_num );
+
+    cmd.addParam( "", RSDBP_IN, 1       );               /* Глава счета   */
+    cmd.addParam( "", RSDBP_IN, FIID    );               /* Валюта счета  */
+    cmd.addParam( "", RSDBP_IN, Account );               /* Номер счета   */
+    cmd.addParam( "", RSDBP_IN, Account );               /* Номер счета   */
+    cmd.addParam( "", RSDBP_IN, FMOperation.DateCarry ); /* Дата операции */
+    cmd.addParam( "", RSDBP_IN, 23 );                    /* Признак следа архивной проводки */
+
+    cmd.addParam( "", RSDBP_IN, Payment.PaymentID );     /* ИД платежа */
+    cmd.addParam( "", RSDBP_IN, 1 );                     /* LinkKindID = PMLINK_CARRY */
+      
+      /* Если же на дату платежа есть другие проводки, то проверяем время их выполнения (arhDoc.SystemTime). 
+         Если все они исполнены после заданного платежа, то добавляем код операции для контроля 4006. Иначе - нет. */
+    if( not RsdRecordset(cmd).moveNext() ) 
+      SetCode = true;
+    end;
+  end;
+  return SetCode;
+end;
+
+
+
+/*/* проверить, является проводка первой по счету */
+private macro _checkPartyCode4006( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty, Account : string, FIID : integer ) : bool
+  
+  var sqlString : string;
+
+  var SetCode = false;
+
+  if( (FMOperation.IsInternalParty(FMOprParty.FMPartyKind)) and (FMOprParty.BankID != FMOprParty.PartyID) )
+
+    if( IsClientAccount(Account) )
+
+      if( (FMOprParty.PartyType == "Ю") or (FMOprParty.PartyType == "П") )
+
+        if( FIID != NATCUR )
+          sqlString = "SELECT 1 FROM darhdoc$_dbt WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID
+                    + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                    + "') AND t_Date_Carry < TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23 AND ROWNUM <= 1";
+        else 
+          sqlString = "SELECT 1 FROM darhdoc_dbt  WHERE t_Chapter = 1 AND t_Code_Currency = " + FIID 
+                    + " AND (t_Account_Payer = '" + Account + "' OR t_Account_Receiver = '" + Account
+                    + "') AND t_Date_Carry < TO_DATE(' " + FMOperation.DateCarry + " ', 'DD.MM.YYYY' ) AND t_Result_Carry <> 23 AND ROWNUM <= 1";
+        end;
+
+        if( not RsdRecordset(sqlString).moveNext() )
+          //SetCode = _checkPartyCode4006_Ex( FMOperation, FMOprParty, Account, FIID );
+          //Если операций по счету небыло в предыдущих днях, то на все отобранные документы ставим код
+          //в независимости от того били ли до него документы в текущем дне.
+          //if( SetCode == true )
+            SetOperationCode( FMOperation, "4006" );
+          //end;
+        end;
+
+      end;
+
+    end;
+
+  end;
+
+  return SetCode;
+
+end;*/
+
+/* проверить, является проводка первой по счету */
+private macro _checkPartyCode4006( FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty, Account : string, FIID : integer ) : bool
+  
+  var sqlString : string;
+  var cmd : RsdCommand;
+
+  var SetCode = false;
+
+  if( (FMOperation.IsInternalParty(FMOprParty.FMPartyKind)) and (FMOprParty.BankID != FMOprParty.PartyID) )
+
+    if( IsClientAccount(Account) )
+
+      if( (FMOprParty.PartyType == "Ю") or (FMOprParty.PartyType == "П") )
+
+        sqlString = "SELECT 1 FROM";
+
+        if( FIID != NATCUR ) sqlString = sqlString + " darhdoc$_dbt ";
+        else                 sqlString = sqlString + " darhdoc_dbt " ;
+        end;
+
+        sqlString = sqlString + "WHERE t_Chapter = ? AND t_Code_Currency = ? AND (t_Account_Payer = ? OR t_Account_Receiver = ?) AND t_Date_Carry < ?";
+
+        sqlString = sqlString + " AND t_Result_Carry <> ? AND ROWNUM <= 1";
+
+        cmd = RsdCommand( sqlString );
+
+        cmd.addParam( "", RSDBP_IN, 1       );
+        cmd.addParam( "", RSDBP_IN, FIID    );
+        cmd.addParam( "", RSDBP_IN, Account );
+        cmd.addParam( "", RSDBP_IN, Account );
+        cmd.addParam( "", RSDBP_IN, FMOperation.DateCarry );
+        cmd.addParam( "", RSDBP_IN, 23 );
+
+        if( not RsdRecordset(cmd).moveNext() )
+          //SetCode = _checkPartyCode4006_Ex( FMOperation, FMOprParty, Account, FIID );
+
+          //if( SetCode == true )
+            SetOperationCode( FMOperation, "4006" );
+          //end;
+        end;
+
+      end;
+
+    end;
+
+  end;
+
+  return SetCode;
+
+end;
+
+
+/* Установить, если требуется, код 4005 */
+private macro CheckCode4006( FMOperation : RsbFMOperation )
+  
+  var SetCode = false;
+
+  if( not SetCode )
+
+    SetCode = _checkPartyCode4006( FMOperation, FMOperation.OprParty(_FM_PARTY_PAYER), Payment.PayerAccount, Payment.FIID );
+
+  end;
+
+  if( not SetCode )
+
+    SetCode = _checkPartyCode4006( FMOperation, FMOperation.OprParty(_FM_PARTY_RECEIVER), Payment.ReceiverAccount, Payment.PayFIID );
+
+  end;
+
+end;
+
+/* Проверка, является ли банк иностранным */
+private macro CheckForeignBank( Code : string, FMOperation : RsbFMOperation, FMOprParty : RsbFMOprParty, FIID : integer )
+  
+  if( (FMOprParty.BankID != FMOperation.BankID) and (FMOprParty.BankID != PTID_UNKNOWNBANK) )
+
+    if( (FMOprParty.Name != "") and (StrUpr(FMOprParty.Name) == StrLwr(FMOprParty.Name)) )
+    
+      if( (FMOprParty.BankCountry != "") and (FMOprParty.BankCountry != {ResidentCountryCodeNum}) )
+          
+        SetOperationCode( FMOperation, Code );
+          
+      end;
+
+    end;
+
+  end;
+
+end;
+
+/* Установить, если требуется, код 1008 */
+private macro CheckCode1008( FMOperation : RsbFMOperation )
+  
+  record accRec("account.dbt");
+
+  record partyRec("party.dbt");
+
+  var CashClientMode : integer;
+
+  /* платеж должен быть приходным кассовым */
+
+  if( (Payment.DocKind == CASH_BOF_INCORDER) or (Payment.DocKind == CASH_PS_INCORDER) )
+
+    /* счет получателя должен быть клиентским */
+
+    if( IsClientAccount(Payment.ReceiverAccount) )
+
+      if( GetAccountRecord(accRec, Payment.ReceiverAccount, Payment.PayFIID) )
+
+        if( (Index(accRec.Type_Account, "L") != 0) and (IsPartyInst(accRec.Client)) )
+        
+          SetOperationCode( FMOperation, "1008" );
+
+          CashClientMode = GetCashClientMode();
+
+          if( (CashClientMode != null) and (CashClientMode == 0) )
+
+            if( FMOperation.OprParty(_FM_PARTY_RECEIVER).RegNumber == "" )
+
+              if( ПолучитьСубъекта(FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID, partyRec) == 0 )
+                
+                FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID = FMOperation.BankID;
+                
+                FMOperation.Descr = "Внесение средств в уставный (складочный) капитал создаваемой организации " + partyRec.ShortName;
+              
+              end;
+
+            end;
+
+          end;
+
+        end;
+
+      end;
+
+    end;
+
+  end;
+
+end;
+
+private macro GetSumSymbolCash_ForOtherSymbs( ConnectAppKind:integer, ConnectAppKey:string, IsIncomeOrder:bool )
+
+  var sqlString, cmd, rs;
+  var SumSymbolCash = $0;
+  var DocKind;
+
+  if( Payment.FIID == NATCUR )
+    DocKind = 1;
+  else
+    DocKind = 7;
+  end;
+  
+  sqlString = " SELECT SUM(t_sum) sum FROM dsymbcash_dbt " +
+              " WHERE t_dockind = ? "
+              " AND (t_applicationkey = LPAD( to_char( ? ), 12, '0') or " +
+              " t_applicationkey = LPAD(to_char(?),5,0) || ? )";
+              
+  if( IsIncomeOrder )
+    sqlString = sqlString + " AND t_kind = 1 AND trim(t_symbol) in ( '02', '11', '19', '32' ) "; 
+  else
+    sqlString = sqlString + " AND t_kind = 2 AND trim(t_symbol) = '53' "; 
+  end;                              
+    
+  cmd = RsdCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, DocKind );
+  cmd.addParam( "", RSDBP_IN, Payment.DocumentID );
+  cmd.addParam( "", RSDBP_IN, ConnectAppKind );
+  cmd.addParam( "", RSDBP_IN, ConnectAppKey );  
+
+  rs = RsdRecordset( cmd );
+
+  if( rs.moveNext )      
+    SumSymbolCash = SQL_ConvTypeSum( rs.value("sum") );    
+  end;
+
+  return SumSymbolCash;
+end;
+
+private macro GetSumSymbolCash_ForSymb22_47( ConnectAppKind:integer, ConnectAppKey:string, IsIncomeOrder:bool )
+
+  var sqlString, cmd, rs;
+  var SumSymbolCash = $0;
+  var DocKind;
+
+  if( Payment.FIID == NATCUR )
+    DocKind = 1;
+  else
+    DocKind = 7;
+  end;
+  
+  sqlString = " SELECT t_sum sum FROM dsymbcash_dbt " +
+              " WHERE t_dockind = ? "
+              " AND (t_applicationkey = LPAD( to_char( ? ), 12, '0') or " +
+              " t_applicationkey = LPAD(to_char(?),5,0) || ? )" +
+              " AND t_kind = ? " +
+              " AND trim(t_symbol) = ? ";
+    
+  cmd = RsdCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, DocKind );
+  cmd.addParam( "", RSDBP_IN, Payment.DocumentID );
+  cmd.addParam( "", RSDBP_IN, ConnectAppKind );
+  cmd.addParam( "", RSDBP_IN, ConnectAppKey );
+  
+  if( IsIncomeOrder )
+    cmd.addParam( "", RSDBP_IN, 1 );    
+    cmd.addParam( "", RSDBP_IN, "22" );   
+  else
+    cmd.addParam( "", RSDBP_IN, 2 );    
+    cmd.addParam( "", RSDBP_IN, "47" );    
+  end;
+
+  rs = RsdRecordset( cmd );
+
+  if( rs.moveNext )      
+    SumSymbolCash = rs.value(0);
+  end;
+
+  return SumSymbolCash;
+end;
+
+/*Установка кода 5006 по сумме документа связанной с игорным бизнесом:*/
+private macro Is5006( FMOperation : RsbFMOperation, ClientID:integer, ConnectAppKind:integer, ConnectAppKey:string, IsIncomeOrder:bool )    
+  var stat;  
+  var addNote:string;
+  var FindAttr:bool;
+  
+  var SumSymbolCash = $0, SumSymbolCashR = $0;
+  
+  file client  ("party.dbt");
+  
+  if( IsIncomeOrder == true ) /*(Payment.DocKind == CASH_PS_INCORDER) or (Payment.DocKind == CASH_BOF_INCORDER)*/
+    /* ПРИХОД */    
+    /*Если для документа установлен приходный кассовый символ 22, то определяем сумму по этому символу - SumSymbolCash.*/    
+    SumSymbolCash = GetSumSymbolCash_ForSymb22_47( ConnectAppKind, ConnectAppKey, IsIncomeOrder );
+
+    /*Если получатель является юридическим лицом или индивидуальным предпринимателем и ему установлен "Код ОКВЭД"  = "92.71"*/       
+    if( IsPartyInstOrEmployer(ClientID) )
+      if( ПолучитьСубъекта(ClientID, client) == 0 )        
+        if( CheckObjAttrPresence ( FindAttr, OBJTYPE_PARTY, UniID( client, OBJTYPE_PARTY), 17, null, "", "92.71", false ) == true )
+          if( FindAttr == true )
+            SumSymbolCash = SumSymbolCash + GetSumSymbolCash_ForOtherSymbs( ConnectAppKind, ConnectAppKey, IsIncomeOrder );
+          end;
+        end;
+      end;
+    end;
+      
+  else /*if( (Payment.DocKind == CASH_PS_OUTORDER) or  (Payment.DocKind == CASH_BOF_OUTORDER) )*/
+    /*Если для документа установлен приходный кассовый символ 47, то определяем сумму по этому символу - SumSymbolCash.*/    
+    SumSymbolCash = GetSumSymbolCash_ForSymb22_47( ConnectAppKind, ConnectAppKey, IsIncomeOrder );
+
+    /*Если получатель является юридическим лицом или индивидуальным предпринимателем и ему установлен "Код ОКВЭД" = "92.71"*/    
+    if( IsPartyInstOrEmployer(ClientID) )      
+      if( CheckObjAttrPresence ( FindAttr, OBJTYPE_PARTY, UniID( client, OBJTYPE_PARTY), 17, null, "", "92.71", false ) == true )
+         if( FindAttr == true )
+           SumSymbolCash = SumSymbolCash + GetSumSymbolCash_ForOtherSymbs( ConnectAppKind, ConnectAppKey, IsIncomeOrder );
+         end;
+      end;
+    end;      
+  end;
+
+  /*Если полученная сумма документа по операциям связанным с игорным бизнесом SumSymbolCash>=600000 (настройка $MIN_SUM) -  
+    добавляем код операции для контроля 5006. При этом, если полученная сумма SumSymbolCash меньше общей суммы платежа, 
+    то в примечание "Дополнительная информация" 
+    добавляем строку: "В том числе по коду 5006: <SumSymbolCash в валюте платежа> (<SumSymbolCash в национальной валюте>)". 
+    Если сумма платежа не в национальной валюте, то в скобках указываем эквивалентную сумму в национальной.*/
+  if( Payment.FIID == NATCUR )
+    SumSymbolCashR = SumSymbolCash;
+    addNote = "В том числе по коду 5006: " + SumSymbolCash;
+  else
+    ConvSum( SumSymbolCashR , SumSymbolCash, {curdate}, Payment.FIID );
+    addNote = "В том числе по коду 5006: " + SumSymbolCash + "(" + SumSymbolCashR + ")";
+  end;
+
+  if( SumSymbolCashR >= SumForOK )
+    if( SumSymbolCash < Payment.Amount )
+      FMOperation.Descr = addNote;
+    end;
+    return true;
+  else
+    return false;
+  end;
+end;
+
+private macro CheckCode5006( FMOperation : RsbFMOperation )
+
+  var stat : bool;
+  var IncomeOrder : bool;
+    
+  var ClientID : integer = PTID_UNKNOWNPARTY;
+
+  record accRec("account.dbt");
+
+  file cashdoc("pscshdoc.dbt");
+
+  if( Payment.Purpose == PM_PURP_CASHBAL )
+
+    ClearRecord( cashdoc );
+    cashdoc.AutoKey = Payment.DocumentID;
+
+    if( GetEQ(cashdoc) )
+
+      if( (Payment.DocKind == CASH_BOF_INCORDER) or (Payment.DocKind == CASH_PS_INCORDER) )       
+        /* ПРИХОД */
+        IncomeOrder = true;
+
+        stat = GetAccountRecord( accRec, Payment.ReceiverAccount, Payment.FIID );
+        if( stat )
+        
+          ClientID = accRec.Client;
+          if( Is5006( FMOperation, ClientID, cashdoc.ConnectAppKind, cashdoc.ConnectAppKey, IncomeOrder ) )
+            SetOperationCode( FMOperation, "5006" );
+          end;
+        end;
+      
+      elif( (Payment.DocKind == CASH_BOF_OUTORDER) or (Payment.DocKind == CASH_PS_OUTORDER))
+     
+        /* РАСХОД */
+        IncomeOrder = false;
+
+        stat = GetAccountRecord( accRec, Payment.PayerAccount, Payment.FIID );
+
+        if( stat )
+          ClientID = accRec.Client;
+          if( Is5006( FMOperation, ClientID, cashdoc.ConnectAppKind, cashdoc.ConnectAppKey, IncomeOrder ) )
+            SetOperationCode( FMOperation,"5006" );
+          end;
+        end;
+
+      end;
+
+    end;
+
+  end;
+
+end;
+
+private macro CheckCode1005( FMOperation : RsbFMOperation )
+  /*1. счет плательщика (pmpaym.PayerAccount) удовлетворяет маске "20202*", 
+      а счет получателя (pmpaym.ReceiverAccount) удовлетворяет маске "10501*, 514*, 515*, 520*, 522*, 523*";
+  var PayerAccMask1 = "20202*";
+  var ReceiverAccMask1 = "10501*, 514*, 515*, 520*, 522*, 523*";*/
+
+  /*2. счет плательщика (pmpaym.PayerAccount) удовлетворяет маске "20207*", 
+     а счет получателя (pmpaym.ReceiverAccount) удовлетворяет маске "520*, 522*, 523*".
+  var PayerAccMask2 = "20207*";
+  var ReceiverAccMask2 = "520*, 522*, 523*";*/
+
+  if( ((CompareStrWithMasks("20202*", Payment.PayerAccount) == 0) 
+       AND (CompareStrWithMasks("10501*, 514*, 515*, 520*, 522*, 523*", Payment.ReceiverAccount) == 0))
+     OR ((CompareStrWithMasks("20207*", Payment.PayerAccount) == 0) 
+       AND (CompareStrWithMasks("520*, 522*, 523*", Payment.ReceiverAccount) == 0)) 
+    )
+    SetOperationCode( FMOperation,"1005" );
+  end;
+end;
+
+
+/*
+ * Функция дополнительной проверки операций, созданных по платежам
+ *
+ * FMOperation - объекта класса RsbFMOperation, описывающего создаваемую операцию
+ *
+ * CheckMode - режим проверки
+ *      1 - обычное сканирование
+ *      2 - проверка на терроризм
+ *      3 - создание операции дробления сумм
+ */
+
+MACRO GetDocNumber(paymid)
+ var rs, str;
+ str = "SELECT t_number " +
+       "  FROM dpmrmprop_dbt " +
+       " WHERE t_paymentid = "+paymid ;
+ rs = trsbdataset(str);
+ if(rs and rs.movenext)
+    return rs.number;
+ else
+    return "";
+ end;
+END;
+
+MACRO GetDocDate(paymid)
+ var rs, str;
+ str = "SELECT t_date " +
+       "  FROM dpmrmprop_dbt " +
+       " WHERE t_paymentid = "+paymid ;
+ rs = trsbdataset(str);
+ if(rs and rs.movenext)
+    return rs.date;
+ else
+    return "";
+ end;
+END;
+
+MACRO GetPartyNameByDoc(paymid, ispayer)
+ var rs, str;
+ str = "SELECT t_payername, t_receivername " +
+       "  FROM dpmrmprop_dbt " +
+       " WHERE t_paymentid = "+paymid ;
+ rs = trsbdataset(str);
+ if(rs and rs.movenext)
+    if(ispayer)
+       return rs.payername;
+    else
+       return rs.receivername;
+    end;
+ else
+    return "";
+ end;
+END;
+
+MACRO GetPartyName(partyid)
+ var rs, str;
+ str = "SELECT t_name " +
+       "  FROM dparty_dbt " +
+       " WHERE t_partyid = "+partyid;
+
+ rs = trsbdataset(str);
+ if(rs and rs.movenext)
+    return rs.name;
+ else
+    return "";
+ end;
+END;
+
+MACRO GetRegion(ptid, adrtype)
+  var rs, str;
+  var region="", province="";
+  str = "SELECT t_coderegion, t_region, t_codeprovince, t_province " +
+        "  FROM dadress_dbt " +
+        " WHERE t_partyid = "+ ptid +
+        "   AND t_type = "+ adrtype ;
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     if((valtype(rs.t_coderegion) != 0) and (strlen(trim(rs.t_coderegion)) > 0))
+        region = rs.t_coderegion;
+     end;
+     if((valtype(rs.t_region) != 0) and (strlen(trim(rs.t_region)) > 0))
+        region = region +" "+ rs.t_region;
+     else
+        region = "";
+     end;
+
+//     debugbreak;
+     if((valtype(rs.t_codeprovince) != 0) and (strlen(trim(rs.t_codeprovince)) > 0))
+        province = rs.t_codeprovince;
+     end;
+     if((valtype(rs.t_province) != 0) and (strlen(trim(rs.t_province)) > 0))
+        province = province +" "+ rs.t_province;
+     else
+        province = "";
+     end;
+
+     if((strlen(region)>0) and (strlen(province)>0))
+        return trim(trim(region) +", "+trim(province));
+     elif(strlen(region)>0)
+        return trim(region);
+     elif(strlen(province)>0)
+        return trim(province);
+     end;
+  end;
+  return "";
+END;
+
+MACRO GetCity(ptid, adrtype)
+  var rs, str;
+  var DISTRICT="", PLACE="";
+  str = "SELECT T_CODEDISTRICT, T_DISTRICT, T_CODEPLACE, T_PLACE " +
+        "  FROM dadress_dbt " +
+        " WHERE t_partyid = "+ ptid +
+        "   AND t_type = "+ adrtype ;
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     if((valtype(rs.T_CODEDISTRICT) != 0) and (strlen(trim(rs.T_CODEDISTRICT)) > 0))
+        DISTRICT = rs.T_CODEDISTRICT;
+     end;
+     if((valtype(rs.T_DISTRICT) != 0) and (strlen(trim(rs.T_DISTRICT)) > 0))
+        DISTRICT = DISTRICT +" "+ rs.T_DISTRICT;
+     else
+        DISTRICT = "";
+     end;
+
+//     debugbreak;
+     if((valtype(rs.T_CODEPLACE) != 0) and (strlen(trim(rs.T_CODEPLACE)) > 0))
+        PLACE = rs.T_CODEPLACE;
+     end;
+     if((valtype(rs.T_PLACE) != 0) and (strlen(trim(rs.T_PLACE)) > 0))
+        PLACE = PLACE +" "+ rs.T_PLACE;
+     else
+        PLACE = "";
+     end;
+
+     if((strlen(DISTRICT)>0) and (strlen(PLACE)>0))
+        return trim(trim(DISTRICT) +", "+trim(PLACE));
+     elif(strlen(DISTRICT)>0)
+        return trim(DISTRICT);
+     elif(strlen(PLACE)>0)
+        return trim(PLACE);
+     end;
+  end;
+  return "";
+END;
+
+
+private macro CheckPayment( FMOperation : RsbFMOperation, CheckMode : integer )
+
+  var stat : integer;
+  var CountrySign : bool;
+  var Chapter : integer;
+
+  stat = 0;
+  debugbreak;
+
+  SetCodeFlag = false;
+
+  SumForOK = FM_GetMinSum();
+
+  Chapter = 1;
+
+  if( (CheckMode != 3) and (FMOperation.SumEquivalent >= SumForOK))
+
+    if( Payment.DocKind == CB_MULTYDOC )
+
+      stat = CheckMutydoc( @Chapter );
+
+    elif( Payment.DocKind == DLDOC_MEMORIALORDER )
+      
+      stat = CheckMemorder( @Chapter );
+
+    end;
+
+    FillOperation( FMOperation );
+
+    if( Chapter == 1 )
+
+      CheckMetal( FMOperation );
+
+      if( Payment.Purpose == PM_PURP_CASHBAL )
+
+        CheckCashPayment( FMOperation );
+
+      end;
+      
+      CountrySign = CheckCode3000( FMOperation );
+
+      CheckForeignBank( "4003", FMOperation, FMOperation.OprParty(_FM_PARTY_RECEIVER) );
+      CheckForeignBank( "4004", FMOperation, FMOperation.OprParty(_FM_PARTY_PAYER   ) );
+
+      CheckCode4005( FMOperation );
+
+      CheckCode4006( FMOperation );
+
+      CheckCode1008( FMOperation );
+    
+      CheckCode5006( FMOperation );
+    
+      CheckCode1005( FMOperation );
+    
+    end;
+
+    /* проверка основания операции */
+    stat = FM_CheckGround( FMOperation, CountrySign, Chapter );
+
+  else
+    FillOperation( FMOperation );
+  end;
+
+ //Пользовательские доработки
+   if(FMOperation.Oper == 0)//пустой операционист
+      FMOperation.Oper = {oper};
+   end;
+
+   if (FMOperation.OprParty(_FM_PARTY_RECEIVER).partyid == -1)//страна плательщика
+       FMOperation.OprParty(_FM_PARTY_RECEIVER).RegCountry = "643";
+       FMOperation.OprParty(_FM_PARTY_RECEIVER).StayCountry = "643";
+   end;
+   if (FMOperation.OprParty(_FM_PARTY_PAYER).partyid == -1)//страна получателя
+       FMOperation.OprParty(_FM_PARTY_PAYER).RegCountry = "643";
+       FMOperation.OprParty(_FM_PARTY_PAYER).StayCountry = "643";
+   end;
+
+   if (FMOperation.PaymDocNumber == "")//пустой номер
+       FMOperation.PaymDocNumber = GetDocNumber(FMOperation.DocumentId);
+   end;
+   //if ((FMOperation.PaymDocDate == "") or (FMOperation.PaymDocDate == date("00.00.0000"))) //пустая дата
+       FMOperation.PaymDocDate = GetDocDate(FMOperation.DocumentId);
+   //end;
+
+   //если плательщик либо получатель ИП - подтягиваем наименование из субъекта
+   /*if ((FMOperation.OprParty(_FM_PARTY_PAYER).partytype == "П") and (FMOperation.OprParty(_FM_PARTY_PAYER).partyid != -1))
+      FMOperation.OprParty(_FM_PARTY_PAYER).name = GetPartyName(FMOperation.OprParty(_FM_PARTY_PAYER).partyid);
+   end;
+   if ((FMOperation.OprParty(_FM_PARTY_RECEIVER).partytype == "П") and (FMOperation.OprParty(_FM_PARTY_RECEIVER).partyid != -1))
+      FMOperation.OprParty(_FM_PARTY_RECEIVER).name = GetPartyName(FMOperation.OprParty(_FM_PARTY_RECEIVER).partyid);
+   end;*/
+
+   //если плательщик либо получатель не наш клиент, наименование подтягиваем из документа
+   if (not AccountExists(FMOperation.OprParty(_FM_PARTY_PAYER).Account))
+       FMOperation.OprParty(_FM_PARTY_PAYER).Name = GetPartyNameByDoc(FMOperation.DocumentId, true);
+   end;
+   if (not AccountExists(FMOperation.OprParty(_FM_PARTY_RECEIVER).Account))
+       FMOperation.OprParty(_FM_PARTY_RECEIVER).Name = GetPartyNameByDoc(FMOperation.DocumentId, false);
+   end;
+
+   //заполняем регион
+   FMOperation.OprParty(_FM_PARTY_PAYER).RegAddrRegion = GetRegion(FMOperation.OprParty(_FM_PARTY_PAYER).PartyID, 1);
+   FMOperation.OprParty(_FM_PARTY_PAYER).StayAddrRegion = GetRegion(FMOperation.OprParty(_FM_PARTY_PAYER).PartyID, 2);
+
+   FMOperation.OprParty(_FM_PARTY_RECEIVER).RegAddrRegion = GetRegion(FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID, 1);
+   FMOperation.OprParty(_FM_PARTY_RECEIVER).StayAddrRegion = GetRegion(FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID, 2);
+
+   //заполняем город 
+   FMOperation.OprParty(_FM_PARTY_PAYER).RegAddrPlaceName = GetCity(FMOperation.OprParty(_FM_PARTY_PAYER).PartyID, 1);
+   FMOperation.OprParty(_FM_PARTY_PAYER).StayAddrPlaceName = GetCity(FMOperation.OprParty(_FM_PARTY_PAYER).PartyID, 2);
+
+   FMOperation.OprParty(_FM_PARTY_RECEIVER).RegAddrPlaceName = GetCity(FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID, 1);
+   FMOperation.OprParty(_FM_PARTY_RECEIVER).StayAddrPlaceName = GetCity(FMOperation.OprParty(_FM_PARTY_RECEIVER).PartyID, 2);
+
+
+  return stat;
+
+end;
+
+
+private macro UserScanPayments( SelPayAlg, dateMin, dateMax, DbAccountMask, CrAccountMask, 
+                                Department, Outgoing, Incoming, Transient, Internal       ) 
+  var DprtList;
+
+  if(SelPayAlg == 0)
+    // системный способ отбора платежей.
+    // можно исправить dfmpaym_tmp 
+
+  elif(SelPayAlg == 1)
+    // вызываем вариант отбора платежей реализованный Расчетным банком 
+
+
+    FM_GetDepartmentsList(Department, DprtList);
+
+    if(not FillExecutedPaymentsList( DprtList,       /* Список кодов филиалов */
+                                  dateMin,        /* Начало периода */
+                                  dateMax,        /* Конец периода */
+                                  DbAccountMask,  /* Маска счёта плательщика */
+                                  CrAccountMask,  /* Маска счёта получателя */
+                                  Internal,       /* Включая внутренние */
+                                  Incoming,       /* Включая входящие */
+                                  Outgoing,       /* Включая исходящие */
+                                  Transient       /* Включая транзитные */
+                              ))
+      return; 
+    end;
+  end;
+  
+  
+  return 0;
+end;

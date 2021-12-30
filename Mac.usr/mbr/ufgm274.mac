@@ -1,0 +1,406 @@
+/****************************************************************************/
+/*                   R-Style SoftLab, RS-Bank 6.0                           */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщения ED274 транспорта УФЭБС                               */
+/*                                                                          */
+/*  Имя файла: ufgm274.mac                                                  */
+/*  Создан:    16.07.12                                Chukina T.           */
+/*  Изменен:   15.11.12   Teleshova A. I-00279033-3                         */
+/*  Изменен:   18.11.12   Teleshova A. C-15514                              */
+/****************************************************************************/
+
+import WldInter, "ufgenmes.mac", "wluftool.mac", "wltools.mac", "rsberror.mac";
+//TAM 13.11.2012
+import BankInter;
+
+private const TYPE_CODE_UFBS_ED274 = 58;
+//private var InRelatedMesId : integer = 0;
+
+private macro GetWlcodeDescription(AlgNum : integer, Code : string) : string
+  var select = "Select t_Description " +
+               "  from dwlcodes_dbt " +
+               " where t_AlgNum = :AlgNum " +
+               "   and t_Code = :Code ";
+  var params = makeArray( SQLParam("AlgNum", AlgNum),
+                          SQLParam("Code",   Code) );
+  var rs = execSQLselect(select, params);
+  if(rs and rs.moveNext)
+    return rs.value("t_Description");
+  end;
+
+  return "";
+end;
+
+//TAM 12.11.2012
+macro UpdateMesAttribute(source:string, attrib:string, old_value:string, new_value:string)
+   var result = "", part_1 = "", part_2 = "", pos;
+   pos = Index(source,"<Annotation>");
+   part_1 = Substr(source,1, pos-1);
+   part_2 = Substr(source, pos);
+   result = StrSubst(part_1, string(attrib + "=\"" + old_value + "\""),string(attrib + "=\"" + new_value + "\""));
+   return string(result + part_2);
+end;
+
+macro UpdateMesValue(mes_id:integer, mes_value:string, refer_number:string)
+  var sql, params;
+  sql = "update dwlmesval_dbt set t_value = :value_str where t_mesid = :mesid";
+  params = makeArray(SQLParam("value_str", mes_value),
+                     SQLParam("mesid", mes_id));
+  execSQl(sql, params);
+  sql = "update dwlmes_dbt set t_trn = :refer where t_mesid = :mesid";
+  params = makeArray(SQLParam("refer", refer_number),
+                     SQLParam("mesid", mes_id));
+  execSQl(sql, params);
+end;
+
+macro MesControl( addrMes, addrReq )
+    debugbreak;
+    record wlmes(wlmes);
+    record wlReq(wlreq);
+    SetBuff( wlmes, addrMes );
+    SetBuff( wlReq, addrReq );
+    var xml:object = ActiveX("Microsoft.XMLDOM");
+    var stat;
+    var xml_str : string = "";
+    var error, GenNumber = "";
+    var EDDate_old, EDNo_old, EDNo_new, s_new, s_old;
+    if ((ПолучитьПоле(wlmes.mesid, XMLField, xml_str)) and (xml.loadXML(xml_str)))
+      EDDate_old = ReadOptinalAttribute(xml, "EDDate");
+      EDNo_old = ReadOptinalAttribute(xml, "EDNo");
+    end;
+    if({curdate} >= ToDate_(EDDate_old)) //TAM 19.11.2012
+      error = GenerateReference(83, GenNumber);
+      if (error > 0)
+         msgbox ("При формировании номера сообщения по референсу возникла ошибка " + error + "!|" + 
+              "Формирование номера невозможно!");
+         return false;
+      end;
+      EDNo_new = substr(GenNumber, 17);
+      s_new = string(UpdateMesAttribute(xml.xml, "EDDate", EDDate_old, YYYYMMDD({curdate})));
+      s_new = string(UpdateMesAttribute(s_new, "EDNo", EDNo_old, EDNo_new));
+      UpdateMesValue(wlmes.mesid, s_new, GenNumber);
+    end;
+    return true;
+end;
+//end TAM
+
+private macro FindInMesByTrn(Trn : string, RelatedRef : @string) : bool
+  RelatedRef = "";
+
+  var rs = execSQLselect("Select t_MesID, t_RelatedRef " +
+                         "  from dwlmes_dbt            " +
+                         " where t_Trn = :Trn          " +
+                         "   and t_Direct = 'X'        ",
+                         makeArray( SQLParam("Trn", Trn) )
+                        );
+  if(rs and rs.moveNext)
+    RelatedRef = rs.value("t_RelatedRef");
+    return true;
+  end;
+
+  return false;
+end;
+
+private macro GetRefFromQueries(Queries : string, RefLabel : string) : string
+  var ref_str = ""; // строка референса
+
+  var ref_ind1 = index(Queries, RefLabel) + StrLen(RefLabel); 
+  var ref_ind2 = index(Queries, "\n", ref_ind1);
+  ref_str = SubStr(Queries, ref_ind1, ref_ind2 - ref_ind1);
+  ref_str = Trim(ref_str);
+
+  return ref_str;
+end;
+
+private macro GetInitialEDReference(InRelatedRef:string, Queries:string) : string
+  var ref_str = "";
+
+  if(InRelatedRef)
+    ref_str = InRelatedRef;
+  else    
+    ref_str = getFldValFromQueries(Queries, "InitialED:");
+  end;
+
+  return ref_str;
+end;
+
+private macro GetEDReceiverForED274(wlReq) : string
+  //return GetEDAuthor(wlReq.RecipientID);
+  var xml_parent:object = ActiveX("Microsoft.XMLDOM"); 
+  var xml_str : string = "";
+  //Gurin S. 24.12.2013 адаптация 31 
+  var rs = execSQLselect("Select t_MesID, t_RelatedRef " +
+                          "  from dwlmes_dbt            " +
+                          " where t_Trn = :Trn          " +
+                          "   and t_Direct = 'X'        ",
+                          makeArray( SQLParam("Trn", wlreq.RelatedRef) )
+                         );
+   if(rs and rs.moveNext)
+      var InRelatedMesId = rs.value("t_MesID");
+      if( ПолучитьПоле(InRelatedMesId, XMLField, xml_str) and xml_parent.loadXML(xml_str) )
+          var EDAuthor_parent : string = ReadOptinalAttribute(xml_parent, "EDAuthor");
+          if(EDAuthor_parent)
+            return  EDAuthor_parent;
+          else
+            return  GetEDAuthor(wlReq.RecipientID);
+          end;
+      end;
+   else
+      return GetEDAuthor(wlReq.RecipientID);
+   end;
+end;
+
+ //TAM 15.11.2012 I-00279033-3
+ //Gurin S. 24.12.2013 адаптация 31 
+private macro GetEDInitDateForED274(Trn) : string
+ debugbreak;
+ var xml_parent:object = ActiveX("Microsoft.XMLDOM"); 
+ var xml_str : string = "";
+ var ED_initdate:string = YYYYMMDD(Date());
+ //TAM 19.11.2013 HF_96 адаптация
+  var rs = execSQLselect("Select t_MesID, t_RelatedRef " +
+                         "  from dwlmes_dbt            " +
+                         " where t_Trn = :Trn          " +
+                         "   and t_Direct = 'X'        ",
+                         makeArray( SQLParam("Trn", Trn) )
+                        );
+  if(rs and rs.moveNext)
+     var InRelatedMesId = rs.value("t_MesID");
+     if( ПолучитьПоле(InRelatedMesId, XMLField, xml_str) and xml_parent.loadXML(xml_str) )
+       ED_initdate = ReadOptinalAttribute(xml_parent, "EDDate");
+     end;
+  end;
+ return ED_initdate;
+end;
+
+private macro isDate( fname:string ):bool
+
+  var day, mon, year;  
+  var sDay, sMon, sYear;
+
+  sDay  = SubStr( fname, 9, 2 );
+  sMon  = SubStr( fname, 6, 2 );
+  sYear = SubStr( fname, 1, 4 );
+  
+  /* Проверка, являются ли символы цифрами */
+  if( StrIsNumber( sDay ) )    
+    day  = Int( sDay );
+  else
+    return false;
+  end;
+
+  if( StrIsNumber( sMon ) )
+    mon  = Int( sMon );
+  else
+    return false;
+  end;
+
+  if( StrIsNumber( sYear ) ) 
+    year = Int( sYear );
+  else
+    return false;
+  end;
+
+  if( year < 0 )
+    return false;
+  end;
+
+  if( (mon < 1) or (mon > 12) )
+    return false;
+  end;
+
+  if( day < 1 )
+    return false;
+  end;
+
+  if( mon == 2 )
+    if( day > 29 )
+      return false;
+    end;
+  end;
+
+  if( (mon==1) or (mon==3) or (mon==5) or (mon==7) or (mon==8) or (mon==10) or (mon==12) )
+    if( day > 31 )
+      return false;
+    end;
+  else
+    if( day > 30 )
+      return false;
+    end;
+  end;
+  //проверка формата
+  if( ( SubStr( fname, 5, 1 ) != "-" ) or ( SubStr( fname, 8, 1 ) != "-" ) )
+    return false;
+  end;
+
+  return true;
+  
+end;
+
+macro CheckObj(addrReq)
+  debugbreak;
+  record wlReq (wlreq);
+  SetBuff( wlReq, addrReq );
+
+  // Проверить поле wlreq.Queries
+  var req_code : string = "";
+  index_wlcode(wlReq.Queries, TYPE_CODE_UFBS_ED274, @req_code);
+  if(not req_code)
+    RsbThrow("Не найден код в сообщении");
+  end;
+
+  var InRelatedRef : string = "";
+
+  var InMesFound = false;
+  if( wlReq.RelatedRef )
+    InMesFound = FindInMesByTrn(wlReq.RelatedRef, @InRelatedRef); //,@InRelatedMesId); //Gurin S. 24.12.2013 адаптация 31
+    if(InMesFound)
+      if(not InRelatedRef and not index(wlReq.Queries, "InitialED:"))
+        RsbThrow("Не найдена ссылка на исходный ЭД");
+      end;
+    end;
+  end;
+
+  if(not wlReq.RelatedRef or not InMesFound)
+    if(not index(wlReq.Queries, "InitialED:"))
+      RsbThrow("Не найдена ссылка на исходный ЭД");
+    end;
+    if(not index(wlReq.Queries, "EDRefID:"))
+      RsbThrow("Не найдена ссылка на исходный ЭПД");
+    end;
+  end;  
+
+  //Gurin S. 25.09.2014 HF2031_19_25_83
+  if( StrLen( getFldValFromQueries( wlReq.Queries, "SumPT" ) ) > 18 )
+    RunError("Не корректно заполнено поле \"SumPT\"");
+  end;
+  if( StrLen( getFldValFromQueries( wlReq.Queries, "AcptSum" ) ) > 18 )
+    RunError("Не корректно заполнено поле \"AcptSum\"");
+  end;
+
+  //Gurin S. 29.09.2014 I-00518162-2 Не понятно зачем это
+  //if( not isDate( getFldValFromQueries( wlReq.Queries, "AcptDate" ) ) )
+  //  RunError("Не корректно заполнено поле \"AcptDate\"");
+  //end;
+
+  // должно обеспечиваться равенство получателя сообщения (EDReceiver) 
+  // отправителю исходного сообщения (InitialED.EDAuthor)
+  var EDReceiver : string = GetEDReceiverForED274(wlReq);
+  var ref_str = GetInitialEDReference(InRelatedRef, wlReq.Queries);
+  var ed_nda = EDNoDateAuthor();
+  ed_nda.ConstructByTrn(ref_str); 
+  if( EDReceiver != ed_nda.EDAuthor )
+    RsbThrow("Получатель уведомления (EDReceiver) не совпадает с " +
+             "отправителем исходного сообщения (InitialED.EDAuthor)");
+  end;
+
+  return true;
+
+  OnError(er) /* обработка ошибок */
+    ExeptionMessage(er);
+    return FALSE;
+end;
+
+macro GenMes( addrMes, addrReq )
+  debugbreak;
+  //TAM 20.03.2014 R-344690 - 
+  /*if( CheckObj(addrReq) != TRUE )
+    return FALSE;
+  end;*/
+
+  record wlmes(wlmes);
+  record wlReq(wlreq);
+
+  SetBuff( wlmes, addrMes );
+  SetBuff( wlReq, addrReq );
+
+  var InRelatedRef : string = "";
+  //Gurin S. 25.09.2014 HF2031_19_25_83
+  var tempstr:string = "";
+ 
+  // Найти входящее сообщение wlmes_in, на которое ссылается ответ
+  if( wlReq.RelatedRef )
+    FindInMesByTrn(wlReq.RelatedRef, @InRelatedRef);
+  end;
+
+  // Заполнение атрибутов поля "xml" сообщения
+  var xml:object = ActiveX("Microsoft.XMLDOM");  
+  var mes:object;
+  
+  mes = xml.createElement("ED274");
+  mes.setAttribute("xmlns", "urn:cbr-ru:ed:v2.0");
+  
+  FillEDNoDateAuthorByRef_XMLField(mes, wlmes.TRN);
+
+  mes.setAttribute("EDReceiver", GetEDReceiverForED274(wlReq) );
+
+  var ind = index(wlReq.Queries, "InfoCode:");
+  mes.setAttribute("InfoCode",   SubStr(wlReq.Queries, ind+9, 1));
+
+  //Gurin S. 25.09.2014 HF2031_19_25_83
+  //Gurin S. 29.09.2014 R-461251-2 Если не SumPT, то не устанавливаем
+  tempstr = getFldValFromQueries( wlReq.Queries, "SumPT" );
+  if( StrLen(tempstr) > 0 )
+     mes.setAttribute("SumPT",  strsubst(tempstr,":",""));
+  end;
+  tempstr = getFldValFromQueries( wlReq.Queries, "AcptSum"  );
+  if( StrLen(tempstr) > 0 )
+    mes.setAttribute("AcptSum" , tempstr );
+  end;
+  tempstr = getFldValFromQueries( wlReq.Queries, "AcptDate" );
+  if( StrLen(tempstr) > 0 )
+    mes.setAttribute("AcptDate", date(tempstr) );
+  end; 
+
+  var elem : object = null;      
+  
+  var Annotation = "";
+  var Narrative = "", Description = "";
+  if( ПрочитатьТекстЗапроса_Ответа(wlReq, Narrative, Description) and Narrative )
+    Annotation = Narrative; // поле "Описание" в панели запроса/ответа
+  else
+    Annotation = GetWlcodeDescription( TYPE_CODE_UFBS_ED274, 
+                                       substr(wlReq.Queries, ind, 10)
+                                     );
+  end;
+  elem = xml.createElement("Annotation");
+  elem.appendChild( xml.createTextNode(TransTextField(Annotation)) );
+  mes.appendChild(elem);
+
+  var ref_str = ""; // строка референса
+
+  ref_str = GetInitialEDReference(InRelatedRef, wlReq.Queries);
+  elem = xml.createElement("InitialED");  
+  FillEDNoDateAuthorByRef_XMLField(elem, ref_str);
+  //TAM 15.11.2012 I-00279033-3
+  //Gurin S. 24.12.2013 адаптация 31
+  //var date_init = GetEDInitDateForED274(wlreq);
+  var date_init = GetEDInitDateForED274(wlreq.RelatedRef); //19.11.2013 TAM
+  elem.setAttribute("EDDate", date_init);
+  elem.appendChild(xml.createTextNode(""));
+  mes.appendChild(elem);
+
+  if(wlReq.RelatedRef)
+    ref_str = wlReq.RelatedRef;    
+  else
+    ref_str = getFldValFromQueries(wlReq.Queries, "EDRefID:");
+  end;                                           
+  elem = xml.createElement("EDRefID");
+  debugbreak;
+  FillEDNoDateAuthorByRef_XMLField(elem, ref_str);
+  //TAM 15.11.2012 I-00279033-3
+  elem.setAttribute("EDDate", date_init);
+  elem.appendChild(xml.createTextNode(""));
+  mes.appendChild(elem);
+
+  ЗаписатьПолеЛог( "xml", mes.xml, TRUE );
+  
+  return TRUE; /* Успешное завершение */
+
+  OnError( er ) /* обработка ошибок */
+    std.msg(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE; 
+end;
+
+

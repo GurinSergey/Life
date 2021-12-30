@@ -1,0 +1,112 @@
+/* ---------------------------------------------------------------------------------------------------------------------------
+ *  @fname  : acc_res.mac
+ *  @desc   : Макрос шага "Формирование резерва на возможные потери"
+ *  @changes: SDA      03.05.2012 исправил на дату планируемого шага операции по счету 
+ *            EVG      01.06.2012 правильно переписал UPDATE
+ *            Lavrenov 05.06.2012 I-00204399-2
+ *            zip_z.   24.07.2012 убрал переписку трёх троллей и параметризовал UPDATE в ExecuteStep и CheckStepAction (С-12765)
+ *            Gurin S. 07.12.2015 HotFix 2031.19.25 (Life_1 1.3)_6
+ * ---------------------------------------------------------------------------------------------------------------------------*/
+
+import InsCarryDoc, "res_carry.mac", "acc_cls.mac", rsd; 
+
+private record RsvParm("rsvprm.dbt");
+
+var OffshoreGroup = 0;
+
+//    Пользовательская часть шага
+macro ExecuteStep( doc, primdoc, DocKind, ID_Operation )
+
+    record acc(account);
+  
+    var ReserveAccount : string;
+    var accPD : AccountPrimdoc;
+    var ClassifReserveLoss : string;
+    var IncomeCatCodePrm = IncomeCatCode;
+    var OutlayCatCodePrm = OutlayCatCode;
+
+    SetBuff( acc, primdoc );
+
+    accPD = AccountPrimdoc( acc, ID_Operation, RsvParm );
+      
+    // 2012-07-24 zip_z. Оптимизация С-12765 >
+    var sql = "UPDATE doproper_dbt o" + 
+              "   SET o.t_Start_Date =" + 
+              "           (SELECT s.t_plan_date" + 
+              "              FROM doprstep_dbt s, daccount_dbt a" +
+              "             WHERE a.t_Chapter = 1 AND a.t_Account = :m_account AND o.t_DocKind = 3" + 
+              "               AND o.t_Kind_Operation = 100 AND o.t_DocumentID = LPAD (a.t_accountid, 34, 0)" +
+              "               AND s.t_ID_Operation = o.t_id_operation AND s.t_IsExecute = 'R')" +
+              " WHERE o.t_DocKind = 3 AND o.t_Kind_Operation = 100 AND o.t_DocumentID = LPAD (:m_accountid, 34, 0)"; 
+    var papams = makeArray (SQLParam ("m_account"  , acc.account  ),
+                            SQLParam ("m_accountid", acc.accountid));
+    execSql (sql, papams);
+    // < 2012-07-10 zip_z. -------------------------------------------------------------------------------------------------
+  
+    if((acc.Open_Close != "") or ((ReserveLoss == $0) and (ReserveLoans == $0) and (ReserveOffshore == $0)))
+        ReserveAccount = FindReserveAccount( accPD, AccOprServDoc.Date );
+        if( Trim(ReserveAccount) == "" )
+            return 0;
+        end;
+    else
+        ReserveAccount = OpenReserveAccount( accPD, AccOprServDoc.Date );
+    end;
+
+    if( Trim(ReserveAccount) == "" )
+        msgbox("Не найден счет резерва.");
+        return 1;
+    end;
+
+    ClassifReserveLoss = GetAccountReserveClassif(KindReserveLoss, RsvParm.RsvClass, KindReserveLoss);
+
+    GetIncomeOutlayCatCodeLoss(ClassifReserveLoss, @IncomeCatCodePrm, @OutlayCatCodePrm, AccOprServDoc.Date);
+
+    if  (SubStr(ClassifReserveLoss, 1, 13) == "3.1.1 (91318)")
+        IncomeCatCodePrm = IncomeCatCodeUONH;
+        OutlayCatCodePrm = OutlayCatCodeUONH;
+    end;
+  
+    if((IncomeCatCodePrm == "") or (OutlayCatCodePrm == ""))
+       msgbox("Не задана категория средств для классификации РВП \"", ClassifReserveLoss, "\"");
+       return 1;
+    else
+       if(((OffshoreGroup == 2) or (OffshoreGroup == 3)) and
+          (GetProcentOfReserveOffshore(acc.Chapter, acc.Code_Currency, acc.Account, AccOprServDoc.Date) != null))
+           if( not OpenSubAccounts(ReserveAccount, RsvParm.RsvClass, RsvParm.RsvClassLoans)) 
+               msgbox("Не удалось открыть субсчета по счету резерва.");
+               return 1;
+           end;
+           if( not CreateReserveLossCarryAcc(accPD, AccOprServDoc.Date, ReserveAccount, IncomeCatCodePrm, OutlayCatCodePrm) )
+               msgbox("Не удалось создать проводку резерва.");
+               return 1;
+           end;
+       else
+           if( not CreateReserveLossCarry(accPD, AccOprServDoc.Date, ReserveAccount, IncomeCatCodePrm, OutlayCatCodePrm) )
+               msgbox("Не удалось создать проводку резерва.");
+               return 1;
+           end;
+       end;
+    end;
+
+    if((acc.Open_Close != "") and (Trim(ReserveAccount) != ""))
+        CloseReserveAccount( accPD, AccOprServDoc.Date );
+    end;
+
+    return 0;
+
+end;
+
+
+macro CheckStepAction( m_message, primDoc, KindDoc, ID_Oper) 
+    record  acc (account);
+    setBuff (acc, primdoc);
+    
+    // 2012-07-24 zip_z. Оптимизация С-12765 >
+    if (m_message == OP_BACKOUT_STEP) // откат шага
+        var sql = "UPDATE doproper_dbt o SET o.t_start_date = RSBSESSIONDATA.CURDATE "
+                  " WHERE o.t_kind_operation = 100 AND o.t_documentid = LPAD (:m_accountid, 34, 0)";
+        execSql (sql, makeArray (SQLParam ("m_accountid", acc.accountid)));
+    end;
+    return 0;
+end;
+

@@ -1,0 +1,176 @@
+/***********************************************************************************/
+/*                                                                                 */
+/*   CDS Макрос пользовательского алгоритма рассчета базовых сумм комиссии 2.2.3.1 */
+/*       Единая комиссия за ведение счетов клиентов, в год с эксплуатацией         */
+/*       системы "Интернет-клиент"                                                 */
+/*                                                                                 */
+/*       Тип комиссии - периодическая.                                             */
+/*                                                                                 */
+/*Изменения:                                                                       */
+/*joy 01.04.2013 C- 18667 Жаворонкова Н. Добавлена проверка на подключение         */
+/*               авансовой комиссии                                                */
+/*joy 25.04.2013 C-19696-6 Жаворонкова Н. Кроме того, есть ли УПК данной комиссии  */
+/*                         проверяем наличие УПК дублирующей                       */
+/*joy 02.10.2013 C-23377   Жаворонкова Н. Добавлена проверка на новые авансовые    */
+/*                         комиссии                                                */
+/***********************************************************************************/
+
+import sfinter, ctinter, currinter, fiinter, cb_sql, rsd, VuzComLib;
+
+private var FICode_calc:string = "";
+
+/* Тип величины enum SfBaseTypes*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+record sfcontr( sfcontr );
+record sfcalcal (sfcalcal); 
+
+/*
+    Расчет для периодических комиссий
+*/
+
+macro CalcServiceSum( sfcontr_addr, /*Договор обслуживания*/
+                      BeginDate,    /*Начало периода*/
+                      EndDate,      /*Конец периода*/
+                      sAddr,        /*Структура sfcalcal*/
+                      sfcontrStruc, /*Cтруктура sfcontr*/
+                      CommNumber)
+
+    var stat, rrstat;
+    var CommQuont = 0;
+    var query, rs, cmd;
+    var flg = true;
+    var CommDoubleNumber = 1072; /*joy  Номер комиссии 2.2.3.2 */
+
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+        SetBuff( sfcontr, sfcontr_addr );
+        SetBuff( sfcalcal, sAddr);
+        CommNumber = sfcalcal.CommNumber;
+    else
+        Copy ( sfcontr, sfcontrStruc );
+    end;
+
+/* C- 18667 joy Проверяем, подключена ли авансовая комиссия */
+    rrstat = ExecMacroFile ("Commisslib.mac", "CheckCatOnAcc", sfcontr.PARTYID);
+    if ((rrstat == 1) or (rrstat == 3) or (rrstat == 4) or (rrstat == 222) or (rrstat == 223) or (rrstat == 224)) /*02.10.2013 joy C-23377 Добавлена проверка на новые авансовые комиссии*/
+        flg = false;
+    end;
+    
+    if (flg)
+        /* Проверяем пользовательский тип счёта */
+        if (CheckUserField( sfcontr.PartyID, UsTypeAcCLB ))
+            query = " SELECT   nvl(add_months(max(t_dateperiodend), 12), to_date('01.01.0001','dd.mm.yyyy')) "+
+                    "   FROM   dsfdefcom_dbt "+
+                    "  WHERE   t_conid IN (SELECT   t_id "+
+                    "                        FROM   dsfcontr_dbt "+
+                    "                       WHERE   t_partyid = ?) "+
+                    "          AND t_commnumber in (?, ?) " 
+                    "          AND t_status > 20 "; 
+            cmd = rsdcommand(query);
+            cmd.AddParam("", RSDBP_IN,sfcontr.PartyID);
+            cmd.AddParam("", RSDBP_IN,CommNumber);
+            cmd.AddParam("", RSDBP_IN,CommDoubleNumber);
+            rs = rsdRecordSet( cmd );
+  
+            if (rs and rs.moveNext())
+                if (rs.value(0, null, V_DATE) <= EndDate)
+                    CommQuont = 1;
+                end;
+            end;
+        end;
+    end;
+
+  /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+        if (CommQuont > 0)
+            return true;
+        end;
+        return false;
+    end;
+ 
+  ClearRecord(sfbassum);
+
+  sfbassum.baseType = SF_BASETYPE_QUONT;
+  sfbassum.baseQuont  = CommQuont;
+
+  sfbassum.baseType2 = SF_BASETYPE_QUONT;
+  sfbassum.baseQuont2  = CommQuont;
+
+  stat = InsertSumList(sfbassum);
+
+  if( stat )
+    MsgBox("Ошибка при вставке базовой суммы");
+  end;
+
+    
+end;/*CalcServiceSum*/
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

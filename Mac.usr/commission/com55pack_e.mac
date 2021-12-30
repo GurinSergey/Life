@@ -1,0 +1,184 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Макрос пользовательского алгоритма расчёта базовых сумм комиссий 5.5.*pack
+       "Прием и зачисление наличных средств на счет клиента:
+          - в случае внесения средств для оплаты комиссий Банка
+          - до 100 тыс. рублей
+          - свыше 100 тыс. рублей
+          - свыше 1 млн. рублей, купюрами достоинством не менее 100 рублей
+          - монеты
+
+       Тип комиссии - единовременная.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ptinter, cb_sql;/*InsertSumList*/
+import ExvComLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+record sfbassum( "sfbassum.str" );
+
+/* ID Категории "Вид тарифа комиссии за прием и зачисление наличных (5.5)" */
+const GroupID = 20;
+
+/* Номер категории, которая определяет тариф для платежей
+   (Тариф 5.5.1, 5.5.5) */
+const Tarif551Number = "5.5.1",
+      Tarif555Number = "5.5.5";
+/* Исключаемый символ*/
+const ExclCashSymbol = "('11')";
+const TpOnline = 29;
+
+/* Символы для подсчёта месячных оборотов */
+const CommCashSymbol = "('02','12','13','14','15','16','17','19','20','21','22','30','31','32','33','37','39')"; 
+
+
+
+/* Проверка применимости комиссии для документа */
+macro CheckCommission( cdoc, cal, contr, sum )
+
+   var rs, cmd, query;
+   var ProperComission = false,
+       CategoryFount   = false,
+       ProperCategory  = false;
+
+
+   /* Проверяем, подходит ли комиссия по сетке. 
+      Используем функцию ЭВ - она умеет обрабатывать комиссии за взнос наличных 55. */
+   if( EXV_Cash_IsProperCommission( contr, cal, Sum ) )
+      ProperComission = true;
+   end;
+
+
+   /* Проверяем признак категории "Вид тарифа комиссии 5.5 за прием и зачисление наличных" */
+   query = " Select subStr(com.t_code, 1, 5) comCode, trim( attr.t_NameObject ) catCode " +
+           "   From DOBJATTR_DBT attr, DOBJATCOR_DBT cor, DSFCOMISS_DBT com " +
+           "  Where cor.t_ObjectType         = 501 " +
+           "    and cor.t_Groupid            = ? " +
+           "    and cor.t_Object             = lpad( to_char(?), 10, '0' ) " +
+           "    and attr.t_ObjectType        = cor.t_ObjectType " +
+           "    and attr.t_Groupid           = cor.t_Groupid " +
+           "    and attr.t_Attrid            = cor.t_Attrid " +
+           "    and com.t_FeeType            = ? " +
+           "    and com.t_Number             = ? " ;
+           //"    and subStr(com.t_code, 1, 5) = trim( attr.t_NameObject ) ";
+   cmd = rsdcommand( query );
+   cmd.AddParam( "p1", RSDBP_IN, GroupID        );
+   cmd.AddParam( "p2", RSDBP_IN, cdoc.Autokey   );
+   cmd.AddParam( "p3", RSDBP_IN, cal.FeeType    );
+   cmd.AddParam( "p4", RSDBP_IN, cal.CommNumber );
+   rs = rsdRecordSet( cmd );
+   while( rs and rs.moveNext() )
+
+      CategoryFount = true;
+      if( rs.Value( "comCode" ) == rs.Value( "catCode" ) )
+         ProperCategory = true;
+      end;
+
+   end;
+
+
+   /* Если комиссия подходит по сетке, и категория не установлена */
+   if( ProperComission and not CategoryFount )
+      return true;
+   /* Если комиссия не подходит по сетке, но на ней установлена нужная категория */
+   elif( not ProperComission and ProperCategory )
+      return true;
+   end;
+
+
+   return false;
+end;
+
+
+
+/*
+    Расчет для единовременных комиссий
+*/
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    var stat:integer; 
+    var query, rs;
+    var CommSum   = $0,
+        SymbSum   = $0,
+        TotalCashSum;
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+        
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+
+    debugbreak;
+    // Комиссия по ОВН
+    if ( docKind == CASH_PS_INCORDER )
+
+       rs = Get55RecordSet( cashDoc.DocKind, cashDoc.AutoKey, TpOnline, ExclCashSymbol );
+       while( rs and rs.moveNext() )
+          SymbSum = SymbSum + rs.value(0, null, V_MONEY);
+       end;
+
+
+       if( GetTarifInfo( sfcontr, EndDate, EndDate, sfcalcal.FeeType, sfcalcal.CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType ) )
+
+          /* Посчитаем сумму платежей с начала месяца */
+          var ProcAllAcc = true, IncOrder = true;
+          TotalCashSum = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, ProcAllAcc, sfcontr, IncOrder);
+
+          var OverLimitSum = TotalCashSum + SymbSum - MaxValue;
+          if( OverLimitSum > $0 )
+
+             /* Если это не первый документ, превышающий лимит, то нужно брать только сумму этого
+                документа, а не всего превышения. */
+             OverLimitSum = min( OverLimitSum, SymbSum );
+
+             /* Проверяем применимость комиссии для данного документа */
+             if( CheckCommission( cashDoc, sfcalcal, sfcontr, OverLimitSum ) )
+
+                CommSum = OverLimitSum * TarifValue / 100;
+
+             end;
+
+          end;
+
+       end;
+
+    end;
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2  = SF_BASETYPE_SUM;
+    sfbassum.baseSum2   = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы: ", GetErrMsg );
+    end;
+
+    
+    
+    /*return integer( 1 ); -- количество*/
+    
+    /*return $1; -- сумма */
+    
+end;/*CalcCommissionSum*/
+

@@ -1,0 +1,526 @@
+/******************************************************************************
+   Имя файла.:       AccountProc.mac
+   Назначение:       Реализация интерфейса "Лицевой счет"
+   Дата......:       22.08.2008
+   Автор.....:       Стадник Александр
+   Изменения.:
+             :29.01.2013 Добавил вставку пользовательского типа C-14927-6 LAO
+// KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+******************************************************************************/
+
+import BankInter, FIInter, RsbDataSet, RSD, globals, "CommonInt.mac", "ProcInit.inc", "LogProc.mac", OprInter;
+import "AccountTest.mac", lib_account;
+
+var AccountsArray = TArray;
+var LastError;
+
+
+// Вставка счета в транзакции                                  
+macro rslCreateAccountInTrn()
+    
+    record accrec("account.dbt");
+    record accblncrec("accblnc.dbt");
+
+    var stat;
+    var ErrorMessage : string;
+    var iCount = 0;
+    
+    var Item;
+    var Account, Chapter, FIID, Balance, KindAccount;
+
+    var cmd,rs,rsbankplanid; /* Golovkin C-6046-6 Выгрузка тарифного плана */
+
+    while (iCount < AccountsArray.Size)
+
+        Item = AccountsArray.value(iCount);
+
+        Account = Item(crtAccountFldAccount);
+        if (GetKey (Account) != Account)
+           LastError = "В счете "+ Account + " неверен ключ";
+           AbortTrn();           
+        end;
+
+        Chapter = Int(Item(crtAccountFldChapter));
+        FIID    = GetFIIDFromAccount(Account, @ErrorMessage);
+
+        if (FIID == -1)
+            LastError = ErrorMessage;
+            AbortTrn();
+        end;
+
+        Balance     = GetBalanceFromAccount(Account);
+        KindAccount = GetKindAccFromBalance(Balance, Chapter, @ErrorMessage);
+
+        if (ValType(KindAccount) == V_INTEGER)
+            LastError = ErrorMessage;
+            AbortTrn();
+        end;
+
+        clearrecord(accrec);
+        clearrecord(accblncrec);
+
+        accrec.Account         = Account;
+        accrec.Code_Currency   = FIID;
+        accrec.Chapter         = Chapter;    
+        accrec.Oper            = Int(Item(crtAccountFldOper));
+        accrec.Department      = Int(Item(crtAccountFldDepartment));
+        accrec.Branch          = Int(Item(crtAccountFldBranch));
+        accrec.Balance         = Balance; 
+        accrec.Client          = Int(Item(crtAccountFldClient));
+        accrec.Kind_Account    = KindAccount; 
+        accrec.Type_Account    = Item(crtAccountFldAccType);
+        accrec.UserTypeAccount = Item(crtAccountFldAccUserType);
+        accrec.NameAccount     = Item(crtAccountFldAccName);
+        /* 21.01.2015 LAO добавляем сортировку*/
+        accrec.Sort            =substr(accrec.Account,1,5)+IfThenElse(substr(accrec.Account,6,3)=="810","###",substr(accrec.Account,6,3))+substr(accrec.Account,10,11);
+       /* A.Gregeradsky - 27,11.2009 - Определяем узел ТС по операционисту */
+        if(accrec.Department == 0)
+         if (Oper_in_base(accrec.Oper)==0)   /*19.07.2012 Проверка на опера*/
+          accrec.Department = DepartmentByOper(accrec.Oper);
+         else
+            ErrorMessage = "Операционист № "+accrec.Oper+" не найден в базе";
+            ErrorMessage = "Ошибка при создании счета " + Account + " : " + ErrorMessage;
+            LastError = ErrorMessage;
+            AbortTrn();
+
+         end
+          
+        end;
+        /* End Gregeradsky */
+
+        if (date(Item(crtAccountFldOpenDate)) == date("00.00.0000"))
+           accrec.Open_Date       = {curdate};
+        else
+           accrec.Open_Date       = date(Item(crtAccountFldOpenDate));
+        end;
+
+        accblncrec.Account     = Account;
+        accblncrec.Chapter     = Chapter;
+        accblncrec.Balance0    = Balance;
+
+        //InitError();//обнуляем системную ошибку Golovkin 20.09.2012
+        stat = Create_Account(accrec, accblncrec, ErrorMessage); // Golovkin 13.03.2013
+                                                                 // ВНЕЗАПНО недокументированная возможность получить текст ошибки
+                                                                 // В случае ошибки ORA-00054 - не пугаться, просто раньше была 
+                                                                 // "Логическая ошибка при выполнении макроса"
+                                                                 // Блокировки уберут по запросу SCR #192992
+        
+        if (stat != 0)
+            //ErrorMessage = GetErrMsg();
+        
+            if (strlen(ErrorMessage) == 0)
+                ErrorMessage = GetErrorMessage(stat);
+            end;
+
+            ErrorMessage = "Ошибка #" + stat + " при создании счета " + Account + " : " + ErrorMessage;
+            LastError = ErrorMessage;
+            AbortTrn();
+        /* Golovkin C-6046-6 Выгрузка тарифного плана */
+        else
+            if( int(Item(11 /*crtAccountFldPlan*/ )) != 0 ) 
+                  cmd = RsdCommand(" select fr.t_planrsbankid from usr_planfrontrsbank_dbt fr where fr.t_planfrontid = :planfrontid "
+                                   " and exists ( select * from dsfplan_dbt p where p.t_sfplanid = fr.t_planrsbankid ) ");
+                  cmd.addparam( "planfrontid", RSDBP_IN, int(Item(11 /*crtAccountFldPlan*/ )) );
+                  rs  = RsdRecordSet(cmd);
+                  if( rs.movenext() )
+                     rsbankplanid = int( rs.value("t_planrsbankid") );
+
+                     cmd = RsdCommand( 
+                                  " DECLARE "
+                                  "    cur_planid number; "
+                                  "    clientid   number      := ?; "
+                                  "    ins_planid number      := ?; "
+                                  "    clientdpt  number      := ?; "
+                                  "    startdate  varchar(20) := ?; "
+                                  " BEGIN "
+                                  "    begin "
+                                  "       select t_sfplanid into cur_planid from dptdpsfplan_dbt "
+                                  "          where t_partyid     = clientid "
+                                  "            and t_department  = clientdpt "
+                                  "            and t_servicekind = 3 "
+                                  "            and t_startdate   = to_date(startdate,'dd.mm.yyyy'); "
+                                  "    exception "
+                                  "       when no_data_found then cur_planid := -1; "
+                                  "    end; "
+                                  "    if cur_planid = -1 then "
+                                  "       insert into dptdpsfplan_dbt values(clientid,clientdpt,ins_planid,3,to_date(startdate,'dd.mm.yyyy')); "
+                                  "    else "
+                                  "       update dptdpsfplan_dbt set t_sfplanid = ins_planid "
+                                  "          where t_partyid     = clientid "
+                                  "            and t_department  = clientdpt "
+                                  "            and t_servicekind = 3 "
+                                  "            and t_startdate   = to_date(startdate,'dd.mm.yyyy'); "
+                                  "    end if; "
+                                  "    commit; "
+                                  " END; "
+                                  );
+                     cmd.addparam( "clntid",  RSDBP_IN, accrec.Client );
+                     cmd.addparam( "plnid",   RSDBP_IN, rsbankplanid );
+                     cmd.addparam( "clntdpt", RSDBP_IN, accrec.Department );
+                     cmd.addparam( "oprdate", RSDBP_IN, string(accrec.Open_Date) );
+                     cmd.execute();
+                  end;
+            end;
+        end;
+      
+        iCount = iCount + 1;
+    end;
+      /*  OnError(x)
+            Println(x.Message); */
+end;
+
+// Вставка счета
+macro rslCreateAccount(Str : string)
+    
+    var ArrayFields = TArray;     
+    var stat, i;
+    ParseStringToArray(Str, ArrayFields);
+
+    AccountsArray(AccountsArray.Size) = ArrayFields;
+
+    var PackMode = Int(ArrayFields(crtAccountFldPackMode));
+    LastError = "";
+
+    if ((PackMode == 0) or (PackMode == 2))
+        stat = ProcessTrn(0, "rslCreateAccountInTrn");
+
+        if (stat == true)
+            LastError = no_error_msg;    
+        end;
+        AccountsArray.Size = 0;
+        
+    end;     
+    
+    LogCreateAccount(Str, ArrayFields, LastError);
+
+    return LastError;
+end;
+
+
+// Модификация параметров счета
+macro rslUpdateAccount(Str : string)
+
+    file AccR("account.dbt") key 0;
+    // KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+    //file AccV("account$.dbt") key 0;
+
+    var AccFile; 
+   
+    var ArrayFields = TArray;
+    var ErrorMessage = "";
+    var stat;
+    var TypeAccount, Overdraft, Limit, OperationDate;
+
+    private var cmd;
+    //private var AccTable;
+
+    ParseStringToArray(Str, ArrayFields);
+
+    var Account        = ArrayFields(updAccountFldAccount);
+    var Code_Currency  = GetFIIDFromAccount(ArrayFields(updAccountFldAccount), @ErrorMessage);
+    var Chapter        = Int(ArrayFields(updAccountFldChapter));        
+    
+    if (Code_Currency != -1)
+
+        // KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+        /*if (Code_Currency == 0)
+            AccTable = "account.dbt";
+        else 
+            AccTable = "account$.dbt";
+        end;*/
+
+        AccFile = TBFile(/*AccTable*/ "account.dbt", "R", 0);
+ 
+        AccFile.Clear();
+
+        AccFile.rec.Account = Account;
+        AccFile.rec.Chapter = Chapter;
+        AccFile.rec.Code_Currency = Code_Currency;
+
+        if (AccFile.GetEQ())
+            
+            TypeAccount    = AccFile.rec.Type_Account;
+            Overdraft      = ArrayFields(updAccountFldOverdraft);
+            OperationDate  = AccFile.rec.OperationDate; 
+            Limit          = Acc_GetLimit(Account); //zmp 28.02.2014 
+
+            Assign(Limit, ArrayFields(updAccountFldLimit));
+            OperationDate = {curdate};
+            Assign(OperationDate, ArrayFields(updAccountFldOperationDate));
+              
+            if (StrUpr(Overdraft) == "SET")
+                //Kozina для правильной обработки К2 надо также тип V
+                if (Index(TypeAccount, "О") == 0)
+                    TypeAccount = TypeAccount + "О";
+                    // KS 12.03.2012 V не надо
+                    //if (Index(TypeAccount, "V") == 0)
+                    //   TypeAccount = TypeAccount + "V";    
+                    //end;    
+                end;               
+            elif (StrUpr(Overdraft) == "CLEAR")
+                  Acc_SetLimit(Account, limit, date(OperationDate)); // очищаем значение лимита
+                if (Index(TypeAccount, "О") != 0)
+                    TypeAccount = StrSubst(TypeAccount, "О", "");
+                    if (Index(TypeAccount, "V") != 0)
+                       TypeAccount = StrSubst(TypeAccount, "V", "");    
+                    end;
+                end;
+            else 
+                TypeAccount = null;
+            end;
+
+            InitError();//обнуляем системную ошибку Golovkin 20.09.2012
+            stat = Update_Account(Chapter, Code_Currency, Account, AccFile.rec.Oper, null, null, money(Limit), TypeAccount, date(OperationDate));
+            if (StrUpr(Overdraft) == "SET") 
+                Acc_SetLimit(Account, limit, date(OperationDate)); /*end;*/ //zmp 28.02.2014 Update_Account лимит в 31 патче не проставляет (
+            end;
+            if (stat != 0)
+                ErrorMessage = GetErrMsg();
+            
+                if (strlen(ErrorMessage) == 0)
+                    ErrorMessage = GetErrorMessage(stat);
+                end;
+            
+                ErrorMessage = "Ошибка #" + stat + " при обновлении счета " + Account + " : " + ErrorMessage;
+            else
+//                if ({curdate} != date(OperationDate)) // KS 11.12.2011 Подменяем дату
+/**************************************************
+                  // Удалим старую запись в истории
+                  cmd = RSDCommand("delete from dacclimit_dbt acc " +
+                                   " where acc.t_account = :account " +
+                                   "   and acc.t_chapter = :chapter " +
+                                   "   and acc.t_code_currency = :Code_Currency " +
+                                   "   and acc.t_limitdate = :newdate " +
+                                   "   and t_limitdate not in " +
+                                   "       (select max(t_limitdate) from dacclimit_dbt " +
+                                   "         where t_account = :account2" +
+                                   "           and t_chapter = :chapter2" +
+                                   "           and t_code_currency = :Code_Currency2" +
+                                   "       ) ");
+
+                  cmd.addParam("account", RSDBP_IN, Account);
+                  cmd.addParam("chapter", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency", RSDBP_IN, Code_Currency);
+                  cmd.addParam("newdate", RSDBP_IN, date(OperationDate));
+                  cmd.addParam("account2", RSDBP_IN, Account);
+                  cmd.addParam("chapter2", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency2", RSDBP_IN, Code_Currency);
+
+                  cmd.Execute();
+
+                  // Обновим неправильную дату (последнюю запись)
+                  cmd = RSDCommand("update dacclimit_dbt acc " +
+                                   "   set acc.t_limitdate = :newdate " +
+                                   " where acc.t_account = :account " +
+                                   "   and acc.t_chapter = :chapter " +
+                                   "   and acc.t_code_currency = :Code_Currency " +
+                                   "   and t_limitdate > :newdate2 " +
+                                   "   and t_limitdate in " +
+                                   "       (select max(t_limitdate) from dacclimit_dbt " +
+                                   "         where t_account = :account2" +
+                                   "           and t_chapter = :chapter2" +
+                                   "           and t_code_currency = :Code_Currency2" +
+                                   "       ) " +
+                                   "   and acc.t_limit = :limit");
+
+                  cmd.addParam("newdate", RSDBP_IN, date(OperationDate));
+                  cmd.addParam("account", RSDBP_IN, Account);
+                  cmd.addParam("chapter", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency", RSDBP_IN, Code_Currency);
+                  cmd.addParam("newdate2", RSDBP_IN, date(OperationDate));
+                  cmd.addParam("account2", RSDBP_IN, Account);
+                  cmd.addParam("chapter2", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency2", RSDBP_IN, Code_Currency);
+                  cmd.addParam("limit",   RSDBP_IN, Limit);
+
+                  cmd.Execute();
+
+                  // Удаляем лишнее
+                  cmd = RSDCommand("delete from dacclimit_dbt acc " +
+                                   " where acc.t_account = :account " +
+                                   "   and acc.t_chapter = :chapter " +
+                                   "   and acc.t_code_currency = :Code_Currency " +
+                                   "   and acc.t_limitdate > :newdate ");
+
+                  cmd.addParam("account", RSDBP_IN, Account);
+                  cmd.addParam("chapter", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency", RSDBP_IN, Code_Currency);
+                  cmd.addParam("newdate", RSDBP_IN, date(OperationDate));
+
+                  cmd.Execute();
+
+                  // поправим карточку счета
+                  cmd = RSDCommand("update d" + strsubst(AccTable,".","_") +
+                                   "   set t_limit = " +
+                                   "        (select acc.t_limit from dacclimit_dbt acc" +
+                                   "          where acc.t_account = :account " +
+                                   "            and acc.t_chapter = :chapter " +
+                                   "            and acc.t_code_currency = :Code_Currency " +
+                                   "            and t_limitdate in " +
+                                   "                (select max(t_limitdate) from dacclimit_dbt " +
+                                   "                  where t_account = :account2" +
+                                   "                    and t_chapter = :chapter2" +
+                                   "                    and t_code_currency = :Code_Currency2" +
+                                   "                )) " +
+                                   " where t_account = :account3 " +
+                                   "   and t_chapter = :chapter3 " +
+                                   "   and t_Code_Currency = :Code_Currency3 ");
+
+                  cmd.addParam("account", RSDBP_IN, Account);
+                  cmd.addParam("chapter", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency", RSDBP_IN, Code_Currency);
+                  cmd.addParam("account2", RSDBP_IN, Account);
+                  cmd.addParam("chapter2", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency2", RSDBP_IN, Code_Currency);
+                  cmd.addParam("account3", RSDBP_IN, Account);
+                  cmd.addParam("chapter3", RSDBP_IN, Chapter);
+                  cmd.addParam("Code_Currency3", RSDBP_IN, Code_Currency);
+
+
+                  cmd.Execute();
+***********************************/
+                ErrorMessage = no_error_msg;
+
+            end;
+        else
+            ErrorMessage = "Ошибка при обновлении счета: не найден счет " + Account;
+        end;
+
+        Close(AccFile);
+    end;
+
+    LogUpdateAccount(Str, ArrayFields, ErrorMessage);
+
+    return ErrorMessage;
+end;
+
+
+// Закрытие счета
+macro rslCloseAccount(Str : string)
+
+    var ArrayFields = TArray;
+    var ErrorMessage = "";
+    var stat;
+    var cmdCloseDate;
+
+    ParseStringToArray(Str, ArrayFields);
+
+    var Account       = ArrayFields(clsAccountFldAccount);
+    var Code_Currency = GetFIIDFromAccount(ArrayFields(clsAccountFldAccount), ErrorMessage);
+    var Chapter       = Int(ArrayFields(clsAccountFldChapter));
+    var CloseDate     = date(ArrayFields(clsAccountFldCloseDate));
+
+    stat = CB_CloseAccount(Chapter, Code_Currency, Account, CloseDate, ErrorMessage);
+
+    if (stat != 0)
+
+        if (strlen(ErrorMessage) == 0)
+            ErrorMessage = GetErrorMessage(stat);
+        end;
+
+        ErrorMessage = "Ошибка #" + stat + " при закрытии счета " + Account + " : " + ErrorMessage;        
+    else
+        execSql("update daccount_dbt set T_CLOSE_DATE = :close_date WHERE t_account = :account", makeArray(SQLParam("close_date", CloseDate), SQLParam("account", Account)));
+        ErrorMessage = no_error_msg;
+    end;
+   
+    println("\n" + ErrorMessage + "\n\n\n");
+ 
+    LogCloseAccount(Str, ArrayFields, ErrorMessage);
+
+    return ErrorMessage;
+end;     
+/*29.01.2013 по аналогии с простым обновлением счета LAO C-14927-6*/
+macro rslUpdateAccount_type(Str : string)
+
+    file AccR("account.dbt") key 0;
+    // KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+    //file AccV("account$.dbt") key 0;
+
+    var AccFile; 
+   
+    var ArrayFields = TArray;
+    var ErrorMessage = "";
+    var stat;
+    var TypeAccount,func_upd,symbol_type;
+
+    private var cmd,rs;
+    //private var AccTable;
+
+    ParseStringToArray(Str, ArrayFields);
+
+    var Account        = ArrayFields(updAccountFldAccount);
+    var Code_Currency  = GetFIIDFromAccount(ArrayFields(updAccountFldAccount), @ErrorMessage);
+    var Chapter        = Int(GetChapterFromAccount(ArrayFields(updAccountFldAccount)));        
+    
+    
+    
+    if (Code_Currency != -1)
+
+        // KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+        /*if (Code_Currency == 0)
+            AccTable = "account.dbt";
+        else 
+            AccTable = "account$.dbt";
+        end;*/
+
+        AccFile = TBFile(/*AccTable*/"account.dbt", "R", 0);
+ 
+        AccFile.Clear();
+
+        AccFile.rec.Account = Account;
+        AccFile.rec.Chapter = Chapter;
+        AccFile.rec.Code_Currency = Code_Currency;
+
+        if (AccFile.GetEQ())
+            TypeAccount    = AccFile.rec.UserTypeAccount;
+            func_upd       = ArrayFields(1);//1 - добавить, 2 - удалить 
+            symbol_type    = ArrayFields(2);//тип добавляемого -удаляемого счета
+            
+            cmd = RsdCommand(" select 1 from dtypeac_dbt typ where TYP.T_TYPE_ACCOUNT=:type_acc");
+                  cmd.addparam( "type_acc", RSDBP_IN,symbol_type);
+                  rs  = RsdRecordSet(cmd);
+            if( not rs.movenext() )
+              ErrorMessage="Ошибка при обновлении счета: не найден пользовательский тип: " + symbol_type;
+              return ErrorMessage;
+            end;
+            if (func_upd == 1)
+                
+                if (Index(TypeAccount, symbol_type) == 0)
+                    TypeAccount = TypeAccount + symbol_type; 
+                end;               
+            elif (func_upd == 2)
+                if (Index(TypeAccount, symbol_type) != 0)
+                    TypeAccount = StrSubst(TypeAccount, symbol_type, "");
+                end;
+            else 
+                TypeAccount = null;
+            end;
+
+            InitError();//обнуляем системную ошибку Golovkin 20.09.2012
+            stat = Update_Account(Chapter, Code_Currency, Account, AccFile.rec.Oper, null, TypeAccount, null, null, date());
+        
+            if (stat != 0)
+                ErrorMessage = GetErrMsg();
+            
+                if (strlen(ErrorMessage) == 0)
+                    ErrorMessage = GetErrorMessage(stat);
+                end;
+            
+                ErrorMessage = "Ошибка #" + stat + " при обновлении счета " + Account + " : " + ErrorMessage;
+            else
+
+                ErrorMessage = no_error_msg;
+
+            end;
+        else
+            ErrorMessage = "Ошибка при обновлении счета: не найден счет " + Account;
+        end;
+
+        Close(AccFile);
+    end;
+
+    
+
+    return ErrorMessage;
+end;

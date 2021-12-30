@@ -1,0 +1,403 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*                     Постобработка файла экспорта                         */
+/*                                                                          */
+/*  Имя файла: wlexpost.mac                                                 */
+/*  Создан:  5.03.2003  Andrew B. Panov                                     */
+/*  Изменен: 13.11.2012 Teleshova A. C-15514: для ED274 имя файла должно    */
+/*           начинаться c "E"                                               */
+/*           28.05.2013 Teleshova C-19326                                   */
+/*           25.02.2014 Teleshova C-27187                                   */
+/*           24.10.2014 Teleshova C-31411                                   */
+/****************************************************************************/
+/*SDA 09.12.2013 адаптация для 31-й*/
+import BankInter, MesInter, oralib, likepy, PSInter, rsexts;//TAM 23.01.13 HF_60
+import fileop;         // Объект для работы с файлами на сервере и терминале   
+import "wlmnstls.mac", RSD;
+//TAM 18.11.2012 C-15514
+import "lib_fg", "lib_registry"; //24.10.2014 Teleshova C-31411
+import "lib_pm_check";
+
+/* Все нормально, перенос файла экспорта в      */
+/* директорию экспорта происходит автоматически */
+const WLD_POSTEXPORT_OK           =  0;
+
+/* Все нормально, но перенос файла экспорта в       */
+/* директорию экспорта производится пользователем в */
+/* данном макросе                                   */
+const WLD_POSTEXPORT_OK_STOP      = -1;
+
+/* Все нормально, перенос файла экспорта в                               */
+/* директорию экспорта происходит автоматически.                         */
+/* Содержимое временного файла изменилось (все изменения проводить       */
+/* в файле с именем, переданным в макрос в качестве параметра FileName). */
+/* При необходимости изменения имени файла экспорта                      */
+/* требуется создать копию временного файла с нужным именем              */
+const WLD_POSTEXPORT_CHANGE       = -2;
+
+/* Все нормально, но перенос файла экспорта в                            */
+/* директорию экспорта производится пользователем в                      */
+/* данном макросе.                                                       */
+/* Содержимое временного файла изменилось (все изменения проводить       */
+/* в файле с именем, переданным в макрос в качестве параметра FileName). */
+/* При необходимости изменения имени файла экспорта                      */
+/* требуется создать копию временного файла с нужным именем.             */
+const WLD_POSTEXPORT_CHANGE_STOP  = -3;
+
+/*Ошибка*/
+const WLD_POSTEXPORT_ERROR        =  1;
+
+/* Внимание! Использовать WLD_POSTEXPORT_OK_STOP, WLD_POSTEXPORT_CHANGE_STOP  */
+/* ТОЛЬКО в том случае, если требуется перенос файла экспорта в нестандартную */
+/* директорию.                                                                */
+
+/****************************************************************************/
+/*Для примера - архивация файла экспорта                                    */
+/****************************************************************************/
+macro RarExport1(FileName, NewFileName)
+  var cmd, dir, fileN, ext, error, arcName;
+  dir = SplitFile(FileName, fileN, ext);
+   //Имя архивного файла.
+  arcName = dir + fileN + ".rar";    
+
+   //Установим новое полное(dir+fname+ext) имя файла экспорта*/
+  NewFileName = arcName;
+  if (SetParm(1, NewFileName) == false)
+    return WLD_POSTEXPORT_ERROR;
+  end;
+
+   //Командная строка для архиватора
+  cmd = "a -ep " + arcName + " " + FileName; 
+   //Архивируем
+  error = Run("rar.exe", cmd);
+  if (error == 0)
+    return WLD_POSTEXPORT_OK;
+  else 
+    return WLD_POSTEXPORT_ERROR;
+  end;
+end;
+
+/*********************************************/
+macro ПолучитьИмяТранспорта(tpId)
+   var rs,str;
+   str = " SELECT t.t_name " +
+           "   FROM dwltransp_dbt t " +
+           "  WHERE t.t_tpid = " + tpId;
+   rs =  trsbdataset(str);
+   if(rs and rs.movenext)
+      return rs.t_name;
+   end;
+   return "";
+end;
+
+macro ПолучитьТекущийЗапрос( sessid )
+   var rs, str;
+   str = " SELECT req.* " +
+         "   FROM dwlmes_dbt mes, dwlmeslnk_dbt lnk, dwlreq_dbt req  " +
+         "  WHERE mes.t_sessionid = " + sessid + 
+         "    AND lnk.t_mesid = mes.t_mesid " +
+         "    AND lnk.t_objkind = 505 " +
+         "    AND req.t_reqid = lnk.t_objid ";
+
+   rs = trsbdataset(str);
+   if(rs and rs.movenext)
+      return rs;
+   else
+      return null;
+   end;
+end;
+
+macro ПолучитьИмяВходФайла( reqid )
+   var rs, str;
+   str = " SELECT ses.t_filename " +
+         "   FROM dwlmes_dbt mes, dwlmeslnk_dbt lnk, dwlsess_dbt ses " +
+         " WHERE lnk.t_objid = " + reqid +
+         "   AND lnk.t_objkind = 505 " +
+         "   AND mes.t_mesid = lnk.t_mesid " +
+         "   AND ses.t_sessionid = mes.t_sessionid " +
+         "   AND ses.t_direct = 'X' " ;
+   rs = trsbdataset(str);
+   if(rs and rs.movenext)
+      return rs.t_filename;
+   else
+      return "";
+   end;
+end;
+
+macro RenameFileFNS(FileName, NewFileName, SessID)
+   var dir, fileN, ext, Name;
+   var dir_in, fileN_in, ext_in;
+   var rs, req, str;
+   var params:TArray;
+   str = "select rls.t_Name, mes.t_MesID from dwlmesrls_dbt rls, dwlmes_dbt mes where mes.t_SessionID =:SessID " + " and mes.t_RlsFormID = rls.t_RlsFormID";
+   params = makeArray( SQLParam("SessID", SessID));
+   rs = execSQLselect( str, params, FALSE );
+   if(not rs.moveNext())
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   dir = SplitFile(FileName, fileN, ext);
+   req = ПолучитьТекущийЗапрос( SessID );
+   if (req == null)
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   Name = ПолучитьИмяВходФайла( req.t_relatedref );
+   if(Name == "")
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   dir_in = SplitFile(Name, fileN_in, ext_in);
+   // name = substr(fileN_in, 5);
+   // msgbox(name+"||"+fileN_in);
+   //Имя файла.
+   if(rs.Value(0) == "PB")
+      if(req.t_queries == "Подтверждение 1")
+         Name = dir + rs.Value(0)+ "1_" + fileN_in + ext;    
+      elif(req.t_queries == "Подтверждение 2")
+         Name = dir + rs.Value(0)+ "2_" + fileN_in + ext;    
+      else
+         return WLD_POSTEXPORT_ERROR;
+      end;
+   elif(rs.Value(0) == "BOS") //Lavrenov: C-8297 Для BOS, BNS и BV расширение = .vrb
+      Name = dir + rs.Value(0)+ "1_" + fileN_in + ".vrb";//ext;    
+   elif(rs.Value(0) == "BNS")
+      Name = dir + rs.Value(0)+ "1_" + fileN_in + ".vrb";//ext;    
+   elif(rs.Value(0) == "BV")
+      Name = dir + rs.Value(0)+ "100_" + fileN_in + ".vrb";//ext;    
+   else
+      name = filename;
+   end;
+
+   if (SetParm(1, Name) == false)
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   return WLD_POSTEXPORT_OK;
+end;
+
+/****************************************************************************/
+/*Для примера - переименование файла экспорта                                    */
+/****************************************************************************/
+//переименование файла экспорта для сообщений ГНИ
+macro RenameFileMNS(FileName, NewFileName, SessID)
+   var cmd, dir, fileN, ext, error, _Name,Name, _dir = "", RlsName = "", ExpPath = "";
+   //24.10.2014 Teleshova C-31411
+   var InstCode: integer = 0;
+   var AccType:  string = "";   
+   var rs:object;
+   var select:string;
+   var params:TArray;
+   select = "select rls.t_Name, mes.t_MesID " + 
+            "  from dwlmesrls_dbt rls, dwlmes_dbt mes " +
+            " where mes.t_SessionID =:SessID " +
+            " and mes.t_RlsFormID = rls.t_RlsFormID";
+   params = makeArray( SQLParam("SessID", SessID));
+   rs = execSQLselect( select, params, FALSE );
+   if(not rs.moveNext())
+      return WLD_POSTEXPORT_ERROR;
+   else
+      RlsName = rs.value(0);
+   end;
+
+   var StartSymbols = substr(RlsName, 1, 2);
+   if (StartSymbols != "BV")
+      StartSymbols = substr(RlsName, 1, 3);
+      if ( (StartSymbols != "BOS") and (StartSymbols != "BNS") and (StartSymbols != "BUV") )
+         StartSymbols = substr(RlsName, 1, 4);
+      end;
+   end;
+
+   dir = SplitFile(FileName, fileN, ext);
+   Name = GetFileNameMNS( StartSymbols, SessID, rs.Value(1) );
+   if(Name == -1)
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   if(StartSymbols == "BUV")
+      StartSymbols = ""; // для BUV все будет в Name после GetFileNameMNS
+   end;
+   //24.10.2014 Teleshova C-31411
+   if(_bank.is_PRBB or _bank.is_VUZ  or _bank.is_EXV_Saratov or _bank.is_SLD) // vea 27.08.15 R-565625
+      InstCode = GetFldValue(rs.value(1), "КодЛица");
+      AccType  = GetFldValue(rs.value(1), "ВидСч");
+      //файлы 2 типа
+      if ((InList(InstCode, 3,4)) or
+          (InList(AccType, "Депозитный", "Счет по вкладу")))
+         ExpPath = RSL_GetRegistryValue("PRBB/FNS/SECOND TYPE CATALOG");
+      //файлы 1 типа
+      else
+         ExpPath = RSL_GetRegistryValue("PRBB/FNS/FIRST TYPE CATALOG");
+      end;
+      //Имя файла.
+      if (CopyFile(filename, ExpPath + "\\" + substr(rs.Value(0), 1, 4) + Name + ext))
+         _Name = dir + substr(rs.Value(0), 1, 4) + Name + ext;
+         if (SetParm(1, _Name) == false)
+            return WLD_POSTEXPORT_ERROR;
+         end;
+         return WLD_POSTEXPORT_OK_STOP /*WLD_POSTEXPORT_OK*/;
+      else
+         msgbox("Не удалось скопировать файл "+ Name + "| в каталог "+ ExpPath + "\\");
+         return WLD_POSTEXPORT_ERROR;
+      end;
+   else
+      //Имя файла.*/
+      _Name = dir + substr(rs.Value(0), 1, 4) + Name + ext;    
+      if (SetParm(1, _Name) == false)
+         return WLD_POSTEXPORT_ERROR;
+      end;
+      return WLD_POSTEXPORT_OK;
+   end;
+end;
+
+//TAM 23.01.13 HF_60 - добавлены 2 функции
+macro GetSysDate():string
+   var day, mon, year, str;
+   DateSplit(date(), day, mon, year );
+   if ( day < 10 )
+      day = "0"+string(day);
+   else
+      day = string(day);
+   end;
+   if ( mon <10 )
+      mon = "0"+string(mon);
+   else
+      mon = string(mon);
+   end;
+   str = SubStr(string(year), 3) + mon + day ;
+   return str;
+end;
+
+//Переименование файла экспорта для сообщений ГИС ГМП
+macro RenameFileGG(FileName, NewFileName, SessID)
+   var Code:string = "", Name:string = "", dir, fileN, ext;
+   var rs:object;
+   var select:string;
+   var params:TArray;
+   dir = SplitFile(FileName, fileN, ext);
+   Name = dir + SubStr( fileN, 1, 4 );
+   select = "select code.t_Code " + 
+           " from dobjcode_dbt code, ddp_dep_dbt dep, dwltpfrmt_dbt frmt, dwlsess_dbt sess " +
+           " where sess.t_SessionID =:SessID            " +
+           " and frmt.t_TpFrmtID    = sess.t_TpFrmtID   " +
+           " and dep.t_Code         = frmt.t_Department " +
+           " and code.t_ObjectID    = dep.t_PartyID     " +
+           " and code.t_CodeKind    = 13                " +
+           " and code.t_ObjectType  = 3                 ";
+  
+   params = makeArray( SQLParam("SessID", SessID));
+   rs = execSQLselect( select, params, FALSE );
+   if(not rs.moveNext())
+      return WLD_POSTEXPORT_ERROR;
+   else
+      Code = rs.value(0);
+   end;
+   if( Index(Code, "/") > 0 ) 
+      Code = SubStr( Code, Index(Code, "/") + 1 );
+      if( Code != "" )
+         Name = Name + strLpad( Code, 4, "0" );
+      end;
+   else 
+      Name = Name + "0000";
+   end;
+
+   Name = Name + GetSysDate() + SubStr( fileN, 11 ) + ".xml";
+   if (SetParm(1, Name) == false)
+      return WLD_POSTEXPORT_ERROR;
+   end;
+   return WLD_POSTEXPORT_OK;
+end;
+
+
+/****************************************************************************/
+/*Для примера - архивация файла экспорта и перенос в указанную директорию   */
+/****************************************************************************/
+macro RarExport2(FileName, NewFileName)
+   var cmd, dir, fileN, ext, error, arcName;
+   dir = SplitFile(FileName, fileN, ext);
+  
+   /*Установим новое полное(dir+fname+ext) имя файла экспорта*/
+   NewFileName = "d:\\bank\\bank51\\export\\"+fileN+".rar"; 
+   if (SetParm(1, NewFileName) == false)
+      return WLD_POSTEXPORT_ERROR;
+   end;
+
+   /*Командная строка для архиватора*/
+   cmd = "m -ep " + NewFileName + " " + FileName;
+
+   /*Архивируем*/
+   error = Run("rar.exe", cmd);
+   if (error == 0)
+      return WLD_POSTEXPORT_OK_STOP;
+   else 
+      return WLD_POSTEXPORT_ERROR;
+   end;
+end;
+/***************************************************************************/
+
+//TAM 13.11.2012 C-15514
+macro RenameFileED274(FileName, NewFileName, SessID)
+   var dir, fileN, ext, Name = "";
+   var rs, req, str;
+   var params:TArray;
+   str = "select rls.t_Name, mes.t_MesID from dwlmesrls_dbt rls, dwlmes_dbt mes where mes.t_SessionID =:SessID "+
+                  " and mes.t_RlsFormID in (363, 378) and mes.t_RlsFormID = rls.t_RlsFormID ";
+   params = makeArray( SQLParam("SessID", SessID));
+   rs = execSQLselect( str, params, FALSE );
+   if(rs.moveNext())
+      dir = SplitFile(FileName, fileN, ext);
+      req = ПолучитьТекущийЗапрос( SessID );
+      if (req == null)
+         return WLD_POSTEXPORT_ERROR;
+      end;
+      if(rs.Value(0) == "ED274")
+         //Gurin S. 08.07.2015
+         Name = dir + "274" + Substr(fileN,2) + ext; //TAM 19.11.2012
+      //TAM 25.02.2014 C-27187
+      elif(rs.Value(0) == "ED276")
+         Name = dir + "276" + Substr(fileN,3) + ext; //TAM 25.02.2014
+      end;
+      if (SetParm(1, Name) == false)
+         return WLD_POSTEXPORT_ERROR;
+      end;
+   end;
+   return WLD_POSTEXPORT_OK;
+end;
+
+// Вызываемый макрос постобработки 
+macro MainExec(FileName, Sess)
+/************************ Не трогать !!!!!!!! ******************************/
+   debugbreak;
+   RECORD s(wlsess);
+   var error;
+   SetBuff(s, Sess);
+   /*Здесь будет находится новое имя файла экспорта*/
+   /*При возврате WLD_POSTEXPORT_OK, WLD_POSTEXPORT_CHANGE это имя*/
+   /*определяет файл в директории временных файлов (будет удален), иначе - имя*/
+   /*определяет местонахождение файла экспорта, который будет связан с сеансом*/
+   s.FileName = FileName;
+   /*****************************************************************************/
+   if (s.TpID == TRANSP_MNS)
+      error = RenameFileMNS(FileName, s.FileName, s.SessionID);
+      return error;
+   elif (ПолучитьИмяТранспорта(s.TpID) == "ФНС_365-П") 
+      error = RenameFileFNS(FileName, s.FileName, s.SessionID);
+      return error;
+   //TAM 13.11.2012 C-15514
+   elif((s.TpID == TRANSP_UFBS) and _bank.is_PRBB)
+      error = RenameFileED274(FileName, s.FileName, s.SessionID);
+      return error;
+   end;
+   //TAM 23.01.13 HF_60
+   //TAM 27.05.2013 С-19326 - файлы мы не формируем 
+   if (s.TpID == 14) //TRANSP_OFK
+      /*error = RenameFileGG(FileName, s.FileName, s.SessionID);
+      return error;*/
+      return WLD_POSTEXPORT_OK_STOP;
+   end;
+
+   //Gurin S. 20.11.2015 R-627132-2 Если по валютному документу более одного SWIFT сообщения, то при выгрузки с проконтролированных не обновляются поля dpmprop_dbt.T_PROPSTATUS и dwlpm_dbt.T_PROPSTATUS на значение 32000
+   if (s.TpID == TRANSP_SWIFT)
+      error = updateCurrencyDocData(s.SessionID);
+      return error;
+   end;
+
+   return WLD_POSTEXPORT_OK;
+end;

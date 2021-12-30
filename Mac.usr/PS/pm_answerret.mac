@@ -1,0 +1,317 @@
+//------------------------------------------------------------------------------
+//            Автоматизированная банковская система RS-Bank
+//
+//   File Name        : pm_answerret.mac
+//
+//   Description      : Заполнение уведомления о возврате (аннулировании) платежа
+//
+//   Author           : Чукина Т.А.
+//
+//   History          : Создан : 23.07.2012
+//   Changes          : TAM 18.11.2013 HF_96
+//                      TAM 20.03.2014 R-344690
+//                      LVV 19/05/15 Адаптация клиентской ветки
+//------------------------------------------------------------------------------
+
+
+import "wluftool.mac", PaymInter, CTInter, MesInter, "oralib.mac", "likepy.mac", "OprInter"; //TAM 26.03.13 HF_71
+import "lib_compare.mac";
+import bcall;
+import "fg_Life_parm.mac"; //TAM 18.06.2014 для Солидарности
+
+private const fgBank = fg_life_subject({OurBank});
+
+// получить PartyID и party.Name филиала
+private macro GetDprtPartyIDandName( DepCode   : integer, 
+                                     PartyID   : @integer, 
+                                     PartyName : @string )
+
+  file dp_dep("dp_dep.dbt") key 0;
+  record party("party.dbt");
+
+  dp_dep.Code = DepCode;
+
+  if( GetEQ(dp_dep) )    
+    PartyID = dp_dep.PartyID;
+    if( ПолучитьСубъекта(PartyID, party) == 0 )
+      PartyName = party.Name;
+    else
+      PartyName = "";
+    end;
+  else
+    PartyID = -1;
+    PartyName = "";
+  end;
+
+end;
+
+//Gurin S. 11.07.2013 C-21521
+// дополнительная информация по документу
+private macro GetFullNarrative(ID)
+    var sql = "    SELECT   (   CASE "
+            + "\n         WHEN (rmprop.T_SHIFROPER = '06') THEN 'И/п №' "
+            + "\n           WHEN (rmprop.T_SHIFROPER = '02') THEN 'П/т №' "
+            + "\n        END "
+            + "\n     || RMPROP.T_NUMBER "
+            + "\n     || ' от ' "
+            + "\n     || TO_CHAR (RMPROP.T_DATE, 'dd.mm.yyyy') " //Gurin S. 20.02.2015 R-547169-2
+            + "\n     || ' на сумму ' "
+            + "\n     || DPM.T_AMOUNT "
+            + "\n     || ', выставленное к счету ' "
+            + "\n     || DPM.T_PAYERACCOUNT "
+            + "\n     || ', плательщик ' "
+            + "\n     || RMPROP.T_PAYERNAME "
+            + "\n     || ', ИНН ' "
+            + "\n     || usr_uf_getinn (RMPROP.T_PAYERINN) "
+            + "\n     || '. ') "
+            + "\n       str "
+            + "\n  FROM   dpmpaym_dbt dpm, dpmrmprop_dbt rmprop "
+            + "\n WHERE   dpm.t_paymentid = rmprop.t_paymentid AND dpm.t_paymentid = :id ";
+    var rs:RsdRecordset = execSQLselect(sql, makeArray (SqlParam ("id", ID)));
+    if (rs and rs.moveNext())
+        return PutDoubleQoute(rs.value("str"));
+    end;
+    return "";
+end;
+
+private macro DefineMessageRelease( OutsideAbonentID, MesKind, MesSubKind,
+                                    TpID : @integer, 
+                                    TpSchemID : @integer, 
+                                    RlsFormID : @integer 
+                                  ) : integer
+  var params:TArray = NULL;
+  var retval:integer = 0;
+  var FormID = 0;
+  params = makeArray( SQLParam( "p_MesKind"    , MesKind              ),
+                      SQLParam( "p_MesSubKind" , MesSubKind           ),
+                      SQLParam( "p_OutsideAbonentID", OutsideAbonentID),
+                      SQLParam( "p_Department",  {OperDprt}),
+                      SQLParam( "p_Corschem",    0),
+                      SQLParam( "p_TpID"       , TpID,      RSDBP_IN_OUT ),
+                      SQLParam( "p_TpShemID"   , TpSchemID, RSDBP_IN_OUT ),
+                      SQLParam( "p_FormID"     , FormID,    RSDBP_IN_OUT ),
+                      SQLParam( "p_RlsFormID"  , RlsFormID, RSDBP_IN_OUT ),
+                      SQLParam( "p_PaymentKind", 0),
+                      SQLParam( "p_InsideAbonentID", 0),
+                      SQLParam( "p_PayerBankID", 0),
+                      SQLParam( "p_ReceiverBankID", 0),
+                      SQLParam( "p_PayerAccount", ""),
+                      SQLParam( "p_ReceiverAccount", ""),
+                      SQLParam( "p_RegionKind", 0),
+                      SQLParam( "p_ShifrOper", ""),
+                      SQLParam( "p_Amount", $0),
+                      SQLParam( "p_FIID", NATCUR),
+                      SQLParam( "p_PayFIID", ALLFININSTR),
+                      SQLParam( "p_InNoControl", V_STRING, RSDBP_OUT ),
+                      SQLParam( "p_QueryString", V_STRING, RSDBP_OUT )
+                    );
+  retval = execStoredFunc( "WLD_POS.DefineMessageRelease", V_INTEGER, params );
+  if( retval == 0 )
+    TpID = params.Value(5).value;
+    TpSchemID = params.Value(6).value;
+    RlsFormID = params.Value(8).value;
+  end;
+  return retval;
+end;
+
+// получить данные из входящего сообщения с референсом wlreq.RelatedRef 
+// заполняет wlreq.InitDateMes, wlreq.InitFormIDMes, TpID, TpSchemID, RlsFormID
+private macro FillInitMesData(wlreq, TpID: @integer, TpSchemID: @integer, RlsFormID: @integer)
+
+  // Find incoming message
+  var select = "Select t_MesID, t_TpSchemID, t_RlsFormID " +
+               "  from dwlmes_dbt " +
+               " where t_Direct = 'X' " +
+               "   and t_Trn = '" + wlreq.RelatedRef + "' ";
+  var rs = execSQLselect(select);
+
+  if( rs and rs.moveNext )
+
+    // InitDateMes
+    var xml_str = "";
+    var xml:object = ActiveX( "MSXML.DOMDocument" );
+    if( ПолучитьПоле (rs.value("t_MesID"), XMLField, xml_str) and
+        xml.loadXML(xml_str) )
+      var EDDate : string = ReadOptinalAttribute(xml, "EDDate");
+      if(EDDate)
+        wlreq.InitDateMes = ToDate_(EDDate); // ToDate из wluftool.mac //TAM 01.08.2012
+      end;
+      wlreq.RecipientCode = ReadOptinalAttribute(xml, "EDAuthor");
+    end;
+
+    // InitFormIDMes
+    select = "Select t_FormID " +
+             "  from dwlmesrls_dbt " +
+             " where t_RlsFormID = :RlsFormID ";
+    var params = makeArray( SQLParam("RlsFormID", rs.value("t_RlsFormID")) );
+    var rs_FormID = execSQLselect(select, params);
+    if( rs_FormID and rs_FormID.moveNext )
+      wlreq.InitFormIDMes = rs_FormID.value("t_FormID");
+    end;
+
+    // TpSchemID, RlsFormID    
+    TpID = getTpIDofTpSchem(rs.value("t_TpSchemID"));
+    TpSchemID = RlsFormID = 0;
+    /*WldDefineRlsForm( OBJTYPE_REQ, 
+                      wlreq.RecipientID, 
+                      WLD_MES_KIND_ANSWER, 
+                      TpID, TpSchemID, RlsFormID, WLD_SUBKIND_ANS_RET );*/
+    DefineMessageRelease( wlreq.RecipientID, WLD_MES_KIND_ANSWER, WLD_SUBKIND_ANS_RET,
+                          @TpID, @TpSchemID, @RlsFormID );
+
+  end;
+
+end;
+
+macro FillAnswerForPaymentAboutReturn( wlreq, 
+                                       Payment, 
+                                       TpID: @integer, 
+                                       TpSchemID: @integer, 
+                                       RlsFormID: @integer 
+                                     )
+  ClearRecord(wlreq);
+  //wlreq.RelatedRef = Payment.Notes.ReadNote(100, {curdate});
+  //TAM 20.03.2014 R-344690
+  wlreq.RelatedRef = Payment.Reference;
+  wlreq.Direct = ""; // WLD_MES_OUT
+  wlreq.Kind = MESKIND_ANSWER;
+  var PartyID = -1, PartyName = "";
+  GetDprtPartyIDandName(Payment.StartDepartment, @PartyID, @PartyName);
+  wlreq.OriginatorID = PartyID;
+  wlreq.OriginatorCodeKind = PTCK_BIC;
+  wlreq.OriginatorCode = ПолучитьКодСубъекта(wlreq.OriginatorID, wlreq.OriginatorCodeKind);
+  wlreq.OriginatorName = PartyName;
+  wlreq.RecipientCode = Payment.ReceiverBankCode;
+  wlreq.RecipientCodeKind = Payment.ReceiverBankCodeKind;
+  wlreq.RecipientID = Payment.ReceiverBankID;
+  wlreq.RecipientName = Payment.ReceiverBankName;
+  TpID = TpSchemID = RlsFormID = 0;
+  FillInitMesData(wlreq, @TpID, @TpSchemID, @RlsFormID);
+  wlreq.Corschem = Payment.OutCorschem;
+  wlreq.FIID = Payment.OutCorschemFIID;
+        
+end;
+
+//TAM 26.03.13 HF_71
+private macro GetCodeNum(wlreq) : string
+  var CodeNum = "";
+
+  const CodeLabel = "InfoCode:";
+
+  var ind = index(wlreq.Queries, CodeLabel);
+  if(ind)
+    CodeNum = substr(wlreq.Queries, ind + strlen(CodeLabel), 1);
+  end;
+
+  return CodeNum;
+end;
+
+//Gurin S. 25.09.2014 HF2031_19_25_83
+private macro YYYYMMDD( dateInit:date )
+  
+  var year, mon, day;
+
+  DateSplit( date, day, mon, year );
+  return StrSubst(string(year:4, "-", mon:2,"-", day:2), " ", "0");
+end;
+
+macro CreateED274
+( PsOrder : RsbPsPayOrder,
+  Queries : string,
+  Narrative : string,
+  ID_Oper : integer,
+  ID_Step : integer
+) : string
+
+  var msg = "";
+
+  record wlreq("wlreq");
+
+  var Payment : RsbPayment = PsOrder.Payment();
+  var AutoCreateNotice = true;
+  GetRegistryValue("PS\\PAYORDER\\DEMAND\\AUTOCREATENOTICE", V_BOOL, AutoCreateNotice);
+
+  if( ((PsOrder.DocKind == PSPOKIND_DEMAND) or (PsOrder.DocKind == PSPOKIND_REQUEST))
+      and (PsOrder.Origin == PSPO_OR_PAYEEBANK)
+      //TAM 20.03.2014 R-344690
+      and Payment.Reference
+      //and Payment.Notes.ReadNote(100, {curdate})
+      and AutoCreateNotice
+      //TAM 18.11.2013 HF_96
+      and not Payment.Categories.IsAttrPresense(18, 1, NULL, NULL, false, {curdate})
+    )
+    var TpID = 0, TpSchemID = 0, RlsFormID = 0;
+
+    FillAnswerForPaymentAboutReturn(wlreq, Payment, @TpID, @TpSchemID, @RlsFormID);
+
+    //Gurin S. 25.09.2014 HF2031_19_25_83
+    if( PsOrder.DocKind == PSPOKIND_DEMAND )
+
+      var InfoCode = int(SubStr( Queries, Index("InfoCode") + 10 ));
+      if( (InfoCode == 3) or (InfoCode == 4) or (InfoCode == 5) )
+
+        //Gurin S. 18.03.2015 R-558523-2
+        //Queries = Queries + "\nSumPT:" + string(int(Payment.OrderAmount *100)); 
+        Queries = Queries + "\nSumPT:" + substr( string (double(Payment.OrderAmount) * 100),1,strlen( string (double(Payment.OrderAmount) * 100))-5); 
+        if( (Payment.FutureBaseAmount > 0) and (Payment.FutureBaseAmount < Payment.OrderAmount) )
+
+          Queries = Queries + "\nAcptSum:" + string(int(Payment.FutureBaseAmount *100));
+
+          var select = " select step.t_Fact_Date " +
+                       "  from doprstep_dbt step, doproper_dbt opr, dpmpaym_dbt pm" +
+                       "   where step.t_ID_Operation = opr.t_ID_Operation " +
+                       "     and step.t_Kind_Action  = 205 " +  // PM_OPR_KA_ACCEPTI1
+                       "     and opr.t_DocKind       = pm.t_PrimDocKind " +
+                       "     and opr.t_DocumentID    = lpad(:PAYMENTID, 34, 0) ";
+          var params = makeArray( SQLParam("PAYMENTID", Payment.PaymentID ) );
+          var rs = execSQLselect(select, params);
+          if( rs and rs.moveNext )
+            var FDate:date;
+            DtTmSplit( rs.Value(0), FDate );
+            Queries = Queries + "\nAcptDate:" + YYYYMMDD( FDate ); // YYYY-MM-DD
+          end;
+        end;
+      end;
+    end;
+
+    wlreq.Queries = Queries;
+
+    rs = execSQLselect( "SELECT dwlreq_dbt_seq.nextval t_ReqID FROM dual" );
+    if(rs and rs.moveNext())
+      wlreq.ReqID = rs.value("t_ReqID");
+    end;
+    Narrative = GetFullNarrative(PsOrder.OrderID) + Narrative;
+    TpID = 9;
+    TpSchemID = 56;
+    RlsFormID = 363;
+    var err = CreateQuery(wlreq, Narrative, "", RlsFormID, TpSchemID, true, ID_Oper, ID_Step, TpID);
+    
+
+    if( err == 0 )      
+      var Trn : string = "";
+      if(wlreq.ReqID > 0)
+        Trn = GetTrnByMesLnk(wlreq.ReqID, OBJTYPE_REQ, "");
+      end;
+
+      msg = "Сформировано уведомление ED274 о результатах приема к исполнению. ";
+      if(Trn)
+        msg = msg + "Референс сообщения " + Trn + ".";
+      end;
+      //if(ShowCodeNum)
+        msg = msg + " В сообщение записан код " + GetCodeNum(wlreq) + ", " +
+            "документ доступен для редактирования в п/с \"Межбанковские расчеты\"";
+      //end;
+    else
+      MemoryError( err );                
+      msg = "Произошла ошибка создания уведомления ED274 о результатах " +
+            "приема к исполнению: " + GetErrMsg();            
+    end;
+
+    if( not IsOprMultiExec() )
+      msgbox(msg);
+    end;
+  end;
+
+  return msg;
+end;
+

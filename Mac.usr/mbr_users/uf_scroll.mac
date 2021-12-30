@@ -1,0 +1,1103 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: uf_scroll.mac v.1
+// @author  : 2012-08-01 zip_z. C-12896 (первоначальная реализация)
+// @desc    : Скроллинг принятых сообщений ED243
+// @changes : 2012-10-10 zip_z. C-14660  (вторая очередь доработок)
+//            2012-10-30 zip_z. C-15056  (третья очередь доработок)
+//            2012-12-10 zip_z. C-15778  (исправление ошибки Рудольфа, который божился, что имена файлов уникальны)
+//            2012-12-20 zip_z. R-136823 (эпический рефакторинг, см. VSS Changelog)
+//            2013-01-30 Gurin S. C-17145 (добавлены 2 столбца в скроллинг: К и К#; 
+//                       убрал с набора параметров временной период, перенес в макросы скроллингов uf_scroll_*.mac в переменную scrollFilter ) )  
+//            2013-03-03 zip_z. С-17661 (изменены параметры отправки сообщений в Lotus)
+//            2013-04-25 Gurin S. C-18664-6 (добавлен столбец в скроллинг: БЗ)
+//            2013-06-26 Gurin S. R-204552-2
+//            2013-06-30 Gurin S. C-20508 
+//            2013-07-26 Gurin S. R-222443-2 Адаптировал для ответа без запроса
+//            2013-07-27 Gurin S. C-21105-6
+//            2013-09-06 Gurin S. C-21844-6
+//            2013-09-24 Gurin S. C-23593-6 (добавлен столбец в скроллинг: IN)
+//            2013-12-13 Gurin S. C-25791 (Ctr + L (проставить/убрать признак отправки в Интернет-Клиент))
+//            2013-12-19 Gurin S. C-25226-6 (Alt + F8 (удалить сообщение))
+// -------------------------------------------------------------------------------------------------
+import BankInter, PaymInter, SbCrdInter, RCW;                     // dst.: C++
+import OraLib, LikePy, TReport, Globals;                          // dst.: MAC
+import uf_common, uf_answer, uf_request, uf_letter_ic, lib_account, lib_oper, "fg_Life_parm.mac"; // usr.: MAC.USR
+
+private const fgBank = fg_life_subject({OurBank});
+
+/* @desc: класс для хранения параметров текущей записи в скроллинге UFScroll
+ *        Используется для позиционирования курсора (UpdateScroll не работает, увы)
+ *        Финты ушами выдуманы из-за #166620 (fxd 2030.48), но переписывать не буду (и так красиво).
+ *        Дима, прости (с)
+ */
+private class TCurrentRecord ()
+    var originalepd_edauthor = null;
+    var originalepd_eddate   = null;
+    var originalepd_edno     = null;
+    var fname                = null;
+    
+    // @desc: заполнить свойства класса согласно полям текущего RecordSet
+    macro Save (rs:RsdRecordSet)
+        this.originalepd_edauthor = rs.value ("originalepd_edauthor");
+        this.originalepd_eddate   = rs.value ("originalepd_eddate");
+        this.originalepd_edno     = rs.value ("originalepd_edno");
+        this.fname                = rs.value ("fname");
+    end;
+    
+    // @desc: сравнить ранее сохраненные свойства класса с текущей записью в RecordSet
+    macro Compare (rs:RsdRecordSet)
+        return ( (this.originalepd_edauthor == rs.value ("originalepd_edauthor")) and 
+                 (this.originalepd_eddate   == rs.value ("originalepd_eddate"  )) and 
+                 (this.originalepd_edno     == rs.value ("originalepd_edno"    )) and
+                 (this.fname                == rs.value ("fname"))
+               );
+    end;
+    
+    // @desc: свойства класса не бывают заполнены, если листалка инициализируется при первом запуске
+    macro IsNull ()
+        return ( (this.originalepd_edauthor == null) and 
+                 (this.originalepd_eddate   == null) and 
+                 (this.originalepd_edno     == null)    
+               );
+    end;
+end;
+
+/* @desc: класс для построения скроллинга принятых сообщений ED243. 
+ *   private:
+ *       dateToString
+ *       setDocBookmarkText
+ *       printWordReport
+ *       updatePaymentID
+ *   
+ *   public:
+ *       handleScrollEvents      - обязан быть открытым методом, иначе обработка событий не случится
+ *       init                    - конструктор. Вызывается ЯВНО (р у к а м и) после инициализации экземпляра 
+ */
+class (TRecHandler) UF_Scroll ()
+    var rs        :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning :bool         = true;        // флаг "скроллинг запущен"
+    var p         :EDParams     = EDParams (); // параметры выгрузки ED
+    var cr        :TCurrentRecord;             // параметры текущей записи скроллинга
+    var BeginDate, EndDate;
+    var MsgName = TArray(), AnswerYes = False, AnswerNo = False;
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+    
+    /* EDDefineRequestCode */
+    const REQ_ACCOUNT           = "01", 
+          REQ_ACCOUNT_NAME      = "02", 
+          REQ_NODOUBLE          = "03",
+          REQ_PAYER_NAME        = "04", 
+          REQ_RECV_NAME         = "05", 
+          REQ_INN_ADDRESS       = "06",
+          REQ_GROUND            = "07", 
+          REQ_NEED_INFO_BY_MASK = "08";
+
+    macro FastUpdateEDScroll(rs : RsdRecordset, m_flag)
+        if (isNull(m_flag)) m_flag =  true; end;
+        if (m_flag)
+            rs.refreshcommand = RSDCommand(rs.command.cmdtext + " AND fname = '" + rs.value("fname") + "'");
+            rs.refreshcommand.AddParam("ourbank"   , RSDBP_IN, {OurBank});
+            rs.refreshcommand.AddParam("date_begin", RSDBP_IN, BeginDate, V_DATE);
+            rs.refreshcommand.AddParam("date_end"  , RSDBP_IN, EndDate,   V_DATE);
+            rs.refreshrecord;
+            UpdateScroll(rs); 
+        else
+            rs.refreshcommand = RSDCommand(rs.command.cmdtext);
+            rs.refreshcommand.AddParam("ourbank"   , RSDBP_IN, {OurBank});
+            rs.refreshcommand.AddParam("date_begin", RSDBP_IN, BeginDate, V_DATE);
+            rs.refreshcommand.AddParam("date_end"  , RSDBP_IN, EndDate,   V_DATE);
+            rs.refreshrecord;
+            UpdateScroll(rs); 
+        end;
+    end;
+
+    macro FastUpdateEDScrollnoReq(rs : RsdRecordset)
+        rs.refreshcommand = RSDCommand(rs.command.cmdtext + " AND paymentid = " + rs.value("paymentid") + " AND is_norequest = chr(88) " +
+                                       " and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = " + rs.value ("EDAuthor_244") +
+                                       " and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = '"+rs.value ("EDDate_244")+"'" +
+                                       " and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = " + rs.value ("EDNo_244")); 
+        rs.refreshcommand.AddParam("ourbank"   , RSDBP_IN, {OurBank});
+        rs.refreshcommand.AddParam("date_begin", RSDBP_IN, BeginDate, V_DATE);
+        rs.refreshcommand.AddParam("date_end"  , RSDBP_IN, EndDate,   V_DATE);
+        rs.refreshrecord;
+        UpdateScroll(rs); 
+    end;
+    
+    // @desc: дата прописью
+    // @return: строка с датой прописью (13 мартобря 2012 года)
+    private macro dateToString (d)
+        var dd, mm, yyyy, mon;
+        dateSplit (d, dd, mm, yyyy);
+        if   (mm == 1)  mon = "января";
+        elif (mm == 2)  mon = "февраля";
+        elif (mm == 3)  mon = "марта";
+        elif (mm == 4)  mon = "апреля";
+        elif (mm == 5)  mon = "мая";
+        elif (mm == 6)  mon = "июня";
+        elif (mm == 7)  mon = "июля";
+        elif (mm == 8)  mon = "августа";
+        elif (mm == 9)  mon = "сентября";
+        elif (mm == 10) mon = "октября";
+        elif (mm == 11) mon = "ноября";
+        elif (mm == 12) mon = "декабря";
+        end;
+        return string ("\"", dd, "\" ", mon, " ", yyyy, "г.");
+    end;
+    
+    // @desc: функция установки текста в закладке шаблона (или документа) Word
+    // @return: объектище документа Word с заполненным текстом
+    private macro setDocBookmarkText (MSODocumentObject, BookmarkName, _Text)
+        MSODocumentObject.Bookmarks(BookmarkName).Range.Text = _Text;
+        return MSODocumentObject;
+    end;
+    
+    
+    // @desc: функция печати извещения в Word
+    // @return: void
+    private macro printWordReport ()
+        var m_bank_recv_mfo;
+        var m_bank_recv_city;
+        var m_bank_recv_name;
+        
+        var pm = RSBPayment (rs.value ("paymentid"));
+        
+        var m_doc_amount     = strSubst (string (pm.payerAmount), ".", "-");
+        var m_doc_date       = string (pm.date);
+        var m_doc_number     = string (pm.number);
+        var m_doc_amount_str = rubToStr (pm.payerAmount);
+        
+        var m_client_account = pm.payerAccount;
+        var m_client_name    = pm.payername;
+        
+        var m_bank_our_date     = {CurDate};
+        var m_bank_our_name     = {Name_Bank};
+        
+        /* вот здесь лучше не шутить, потому что RSBParty и RSBPayment - очень тяжелые классы сами по себе...*/
+        var sql =   "select   t_code m_bank_recv_mfo,"
+                  + "         upper (t_codedistrict || '. ' || t_district) m_bank_recv_city,"
+                  + "         upper (pt.t_name) m_bank_recv_name"
+                  + "  from   dobjcode_dbt c, dadress_dbt ad, dparty_dbt pt"
+                  + " where       c.t_objecttype = 3 and c.t_codekind = 3 and c.t_state = 0"
+                  + "         and c.t_objectid = lpad (to_char (pt.t_partyid), 10, '0')"
+                  + "         and ad.t_partyid = pt.t_partyid and t_type = 1"
+                  + "         and pt.t_partyid = :receiverbankid";
+        var parm = makeArray (SQLParam ("receiverbankid", pm.receiverBankID));
+        sql = execSQLSelect (sql, parm);
+        if (sql.moveNext ())
+            m_bank_recv_city = sql.value ("m_bank_recv_city");
+            m_bank_recv_mfo  = sql.value ("m_bank_recv_mfo");
+            m_bank_recv_name = sql.value ("m_bank_recv_name");
+        end;
+        
+        var m_oper_name = "";
+        sql = "select t_shortname from dparty_dbt pt, dperson_dbt p where pt.t_partyid = p.t_partyid and p.t_oper = :oper";
+        parm = makeArray (SQLParam ("oper", {oper}));
+        sql = execSQLSelect (sql, parm);
+        if (sql.moveNext ())
+            m_oper_name = sql.value ("t_shortname");
+        end;
+        
+        // Вот здесь может упасть по ORA-06502: PL/SQL: numeric or value error: character string buffer too small
+        // если мы слишком перестараемся, поэтому пришлось мистически отказаться от варианта с  
+        // m_correct_req = execStoredFunc ("usr_uf_getCorrectFields", V_STRING, parm);
+        // и написать вот такую ересь:
+        sql = "select usr_uf_getcorrectfields (:p_filename, :p_filename_ed244, :p_EDAuthor, :p_EDDate, :p_EDNo) answer from dual";
+        //Gurin S. R-222443-2 Адаптировал для ответа без запроса
+        if (rs.value ("is_norequest") == "X")
+            parm = makeArray ( SQLParam ("p_filename"       , rs.value ("fname"        )),
+                               SQLParam ("p_filename_ed244" , rs.value ("fname_ed244"  )),
+                               SQLParam ("p_EDAuthor"       , rs.value ("edauthor_244" )),
+                               SQLParam ("p_EDDate"         , rs.value ("eddate_244"   )),
+                               SQLParam ("p_EDNo"           , rs.value ("edno_244"     ))
+                             );
+        else
+            parm = makeArray ( SQLParam ("p_filename"       , rs.value ("fname"                )),
+                               SQLParam ("p_filename_ed244" , rs.value ("fname_ed244"          )),
+                               SQLParam ("p_EDAuthor"       , rs.value ("OriginalEPD_EDAuthor" )),
+                               SQLParam ("p_EDDate"         , rs.value ("OriginalEPD_EDDate"   )),
+                               SQLParam ("p_EDNo"           , rs.value ("OriginalEPD_EDNo"     ))
+                             );
+        end;
+        sql = execSQLSelect (sql, parm);
+        
+        var has_correct_fields = sql.moveNext ();
+        var m_correct_req = IfThenElse (has_correct_fields, sql.value ("answer"), " ");
+        var path,  w, doc;
+        if (not (path = findpath("uf_template.dot", RSL_GetRegistryValue("BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/USERTEMPLSDIR"))))
+            msgbox("Не найден шаблон печати");
+        else
+            w = createObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone()).CreateComObject("Word.Application");
+            if( doc = w.documents.add(path))
+                doc.Bookmarks("m_bank_recv_city").range.text  = m_bank_recv_city;
+                doc.Bookmarks("m_bank_recv_name").range.text  = m_bank_recv_name;
+                doc.Bookmarks("m_bank_recv_mfo").range.text   = m_bank_recv_mfo;
+                doc.Bookmarks("m_doc_date").range.text        = m_doc_date;
+                doc.Bookmarks("m_doc_number").range.text      = m_doc_number;
+                doc.Bookmarks("m_doc_amount").range.text      = m_doc_amount;
+                doc.Bookmarks("m_doc_amount_str").range.text  = m_doc_amount_str;
+                doc.Bookmarks("m_client_account").range.text  = m_client_account;
+                doc.Bookmarks("m_client_name").range.text     = m_client_name;
+                doc.Bookmarks("m_correct_req").range.text     = string (m_correct_req);
+                doc.Bookmarks("m_oper_name").range.text       = m_oper_name;
+                doc.Bookmarks("m_curdate").range.text         = dateToString ({CurDate});
+                doc.Bookmarks("m_bank_our_name").range.text   = {name_bank};
+                w.visible = true;
+            end;
+        end;
+    end;
+    
+    // @desc  : ручное обновление PaymentID исходного платежа для текущей записи скроллинга
+    // @return: void
+    private macro updatePaymentID (pid, f)
+        var sql = "update usr_uf_container set paymentid = :pid, is_payment_found = :found where fname = :f" +
+                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+        var parm = makeArray ( SQLParam ("pid"         ,pid                                    ), 
+                               SQLParam ("found"       ,IfThenElse (pid, SET_CHAR, UNSET_CHAR )), 
+                               SQLParam ("f"           ,f                                      ),
+                               SQLParam ("EDAuthor"    ,rs.value ("OriginalEPD_EDAuthor"      )),
+                               SQLParam ("EDDate"      ,rs.value ("OriginalEPD_EDDate"        )),
+                               SQLParam ("EDNo"        ,rs.value ("OriginalEPD_EDNo"          )));
+        if (not execSQL (sql, parm))
+            msgbox ("Не удалось обновить информацию об идентификаторе платежа" );
+        end;
+    end;
+    
+    // @desc  : Аналог RPAD в oracle
+    // @return: void
+    macro RPAD_MFO() 
+        const StrSize = 10;  
+        var StrName = SUBSTR({MFO_Bank},3) + mkstr( "0", StrSize - strlen(SUBSTR({MFO_Bank},3)) );
+        return StrName;
+    end;
+
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+        private var sql, parm, out, answer, ref, ed244_name;
+
+        if   (cmd == DLG_INIT)
+            // таким вот неочевидным Макаром мы перебрасываемся на нужную запись скроллинга при инициализации
+            if (not cr.IsNull ())
+                var flag = false;
+                while(rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+
+            if ((not AddMultiAction (rs, 287)) or (not AddMultiAction (rs, 279))) 
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end; 
+        
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            
+            elif ((key == 322) or (key == 323)) // F8, F9
+                ret = CM_IGNORE;
+            
+            // DONE: Alt + W (печать извещения в Word)
+            elif (key == 273) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                /*if (rs.value ("is_norequest") == "X")
+                    msgbox("Сообщение создано без запроса. Этот функционал не работает");
+                else*/
+                    if (rs.value("is_answer_made") == SET_CHAR)
+                        //Gurin S. R-222443-2 Адаптировал для ответа без запроса
+                        printWordReport ();
+                        sql = "update usr_uf_container set is_word_letter_printed = chr (88) where";
+                              if (rs.value ("is_norequest") == "X")
+                                  sql = sql + "   fname_ed244 = :f" +
+                                  "   and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                                  "   and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                                  "   and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo ";
+                                  parm = makeArray (SQLParam ("f"                , rs.value ("fname_ed244"  )),
+                                                    SQLParam ("p_EDAuthor"       , rs.value ("edauthor_244" )),
+                                                    SQLParam ("p_EDDate"         , rs.value ("eddate_244"   )),
+                                                    SQLParam ("p_EDNo"           , rs.value ("edno_244"     )));
+                              else
+                                  sql = sql + "   fname = :f" +
+                                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                                  "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo ";
+                                  parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )),
+                                                    SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                                    SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                                    SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                              end;
+                        
+                        execSQL (sql, parm);
+                    else
+                        msgbox ("Перед печатью извещения в Word нужно сформировать ответ ED244");
+                    end;
+                //end;
+                ret = CM_IGNORE;
+            
+            // DONE: Alt + O (сформировать ответ ED244)
+            elif (key == 280) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value ("is_our_243") != "X")
+                    if (rs.value ("is_norequest") == "X")
+                        //msgbox("Сообщение ED244 создано по платежу id: ", rs.value ("paymentid"), "|Повторите формирование ответа с помощью пользовательского | функционала по Ctr+Z на этом платеже");
+                        UF_Answer.InitByRowData (rs, false); 
+                        FastUpdateEDScrollnoReq(rs);
+                        //ret = CM_SELECT;
+                    else
+                        // юный хакер, помни о прелести неполного вычисления выражений типа if (A or B): 
+                        // если а == true, то B - не вычисляется !!!
+                        if (   (rs.value ("paymentid") != 0) 
+                            or (getTrue (false, "Невозможно найти платёж по заданной комбинации | EDAuthor, EDDate, EDNo в блоке OriginalEPD |Сформировать ответ ED244 вручную?")))
+                            UF_Answer.InitByRowData (rs); 
+                            //Gurin S. 14.04.2014 I-00480171-2
+                            FastUpdateEDScroll(rs);
+                            //ret = CM_SELECT;
+                        end;
+                    end;
+                end;
+
+            // DONE: Alt + P (просмотреть платёж)
+            elif (key == 281) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value ("paymentid") != 0)
+                    PM_ProcessPanel (RSBPayment (rs.value ("paymentid")));
+                else
+                    if (getTrue (true,  "Невозможно найти платёж по заданной комбинации | EDAuthor, EDDate, EDNo в блоке OriginalEPD. |Ввести информацию о платеже вручную?"))
+                        if (getInt (answer, "PaymentID", 10))
+                            updatePaymentID (answer, rs.value ("fname"));
+                            ret = CM_SELECT;
+                        end;
+                    else
+                        ret = CM_IGNORE;
+                    end;
+                end;
+
+            // DONE: Alt + F8 (удалить сообщение)
+            elif (key == 367) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if ((rs.value ("is_our_243") == "X") and (rs.value ("is_sent_file") != "X"))
+                    sql = "delete from usr_uf_container where fname = :f and is_our_243 = 'X'";
+                    parm = makeArray (SQLParam ("f",rs.value ("fname")));
+                    if (not execSQL (sql, parm))
+                        msgbox ("Не удалось удалить сообщение");
+                    else
+                        msgbox ("Сообщение удалено");
+                        FastUpdateEDScroll(rs, false);
+                    end;
+                elif ((rs.value ("is_our_243") == "X") and (rs.value ("is_sent_file") == "X"))
+                    msgbox("Сообщение уже выгружено. Удалять нельзя"); 
+                end;
+                //Gurin S. 19.09.2014 C-33364-7
+                if (rs.value ("is_norequest") == "X")
+                   if ((rs.value ("is_sent_file") != "X") and GetTrue(True, "Удалить ответ?"))
+                       sql = "delete from usr_uf_container "+
+                             " where     paymentid = :id and is_norequest = 'X'"
+                             "       and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :p_EDAuthor " +
+                             "       and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :p_EDDate " +
+                             "       and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :p_EDNo ";
+                       parm = makeArray (SQLParam ("id"             , rs.value ("paymentid")),
+                                         SQLParam ("p_EDAuthor"     , rs.value ("edauthor_244" )),
+                                         SQLParam ("p_EDDate"       , rs.value ("eddate_244"   )),
+                                         SQLParam ("p_EDNo"         , rs.value ("edno_244"     )));
+                       if (not execSQL (sql, parm))
+                           msgbox ("Не удалось удалить сообщение");
+                       else
+                           msgbox ("Сообщение удалено");
+                           FastUpdateEDScrollnoReq(rs);
+                       end;
+                   elif ((rs.value ("is_norequest") == "X") and (rs.value ("is_sent_file") == "X"))
+                       msgbox("Сообщение уже выгружено. Удалять нельзя"); 
+                   end;
+                else
+                   msgbox("Для этого вида/состояния сообщения этот функционал не реализован"); 
+                end;
+            // DONE: Ctrl + P (изменить paymentID)
+            elif (key == 16) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value ("is_our_243") != "X")
+                    if (rs.value ("PaymentID") != 0)
+                        if (getTrue (true, "Платёж уже найден по комбинации EDAuthor, EDDate, EDNo в блоке OriginalEPD. |Изменить PaymentID вручную?"))
+                            if (getInt (answer, "PaymentID", 10))
+                                updatePaymentID (answer, rs.value ("fname"));
+                                ret = CM_SELECT;
+                            end;
+                        end;
+                    else
+                        if (getInt (answer, "PaymentID", 10))
+                            updatePaymentID (answer, rs.value ("fname"));
+                            ret = CM_SELECT;
+                        end;
+                    end;
+                end;
+
+            // DONE: Alt + S (выгрузить XML ED244)
+            elif (key == 287) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value ("is_our_243") == "X")
+                    var ed243name, tmpname;
+                    //msgbox("Сообщение уже было выгружено");
+                    sql  = "select replace (convert (t.xmldata.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                           "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml from usr_uf_container t where fname = :f1" + 
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                    parm = makeArray (SQLParam ("f1"          , rs.value ("fname"                )),
+                                      SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                      SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                      SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                    sql  = execSQLSelect (sql, parm);
+                    if (sql.moveNext ())
+                        out  = string (p.m_txtdir_export_243,"\\", rs.value ("fname"));
+                        setOutput (out);
+                        println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                        println (sql.value ("xml"));
+                        setOutput (null, true);
+                        sql = "update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f1 "
+                              " where     trim (fname) = :f2 "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                        parm = makeArray (SQLParam ("f1"          , ed244_name),
+                                          SQLParam ("f2"          , rs.value ("fname"                )),
+                                          SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                          SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                          SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                        execSQL (sql, parm);
+                        FastUpdateEDScroll(rs);
+                        msgbox ("Файл выгрузки находится по пути " + out);
+                        //ret = CM_SELECT;
+                    else
+                        msgbox ("Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                        ret = CM_IGNORE;
+                    end;
+                elif ((rs.value ("is_norequest") == "X") and (rs.value ("is_our_243") != "X"))
+                    var ed244name;
+                    generateReference (1000044, ed244name);
+                    tmpname = string(UF_Scroll.RPAD_MFO(),ed244name,".xml");
+                    //msgbox("Сообщение уже было выгружено");
+                    sql  = "select replace (convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                                   "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml " +
+                           "  from usr_uf_container t where paymentid = :id and is_norequest = chr(88)" +/*fname = :f ";*/
+                           "       and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                           "       and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                           "       and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo "; 
+                    parm = makeArray (SQLParam ("id"       , rs.value ("paymentid"    )),
+                                      SQLParam ("EDAuthor" , rs.value ("EDAuthor_244" )),
+                                      SQLParam ("EDDate"   , rs.value ("EDDate_244"   )),
+                                      SQLParam ("EDNo"     , rs.value ("EDNo_244"     ))); /*SQLParam ("f", rs_global.value ("fname"))*/                         
+                    sql  = execSQLSelect (sql, parm);
+                    if (sql.moveNext ())
+                        //var out  = string (p.m_txtdir_export, "\\ED244_", trim (rs_global.value ("fname")));
+                        out  = string (p.m_txtdir_export, "\\ED244_", tmpname/*trim (rs.value ("fname_ed244"))*/);
+                        setOutput (out);
+                        println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                        println (sql.value ("xml"));
+                        setOutput (null, true);
+                        sql = " update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f "
+                              " where paymentid = :id and is_norequest = chr(88) " 
+                              "       and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                              "       and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                              "       and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo "; ;/*trim (fname) = :f";*/
+                        parm = makeArray (SQLParam ("f",         tmpname/*rs.value ("fname_ed244")*/),
+                                          SQLParam ("id",        rs.value ("paymentid"    )),
+                                          SQLParam ("EDAuthor" , rs.value ("EDAuthor_244" )),
+                                          SQLParam ("EDDate"   , rs.value ("EDDate_244"   )),
+                                          SQLParam ("EDNo"     , rs.value ("EDNo_244"     )));
+                        execSQL (sql, parm);
+                        FastUpdateEDScrollnoReq(rs);
+                        msgbox ("Файл выгрузки находится по пути " + out);
+                        //ret = CM_SELECT;
+                    else
+                        msgbox ("Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                        ret = CM_IGNORE;
+                    end; 
+                elif ((rs.value ("is_norequest") == "") and (rs.value ("is_our_243") != "X"))
+                    if (rs.value ("is_answer_made") == "X")
+                        generateReference (1000044, ref);
+                        ed244_name = string(RPAD_MFO(),ref,".xml"); 
+                        //out  = string (p.m_txtdir_export, "\\ED244_", trim (rs.value ("fname")));
+                        out  = string (p.m_txtdir_export, "\\ED244_", ed244_name);
+                        // sql  = "select convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866') as xml from usr_uf_container t where fname = :f";         // !!!!
+                        // оказывается, бой ведёт себя не так, как тест, и заполняет XML Root 
+                        // До выяснения с Джетом, что за дела, делаем replace.
+                        sql  = "select replace (convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                               "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml from usr_uf_container t where fname = :f1" + 
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                        parm = makeArray (SQLParam ("f1"          , rs.value ("fname"                )),
+                                          SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                          SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                          SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                        sql  = execSQLSelect (sql, parm);
+                        if (sql.moveNext ())
+                            setOutput (out);
+                            println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                            println (sql.value ("xml"));
+                            setOutput (null, true);
+                            sql = "update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f1 "
+                                  " where     trim (fname) = :f2 "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                            parm = makeArray (SQLParam ("f1"          , ed244_name),
+                                              SQLParam ("f2"          , rs.value ("fname"                )),
+                                              SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                              SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                              SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                            execSQL (sql, parm);
+                            FastUpdateEDScroll(rs);
+                            msgbox ("Файл выгрузки находится по пути " + out);
+                            ret = CM_SELECT;
+                        else
+                            msgbox ("Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                            ret = CM_IGNORE;
+                        end;
+                    else
+                        msgbox ("Перед отправкой ответ ED244 необходимо сформировать по Alt+O");
+                        ret = CM_IGNORE;
+                    end;
+                end;
+                 
+            // DONE: Alt + L (отправить оповещение в Lotus)
+            elif (key == 294) 
+                if (rs.value ("is_our_243") != "X")
+                    cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                    if (rs.value ("is_norequest") == "X")
+                        msgbox("Сообщение создано без запроса. Этот функционал не работает");
+                    else
+                        if (rs.value ("PaymentID") > 0)
+                            var pm   = RSBPayment (rs.value ("PaymentID"));
+                            var acc  = RSL_Account (pm.payerAccount, pm.baseFiid); // хотят брать опера из карточки л/счета плательщика, а не из платежа
+                            var mail = findLotusMailByOper (acc.rec.oper);
+                    
+                            if (mail != "")
+                           
+                                var subject = "RS-Bank v6: запрос на уточнение реквизитов по п/п";
+                                var letter  = string (
+                                            "Добрый день! ", "\n", 
+                                            "Поступил запрос на уточнение реквизитов по платежу:", "\n", 
+                                            "Код запроса на уточнение : ", UF_Answer.UF_Hlp_GetDescriptionByCode (UF_REF_TYPE_REQUEST, rs.value("EdDefineRequestCode")), "\n", 
+                                            "Номер платежа   : ", pm.number          , "\n", 
+                                            "Счёт плательщика: ", pm.payerAccount    , "\n", 
+                                            "Счёт получателя : ", pm.receiverAccount , "\n", 
+                                            "Сумма           : ", pm.baseAmount      , "\n", 
+                                            "Дата значения   : ", pm.valueDate       , "\n",
+                                            "Просьба передать данную информацию клиенту."); 
+                                    //Gurin S. 29.01.2015 R-535588-2
+                                      //Gurin S. 26.06.2013 R-204552-2
+                                      //if (not fgBank.is_EXV)
+                                      //    letter   = letter + string( "Уточняющее письмо Вы можете отправить по БД \"Заявки ЕРЦ\"." );
+                                      //end;
+                                    letter   = letter + string("\n\n\n","Отправитель сообщения: ", RSL_Person ({OPER}).name, ".", "\n",
+                                            "*** Внимание! Это письмо автоматически сформировано роботом RS-Bank. На него не нужно отвечать.***"
+                                            );
+                                sendLotusNotify (subject, letter, mail);
+                                sql  = "update usr_uf_container set is_lotus = chr (88) where trim (fname) = :f"
+                                       "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor "
+                                       "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate "
+                                       "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                                parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )),
+                                                  SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                                  SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                                  SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                                execSQL (sql, parm);
+
+                                msgbox ("Сообщение в Lotus отправлено");
+                                ret  = CM_SELECT;
+                            end;
+                        else
+                            msgbox ("Платёж не найден. Отправить сообщение в Lotus невозможно.");
+                            ret = CM_IGNORE;
+                        end;
+                    end;
+                end;
+                    
+            // DONE: Ctr + L (проставить/убрать признак отправки в Интернет-Клиент)
+            elif (key == 12)
+                cr.Save (rs);
+                if ((rs.value ("is_norequest") == "") and (rs.value ("is_our_243") != "X"))
+                    sql  = "UPDATE   USR_UF_CONTAINER "
+                           "   SET   is_lotus = DECODE (is_lotus, CHR (0), CHR (88), CHR (0)) "
+                           " WHERE   FNAME = :f ";
+                    parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )));
+                    if (execSQL (sql, parm)) 
+                        msgbox ("Выполнено"); 
+                        FastUpdateEDScroll(rs); 
+                    else 
+                        msgbox ("Не выполнено"); 
+                    end;
+                elif ((rs.value ("is_norequest") == "X") and (rs.value ("is_our_243") != "X"))
+                    sql  = "UPDATE   USR_UF_CONTAINER "
+                           "   SET   is_lotus = DECODE (is_lotus, CHR (0), CHR (88), CHR (0)) "
+                           " WHERE   FNAME_ED244 = :f ";
+                    parm = makeArray (SQLParam ("f"           , rs.value ("fname_ed244"             )));
+                    if (execSQL (sql, parm)) 
+                        msgbox ("Выполнено"); 
+                        FastUpdateEDScrollnoReq(rs); 
+                    else 
+                        msgbox ("Не выполнено"); 
+                    end;
+                end;
+
+            // DONE: Alt + I (отправить оповещение в Интернет-Клиент)
+            elif (key == 279)
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if ( ((rs.value ("is_ib_notify") == "X") and GetTrue(True, "По этому сообщению уже было отправлено оповещание в Интернет-Клиент. | Отправить повторно?"))
+                     or (rs.value ("is_ib_notify") != "X") )
+                    if (rs.value ("is_our_243") != "X")
+                        if (rs.value ("PaymentID") > 0)
+                            pm = RSBPayment (rs.value ("PaymentID"));
+                            if (IC_FindClientByPartyID (pm.payer) == true)
+                                letter  = string (
+                                            "Добрый день! ", "\n", 
+                                            "Поступил запрос на уточнение реквизитов по платежу.", "\n", 
+                                            "Номер платежа   : ", pm.number          , "\n", 
+                                            "Счёт плательщика: ", pm.payerAccount    , "\n", 
+                                            "Счёт получателя : ", pm.receiverAccount , "\n", 
+                                            "Сумма           : ", pm.baseAmount      , "\n", 
+                                            "Дата значения   : ", pm.valueDate       , "\n", 
+                                            "Запрос на уточнение : ", 
+                                            UF_Answer.UF_Hlp_GetDescriptionByCode (UF_REF_TYPE_REQUEST, rs.value("EdDefineRequestCode")), 
+                                            ". Уточняющее письмо Вы можете отправить по системе Интернет-Клиент ", 
+                                            "на операционных работников с темой письма 'Уточнение реквизитов по п/п'."
+                                            );
+                                if (UF_MessageSender (pm.payer, letter).SendNotify ())
+                                    sql  = "update usr_uf_container set is_ib_notify = chr (88) where trim (fname) = :f" +
+                                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                                    parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )),
+                                                      SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                                      SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                                      SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                                    execSQL (sql, parm);
+                                    ret  = CM_SELECT;
+                                    msgbox ("Сообщение отправлено");
+                                end;
+                            else
+                                msgbox ("Клиент не находится на обслуживании в интернет-банке."
+                                        "|Используйте отправку сообщения в Lotus "
+                                        "|ответственному операционисту (Alt + L)");
+                            end;
+                          
+                        else
+                            msgbox ("Платёж не найден. Отправить сообщение в Интернет-Клиент невозможно.");
+                            ret = CM_IGNORE;
+                        end;
+                    end;
+                end;
+            
+            // DONE: F7 (печать оригинального сообщения ED243)
+            elif (key == 321) 
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value ("is_norequest") == "X")
+                    msgbox("Сообщение создано без запроса. Этот функционал не работает"); 
+                else
+                    // @readme: http://www.sql.ru/forum/actualthread.aspx?tid=105944
+                    //Gurin S. 11.08.2014 R-427855-2
+                    //sql  = "select t.xmldata.extract('/').getStringVal () as xml from usr_uf_container t where fname = :f " +
+                    sql  = "select to_char(xmlserialize (document t.xmldata)) xml from usr_uf_container t where fname = :f " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                    parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )),
+                                      SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                      SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                      SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                    sql  = execSQLSelect (sql, parm);
+                    out  = getTxtFileName ("uf_message_p");
+                    open (fp, out);
+                    if (sql.moveNext ())
+                        setOutput (out);
+                        println (sql.value ("xml"));
+                        setOutput (null, true);
+                        viewFile (fp);
+                    else
+                        msgbox ("Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                    end;
+                    close (fp);
+                end;
+            end;
+
+        elif (cmd == DLG_MSEL) 
+            if (key == 287) //Alt + S (выгрузить XML ED244)
+                if (rs.value ("is_our_243") == "X")
+                    //msgbox("Сообщение уже было выгружено");
+                    sql  = "select replace (convert (t.xmldata.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                           "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml from usr_uf_container t where fname = :f1" + 
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                           "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                    parm = makeArray (SQLParam ("f1"          , rs.value ("fname"                )),
+                                      SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                      SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                      SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                    sql  = execSQLSelect (sql, parm);
+                    if (sql.moveNext ())
+                        out  = string (p.m_txtdir_export_243,"\\", rs.value ("fname"));
+                        setOutput (out);
+                        println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                        println (sql.value ("xml"));
+                        setOutput (null, true);
+                        sql = "update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f1 "
+                              " where     trim (fname) = :f2 "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate "
+                              "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                        parm = makeArray (SQLParam ("f1"          , ed244_name),
+                                          SQLParam ("f2"          , rs.value ("fname"                )),
+                                          SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                          SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                          SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                        execSQL (sql, parm);
+                        MsgName[MsgName.Size] = ForEDProtocol(ed244_name, out);
+                        FastUpdateEDScroll(rs);
+                        ret = CM_SELECT;
+                    else
+                        MsgName[MsgName.Size] = ForEDProtocol(ed244_name, "Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                        ret = CM_IGNORE;
+                    end;
+                //Gurin S. 05.10.2014 C-33346-7
+                elif ((rs.value ("is_norequest") == "X") and (rs.value ("is_our_243") != "X"))
+                    generateReference (1000044, ed244name);
+                    tmpname = string(UF_Scroll.RPAD_MFO(),ed244name,".xml");
+                    //msgbox("Сообщение уже было выгружено");
+                    sql  = "select replace (convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                                   "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml " +
+                           "  from usr_uf_container t where paymentid = :id and is_norequest = chr(88)" +/*fname = :f ";*/
+                           "       and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                           "       and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                           "       and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo "; 
+                    parm = makeArray (SQLParam ("id"       , rs.value ("paymentid"    )),
+                                      SQLParam ("EDAuthor" , rs.value ("EDAuthor_244" )),
+                                      SQLParam ("EDDate"   , rs.value ("EDDate_244"   )),
+                                      SQLParam ("EDNo"     , rs.value ("EDNo_244"     ))); /*SQLParam ("f", rs_global.value ("fname"))*/                         
+                    sql  = execSQLSelect (sql, parm);
+                    if (sql.moveNext ())
+                        //var out  = string (p.m_txtdir_export, "\\ED244_", trim (rs_global.value ("fname")));
+                        out  = string (p.m_txtdir_export, "\\ED244_", tmpname/*trim (rs.value ("fname_ed244"))*/);
+                        setOutput (out);
+                        println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                        println (sql.value ("xml"));
+                        setOutput (null, true);
+                        sql = " update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f "
+                              " where paymentid = :id and is_norequest = chr(88) " 
+                              "       and extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                              "       and extractvalue (xml_answer, '/ED244/@EDDate',   'xmlns=urn:cbr-ru:ed:v2.0') = :EDDate " +
+                              "       and extractvalue (xml_answer, '/ED244/@EDNo',     'xmlns=urn:cbr-ru:ed:v2.0') = :EDNo "; ;/*trim (fname) = :f";*/
+                        parm = makeArray (SQLParam ("f",         tmpname/*rs.value ("fname_ed244")*/),
+                                          SQLParam ("id",        rs.value ("paymentid"    )),
+                                          SQLParam ("EDAuthor" , rs.value ("EDAuthor_244" )),
+                                          SQLParam ("EDDate"   , rs.value ("EDDate_244"   )),
+                                          SQLParam ("EDNo"     , rs.value ("EDNo_244"     )));
+                        execSQL (sql, parm);
+                        MsgName[MsgName.Size] = ForEDProtocol(tmpname, out);
+                        //FastUpdateEDScrollnoReq(rs);
+                        ret = CM_SELECT;
+                    else
+                        MsgName[MsgName.Size] = ForEDProtocol(tmpname, "Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                        ret = CM_IGNORE;
+                    end;
+                elif ((rs.value ("is_norequest") == "") and (rs.value ("is_our_243") != "X"))
+                    if (rs.value ("is_answer_made") == "X")
+                        generateReference (1000044, ref);
+                        ed244_name = string(RPAD_MFO(),ref,".xml"); 
+                        //out  = string (p.m_txtdir_export, "\\ED244_", trim (rs.value ("fname")));
+                        out  = string (p.m_txtdir_export, "\\ED244_", ed244_name);
+                        // sql  = "select convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866') as xml from usr_uf_container t where fname = :f";         // !!!!
+                        // оказывается, бой ведёт себя не так, как тест, и заполняет XML Root 
+                        // До выяснения с Джетом, что за дела, делаем replace.
+                        sql  = "select replace (convert (t.xml_answer.extract('/').getStringVal (), 'CL8MSWIN1251', 'RU8PC866'), " + 
+                               "'<?xml version=\"1.0\" encoding=\"CP866\"?>', null) as xml from usr_uf_container t where fname = :f1" + 
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                        parm = makeArray (SQLParam ("f1"          , rs.value ("fname"                )),
+                                          SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                          SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                          SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                        sql  = execSQLSelect (sql, parm);
+                        if (sql.moveNext ())
+                            setOutput (out);
+                            println ("<?xml version=\"1.0\" encoding=\"windows-1251\" ?>");
+                            println (sql.value ("xml"));
+                            setOutput (null, true);
+                            sql = "update usr_uf_container set is_sent_file = chr (88), trncount = (trncount + 1), fname_ed244 = :f1 "
+                                  " where     trim (fname) = :f2 "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate "
+                                  "       and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                            parm = makeArray (SQLParam ("f1"          , ed244_name),
+                                              SQLParam ("f2"          , rs.value ("fname"                )),
+                                              SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                              SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                              SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                            execSQL (sql, parm);
+                            MsgName[MsgName.Size] = ForEDProtocol(ed244_name, out);
+                            FastUpdateEDScroll(rs);
+                            ret = CM_SELECT;
+                        else
+                            MsgName[MsgName.Size] = ForEDProtocol(ed244_name, "Не удалось получить содержимое XML-контейнера для печати принятого сообщения");
+                            ret = CM_IGNORE;
+                        end;
+                    else
+                        MsgName[MsgName.Size] = ForEDProtocol(ed244_name, "Перед отправкой ответ ED244 необходимо сформировать по Alt+O");
+                        ret = CM_IGNORE;
+                    end;
+                end;
+                return CM_MSEL_CONT_CLEAR;
+            //C-33345-7 09.10.2014 C-33345-7
+            elif (key == 279) // Alt + I (отправить оповещение в Интернет-Клиент)
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (rs.value("is_answer_made") != "X")
+                    if (AnswerNo or AnswerYes or GetTrue(true, "Отправить по всем выделенным сообщениям оповещения в ИК?"))
+                        if (not AnswerNo)
+                            AnswerYes = True;
+                            if (inList(rs.value("EdDefineRequestCode"),"01","02","05"))
+                                if (rs.value ("is_ib_notify") != "X")
+                                    if (rs.value ("is_our_243") != "X")
+                                        if (rs.value ("PaymentID") > 0)
+                                            if (rs.value ("is_lotus") != "X") //Gurin S. 17.04.2015 R-572308-2
+                                                pm = RSBPayment (rs.value ("PaymentID"));
+                                                if (IC_FindClientByPartyID (pm.payer) == true)
+                                                    letter  = string (
+                                                            "Добрый день! ", "\n", 
+                                                            "Поступил запрос на уточнение реквизитов по платежу.", "\n", 
+                                                            "Номер платежа   : ", pm.number          , "\n", 
+                                                            "Счёт плательщика: ", pm.payerAccount    , "\n", 
+                                                            "Счёт получателя : ", pm.receiverAccount , "\n", 
+                                                            "Сумма           : ", pm.baseAmount      , "\n", 
+                                                            "Дата значения   : ", pm.valueDate       , "\n", 
+                                                            "Запрос на уточнение : ", 
+                                                            UF_Answer.UF_Hlp_GetDescriptionByCode (UF_REF_TYPE_REQUEST, rs.value("EdDefineRequestCode")), 
+                                                            ". Уточняющее письмо Вы можете отправить по системе Интернет-Клиент ", 
+                                                            "на операционных работников с темой письма 'Уточнение реквизитов по п/п'."
+                                                            );
+                                                    if (IC_SendMessage (pm.payer, "Запрос на уточнение реквизитов платежа", letter) == 0)
+                                                        sql  = "update usr_uf_container set is_ib_notify = chr (88) where trim (fname) = :f" +
+                                                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = :EDAuthor " +
+                                                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')   = :EDDate " +
+                                                               "   and extractvalue (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')     = :EDNo ";
+                                                        parm = makeArray (SQLParam ("f"           , rs.value ("fname"                )),
+                                                                          SQLParam ("EDAuthor"    , rs.value ("OriginalEPD_EDAuthor" )),
+                                                                          SQLParam ("EDDate"      , rs.value ("OriginalEPD_EDDate"   )),
+                                                                          SQLParam ("EDNo"        , rs.value ("OriginalEPD_EDNo"     )));
+                                                        execSQL (sql, parm);
+                                                        MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение отправлено");
+                                                        ret  = CM_SELECT;
+                                                    else
+                                                        MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение не отправлено");
+                                                        ret  = CM_IGNORE;
+                                                    end;
+                                                else
+                                                    MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Клиент не находится на обслуживании в интернет-банке."
+                                                                                                              "|Используйте отправку сообщения в Lotus "
+                                                                                                              "|ответственному операционисту (Alt + L)");
+                                                    ret  = CM_IGNORE;
+                                                end;
+                                            else
+                                               MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение не отправлено. Данный запрос обработан вручную");
+                                               ret  = CM_IGNORE;
+                                            end;
+                                        else
+                                            MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Платёж не найден. Отправить сообщение в Интернет-Клиент невозможно");
+                                            ret = CM_IGNORE;
+                                        end;
+                                    end;
+                                else
+                                    MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение не отправлено. По этому сообщению уже было отправлено оповещание в Интернет-Клиент");
+                                    ret = CM_IGNORE;
+                                end;
+                            else
+                                MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение не отправлено. Код запроса (" + rs.value("EdDefineRequestCode") + ") не 01, 02, 05");
+                                ret = CM_IGNORE;                    
+                            end;
+                        end;
+                    else
+                        AnswerNo = True;
+                    end;
+                else
+                    MsgName[MsgName.Size] = ForEDProtocol(rs.value ("fname"), "Сообщение не отправлено. Уже сформирован ответ");
+                    ret = CM_IGNORE;                    
+                end;
+                return CM_MSEL_CONT_CLEAR;
+            end;
+
+        elif (cmd == DLG_MSELEND)            
+            ShowEDProtocol(MsgName);
+            MsgName = TArray();
+            AnswerYes = False; AnswerNo = False;
+            return CM_CANCEL;
+        end;
+        
+        return ret;
+    
+    onError (e)
+      debugbreak ();
+    end;
+    
+    macro init (_dateBegin, _dateEnd, _filter)
+        BeginDate = _dateBegin;
+        EndDate   = _dateEnd;
+        p.readEDParams ();
+        private var scrollCaption = string ("Список загруженных сообщений ED243 за период EDDate с ", _dateBegin, " по ", _dateEnd);
+        private var msg;
+        if (index(_filter,"IS_OUR_243 = CHR(88)") > 0)
+            msg = "(F7) - печать ED243 | (Alt + S) - выгрузить ED243 | (Alt + P) - платеж | (Alt + F8) - удалить сообщение";
+        else
+            msg = "(F7) - печать ED243 | (Alt + L) - Lotus | (Ctr + L) - On/Off признак L | (Alt + W) - Word | (Alt + O) - сформировать ответ | (Alt + S) - выгрузить ED244 | (Alt + P) - платеж | (Ctrl + P) изменить ID | (Alt + F8) - удалить сообщение";
+        end;
+        if (_dateBegin == _dateEnd)
+            scrollCaption = string ("Список загруженных сообщений ED243 за период EDDate = ", _dateEnd);
+        end;
+        
+        private var scrollResult = false;
+        private var cmd;
+        
+        // @readme: http://docs.oracle.com/cd/B28359_01/appdev.111/b28369/xdb04cre.htm
+        private var sql = "SELECT   fname,";
+                          if (index(_filter,"IS_OUR_243 = CHR(88)") == 0)
+                              sql = sql + " fname_ED244,"
+                          end;
+                          sql = sql + "         EXTRACTVALUE (xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') edauthor,"
+                          "         EXTRACTVALUE (xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0') eddate,"
+                          "         EXTRACTVALUE (xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0') edno,"
+                          "       nvl (extractvalue (xml_answer, '/ED244/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0'), '-') edauthor_244,"
+                          "       nvl (extractvalue (xml_answer, '/ED244/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), '-') eddate_244,"
+                          "       nvl (extractvalue (xml_answer, '/ED244/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0'), '-') edno_244,";
+                          //Gurin S. 29.07.2013
+                          //"         EXTRACTVALUE (xmldata, '/ED243/@EDDefineRequestCode', 'xmlns=urn:cbr-ru:ed:v2.0') eddefinerequestcode,"
+                          if (index(_filter,"is_norequest = chr (88)") > 0)
+                              sql = sql + " EXTRACTVALUE (xml_answer, '/ED244/@EDDefineRequestCode', 'xmlns=urn:cbr-ru:ed:v2.0') eddefinerequestcode,"
+                          else
+                              sql = sql + " EXTRACTVALUE (xmldata, '/ED243/@EDDefineRequestCode', 'xmlns=urn:cbr-ru:ed:v2.0') eddefinerequestcode,";
+                          end;
+                          sql = sql + 
+                          "         EXTRACTVALUE (xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') originalepd_edauthor,"
+                          "         EXTRACTVALUE (xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0') originalepd_eddate,"
+                          "         EXTRACTVALUE (xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0') originalepd_edno,"
+                          "         NVL (pm.t_payeraccount, '???') t_payeraccount,"
+                          "         NVL (rm.t_payername, '???') t_payername,"
+                          "         NVL (pm.t_amount, 0) t_amount,"
+                          "         NVL (TO_CHAR (rm.t_number), '???') t_number,"
+                          "         NVL (TO_CHAR (rm.t_date, 'dd.mm.yyyy'), '???') t_date,"
+                          "         CASE WHEN pm.t_receiverbankid = :ourbank THEN 'X' ELSE ' ' END is_input_paym,"
+                          "         t.is_answer_made,"
+                          "         t.is_ib_notify,"
+                          "         t.is_lotus,"
+                          "         t.is_payment_found,"
+                          "         t.is_sent_file,"
+                          "         t.is_ask, " //2013-01-30 Gurin S. C-17145
+                          "         t.is_word_letter_printed,"
+                          "         t.paymentid, "
+                          "         t.trncount, "
+                          "         t.ask_count, " //2013-01-30 Gurin S. C-17145
+                          "         t.is_norequest, " //Gurin S. C-18664-6
+                          "         t.is_our_243 "; //Gurin S. C-21844-6
+                           if (index(_filter,"IS_OUR_243 = CHR(88)") > 0)
+                              sql = sql + 
+                              ", CASE "
+                              "     WHEN ( (REGEXP_SUBSTR (t.xml_ask.EXTRACT ('/','xmlns=urn:cbr-ru:ed:v2.0').getstringval (),'ED[0-9]{3}') = 'ED208') "
+                              "           AND (TO_CHAR(EXTRACTVALUE (t.xml_ask, '/ED208/@ResultCode', 'xmlns=urn:cbr-ru:ed:v2.0')) = '2')) "
+                              "     THEN  'Доставлено получателю' "
+                              "     WHEN (REGEXP_SUBSTR (t.xml_ask.EXTRACT ('/', 'xmlns=urn:cbr-ru:ed:v2.0').getstringval (),'ED[0-9]{3}') = 'ED201') "
+                              "     THEN  TO_CHAR(EXTRACTVALUE (t.xml_ask, '/ED201/Annotation', 'xmlns=urn:cbr-ru:ed:v2.0')) "
+                              "           || ', ' "
+                              "           || TO_CHAR(EXTRACTVALUE (t.xml_ask, '/ED201/ErrorDiagnostic', 'xmlns=urn:cbr-ru:ed:v2.0')) "
+                              "     ELSE '' "
+                              "  END ask_result ";
+                          end;
+                          sql = sql +
+                          "  FROM   usr_uf_container t, dpmrmprop_dbt rm, dpmpaym_dbt pm"
+                          " WHERE   t.paymentid = rm.t_paymentid(+) AND rm.t_paymentid = pm.t_paymentid(+)";
+                          //2013-01-30 Gurin S. C-17145
+                          //"         AND EXTRACTVALUE (xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0') "
+                          //"         BETWEEN TO_CHAR (:date_begin, 'yyyy-mm-dd') AND  TO_CHAR (:date_end, 'yyyy-mm-dd')";
+        if (_filter)
+            sql = sql + " and " + _filter;
+        end;
+         
+        // вот так мы формируем массив колонок для скроллинга (а addColumn, которая нещадно копируется с примеров, задолбала до зевоты)
+        private var col;
+        if (index(_filter,"IS_OUR_243 = CHR(88)") > 0)
+            col = makeArray ("Fname"                  ,"Имя файла"       ,30,  0, -1, 0,
+                             "EDAuthor"               ,"EDAuthor"        ,10,  0, -1, 0,
+                             "EDDate"                 ,"EDDate"          ,10,  0, -1, 0,
+                             "EDNo"                   ,"EDNo"            , 9,  0, -1, 0, 
+                             "EDDefineRequestCode"    ,"Код"             , 3,  0, -1, 0,
+                             "OriginalEPD_EDAuthor"   ,"OR_EDAuthor"     ,10,  0, -1, 0, 
+                             "OriginalEPD_EDDate"     ,"OR_EDDate"       ,10,  0, -1, 0, 
+                             "OriginalEPD_EDNo"       ,"OR_EDNo"         , 9,  0, -1, 0, 
+                             "is_sent_file"           ,"S"               , 1,  0, -1, 0,
+                             "trncount"               ,"S#"              , 2,  0, -1, 0,
+                             "paymentid"              ,"PID"             , 9,  0, -1, 0,
+                             "t_payeraccount"    ,"Счет плательщика"     ,20,  0, -1, 0,
+                             "t_payername"       ,"Плательщик"           ,50,  0, -1, 0,
+                             "t_amount"          ,"Сумма док."           ,12,  0,  2, 0,
+                             "t_number"          ,"Номер док."           ,10,  0, -1, 0,
+                             "t_date"            ,"Дата док."            ,10,  0, -1, 0,
+                             "ask_result"        ,"Результат квитовки"   ,90,  0, -1, 0
+                             );
+        else
+            col = makeArray ("Fname"                  ,"Имя файла"       ,30,  0, -1, 0,
+                             "Fname_ED244"            ,"Имя файла ED244" ,30,  0, -1, 0,
+                             "EDAuthor"               ,"EDAuthor"        ,10,  0, -1, 0,
+                             "EDDate"                 ,"EDDate"          ,10,  0, -1, 0,
+                             "EDNo"                   ,"EDNo"            , 9,  0, -1, 0, 
+                             "EDAuthor_244"           ,"EDAuthor_244"    ,10,  0, -1, 0,
+                             "EDDate_244"             ,"EDDate_244"      ,10,  0, -1, 0,
+                             "EDNo_244"               ,"EDNo_244"        , 9,  0, -1, 0, 
+                             "EDDefineRequestCode"    ,"Код"             , 3,  0, -1, 0,
+                             "OriginalEPD_EDAuthor"   ,"OR_EDAuthor"     ,10,  0, -1, 0, 
+                             "OriginalEPD_EDDate"     ,"OR_EDDate"       ,10,  0, -1, 0, 
+                             "OriginalEPD_EDNo"       ,"OR_EDNo"         , 9,  0, -1, 0,
+                             //Gurin S. 24.09.2013 C-23593-6
+                             "is_input_paym"          ,"IN"              , 2,  0, -1, 0,
+                             "is_answer_made"         ,"O"               , 1,  0, -1, 0,
+                             "is_ib_notify"           ,"I"               , 1,  0, -1, 0,
+                             "is_lotus"               ,"L"               , 1,  0, -1, 0,
+                             "is_payment_found"       ,"P"               , 1,  0, -1, 0,
+                             "is_sent_file"           ,"S"               , 1,  0, -1, 0,
+                             "trncount"               ,"S#"              , 2,  0, -1, 0,
+                             //2013-01-30 Gurin S. C-17145
+                             "is_ask"                 ,"K"               , 1,  0, -1, 0,
+                             "ask_count"              ,"K#"              , 2,  0, -1, 0,
+                             //Gurin S. C-18664-6
+                             "is_norequest"           ,"БЗ"              , 2,  0, -1, 0,
+                             //end Gurin S.
+                             "is_word_letter_printed" ,"W"               , 1,  0, -1, 0,
+                             "paymentid"              ,"PID"             , 9,  0, -1, 0,
+                             "t_payeraccount"    ,"Счет плательщика"     ,20,  0, -1, 0,
+                             "t_payername"       ,"Плательщик"           ,50,  0, -1, 0,
+                             "t_amount"          ,"Сумма док."           ,12,  0,  2, 0,
+                             "t_number"          ,"Номер док."           ,10,  0, -1, 0,
+                             "t_date"            ,"Дата док."            ,10,  0, -1, 0
+                             );
+        end;
+
+        // основной цикл для отрисовки скроллинга. Достопримечательности:
+        //      1. инициализация RsdCommand и RsdRecordSet - только здесь. Осознанно.
+        //      2. если где-то в handleScrollEvents случается установка isRunning в false, происходит выход
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            cmd.addParam("ourbank",    RSDBP_IN, {OurBank});
+            cmd.addParam("date_begin", RSDBP_IN, _dateBegin, V_DATE);
+            cmd.addParam("date_end"  , RSDBP_IN, _dateEnd,   V_DATE);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, 10 );
+        end;
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+
+    // конструктор родительского класса
+    initTRecHandler ("ed244", getResourceLibPath ("zResLib.lbr"), true);
+end;

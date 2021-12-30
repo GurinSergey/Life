@@ -1,0 +1,226 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank v6.0                     */
+/****************************************************************************/
+/*                  Подсистема РКО, Финансовый мониторинг                   */
+/*  Функционал установки кода ФМ и примечания к операции ФМ в массовом      */
+/*   режиме по Ctrl+Z                                                       */
+/*                                                                          */
+/*  Имя файла:  fm_inscode_mass.mac                                         */
+/*  Создан   :  11.03.2015                                   Чесноков Д.С.  */
+/*  Заявка   :  C-31920                                                     */
+/*  Описание :  Функционал вызывается по сочетанию клавиш Ctrl+Z из списка  */
+/*              всех платежей РКО для выделенных документов. При заполнении */
+/*              дополнительной информации проверяется наличие операции ФМ   */
+/*              по выделенным платежам. Если операция ФМ присутствует и     */
+/*              находится в статусе != 5(выгружена), то дополнительная      */
+/*              информация записывается в примечание к операции ФМ. Если    */
+/*              операция ФМ по платежу еще не создана, то дополнительная    */
+/*              информация записывается в примечание №700 для платежа.      */
+/*              Далее при создании операции ФМ по указанному платежу, инфор */
+/*              мация из примечания платежа переносится в примечание опера  */
+/*              ции ФМ, при помощи триггра dopcontr_dbt_t1_repldescr        */
+/****************************************************************************/
+import RsbFormsInter, CTInter, RSD, "KeyCodes.mac", "globals.mac", "soa_core.mac";
+
+/*Константы типов данных для RsbFormsInter*/
+private const FT_INT32 = 1, FT_STRING = 7,
+              FT_NUMSTR = 18, FT_NUMERIC = 25;
+
+const OBJTYPE_OPR_FM = 700;
+const NOTE_DESCR_PM = 700;
+const NOTE_DESCR_FM_OPR = 2;
+const OPR_GR_OK = 1;
+const OPR_GR_NO = 2;
+const PAYM_GR_OK = 11;
+const PAYM_GR_NO = 12;
+var ObjAttr = TRecHandler( "objattr.dbt" );
+var rs, cmd, sql, is_ECS:bool = false;
+var OKCode_Attrid = 0, NOCode_Attrid = 0;
+
+class(TRsbPanel) MainPanel();
+  
+  InitTRsbPanel();
+  
+  setCaption("Панель выбора параметров");
+  setStatus("Esc - Выход, ~F3~ - Выбор, ~F9~ - Сохранить");
+
+  setPosition(36,12);
+  setSize(60,15);
+
+  var labelOKCode:TRsbLabel = TRsbLabel(4, 2, "Код операции для контроля:");
+  var labelNOCode:TRsbLabel = TRsbLabel(4, 4, "Код необычной операции:");
+  var labelDESCR:TRsbLabel  = TRsbLabel(18, 6, "Дополнительная информация (DESCR)");
+  
+  var val_OKCode:STRING = ""; 
+  var val_NOCode:STRING = ""; 
+  var val_Descr_str:STRING = "";
+
+  var OKCode:TRsbEditField = TRsbEditField(FT_STRING);
+  var NOCode:TRsbEditField = TRsbEditField(FT_STRING);
+  var Descr_str:TRsbEditField = TRsbEditField(FT_STRING);
+
+  addLabel(labelOKCode);
+  addLabel(labelNOCode);
+  addLabel(labelDESCR);
+
+  OKCode.bindValue(this, "val_OKCode", 7);
+  OKCode.SetPosition(24, 2);
+  OKCode.setSize(7, 1);
+  OKCode.Editable = false;
+  OKCode.Focusable = true;
+  OKCode.Name = "OKCode";
+  AddControl(OKCode);
+
+  NOCode.bindValue(this, "val_NOCode", 7);
+  NOCode.SetPosition(24, 4);
+  NOCode.setSize(7, 1);
+  NOCode.Editable = false;
+  NOCode.Focusable = true;
+  NOCode.Name = "NOCode";
+  AddControl(NOCode);
+
+  Descr_str.bindValue(this, "val_Descr_str", 508);
+  Descr_str.SetPosition(3, 7);
+  Descr_str.setSize(55,7);
+  Descr_str.Editable = true;
+  Descr_str.Focusable = true;
+  Descr_str.Name = "Descr_str";
+  AddControl(Descr_str);
+
+  addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "PressKey_MainPanel"));
+
+  macro CheckData()
+    //перед проверкой тоже очистим
+    RsdCommand("TRUNCATE TABLE USR_INSFMCODE_MASS").Execute();
+  
+    if (OKCode.Value == "")
+      msgbox("Не указан \"Код обязательного контроля");
+      return false;
+    elif (Descr_str.Value == "")
+      if (not GetTrue(false, "Не заполено поле \"DESCR | Продолжить установку кода без заполнения DESCR?"))
+        return false;
+      end;
+    end;
+    
+    return true;
+  end;
+
+  macro PressKey_MainPanel(RsbEvent:object)
+    
+    if ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "OKCode"))
+      if (ListObjAttr(OBJTYPE_OPR_FM, OPR_GR_OK, ObjAttr))
+        OKCode.Value = ObjAttr.rec.NumInList;
+        OKCode_Attrid = ObjAttr.rec.Attrid;
+      end;
+    elif ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "NOCode"))
+      if (ListObjAttr(OBJTYPE_OPR_FM, OPR_GR_NO, ObjAttr))
+        NOCode.Value = ObjAttr.rec.NumInList;
+        NOCode_Attrid = ObjAttr.rec.Attrid;
+      end;
+    elif (RsbEvent.KeyCode == KEY_F9)
+      if (CheckData)
+        sql = "INSERT INTO USR_INSFMCODE_MASS (T_OKCODE_ATTRID, T_NOCODE_ATTRID, T_DESCR )" +
+              "                        VALUES (?, ?, ?)";
+        cmd = RsdCommand(sql);
+        cmd.AddParam("OKCODE", RSDBP_IN, OKCode_Attrid );
+        cmd.AddParam("NOCODE", RSDBP_IN, NOCode_Attrid);
+        cmd.AddParam("DESCR" , RSDBP_IN, Descr_str.Value);
+        cmd.NullConversion = true;
+        cmd.Execute();
+        this.hide();
+        is_ECS = false;
+      end;
+    elif (RsbEvent.KeyCode == KEY_ESC)
+      //очистим таблицу для надежности.
+      RsdCommand("TRUNCATE TABLE USR_INSFMCODE_MASS").Execute();
+      is_ECS = true;
+    end;
+  end;
+
+end;
+
+macro Dialog_mass()
+  var panel:TRsbPanel = MainPanel;
+  panel.run;
+  
+  if (is_ECS)//возвращаем для того что бы не запускать массовый режим
+    return 1;
+  end;
+  return 0;
+end;
+
+macro GetFmOpr(PaymentID, Fm_Opr_ID)
+  
+  var rs, sql;
+  
+  sql = "select t_operationid, t_status from dopcontr_dbt where t_documentid = to_char(" + PaymentID  +")";
+  rs = RsdRecordSet(sql);
+  
+  if (rs and rs.MoveNext())
+    if (rs.value("t_status") == 5)//запрещаем изменение по выгруженным операциям
+      SetParm(1, rs.value("t_operationid"));
+      return 1;
+    else
+      SetParm(1, rs.value("t_operationid"));
+      return 0;
+    end;
+  end;
+  
+  SetParm(1, 0);
+  return 0;
+end;
+
+macro SetCodeAndDescr(RsbPaym:strucref)
+  
+  file attr("objattr.dbt") key 0;
+  var cat, stat;
+  var rs, sql, Fm_Opr_ID = 0;
+  
+  sql = "Select * from USR_INSFMCODE_MASS";
+  rs = RsdRecordSet(sql);
+  
+  if (not GetFmOpr(RsbPaym.PaymentID, Fm_Opr_ID))
+  
+    if (rs and rs.MoveNext)
+      cat = RsbObjCategories(OBJTYPE_PAYMENT, UniID (RsbPaym, OBJTYPE_PAYMENT));
+      stat = cat.ConnectAttr(PAYM_GR_OK, rs.value("T_OKCODE_ATTRID"), null, null, {curdate});
+      if (stat == 0) 
+        stat = cat.Save(UniID (RsbPaym, OBJTYPE_PAYMENT));
+      else
+        return 1;
+      end;
+    
+      if (rs.value("T_NOCODE_ATTRID") != 0)
+        stat = cat.ConnectAttr(PAYM_GR_NO, rs.value("T_NOCODE_ATTRID"), null, null, {curdate});
+        if (stat == 0) 
+          stat = cat.Save(UniID (RsbPaym, OBJTYPE_PAYMENT));
+        else
+          return 1;
+        end;
+      end;
+    
+      if (rs.value("T_DESCR") != StrFor(1))//проверим что поле не пустое
+        if (Fm_Opr_ID != 0)//если есть операция ФМ, то примечание к операции
+          if (addNoteForObject(OBJTYPE_OPR_FM, makeFastUniId(OBJTYPE_OPR_FM, Fm_Opr_ID), 2/*NOTE_DESCR_FM_OPR*/, rs.value("T_DESCR")))
+            msgbox("Ошибка при установке примечания к операции ФМ");
+            return 1;
+          end;
+        else//если операции нет, то примечание к платежу
+          if (addNoteForObject(OBJTYPE_PAYMENT, UniID (RsbPaym, OBJTYPE_PAYMENT), 700/*NOTE_DESCR_PM*/, rs.value("T_DESCR")))
+            msgbox("Ошибка при установке примечания к платежу");
+            return 1;
+          end;
+        end;
+      end;
+    
+    else
+      return 1;
+    end;
+  else
+    msgbox("По документу " + RsbPaym.PaymentID + " операция в Финмониторинге уже выгружена.");
+    return 1;
+  end;
+  
+  return 0;
+  
+end;

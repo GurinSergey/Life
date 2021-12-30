@@ -1,0 +1,217 @@
+/******************************************************************************************/
+/* OperationProc.mac                                                                      */
+/* Запуск шагов операции по сообщению из внешней системы                                  */
+/*                                                                                        */
+/* Правки макроса:                                                                        */
+/* KS 04.09.2012 Запуск платежа без ожидания ответа                                       */
+/* 31.10.2012 Golovkin I-00274105 исправление ошибки "Шаг не найден" на "Документ закрыт" */
+/* 12.12.2012 LAO если документа нет в БД, то формируем соответствующую ошибку            */
+/* 16.01.2013 Golovkin установка категории Инициатор операции                             */
+/* 13.02.2013 Golovkin убрал костыль в связи с установкой HotFix 2030.45.09_59            */
+/* 15.02.2013 LAO обернул проверку статуса обработчиков ИК                                */
+/* 18.02.2013 Golovkin обнуление системной ошибки                                         */
+/******************************************************************************************/ 
+
+import "CommonInt.mac", "ProcInit.inc", "LogProc.mac", PaymInter, rsd, oralib, cb_sql, globals, "likepy.mac";
+
+
+private macro UsrCrushLogAdd(pid)
+   var rsd = RsdCommand("insert into usr_crush_log(PID, SESID, oper ) values("+pid+" , SYS_CONTEXT('USERENV', 'SID' ), " + {oper} + ")");
+       rsd.execute;
+onError
+end;
+
+private macro UsrCrushLogDel(pid)  
+   var rsd = RsdCommand("delete from usr_crush_log where pid = "+ pid +" and sesid = SYS_CONTEXT('USERENV', 'SID' )");  
+       rsd.execute;
+onerror
+end;
+
+private macro updatePurpose(pid, DocKind)
+   if(DocKind == 286)
+   var rsd = RsdCommand(" update dpmpaym_dbt pm                                        "+
+                        " set PM.T_PURPOSE = decode(PM.T_PURPOSE, 0, 68, PM.T_PURPOSE) "+
+                        " where PM.T_DOCKIND = 286 and T_FIID = 0                      "+
+                        " and PM.T_PAYMENTID                                         = "+ pid); 
+       rsd.execute;
+   end;
+onError
+end;
+
+/*VDN 11.08.2015 Проверяем возможность провести платеж - в связи с ввеедением временной администрации*/
+private macro check_run_operaton ( paymentid )
+    var rs = RSDRecordset (" SELECT 1 FROM dpmpaym_dbt pmpaym "+
+                           " WHERE  ( ( pmpaym.t_dockind = 200 "+
+                           "     AND ( REGEXP_LIKE (pmpaym.t_payeraccount, '^405|^406|^407|^40802|^40807|^40821') "+
+                           "     AND REGEXP_LIKE (pmpaym.t_receiveraccount, '^47405') ) ) "+
+                           "   OR    ( pmpaym.t_payerbankid = pmpaym.t_receiverbankid "+
+                           "     AND ( REGEXP_LIKE (pmpaym.t_payeraccount, '^405|^406|^407|^40802|^40807|^40821|^423|^426|^40817|^40820') "+
+                           "     AND REGEXP_LIKE (pmpaym.t_receiveraccount, '^306') ) ) ) "+
+                           "     AND pmpaym.t_payerbankid = 3045 "+
+                           "   AND pmpaym.t_paymentid = " + paymentid);
+        
+    if (rs and rs.MoveNext) return true; end;
+  
+    return false;
+end;
+
+macro RunOperationStep(Str:string)
+
+    private var ArrayFields = TArray;     
+    private var stat, cmd,cmds;
+    private var ErrorMessage : string = "";
+    private var imode, sys_error;
+    
+    ParseStringToArray(Str, ArrayFields);
+    
+    private var PaymentID  = Int(ArrayFields(crtOperationPaymentID));
+    private var DocKind    = Int(ArrayFields(crtOperationDocKind));
+    private var PackID     = Int(ArrayFields(crtOperationPackID));
+
+    /*VDN 11.08.2015 В связи с введение временной администрации в ПРбБ*/
+    if ( check_run_operaton ( paymentid ) )
+      return "Операция запрещения" + chrDelimiter + PaymentID;     
+    end;
+
+//    if ({curdate} < date())
+//       ErrorMessage = "Текущая дата обработчика не соответствует системной";
+//       stat = false
+//    else
+
+ //  InitError(); // обнуляем системную ошибку Golovkin 18.02.2013
+
+   if (PaymentID!=0) // 29.01.2013 Не стартуем операции по платежу, если платеж нулевой! LAO
+       imode = SetDialogFlag(0);
+       // zmp 18.11.2014 R-495244-2
+       UsrCrushLogAdd(PaymentID);
+       updatePurpose(PaymentID, DocKind);
+       stat = PM_ExecuteOperation(PaymentID, DocKind);
+       UsrCrushLogDel(PaymentID);  
+
+       SetDialogFlag(imode);
+   else
+        stat = false;
+   end;
+      
+
+    if (DocKind == 320)
+
+      // KS 04.08.2011 Провередение ответных входящих. Исправление истории смены сегментов статуса
+      cmd = RSDCommand("update doprsthist_dbt hist" + "\n" +
+                       "   set hist.t_oldvalue = 1" + "\n" +
+                       " where hist.t_id_step = 0" + "\n" +
+                       "   and hist.t_statuskindid = 291" + "\n" +
+                       "   and hist.t_numvalue = 2" + "\n" +
+                       "   and hist.t_numvalue = hist.t_oldvalue" + "\n" +
+                       "   and hist.t_id_operation in" + "\n" +
+                       "       (select oproper.t_id_operation" + "\n" +
+                       "          from doproper_dbt oproper" + "\n" +
+                       "         where oproper.t_dockind = 320" + "\n" +
+                       "           and oproper.t_documentid = lpad(?,34,'0'))");
+      cmd.addParam("PmID", RSDBP_IN, PaymentID);
+      cmd.Execute();
+
+      /* 31.10.12 Если документ закрыт, то почему-то возвращается ошибка "Шаг не найден". Такое встречается у ответных входящих. */
+      if (stat != true)
+          /* проверяем статус платежа */
+          cmd = RSDRecordset(" select 1 from dpmpaym_dbt where t_paymentid = " + PaymentID + " and t_paymstatus = 32000 ");
+          if(cmd.movenext())
+              /* если документ закрыт, то формируем соответствующую ошибку */
+              sys_error = GetErrMsg();
+              ErrorMessage = "Ошибка выполнение шага для платежа " + PaymentID + ":Документ закрыт";
+          end;
+      end;
+
+    end;
+
+//    end;
+
+    cmd = RSDCommand("update usr_operations_log set error_text = ? where paymentid = ? and pack_id = ?");
+
+    if (stat != true)
+
+      cmds = RSDRecordset(" select 1 from dpmpaym_dbt where t_paymentid = " + PaymentID );
+      if(not cmds.movenext())
+         /*12.12.2012 LAO если документа нет в БД, то формируем соответствующую ошибку */
+         sys_error = GetErrMsg();
+         ErrorMessage = "Ошибка выполнение шага для платежа " + PaymentID + ":Документ не найден в РС";
+      end;
+
+      if (ErrorMessage == "")
+         sys_error = GetErrMsg();
+         ErrorMessage = "Ошибка выполнение шага для платежа " + PaymentID + ":" + sys_error;
+      else
+         sys_error = ErrorMessage;
+      end;
+
+      cmd.addParam("error_text", RSDBP_IN, sys_error);   
+
+    else
+
+      ErrorMessage = no_error_msg;
+      cmd.addParam("error_text", RSDBP_IN, no_error_msg);
+
+    end;                      
+
+    LogRunOperationStep(Str, ArrayFields, ErrorMessage);
+    cmd.addParam("paymentid", RSDBP_IN, PaymentID);
+    cmd.addParam("packid", RSDBP_IN, PackID);
+
+
+    cmd.Execute();
+
+    return ErrorMessage+chrDelimiter+PaymentID;
+
+end;
+
+macro is_pipe_enable_ib()
+    private  var stat,cmd;
+       cmd=rsdcommand("begin ?:=is_pipe_enable_ib; end;");
+       cmd.addParam("Stat", RSDBP_OUT, V_STRING);
+       cmd.execute;
+       stat = cmd.Param("Stat").value;
+       if (stat=="0")
+         return true;
+        else
+         return false;
+       end;
+end;
+
+macro is_pipe_enable_ik()
+    private  var stat,cmd;
+       cmd=rsdcommand("begin ?:=is_pipe_enable_ik; end;");
+       cmd.addParam("Stat", RSDBP_OUT, V_STRING);
+       cmd.execute;
+       stat = cmd.Param("Stat").value;
+       if (stat=="0")
+         return true;
+        else
+         return false;
+       end;
+end;
+
+// KS 04.09.2012 Запуск платежа без ожидания ответа
+//               PaymentID Ид Платежа
+//               DocKind   Тип Платежа
+//               Важно!!!! Перед процедурой вызвать set_pipe_server с нужным именем канала
+//                         Если не устраивает имя канала по-умолчанию.
+//                         Имя канала должно быть переменной, чьё значение инициализируется из настройки.
+//                         Пример таких переменных в CommonInt.mac
+macro RsbExecuteStep (PaymentID, DocKind)
+
+   private var cmd;
+   private var msg_mci="8"+chrDelimiter+"1"+chrDelimiter+string(PaymentID)+chrDelimiter+string(DocKind)+chrDelimiter+"0"+chrDelimiter;
+
+   cmd = RSDCommand("begin ? := usr_send_message(usr_common.m_pipename, ?); end;");
+
+   cmd.addparam("stat", RSDBP_RETVAL, V_INTEGER );
+   cmd.addparam("mes", RSDBP_IN, msg_mci);
+   cmd.execute();
+
+   return cmd.param(0).value;
+
+OnError
+
+   return -1;
+
+end;

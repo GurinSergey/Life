@@ -1,0 +1,613 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: Accl1.mac
+// @author  : Гурин С.
+// @desc    : Отчет по  документам  комиссий, находящимся в КОР
+// @request : C-30734-7
+// @modify  : none
+// -------------------------------------------------------------------------------------------------
+import globals, oralib, bankinter, likePy, lib_lang, cb_sql;
+
+import fg_Life_parm;
+
+import RSD, rsbdataset, psinter;
+var SQL,cmd,ex,ob,obbook,obsheet, wdays, rest, n, sm, cnt, datasq, sq, acclaiminf, i, as, br, dprt_v, k, sum1, sum2, maxs:integer;
+array comment;
+
+record Department ("dp_dep.dbt");
+record Person     ("person.dbt");
+
+var Fulloutputl, outl, outputl="accl2.lbr";                    
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+var dlg = TRecHandler("kart2", fulloutputl, TRUE); 
+
+const  KEY_F1      =315;
+const  KEY_F2      =316;
+const  KEY_F3      =317;
+const KEY_ESC      = 27;
+const KEY_SPACE    = 32;
+const KEY_ENTER    = 13;
+
+var output = GetTxtFileName("rest2");
+
+var inter:string,
+    Branch:integer,
+    NameBr:string = "",
+    NumBranch:string = "",
+    NameBranch:string = "",
+    OperNum:integer = 0,
+    OperName:string = "",
+    MinRest:money = 0;
+
+const REPTYPE_KOR    = 0;
+var ReportType, ReportTypeTxt, isAccountForRkoRepType;
+
+var bnk = fg_life_subject();
+bnk.ConsrtuctByBic( {MFO_bank} );
+
+
+private macro sumpr(planrest,sinpl2)
+   if ((planrest - sinpl2)>0 )
+   return (planrest - sinpl2)
+   else
+   return 0;
+   end;
+end;
+
+/*Начало группы операционистов*/
+private macro persongroupoperfo(id)
+    var  sl=" select t.t_groupoperfo as grp from dperson_dbt t where t.t_oper="+id;
+    var  DataS=TRsbDataSet(sl);
+    if( DataS.moveNext()) return DataS.grp; end;
+end;
+
+/*Окончание группы операционистов*/
+private macro persongroupoperlo(id)
+    var  sl=" select t.t_groupoperlo as grp from dperson_dbt t where t.t_oper="+id;
+    var  DataS=TRsbDataSet(sl);
+    if( DataS.moveNext()) return DataS.grp; end;
+end;
+
+/*Имя по Partyid*/
+private macro GetClientName(id)
+    var  sl=" select t_name from dparty_dbt t where t.t_PartyID="+id;
+    var  DataS=TRsbDataSet(sl);
+    if( DataS.moveNext()) return DataS.name;
+    else
+        if (id !=0)
+            msgbox("Субъект не найден в party.dbt");
+            return 0;
+        else
+            return "ОАО АКБ Пробизнесбанк";
+        end;
+    end;
+END;
+
+/* Процедура отображения название операциониста по номеру */
+private macro GetOperName(NumOper:integer):string
+    var sl = "SELECT t_name FROM dperson_dbt "+
+             "WHERE t_oper = "+NumOper+"";
+    var dataS = TRsbDataSet(sl);;
+    while(DataS.moveNext())
+        return DataS.name;
+    end;
+
+    return "";  
+end;
+
+/*Определение претензий к счету*/
+private macro acclaim(acc)
+var sl;
+//sl = "select count(*) cnt from dacclaim_dbt where t_account='"+acc+"'";
+//Lavrenov - только активные претензии
+sl = "SELECT count(*) " +
+     "  FROM dacclaim_dbt cl, dacclaimstate_dbt st " +
+     " WHERE cl.t_account = '"+acc+"'" +
+     "   AND st.t_claimid = cl.t_claimid " +
+     "   AND st.t_state = 1 " +
+     "   AND cl.t_startdate <= TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy') " ;
+
+var DataS = TRsbDataSet(sl);
+dataS.movenext();
+
+return dataS.cnt;
+
+end;
+
+/*Тип претензии*/
+private macro TypeP(id)
+var sl = "SELECT   t_name FROM dllvalues_dbt WHERE t_list = 2522 and t_flag="+id;
+
+var DataS = TRsbDataSet(sl);
+dataS.movenext();
+
+return dataS.name;
+
+end;
+
+/*Вид претензии*/
+private macro TypeV(id)
+var sl = "SELECT  t_name  FROM dllvalues_dbt  WHERE t_list = 2520 and t_flag="+id;
+
+var DataS = TRsbDataSet(sl);
+dataS.movenext();
+
+return dataS.name;
+
+end;
+
+private macro SinPl1(acc)
+    var sl = "SELECT COUNT (1), nvl(SUM (acclaimstate.t_currentamount),0) as sm"+
+             "  FROM dacclaim_dbt claim, dacclaimstate_dbt acclaimstate "+
+             " WHERE     claim.t_chapter = 1 "+
+             "       and (claim.t_finishdate > to_date ('"+{curdate}+"','DD-MM-YYYY') or claim.t_finishdate = to_date ('01.01.0001','DD-MM-YYYY')) "+
+             "       and ACCLAIMSTATE.T_STATE = (SELECT MAX (t_state) " +                // 27.06.2013 joy R-209871-2 Нужен наибольший статус претензии
+             "                                     FROM DACCLAIMSTATE_DBT " +            
+             "                                    WHERE     T_CLAIMID = claim.T_CLAIMID)"+   
+             "                                          AND acclaimstate.t_state in (1,2)  "+
+             "                                          AND claim.t_account = '"+acc+"'"+
+             "                                          AND claim.t_claimid = acclaimstate.t_claimid ";
+ 
+    var DataS = TRsbDataSet(sl);
+    if (dataS.movenext()) return dataS.sm; else return 0; end;
+end;
+
+/*Сумма проводок претензии*/
+private macro SumPl(acc)
+    var sl = "select sum(pmpaym.T_FUTUREPAYERAMOUNT) as sum "+
+             "  from dpsinprop_dbt t, dpmpaym_dbt pmpaym "+
+             " where t.t_account='"+acc+"' and pmpaym.t_paymentid=t.t_paymentid";
+
+    var DataS = TRsbDataSet(sl);
+    datas.movenext();
+    if (datas.sum) return datas.sum; else return 0; end;
+end;
+
+/*Сумма картотеки КОР*/
+private macro SumKOR(acc)
+    var sl = "select t_sum sum from dpsiwpacc_dbt where T_ACCOUNT = '"+acc+"'";
+    var DataS = TRsbDataSet(sl);
+    datas.movenext();
+    if (datas.sum) return datas.sum; else return 0; end;
+end;
+
+/*Тип доступа*/
+private macro persontype(id)
+    var sl = "select t_ctypeperson type from dperson_dbt where t_oper="+id;
+    var DataS = TRsbDataSet(sl);
+    dataS.movenext();
+
+    return dataS.type;
+end;
+
+macro CheckK2Documents( account )
+    var query, rs, mask;
+    if (bnk.is_SLD)
+        mask = "47423810?3*,47423*,70601*";
+    else
+        mask = "47423810?3*";
+    end;
+ 
+    query = " Select pm.t_ReceiverAccount From DPsInProp_dbt ind, DPmPaym_dbt pm " +
+            "  Where     ind.t_Account  = " + getSQLString( account ) +
+            "        and pm.t_PaymentId = ind.t_PaymentId ";
+    rs = rsdRecordSet( query );
+    while( rs and rs.moveNext() )
+        if ( CompareStrWithMasks( mask, rs.value( 0, null, V_STRING ) ) 
+            // Счёт получателя может быть не задан (платёж с разноской)
+            and ( rs.value( 0, null, V_STRING ) != strfor( 1 ) ) )
+           return false;
+        end;
+    end;
+
+    return true;
+end;
+
+macro CheckAccountType( account )
+ var query, rs;
+ var AccType_Arrest = "Т";
+
+ query = " Select t_Type_Account From daccount_dbt " +
+         "  Where t_Account  = " + getSQLString( account );
+ rs = rsdRecordSet( query );
+ while( rs and rs.moveNext() )
+    if ( index( rs.value( 0, null, V_STRING ), AccType_Arrest ) > 0 )
+       return false;
+    end;
+ end;
+
+ return true;
+end;
+
+macro planrestSubst( alias, aliasR, p_date )
+    if( valType( p_date ) == V_UNDEF )
+        p_date = {curdate};
+    end;
+
+    if( valType( aliasR ) == V_UNDEF )
+        aliasR = "";
+    end;
+
+    return "RSI_RSB_ACCOUNT.planresta( " + alias + ".t_account," + getSQLDate( p_date ) + "," + alias + ".t_chapter ) " + aliasR;
+end;
+
+
+/*Выводим в документ*/
+private macro OutAll()
+    var tmp_sum;
+    var sl = "select count (*) cnt from dpsiwpacc_dbt acc where " + planrestSubst( "acc" ) + " >"+minrest+inter;
+
+    var DataS = TRsbDataSet(sl);
+    datas.movenext();
+    maxs=datas.cnt;
+    initprogress(-1,"Обрабатываются счета, ждите","Обрабатываются счета");
+    useprogress;
+    if(ReportType == REPTYPE_KOR)
+
+        sql = " SELECT a.t_account, a.planrest, a.t_nameaccount, a.t_oper, a.t_name, b.cl" +
+           "      FROM  (SELECT   acc.t_account,"+
+           "                      " + planrestSubst( "acc" ) + "planrest ,"+
+           "                      acc.t_nameaccount,"+
+           "                      acc.t_oper,"+
+           "                      dep.t_name,"+
+           "                      acc.t_code_currency,"+
+           "                      acc.t_chapter,"+
+           "                      acc.t_balance,"+
+           "                      acc.t_branch,"+
+           "                      acc.t_client"+
+           "               FROM daccount_dbt acc, ddp_dep_dbt dep"+
+           "              WHERE    acc.t_CHAPTER = 1 "+
+           "                   AND EXISTS (SELECT 1 "+  
+           "                                 FROM dpsiwpacc_dbt " +
+           "                                WHERE T_ACCOUNT =  acc.t_account ) " +
+           "                   AND acc.t_branch = dep.t_code"+
+           "                   AND " + planrestSubst( "acc" ) + " > " + minrest + inter +") a"+ 
+           "          LEFT JOIN"+
+           "             (  SELECT   CHR (88) cl,"+
+           "                         COUNT (1),"+
+           "                         claim.t_Account,"+
+           "                         claim.t_chapter,"+
+           "                         claim.t_fiid"+
+           "                 FROM  dacclaim_dbt claim, dacclaimstate_dbt acclaimstate"+
+           "                WHERE (claim.t_FinishDate = TO_DATE ('01.01.0001', 'dd.mm.yyyy')"+
+           "                       OR claim.t_FinishDate > TO_DATE ('" + {curdate} + "', 'dd.mm.yyyy'))"+
+           "                      AND claim.t_ClaimID = acclaimstate.t_ClaimID"+
+           "                      AND (acclaimstate.t_State = 1"+
+           "                           OR acclaimstate.t_State = 2)"+
+           "                      AND acclaimstate.t_StateDate ="+
+           "                            ( (SELECT MAX (t.t_StateDate)"+
+           "                                 FROM dacclaimstate_dbt t"+
+           "                                WHERE     t.t_ClaimID = claim.t_ClaimID"+
+           "                                      AND t.t_StateDate <= TO_DATE ('" + {curdate} + "', 'dd.mm.yyyy')))"+
+           "             GROUP BY claim.t_Account, claim.t_chapter, claim.t_fiid) b"+
+           "          ON     a.T_ACCOUNT = b.t_Account"+
+           "             AND b.t_Chapter = a.t_chapter"+
+           "             AND b.t_FIID = a.t_code_currency,"+
+           "          dobjcode_dbt cod,"+
+           "          dpmpaym_dbt paym,"+
+           "          dpmrmprop_dbt rm "+
+           "    WHERE     cod.t_codekind = 1 and cod.t_objectid=a.t_client and cod.t_state=0 and t_objecttype=3 "+ 
+           "          AND paym.t_payeraccount = a.t_account"+
+           "          AND paym.t_paymstatus = 2100"+
+           "          AND (SUBSTR (paym.t_receiveraccount, 1, 5) IN ('47423', '70601')"+
+           "               OR paym.t_paymentid IN"+
+           "                      (SELECT pi.t_paymentid"+
+           "                         FROM dpmaddpi_dbt pi"+
+           "                        WHERE     pi.t_paymentid = paym.t_paymentid"+
+           "                              AND SUBSTR (pi.t_account, 1, 5) IN ('47423', '70601')))"+
+           "          AND paym.t_paymentid = rm.t_paymentid"+
+           "          AND (usr_get_rest_current (a.t_account, TO_DATE ('" + {curdate} + "', 'dd.mm.yyyy'), rm.t_priority) > 0)"+
+           " GROUP BY a.t_account, a.planrest, a.t_nameaccount, a.t_oper, a.t_name, b.cl"+
+           " ORDER BY b.cl DESC, a.t_name, a.t_oper";
+    end;
+
+    var DataSet = TRsbDataSet(sql);
+    remprogress;
+
+    sum1 = 0; sum2 = 0;
+    if (branch==0) br=""; else br=branch; end;
+
+    /*Выводим шапку документа*/
+    [  Отчет по счетам с ненулевыми остатками с документами в картотеке ОР
+       По подразделению ############ ##########################################
+
+       На дату: ##########
+
+       Форма отчёта: #
+  
+    ┌─────┬──────────────────────┬────┬────────────────────────────────────────┬───────────────┬──────────────┬──────────────┬──────┬────────────────────────────────────────┐
+    │№ док│      Номер счета     │Фил.│          Наименование клиента          │    Остаток    │    Остаток   │   Сумма      │ Опер.│              Претензии                 │
+    │     │                      │    │                                        │               │    свободн.  │  картотеки   │      │                                        │
+    ├─────┼──────────────────────┼────┼────────────────────────────────────────┼───────────────┼──────────────┼──────────────┼──────┼────────────────────────────────────────┤]
+    (Namebr,NameBranch,{curdate},ReportTypeTxt);
+    cnt=0; 
+    initprogress(maxS,"Вывод на печать, ждите","Вывод счетов");
+    while (DataSet.movenext());
+        isAccountForRkoRepType = false;
+        k = 1;
+        sq = " select count(1) as cnt, sum(claim.t_startamount) as t_startamount, claim.t_priority, claim.t_claimkind, claim.t_restkind, val.t_note from dacclaim_dbt claim, dacclaimstate_dbt acclaimstate, dllvalues_dbt val "+
+             " where (claim.t_finishdate > to_date ('"+{curdate}+"','DD-MM-YYYY') or claim.t_finishdate = to_date ('01.01.0001','DD-MM-YYYY')) "+
+             " and claim.t_startdate <= to_date ('"+{curdate}+"','DD-MM-YYYY') "+
+             " and acclaimstate.t_state in (1,2) "+
+             " and val.t_element = DECODE (claim.t_initiator, 100, 6, claim.t_initiator) and val.t_list = 2523 "+
+             " and claim.t_claimid = acclaimstate.t_claimid and t_account ='"+dataset.account+"' "+
+             " and acclaimstate.t_statedate = (select max(t_statedate) from dacclaimstate_dbt where t_claimid = claim.t_claimid "+
+             " and t_statedate <= " + GetSQLDate({CurDate}) + ") " +
+             " group by claim.t_restkind, claim.t_priority, claim.t_claimkind, claim.t_initiator, val.t_note";
+
+        DataSQ = TRsbDataSet(sq);
+        acclaiminf = "";
+        while (dataSQ.movenext())
+            sum1 = sum1 + money(dataset.planrest);
+            sum2 = sum2 + money(sumKOR(dataset.account)); 
+            acclaiminf="Вид: "+typeV(datasq.claimkind);
+            if (k == 1)
+                cnt = cnt + 1;
+                tmp_sum = SumKOR(dataset.account); 
+                [│#####│ #################### │ ###│########################################│###############│##############│##############│ #####│########################################│]
+                (cnt,dataset.account,dataset.name, substr(dataset.nameaccount,1,40),money(dataset.planrest),money(string(sumpr(dataset.planrest,sinpl1(dataset.account)))),money(tmp_sum),dataset.oper,acclaiminf);
+            else
+                 [│     │                      │    │                                        │               │              │              │      │########################################│]  
+                 (acclaiminf);
+            end;
+
+            [│     │                      │    │########################################│               │              │              │      │########################################│]
+            (substr(dataset.nameaccount,41,40), "Тип: "+TypeP(datasq.restkind));
+
+            if ((datasq.restkind!=1) and (datasq.restkind!=2))      //1 или 2 - полн или частичный не выводим
+                [│     │                      │    │########################################│               │              │              │      │########################################│]
+                (substr(dataset.nameaccount,81,40),"Сумма: "+money(datasq.startamount));                                   //или datasq.T_CURRENTAMOUNT
+                k = 2;
+            end;
+
+            k = k + 1;          
+          
+            [│     │                      │    │########################################│               │              │              │      │########################################│]
+            (substr(dataset.nameaccount,(k*40+1),40), "Инициатор: "+datasq.note);
+          
+            if (datasq.restkind!=1)  
+                k = k+1;                                   
+                [│     │                      │    │########################################│               │              │              │      │########################################│]
+                (substr(dataset.nameaccount,(k*40+1),40), "Приоритет: "+datasq.priority);
+                k = k+1;                                   
+                [│     │                      │    │########################################│               │              │              │      │########################################│]
+               (substr(dataset.nameaccount,(k*40+1),40), "Количество арестов: "+int(datasq.cnt));
+            end;
+
+        end; // while (dataSQ.movenext())
+
+        if ( ( k == 1 )                                        // Используем k == 1 как признак того, что претензий по счёту нет, иначе бы k было больше.
+             and ( money(dataset.planrest) > $0 )              // Остаток на счёте > 0
+             and CheckK2Documents( dataset.account )           // Пройдена проверка документов К2
+             and CheckAccountType( dataset.account )           // Пройдена проверка типа счёта
+           )
+           isAccountForRkoRepType = true;
+        end;
+
+        if (k > 1)
+            [├─────┼──────────────────────┼────┼────────────────────────────────────────┼───────────────┼──────────────┼──────────────┼──────┼────────────────────────────────────────┤];
+        end;
+
+        if (k == 1)
+            if ( ( ReportType == REPTYPE_KOR ) and isAccountForRkoRepType  )
+          
+                cnt = cnt + 1;
+                sum1 = sum1 + money(dataset.planrest);
+                sum2 = sum2 + money(sumKOR(dataset.account)); 
+
+                [│#####│ #################### │ ###│########################################│###############│##############│##############│ #####│########################################│]
+                (cnt,dataset.account,dataset.name, substr(dataset.nameaccount,1,40),money(dataset.planrest),money(string(sumpr(dataset.planrest,sinpl1(dataset.account)))),money(SumKOR(dataset.account)),dataset.oper,acclaiminf);
+
+                k = 1;
+                while (strlen(substr(dataset.nameaccount,(k*40+1),40)) > 0)
+                    [│     │                      │    │########################################│               │              │              │      │                                        │]
+                    (substr(dataset.nameaccount,(k*40+1),40));
+                    k=k+1;
+                end;
+          
+              [├─────┼──────────────────────┼────┼────────────────────────────────────────┼───────────────┼──────────────┼──────────────┼──────┼────────────────────────────────────────┤];
+            end;
+        end;
+    
+        useprogress(cnt);
+   
+    end;
+ 
+    [└─────┴──────────────────────┴────┴────────────────────────────────────────┴───────────────┴──────────────┴──────────────┴──────┴────────────────────────────────────────┘
+     Итого                                                                ###############                ##############]
+    (money(sum1), money(sum2));
+
+
+    remprogress(cnt);
+    SetOutput (Null,True);
+END;
+
+
+MACRO Event (dlg, cmd, id, key)
+
+    var const_mess = "~F2~ Продолжить ~SPACE~ По всем офисам ~ESC~ Выход ";
+    var const_mess2 = "~F2~ Продолжить ~ESC~ Выход ";
+    var choice;
+
+    array repType;
+    repType(0) = "Картотека ОР";
+    
+    if(cmd == DLG_INIT)
+        dprt_v = 0;
+        if (persontype({oper})=="О")
+            dlg.rec.branch = "";
+            dlg.rec.Namebranch = "";
+            dlg.rec.OperNum = {oper};
+            dlg.rec.OperName = GetOperName({oper});
+        elif (persontype({oper})=="Н")
+            dlg.rec.branch = "";
+            dlg.rec.Namebranch = "Весь банк";
+            dlg.rec.OperNum = "";
+            dlg.rec.OperName = "Группа операционистов";
+        else
+            dlg.rec.branch = "";
+            dlg.rec.Namebranch = "Весь банк";
+            dlg.rec.OperNum = "";
+            dlg.rec.OperName = "Все операционисты";
+        end;
+
+        dlg.rec.repType = ReportTypeTxt = repType(0);
+        ReportType = 0;
+      
+        dlg.rec.minrest=minrest;
+        UpdateFields(Dlg);
+        SetFocus (dlg, 2 );
+        return CM_IGNORE;
+    end;
+
+    /*Установка подсказок в строке состояния*/
+    if (cmd==DLG_SETFOCUS)
+        if (FldName(dlg,id)=="Branch") 
+            if(persontype({oper})!="О")
+                message(" ~F3~ Список подразделений "+const_mess);
+            else 
+                message(const_mess2);
+            end;
+        elif (FldName(dlg,id)=="OperNum") 
+            if (persontype({oper})=="Н")
+                message(" ~F3~ Список операционистов "+const_mess2+" ~SPACE~ По группе операционистов");
+            elif (persontype({oper})=="О")
+                message(const_mess2);
+            else
+                message(" ~F3~ Список операционистов "+const_mess2+" ~SPACE~ По всем операционистам");
+            end;
+        elif (FldName(dlg,id)=="MinRest")
+            message(const_mess2);
+        end;
+    end;
+
+    if ((cmd == DLG_REMFOCUS))
+         if (FldName(dlg,id)=="OperNum")
+             if ((GetOperName(dlg.rec.OperNum) == "") and (dlg.rec.operNum!="")) 
+                 msgbox("Операционист "+dlg.rec.OperNum+" не найден ");
+                 UpdateFields(dlg);
+                return CM_CANCEL;
+             else
+                 if ((dlg.rec.OperNum == "") and (persontype({oper})!="Н"))
+                     dlg.rec.OperName = "Все операционисты";
+                 elif ((dlg.rec.OperNum == "") and (persontype({oper})=="Н"))
+                     dlg.rec.OperName = "Группа операционистов";
+                 else  
+                     dlg.rec.OperName = GetOperName(dlg.rec.OperNum);
+                 end;
+                 UpdateFields(dlg); 
+            end;
+         end;
+         UpdateFields(dlg); 
+    end; 
+
+    if (cmd==DLG_KEY)
+        if (KEY==KEY_ESC)
+            exit(1);
+            return  CM_CANCEL;
+        elif (KEY==KEY_F3)
+            if ((FldName(dlg,id) == "Branch") and (persontype({oper})!="О"))
+                if (ListDepartment (Department))
+                    dprt_v = department.code;
+                    dlg.rec.Branch = Department.Name;
+                    dlg.rec.NameBranch = GetClientName(Department.PartyID);
+                    UpdateFields(dlg);
+                end;
+            elif ((FldName(dlg,id) == "OperNum") and (persontype({oper})!="О"))
+                if (ListOper(Person))
+                    if (persontype({oper})=="Н") 
+                        if ((person.oper>=persongroupoperfo({oper})) AND (person.oper<=persongroupoperlo({oper})))
+                            dlg.rec.OperNum = Person.Oper;
+                            dlg.rec.OperName = Person.Name;
+                        else
+                            msgbox("Операционист не входит в Вашу группу операционистов \n"+
+                                   "Ваша группа: начало номеров "+persongroupoperfo({oper})+", окончание номеров "+persongroupoperlo({oper}));
+                            dlg.rec.OperNum = persongroupoperfo({oper});
+                            dlg.rec.OperName = GetOperName(dlg.rec.opernum);
+                        end;
+                    elif (persontype({oper})!="Н") 
+                        dlg.rec.OperNum = Person.Oper;
+                        dlg.rec.OperName = Person.Name;
+                    else
+                        dlg.rec.operName = "Группа операционистов";
+                        dlg.rec.OperNum="";
+                    end;
+                    UpdateFields(dlg); 
+                end; 
+         
+            /*Выбор значения поля "Форма отчёта" */
+            elif( FldName(dlg,id) == "repType" )
+                choice = menu( repType );
+                if ( choice >= 0 )
+                    dlg.rec.repType = repType( choice );
+                    ReportType      = choice;
+                    ReportTypeTxt   = repType( choice );
+                else
+                    Return CM_DEFAULT;
+                end;
+                UpdateFields(dlg); 
+            end;
+         
+            elif (KEY == KEY_SPACE)
+            /*Сброс установок в поле офис банка*/
+                if ((FldName(dlg,id) == "Branch") and (persontype({oper})!="О"))
+                    dlg.rec.Namebranch = "Весь банк";
+                    dlg.rec.branch="";
+                    dprt_v = 0;
+                    UpdateFields(dlg);
+                end;
+
+                /*Сброс установок в поле операционист*/
+                if ((FldName(dlg,id) == "OperNum") and (persontype({oper})!="О"))
+                    if (persontype({oper})!="Н")
+                        dlg.rec.operName = "Все операционисты";
+                        dlg.rec.OperNum="";
+                    else
+                        dlg.rec.operName = "Группа операционистов";
+                        dlg.rec.OperNum="";
+                    end;
+                    UpdateFields(dlg);
+                end;
+
+            elif ( KEY==KEY_F2 )
+                Branch = dprt_v;
+                NameBranch = dlg.rec.NameBranch;
+                NameBr = dlg.rec.Branch;
+                OperNum = dlg.rec.OperNum;
+                OperName = dlg.rec.OperName;
+                Minrest = dlg.rec.Minrest;
+ 
+                if ((operNum!=0) or (operName=="Группа операционистов"))             //Операционист
+                    if (operName=="Группа операционистов")
+                        if (branch!=0)
+                            inter=" and acc.t_oper between "+persongroupoperfo({oper})+" and "+ persongroupoperlo({oper})+" and acc.t_branch= "+branch;
+                        else
+                            inter=" and acc.t_oper between "+persongroupoperfo({oper})+" and "+ persongroupoperlo({oper});
+                        end;
+                    else
+                        inter=" and acc.t_oper="+operNum;
+                    end;
+                elif (branch!=0)              //Если операциониста нет, а есть всп
+                    if (department.nodetype==1) 
+                        inter=" and acc.t_department= "+branch;   //Все
+                    else
+                        inter=" and acc.t_branch= "+branch;
+                    end;
+                else 
+                    inter="";
+                end;
+                Return CM_SAVE;
+            else
+            Return CM_DEFAULT;
+    end; /* end cmd==DLG_KEY*/
+end;
+end;
+
+/*Точка входа в макрос*/
+//macro Rest2
+if (RunDialog(dlg, "Event"))                  
+  OutAll;
+//end;
+
+end;

@@ -1,0 +1,754 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: soa_client_checkdata.mac v.1
+// @author  : 2013-07-10 LAO
+// @desc    : ТК Life - субъекты экономики: макросы для проверки переданных параметров
+// @changes : 2013-07-30 zip_z. + getPersonInfoByDoc
+//                              + getOrganizationInfoByCode
+//                              + getPersonInfoByDoc_Callback
+//                              + getOrganizationInfoByCode_Callback
+//                              рефакторинг и упрощение всея идеологии проверок
+// -------------------------------------------------------------------------------------------------
+import soa_core,ws_party;
+
+private macro GetPartyID
+(
+  PartyCode /*: TWsPartyCode*/  /* Код субъекта для поиска. */
+)
+  var m_PartyID = -1;
+  var query, rs;
+  var params : TArray;
+  query =         "SELECT t_ObjectID ";
+  query = query + "  FROM dobjcode_dbt ";
+  query = query + " WHERE t_ObjectType = :ObjectType ";
+  query = query + "   AND t_CodeKind = :CodeKind ";
+  query = query + "   AND t_Code = :Code ";
+  query = query + "   AND t_BankDate <= :FromDate ";
+  query = query + "   AND :ToDate < DECODE(t_BankCloseDate, TO_DATE('01010001', 'DDMMYYYY'), TO_DATE('31129999', 'DDMMYYYY'), t_BankCloseDate)";
+  params = makeArray(SQLParam("ObjectType", OBJTYPE_PARTY)
+                      ,SQLParam("CodeKind"  , PartyCode.CodeKind)
+                      ,SQLParam("Code"      , PartyCode.Code)
+                      ,SQLParam("FromDate"  , {CURDATE})
+                      ,SQLParam("ToDate"    , {CURDATE})
+                      );
+
+  rs = execSQLselect(query, params, true);
+  if(rs and rs.moveNext())
+    m_PartyID = rs.value(0);
+    if(rs.moveNext())
+      m_PartyID = -100;
+    end;
+  end;                         
+  return m_PartyID;
+end;
+
+private macro getOrganizationInfoByCode_Callback (organizationName, codekind:integer, code:string, out:object)
+    class TArrayList (_organizationId, _organizationName, _inn, _rscode, _bik, _swift, _shortname, _isLocked)
+        var organizationID         :integer = nvl_ex ( _organizationId    , zeroValue (V_INTEGER)); 
+        var organizationName       :string  = nvl_ex (_organizationName   , zeroValue (V_STRING ));
+        var inn                    :string  = nvl_ex (_inn                , zeroValue (V_STRING ));
+        var rscode                 :string  = nvl_ex (_rscode             , zeroValue (V_STRING )); 
+        var bik                    :string  = nvl_ex (_bik                , zeroValue (V_STRING )); 
+        var swift                  :string  = nvl_ex (_swift              , zeroValue (V_STRING ));
+        var organizationShortName  :string  = nvl_ex (_shortname          , zeroValue (V_STRING ));
+        var isLocked               :integer = nvl_ex (_isLocked           , zeroValue (V_INTEGER));
+    end;
+    var parm = TArray ();
+    var sql = " SELECT t_partyid      AS organizationId"
+            + "      , t_name         AS organizationName"
+            + "      , t_shortname    AS organizationShortName"
+            + "      , code_rs        AS rscode"
+            + "      , code_bic_rur   AS bik"
+            + "      , code_bic_swift AS swift"
+            + "      , code_inn       AS inn"
+            + "      , isLocked       AS isLocked"
+            + "   FROM usr_vw_soa_organization_chk";
+            if (codekind==0)
+             sql=sql+ " WHERE t_partyid = :party_id ";
+             parm [ parm.size () ] = SqlParam ("party_id", code);
+            else 
+             sql=sql+ "  WHERE t_partyid = ANY"
+            + "    (SELECT t_objectid"
+            + "       FROM dobjcode_dbt"
+            + "      WHERE t_objecttype = 3 AND t_codekind = :codekind AND"
+            + "            :code in (regexp_substr ( t_code, '[[:digit:]]+' ), t_code) AND t_state = 0 AND rownum = 1 ) ";
+            parm [ parm.size () ] = SqlParam ("codekind", codekind);
+            parm [ parm.size () ] = SqlParam ("code"    , code    );
+            end;
+
+  
+    
+    if (notnull (organizationName))
+        sql = sql + " AND t_name = :organizationname";
+        parm [ parm.size () ] = SqlParam ("organizationname", organizationName);
+    end;
+    
+    sql = execSqlSelect (sql, parm);
+    while (sql.moveNext ())
+        out [ out.size () ] = TArrayList (sql.value ("organizationid"         , null, V_INTEGER)
+                                         ,sql.value ("organizationName"       , null, V_STRING )
+                                         ,sql.value ("inn"                    , null, V_STRING )
+                                         ,sql.value ("rscode"                 , null, V_STRING )
+                                         ,sql.value ("bik"                    , null, V_STRING )
+                                         ,sql.value ("swift"                  , null, V_STRING )
+                                         ,sql.value ("organizationShortName"  , null, V_STRING )
+                                         ,sql.value ("isLocked"               , null, V_INTEGER)
+                                         );
+    end;
+    SetParm (3, out);
+end;
+
+private macro getPersonInfoByDoc_Callback (person_fio   :object 
+                                          ,doc_ser      :string 
+                                          ,doc_num      :string 
+                                          ,doc_type     :integer
+                                          ,birth_date   :date   
+                                          ,birth_place  :string 
+                                          ,inn          :string
+                                          ,partyid      :integer
+                                          ,v_serch      :integer
+                                          )
+    var parm = TArray ();
+    var sql  = "WITH t AS "
+             + "    (SELECT f.t_personid      AS personid    "
+             + "          , t_paperkind       AS doc_type    " 
+             + "          , t_paperseries     AS doc_ser     "
+             + "          , t_papernumber     AS doc_num     "
+             + "          , t_name1           AS surname     "
+             + "          , t_name2           AS name        " 
+             + "          , t_name3           AS patronymic  "
+             + "          , p.t_shortname     AS person_fio  " 
+             + "          , t_born            AS birth_date  "
+             + "          , t_birsplase       AS birth_place "
+             + "          , t_isemployer      AS isEmployer  "
+             + "          , t_locked          AS isLocked    "
+             + "          ,(SELECT t_code FROM dobjcode_dbt WHERE t_objectid = f.t_personid "
+             + "             AND t_objecttype = 3 AND t_codekind = 16 AND t_state = 0 AND rownum = 1 "
+             + "           )inn "
+             + "          ,(SELECT   t_code "
+             + "                    FROM   dobjcode_dbt "
+             + "                   WHERE       t_objecttype = 3 "
+             + "                           AND t_codekind = 1 "
+             + "                          AND t_objectid = f.t_personid "
+             + "                           AND t_state = 0 "
+             + "                           AND ROWNUM = 1) rs_code "
+             + "       FROM dpersn_dbt f, dparty_dbt p, dpersnidc_dbt idc ";
+             
+    if ((notnull (partyid)) and (v_serch==1))
+                sql = sql + "      WHERE f.t_personid = p.t_partyid AND idc.t_personid(+)   = f.t_personid ) ";
+    else
+                sql = sql + "      WHERE f.t_personid = p.t_partyid AND idc.t_personid   = f.t_personid ) ";
+    end;  
+    
+     sql = sql + " SELECT personid, person_fio, inn, doc_ser, doc_num, doc_type, birth_date, birth_place, surname, name, patronymic, isEmployer, isLocked , rs_code "
+                + "   FROM t ";
+                
+  if (v_serch==0)
+     sql = sql + "  WHERE doc_type = :m_paperkind AND doc_ser = :m_paperseries AND doc_num = :m_papernumber ";
+
+             
+    parm [parm.size ()] = SqlParam ("m_paperkind"  , doc_type);
+    parm [parm.size ()] = SqlParam ("m_paperseries", doc_ser );
+    parm [parm.size ()] = SqlParam ("m_papernumber", doc_num );
+    
+    if (notnull (birth_date))
+        sql = sql + " AND birth_date = :m_birth_date";
+        parm [parm.size ()] = SqlParam ("m_birth_date", birth_date);
+    end;
+    
+    if (notnull (birth_place))
+        sql = sql + " AND birth_place = :m_birth_place";
+        parm [parm.size ()] = SqlParam ("m_birth_place", birth_place);
+    end;
+    
+    if (notnull (inn))
+        sql = sql + " AND inn = :m_inn";
+        parm [parm.size ()] = SqlParam ("m_inn", inn );
+    end; 
+    
+    var m_name       = safeGetPropMandatory (person_fio, "name"      ,V_STRING);
+    var m_surname    = safeGetPropMandatory (person_fio, "surname"   ,V_STRING);
+    var m_patronymic = safeGetPropMandatory (person_fio, "patronymic",V_STRING);
+    
+    if (notnull (m_name))
+        sql = sql + " AND name = :m_name";
+        parm [parm.size ()] = SqlParam ("m_name", m_name );
+    end;
+    
+    if (notnull (m_surname))
+        sql = sql + " AND surname = :m_surname";
+        parm [parm.size ()] = SqlParam ("m_surname", m_surname );
+    end;
+    
+    if (notnull (m_patronymic))
+        sql = sql + " AND patronymic = :m_patronymic";
+        parm [parm.size ()] = SqlParam ("m_patronymic", m_patronymic);
+    end;
+  else
+
+    sql = sql + " WHERE personid = :m_partyid ";
+    parm [parm.size ()] = SqlParam ("m_partyid", partyid );
+
+  end; 
+    return execSqlSelect (sql, parm);
+end;
+
+// @desc    : получить форму собственности по известному partyid
+macro PT_GetLegalForm (p_partyid):integer
+    var sql = execSqlSelect ("select t_legalform from dparty_dbt where t_partyid = :m_partyid", makeArray (SqlParam ("m_partyid", p_partyid)), false);
+    var ret = null;
+    if (sql.moveNext ())
+        ret = sql.value ("t_legalform", null, V_INTEGER);
+    end;
+    return ret;
+onerror (e) catchUserError (e);        
+end;
+
+//LAO Вставка капитала , нужно писать запрос в разработку, штатный не работает
+// zip_z. Cool story.
+macro add_capital (v_partyID:integer, v_declarecapital:money, v_realcapital:money)
+     
+    var sqlstr,cmd, needExecute = false;
+
+    if ((notnull (v_declarecapital )) or (notnull (v_realcapital )))
+        sqlstr = "update dinstitut_dbt set ";
+
+        if (v_declarecapital !=$0)
+            sqlstr = sqlstr + " t_DeclareCapital="+strsubst(string(v_declarecapital), ",",".")+",";
+            needExecute = true;
+        end;
+        
+        if (v_realcapital !=$0)
+            sqlstr = sqlstr+" t_RealCapital="+strsubst(string(v_realcapital),    ",",".")+",";
+            needExecute = true;
+        end;
+        
+        sqlstr = substr(sqlstr,1,strlen(sqlstr)-1) + " where t_partyid =?";
+        
+        if (needExecute)
+            cmd = RSDCommand(sqlstr);
+            cmd.addParam("P_ID", RSDBP_IN, v_partyID);
+            cmd.Execute();
+        end;
+    end;
+   
+   /*  LAO так нельзя, могут прилететь не все параметры(при обновление), тогда какой -то очистится,что будет некорректно.
+    var sql  = "update dinstitut_dbt set t_declarecapital = :m_declarecapital, t_realcapital = :m_realcapital where t_partyid = :m_partyid";
+    var parm = makeArray (SqlParam ("m_declarecapital" , nvl_ex (v_declarecapital ,$0 ))
+                         ,SqlParam ("m_realcapital"    , nvl_ex (v_realcapital    ,$0 ))
+                         ,SqlParam ("m_partyid"        , v_partyID                     )
+                         );
+    execSql (sql, parm, false);*/
+end;
+
+//LAO проверка на ID клиента
+
+macro SOA_CheckPartyID(PartyID, ErrorMessage)
+    var Command, DataSet;
+    var bResult = true;    
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT t_partyid FROM dparty_dbt WHERE t_partyid = ?");
+    Command.addParam("", RSDBP_IN, PartyID);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext())        
+        ErrorMessage = "Не найден клиент с идентификатором " + PartyID;
+        bResult = false;
+    end;    
+    SetParm(1, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "ошибка при проверки клиента с идентификатором " + PartyID + ": " + Error.Message;
+        SetParm(1, ErrorMessage);
+        return false;
+end;
+
+// проверка существования вида обслуживания
+macro SOA_CheckServKind(ServKind, ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT t_servisekind FROM dservkind_dbt WHERE t_servisekind = ?");
+    Command.addParam("", RSDBP_IN, ServKind);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext())        
+        ErrorMessage = "не найден вид обслуживания с идентификатором " + ServKind;
+        bResult = false;
+    end;   
+    SetParm(1, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка, вид обслуживания " + ServKind + ": " + Error.Message;
+        SetParm(1, ErrorMessage);
+        return false;
+end;
+//
+// проверка существования вида документа
+macro SOA_CheckDOCKind(p_paprkind, ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT T_PAPERKIND FROM dpaprkind_dbt WHERE T_PAPERKIND = ?");
+    Command.addParam("", RSDBP_IN, p_paprkind);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext())        
+        ErrorMessage = "не найден тип документа с идентификатором " + p_paprkind;
+        bResult = false;
+    end;   
+    SetParm(1, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка, тип документа " + p_paprkind + ": " + Error.Message;
+        SetParm(1, ErrorMessage);
+        return false;
+end;
+//
+
+macro SOA_CHECKCODE(CODE,ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT t_codekind FROM DOBJKCODE_DBT WHERE T_OBJECTTYPE = 3 and t_codekind= ?");
+    Command.addParam("", RSDBP_IN, CODE);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext())        
+        ErrorMessage = "не найден вид вид кода с идентификатором " + CODE;
+        bResult = false;
+    end; 
+      SetParm(1, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка, вид кода " + CODE + ": " + Error.Message;
+        SetParm(1, ErrorMessage);
+        return false;
+end;
+//
+macro SOA_CHECKADDTYPE(CODE,ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT T_TYPE FROM dadrtype_dbt WHERE T_TYPE = ?");
+    Command.addParam("", RSDBP_IN, CODE);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext())        
+        ErrorMessage = "не найден  тип адреса с идентификатором " + CODE;
+        bResult = false;
+    end; 
+      SetParm(1, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка, тип адреса " + CODE + ": " + Error.Message;
+        SetParm(1, ErrorMessage);
+        return false;
+end;
+
+macro SOA_CHECKSERVISE(P_partyid,fDate,ErrorMessage)
+    var Command, DataSet;
+    var bResult = false; 
+    ErrorMessage = "";
+    Command = RsdCommand("SELECT T_TYPE FROM DCLIENT_DBT WHERE T_PARTYID = ? AND T_FINISHDATE >?");
+    Command.addParam("", RSDBP_IN, P_partyid);   
+    Command.addParam("", RSDBP_IN, fDate);      
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (DataSet.MoveNext())        
+        ErrorMessage = "Клиент  " + P_partyid+" не может быть закрыт, он находится на обслуживание";
+        bResult = true;
+    end; 
+      SetParm(2, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки активного обслуживания для клиента произошла ошибка" + P_partyid + ": " + Error.Message;
+        SetParm(2, ErrorMessage);
+        return false;
+end;
+
+macro SOA_ISDoubleDUL(p_person,p_kind):bool
+    var Command, DataSet;
+    var bResult = false; 
+
+    Command = RsdCommand("SELECT T_PAPERKIND FROM dpersnidc_dbt WHERE t_personid = ? and T_PAPERKIND = ? ");
+    Command.addParam("", RSDBP_IN, p_person);    
+    Command.addParam("", RSDBP_IN, p_kind);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (DataSet.MoveNext())        
+        bResult = true;
+    end; 
+    return bResult;
+end;
+
+macro SOA_ISDoubleADRESS(party,CODE):bool
+    var Command, DataSet;
+    var bResult = false; 
+
+    Command = RsdCommand("SELECT T_TYPE FROM dadress_dbt WHERE t_partyid = ? and T_TYPE = ? ");
+    Command.addParam("", RSDBP_IN, party);    
+    Command.addParam("", RSDBP_IN, CODE);    
+    Command.Execute(); 
+    DataSet = TRsbDataSet(Command);
+    if (DataSet.MoveNext())        
+        bResult = true;
+    end; 
+    return bResult;
+end;
+
+macro SOA_CHECKREGDOC(PartyID,RegPartyKind,RegDocKind,DocDate,ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    
+   // KS I-066939 Ошибка в интерфейсе usr_clients.set_client_regdoc
+    Command = RSDCommand ("select T_DOCDATE from DOBJRGDOC_DBT where T_OBJECTTYPE = 3 and T_REGPARTYKIND = ?"
+                                                   " and T_REGDOCKIND = ?"+
+                                                   " and T_OBJECTID = ?"  +
+                                                   " and T_DOCDATE > ?"   );
+    Command.addparam("RPK", RSDBP_IN, RegPartyKind);
+    Command.addparam("RDK", RSDBP_IN, RegDocKind);
+    Command.addparam("PID", RSDBP_IN, PartyID);
+    Command.addparam("RDD", RSDBP_IN, DocDate);
+    DataSet = TRsbDataSet(Command);
+    if (DataSet.MoveNext() and (valtype(DataSet.value(0)) != 26 /*null*/))        
+        ErrorMessage = "Уже введен регистрационный документ для данного субъекта с более поздней датой ("+date(DataSet.value(0))+")";
+        bResult = false;
+    end; 
+      SetParm(4, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка: " + Error.Message;
+        SetParm(4, ErrorMessage);
+        return false;
+end;
+
+macro FIND_REGDOC(PartyID,RegPartyKind,RegDocKind,ErrorMessage)
+    var Command, DataSet;
+    var bResult = false; 
+    ErrorMessage = "";
+    
+    Command = RSDCommand ("select T_REGPARTYKIND from DOBJRGDOC_DBT where T_OBJECTTYPE = 3 and T_REGPARTYKIND = ?"
+                                                   " and T_REGDOCKIND = ?"+
+                                                   " and T_OBJECTID = ?"   );
+    Command.addparam("RPK", RSDBP_IN, RegPartyKind);
+    Command.addparam("RDK", RSDBP_IN, RegDocKind);
+    Command.addparam("PID", RSDBP_IN, PartyID);
+    DataSet = TRsbDataSet(Command);
+    if (DataSet.MoveNext())        
+       bResult = true;
+    else 
+       ErrorMessage="У клиента отсутствует  вид кода/значение кода";
+       SetParm(3, ErrorMessage);
+    end;  
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка: " + Error.Message;
+        SetParm(3, ErrorMessage);
+        return false;
+end;
+
+macro SOA_CHECKREGDOCTYPE(RegPartyKind,RegDocKind,ErrorMessage)
+    var Command, DataSet;
+    var bResult = true; 
+    ErrorMessage = "";
+    
+    Command = RSDCommand ("select T_REGPARTYKIND from dobjalreg_dbt where T_OBJECTTYPE = 3 and T_REGPARTYKIND = ?"
+                                                   " and T_REGDOCKIND = ?"   );
+    Command.addparam("RpK", RSDBP_IN, RegPartyKind);
+    Command.addparam("RDK", RSDBP_IN, RegDocKind);
+    DataSet = TRsbDataSet(Command);
+    if (not DataSet.MoveNext() and (valtype(DataSet.value(0)) != 26 /*null*/))        
+        // ErrorMessage = "Не найден вид рег. органа:"+RegPartyKind;
+        ErrorMessage = "Не найден допустимый вид документа для регистрационного органа";
+        bResult = false;
+    end;    
+      SetParm(2, ErrorMessage);
+    return bResult;
+    OnError(Error)
+        ErrorMessage = "При проверки произошла ошибка: " + Error.Message;
+        SetParm(2, ErrorMessage);
+        return false;
+end;
+// @desc  : проверки переданных параметров.
+// @return: V_STRING (EMPTY_STRING - если всё хорошо).
+macro checkData (p_legalform  :integer
+                ,p_shortname  :string
+                ,p_fullname   :string
+                ,p_firstname  :string
+                ,p_secondname :string
+                ,p_lastname   :string
+                ):string
+
+    var ret:string = EMPTY_STRING; // результат проверки
+    
+    private var arr = TArray;
+    if   ( p_legalform == PT_PARTYKIND_LEGAL    ) // проверки для юриков
+        if ( isNull (p_shortname  )) arr [ arr.size () ] = "сокращенное наименование (shortname)"; end;
+        if ( isNull (p_fullname   )) arr [ arr.size () ] = "полное наименование (fullname)";       end;
+    elif ( p_legalform == PT_PARTYKIND_PHYSICAL ) // проверки для физиков и ИП
+        if ( isNull (p_firstname  )) arr [ arr.size () ] = "имя (firstname)";       end;
+        if ( isNull (p_secondname )) arr [ arr.size () ] = "фамилия (secondname)";  end;
+        if ( isNull (p_lastname   )) arr [ arr.size () ] = "отчество (lastname)";   end;
+    else // андроиды
+        ret = ret + "Неверно задан вид (организационно-правовая форма) клиента. ";
+    end;
+    
+    if (arr.size () > 0)
+        ret = ret + "Обязательные параметры не заполнены: " + join (arr, ", ") + ".";
+    end;
+    
+    return ret;
+end;
+
+// @desc  : Получаем сокращенное наименование клиента 
+// @return: V_STRING
+macro getShortName (fullname:string):string
+    // избавляемся от двух пробелов
+    while (index (fullname, "  ")) 
+        fullname = trim (strSubst (fullName, "  ", " "));
+    end;
+    var ret = fullname;
+    var f   = split(trim(fullName), " ");
+    // если заполнены Фамилия Имя Отчество, парсим и возвращаем Фамилия И.О. 
+    // иначе - вылетает строка в почти исходном виде (с замененными двумя пробелами на один)
+    if (f.size () > 2)
+        ret = (string(f[0], " ", strUpr (substr (f[1], 1, 1)), ".", strUpr (substr (f[2], 1, 1)), "."));
+    end;
+    return ret;
+end;
+
+// @desc  : Получаем полное наименование
+// @return: V_STRING
+macro getFullName (f:string, i:string, o:string):string
+    return string (trim (f), " ", trim (i) + " " + trim (o));
+end;
+
+
+// @desc  : Получить информацию о ФЛ по регистрационному документу
+// @return: V_OBJECT (массив из объектов TArrayList) по найденным субъектам или NULL, если ничего не найдено
+macro getPersonInfoByDoc (person_fio   :object  // (can be null)
+                         ,doc_ser      :string  // (mandatory)
+                         ,doc_num      :string  // (mandatory)
+                         ,doc_type     :integer // (mandatory)
+                         ,birth_date   :date    // (can be null)
+                         ,birth_place  :string  // (can be null)
+                         ,inn          :string  // (can be null)
+                         ,partyid      :integer // (can be null).
+                         ,rs_code      :string // (can be null).
+                         )
+    //Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var search=0;
+    var ret  = null;
+    var sql;
+    var parm;
+    class TArrayList (_personid, _person_fio, _inn, _doc_ser, _doc_num, _doc_type, 
+                      _birth_date, _birth_place, _surname, _name, _patronymic, _isEmployer, _isLocked,_rs_code
+                     )
+        var personid    :integer = nvl_ex ( _personid   , zeroValue (V_INTEGER));  // RS-Partyid
+        var person_fio  :string  = nvl_ex (_person_fio  , zeroValue (V_INTEGER));  // ФИО (одной строкой)
+        var inn         :string  = nvl_ex (_inn         , zeroValue (V_INTEGER));  // ИНН
+        var doc_ser     :string  = nvl_ex (_doc_ser     , zeroValue (V_INTEGER));  // Серия ДУЛ
+        var doc_num     :string  = nvl_ex (_doc_num     , zeroValue (V_INTEGER));  // Номер ДУЛ
+        var doc_type    :integer = nvl_ex (_doc_type    , zeroValue (V_INTEGER));  // Тип ДУЛ
+        var birth_date  :date    = nvl_ex (_birth_date  , zeroValue (V_DATE   ));  // Дата рождения
+        var birth_place :string  = nvl_ex (_birth_place , zeroValue (V_INTEGER));  // Место рождения
+        var surname     :string  = nvl_ex (_surname     , zeroValue (V_INTEGER));  // Фамилия
+        var name        :string  = nvl_ex (_name        , zeroValue (V_INTEGER));  // Имя
+        var patronymic  :string  = nvl_ex (_patronymic  , zeroValue (V_INTEGER));  // Отчество
+        
+        var isEmployer  :integer = iif (_isEmployer == "X", 1, 0);  // Признак ИП (1, если true)
+        var isLocked    :integer = iif (_isLocked   == "X", 1, 0);  // Признак блокировки (1, если true)
+        var rs_code     :string  = nvl_ex (_rs_code     , zeroValue (V_INTEGER));
+    end;
+    
+    // проверки параметров
+    if (isNull (doc_ser )) RunError ("Отсутствует обязательный параметр doc_ser "); end;
+    if (isNull (doc_num )) RunError ("Отсутствует обязательный параметр doc_num "); end;
+    if (isNull (doc_type)) RunError ("Отсутствует обязательный параметр doc_type"); end;
+    
+    if ((isNull(partyid)) and (not isNull(rs_code))) //LAO Если partyid не передан, но РС КОД передан, тогда ищем по нему partyid
+        sql  =  " SELECT   t_objectid "+
+                " FROM   dobjcode_dbt "+
+                " WHERE   t_objecttype = 3 AND t_codekind = 1"+
+                " AND ? IN (REGEXP_SUBSTR (t_code, '[[:digit:]]+'), t_code)"+
+                " AND t_state = 0"+
+                " AND ROWNUM = 1";
+        parm = makeArray (SqlParam ("m_rscode", rs_code));
+        sql = execSqlSelect (sql, parm);
+        if (sql.moveNext ()) //если нашли, запомним это.
+            //search=1;
+            partyid=sql.value("t_objectid"  ,null, V_INTEGER  )
+        end;
+    end;
+    
+    if (not isNull(partyid)) //LAO Если не нулевой параметр, тогда ищем в пати 
+        sql  = "SELECT 1 FROM dparty_dbt WHERE t_partyid = :m_partyid";
+        parm = makeArray (SqlParam ("m_partyid", partyid));
+        sql = execSqlSelect (sql, parm);
+        if (sql.moveNext ()) //если нашли, запомним это.
+            search=1;
+        end;
+    end;
+    
+    // есть ли физик с таким паспортом ?
+    sql  = "SELECT 1 FROM dpersnidc_dbt WHERE t_paperKind = :m_paperKind AND t_paperSeries = :m_paperSeries AND t_paperNumber = :m_paperNumber";
+    parm = makeArray (SqlParam ("m_paperKind", doc_type), SqlParam ("m_paperSeries", doc_ser), SqlParam ("m_paperNumber", doc_num));
+    sql = execSqlSelect (sql, parm);
+    
+
+    // да, есть: тянем информацию для возврата в array_list
+    if (sql.moveNext () or (search==1))
+        sql = getPersonInfoByDoc_Callback (person_fio, doc_ser, doc_num, doc_type, birth_date, birth_place, inn,partyid,search);
+        ret = TArray ();
+        while (sql.moveNext ())
+            ret [ret.size ()] = TArrayList ( sql.value ("personid"    ,null, V_INTEGER ), sql.value ("person_fio"  ,null, V_STRING  ),
+                                             sql.value ("inn"         ,null, V_STRING  ), sql.value ("doc_ser"     ,null, V_STRING  ),
+                                             sql.value ("doc_num"     ,null, V_STRING  ), sql.value ("doc_type"    ,null, V_INTEGER ),
+                                             sql.value ("birth_date"  ,null, V_DATE    ), sql.value ("birth_place" ,null, V_STRING  ),
+                                             sql.value ("surname"     ,null, V_STRING  ), sql.value ("name"        ,null, V_STRING  ),
+                                             sql.value ("patronymic"  ,null, V_STRING  ), sql.value ("isEmployer"  ,null, V_STRING  ),
+                                             sql.value ("isLocked"    ,null, V_STRING  ), sql.value ("rs_code"     ,null, V_STRING  ));
+        end;
+    end;
+    return ret;
+end;
+
+// @desc  : Получить информацию о ЮЛ по коду субъекта
+// @return: V_OBJECT (массив из объектов TArrayList) по найденным субъектам или NULL, если ничего не найдено
+macro getOrganizationInfoByCode (organizationName:string, organizationCode:object)
+    //Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var inn     = safeGetPropMandatory  (organizationCode, "inn"   , V_STRING);
+    var rscode  = safeGetPropMandatory  (organizationCode, "rscode", V_STRING);
+    var bik     = safeGetPropMandatory  (organizationCode, "bik"   , V_STRING);
+    var swift   = safeGetPropMandatory  (organizationCode, "swift" , V_STRING);
+    var partyid = safeGetPropMandatory  (organizationCode, "partyid" , V_INTEGER);
+    // виды кодов субхектов (PTInter идет карасиком)
+    private const PT_CODEKIND_RSCODE  = 1;
+    private const PT_CODEKIND_BIC_RUR = 3;
+    private const PT_CODEKIND_BIC_ISO = 6;
+    private const PT_CODEKIND_INN     = 16;
+    private const PT_PARTYID          = 0;
+    // проверки параметров
+    var chkStatus = false;
+    chkStatus = isNullorZero (organizationCode); 
+    if (chkStatus)  RunError ("Не заполнена обязательная структура organizationCode");      end;
+    
+    chkStatus = (isNullorZero (inn) and isNullorZero (rscode) and isNullorZero (bik) and isNullorZero (swift));
+    if (chkStatus)  RunError ("Не заполнен ни один вид кода в структуре organizationCode"); end;
+    
+    // поиск субъекта, заполнение массива ret объектами класса TArrayList - определен в getOrganizationInfoByCode_Callback ()
+    var ret = TArray ();
+    if (notNullOrZero (rscode )) getOrganizationInfoByCode_Callback (organizationName, PT_CODEKIND_RSCODE , rscode,  ret); end;
+    if (notNullOrZero (bik    )) getOrganizationInfoByCode_Callback (organizationName, PT_CODEKIND_BIC_RUR, bik   ,  ret); end;
+    if (notNullOrZero (swift  )) getOrganizationInfoByCode_Callback (organizationName, PT_CODEKIND_BIC_ISO, swift ,  ret); end;
+    if (notNullOrZero (inn    )) getOrganizationInfoByCode_Callback (organizationName, PT_CODEKIND_INN    , inn   ,  ret); end;
+    if (notNullOrZero (partyid)) getOrganizationInfoByCode_Callback (organizationName, PT_PARTYID         , partyid, ret); end;
+    
+    // если субъект не найден, возвращаем null; если найден - массив из TArrayList
+    if ( ret.size () == 0 ) ret = null; end;
+    return ret;
+end;
+
+/*Проверка резидентности клиента/банка по ИНН/Бик/Swift*/
+macro isNotResident(code, code_kind, nrcountry_client)
+  nrcountry_client = "";
+  var clause = "t_codekind = ? AND SUBSTR(t_code, 1, INSTR(t_code, '/' ) - 1) = ?";
+  if (code_kind == 3) clause = "t_codekind IN (?, 6) AND t_code = ?"; end;
+  var cmd = RsdCommand("SELECT DECODE(t_notresident, CHR(0), CHR(1), t_notresident) nr, t_nrcountry cntry "+ 
+                       "FROM dparty_dbt, dobjcode_dbt "+
+                       "  WHERE t_partyid = t_objectid AND " + clause);
+  cmd.AddParam("codekind" , RSDBP_IN, code_kind); 
+  cmd.AddParam("codevalue", RSDBP_IN, code     );
+
+  var rs = RsdRecordSet(cmd);
+  if(rs and rs.moveNext())
+    if ((SQL_ConvTypeStr(rs.value(0, null, V_STRING)) == "X") and
+        (SQL_ConvTypeStr(rs.value(1, null, V_STRING)) != ""))
+      SetParm(2, SQL_ConvTypeStr(rs.value(1, null, V_STRING)));   
+    end;
+  end;
+  return 0;
+onError
+  return 1;
+end; 
+
+
+macro getLegalClientData(PartyId,OrgInfo,Oper,Department)
+     //Vaschenko D. обнуляем опера
+    initSessionData();
+    var CodeSets;
+    var PID = -1;
+    var _Partyid = -1;
+    var i = 0;
+    var result_info;
+    class tws_party
+        var Partyid :integer;
+        var operid :integer;
+        var department :integer;
+    end;
+    
+    var ws_p = tws_party;
+    
+    //проверим приналежность кодов к одному и тому же субъекту
+    if (PartyId == null)
+    
+        if (OrgInfo.size<1)
+             RunError("PartyID субъекта или Код(ы) субъекта должны быть обязательно переданы",444);
+        end;
+        
+        
+        while(i < OrgInfo.size) //переберем весь массив кодов.
+        
+            CodeSets= OrgInfo[i]; //заполняем объект для дальнейшего поиска.
+            
+            PID = GetPartyID(CodeSets); // находим объекта GetPartyID взята из ws_party
+            
+            if (PID ==-100)  //если код встречается более одного раза
+                RunError("Вид кода : "+CodeSets.Codekind+" со значением: "+CodeSets.Code+" встречается в БД более одного раза",445);
+            end;
+            
+            if (PID > 0) //нашли субъект
+                if (_Partyid ==-1) // если это первое заполнение субъекта 
+                    _Partyid = PID ;// сохраняем ид.
+                else
+                    if (_Partyid!=PID)
+                        RunError("Поиск по  значению: "+CodeSets.Code+" вернул ID:"+ PID+", ранее был найден ID:"+_Partyid ,446);
+                    end;
+                end;    
+            end;
+            i=i+1;  
+        end;
+    ELSE
+        _Partyid=PartyId;
+    end;
+    
+    //если ничего не нашли
+    if (_Partyid<=0)
+        runerror("Поиск субъекта не дал результатов",WS_ERR_PARTY_NOTFOUND);
+    end;
+    
+    /*Собираем, мыссив кодов нам уже не нужен, так как мы однозначно нашли Субъекта*/
+    ws_p.Partyid=_Partyid;
+    ws_p.operid=IfThenElse(isNull(Oper),{oper},Oper);
+    ws_p.department=IfThenElse(isNull (department),{NumDprt},department);
+    
+    result_info=GetClientData(ws_p);
+    /*VDN пока оставил так*/
+/*    var req = rsdcommand ("begin ? := usr_get_client_legal_type (?); end;");
+        req.addParam("lawSubject", RSDBP_RETVAL, V_STRING);  
+        req.addParam("cliendId",   RSDBP_IN,     _Partyid);   
+        req.execute();
+
+    if (valtype(result_info.persn) != V_UNDEF)
+      result_info.persn.lawSubject = req.param("lawSubject").value;
+    else
+      result_info.inst.lawSubject  = req.param("lawSubject").value;
+    end;  */
+    return result_info;
+end;
+

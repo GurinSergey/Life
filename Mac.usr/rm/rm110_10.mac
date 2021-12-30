@@ -1,0 +1,705 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29000 - "Позиционирование"
+// Шаг      : 10    - "Позиционирование"
+// Описание : Макрос шага
+// Изменения вносили:
+// TAM 02.11.11 I-00034244-2 - формирование шапки дебетового авизо для транспортного сообщения 
+// TAM 11.02.13 C-12818 - предупреждение о перепозиционировании платежа fullpay с SCBLUS33
+// Jushmanov 2014-02-24 C-19151 Логгирование массово выполненных шагов
+//-----------------------------------------------------------------------------
+import InsCarryDoc, PaymInter, PTInter, OprInter, BankInter, "rmtools.mac", "cbctuncs.mac", "wlglobal.mac",
+       "cbsttls.mac", "pm_common.mac", pm_setst, "pmcarfun.mac","pm_tools.mac", rsberror;
+import WldInter; //SDA - импорт перенесен из rmtools.mac
+import pmprepromass;
+import "fg_Life_parm.mac";
+import oralib; //Jushmanov 2014-02-24 C-19151
+
+private Const fdBank = fg_life_subject({OurBank});
+
+var PaymentObj:RsbPayment;
+
+record Corschem(corschem); //корсхема до позиционирования
+record OutProp(pmprop); //исходящее свойство платежа после позиционирования
+
+
+private macro IsUnfinAcc( FIID, Account ):bool
+    var select = " select 1 " +
+                   " from dmcaccdoc_dbt doc, dmccateg_dbt cat " +
+                  " where doc.t_Chapter = 1 " +
+                    " and doc.t_Currency = :FIID " +
+                    " and doc.t_Account = :Account " +
+                    " and doc.t_CatID  = cat.t_ID " +
+                    " and cat.t_Number = 103 ";
+    var params = makeArray( SQLParam( "FIID", FIID ), 
+                            SQLParam( "Account", Account ) );
+    var rs = execSQLselect( select, params, TRUE );
+  
+    if( rs and rs.moveNext() )
+        return true;
+    else
+        return false;
+    end;
+end;
+
+
+macro ПолучитьПроводкуПоКорсчету(PaymentID, rs:@RsdRecordset)
+//Мультивалютные тоже удаляем
+    var cmd = RSDCommand("select distinct MULTY.T_CARRYID,  "+
+        " multy.t_iapplicationkind t_appkind,     "+
+        " multy.t_applicationkey t_appkey,        "+
+        " multy.t_date t_date,                    "+
+        " multy.t_chapter t_chapter,              "+
+        " multy.t_fiid_from t_payerfiid,          "+
+        " multy.t_amount_from t_payeramount,      "+
+        " multy.t_account_from t_payeraccount,    "+
+        " multy.t_fiid_to t_receiverfiid,         "+
+        " multy.t_amount_to t_receiveramount,     "+
+        " multy.t_account_to t_receiveraccount,   "+
+        " multy.t_department t_department         "+
+        "  from   DMULTYCAR_DBT multy,            "+
+        " dpmprop_dbt pmpr,                       "+
+        " dcorschem_dbt cor                       "+
+        "  where       multy.T_PAYMENTIDC = ?     "+
+        " and pmpr.t_paymentid = multy.T_PAYMENTIDC "+
+        " and pmpr.t_corschem = cor.t_number        "+
+        " and (multy.t_account_from = cor.t_account or multy.t_account_to = cor.t_account)"+
+        "union                                                                            "+
+        "select   distinct pmd.t_autokey,                               "+
+        " nvl (ad.t_iapplicationkind, adv.t_iapplicationkind) t_appkind,"+ 
+        " nvl (ad.t_applicationkey, adv.t_applicationkey) t_appkey,     "+
+        " nvl (ad.t_date_carry, adv.t_date_carry) t_date,               "+
+        " nvl (ad.t_chapter, adv.t_chapter) t_chapter,                  "+
+        " nvl (ad.t_code_currency, adv.t_code_currency) t_payerfiid,    "+
+        " nvl (ad.t_sum, adv.t_sum) t_payeramount,                      "+
+        " nvl (ad.t_account_payer, adv.t_account_payer) t_payeraccount, "+
+        " nvl (ad.t_code_currency, adv.t_code_currency) t_receiverfiid, "+
+        " nvl (ad.t_sum, adv.t_sum) t_receiveramount,                   "+
+        " nvl (ad.t_account_receiver, adv.t_account_receiver) t_receiveraccount,"+ 
+        " nvl (ad.t_department, adv.t_department) t_department                  "+
+        "  from   dpmdocs_dbt pmd,                                              "+
+        " darhdoc_dbt ad,                                                       "+
+        " darhdoc$_dbt adv,                                                     "+
+        " dpmprop_dbt pmpr,                                                     "+
+        " dcorschem_dbt cor                                                     "+
+        "  where       pmd.t_paymentid = ?                                      "+
+        " and ad.t_applicationkey(+) = pmd.t_applicationkey                     "+
+        " and adv.t_applicationkey(+) = pmd.t_applicationkey                    "+
+        " and adv.t_iapplicationkind(+) = pmd.t_applicationkind                 "+
+        " and pmpr.t_paymentid = pmd.t_paymentid                                "+
+        " and pmpr.t_corschem = cor.t_number                                    "+
+        " and ( (ad.t_account_payer = cor.t_account or ad.t_account_receiver = cor.t_account) "+
+        "    or (adv.t_account_payer = cor.t_account or adv.t_account_receiver = cor.t_account) )");
+   
+    cmd.addparam("pmid", RSDBP_IN, paymentid);
+    cmd.addparam("pmid1", RSDBP_IN, paymentid);
+    rs = RSDRecordset(cmd);
+
+    return rs.movenext();
+end;
+
+
+private macro MR_ErrorDesc( stat:integer )
+    if( stat == 1 )
+        return "Неверный номер счёта";
+    elif( stat == 2 )
+        return "Недостаточно свободных средств на счёте";
+    else
+        return "";
+    end;
+end;
+
+
+private class TReserveCreator( Payment:RsbPayment, Account:string, Chapter:integer, FIID:integer, Amount:money, p_CarryStatus:integer )
+
+    private var m_Payment:RsbPayment = Payment,
+                m_Account:string     = Account,
+                m_Chapter:integer    = Chapter,
+                m_FIID:integer       = FIID,
+                m_Amount:money       = Amount;
+
+    var CarryStatus : integer = p_CarryStatus;
+
+    macro Create( ErrDesc:@string ) : integer
+        var stat:integer = m_Payment.MakeReserve( m_Account, m_Chapter, m_FIID, m_Amount, {curdate}, false, true, true, false, false );
+        ErrDesc = "Ошибка при формировании претензии к счету " + m_Account + "|" + MR_ErrorDesc( stat );
+        return stat;
+    end;
+
+end;
+
+
+macro GetPartyCodeByCorschem(Corschem_number)
+    var cmd, rs;
+    cmd = RSDCommand(" SELECT cd.t_code " +
+                     " FROM   dcorschem_dbt sc, dobjcode_dbt cd " +
+                     " WHERE SC.T_NUMBER = ? " +
+                     "   AND CD.T_OBJECTID = SC.T_CORRID " +
+                     "   AND CD.T_CODEKIND = 6 ");
+    cmd.addparam("cor", RSDBP_IN, Corschem_number);
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+        return rs.value(0);
+    end;
+end;
+
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first )
+    var stat = 0;
+    var rs:RsdRecordset;  
+    var params:Tarray;
+    var AccountUnclosed;
+    // Создатель резерва
+    var ReserveCreator:TReserveCreator = null;
+
+    // Для поиска корсхемы
+    record cors(corschem);
+
+    if ({oper} != 20020)
+       var sql = execSqlSelect("select 1 from USR_ROBOT_PAYMENT_TMP where paymid = :id and ismanual = chr(0)",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+       if (sql.movenext()) 
+          MsgBox("В данный момент платеж: "+PaymentObj.Paymentid+" обрабатывается роботом. | Ручная обработка/корректировка запрещена.");
+          return 1; 
+       end;
+    end;
+
+    var Inner = PaymentObj.IsExternalIncoming() and not PaymentObj.IsTransit();
+    var NeedCor, NeedTransferDate;
+    if (Inner)
+        NeedCor = PaymentObj.InCorschem;
+        NeedTransferDate = PaymentObj.InTransferDate;
+    else
+        NeedCor = PaymentObj.OutCorschem;
+        NeedTransferDate = PaymentObj.OutTransferDate;
+        if( НайтиКорсхему( OutProp.Corschem, OutProp.PayFIID, cors ) )
+            MsgBox( "Не найдена исходящая корсхема" );
+            return 1;
+        end;
+    end;
+
+    file rmprop (pmrmprop) key 0; //TAM C-12818 05.02.13
+
+    //TAM 2.11.11 I-00034244-2
+    var select, query, cmd;
+    //SDA признаки изменения кор.схемы или исходящей ДПП
+    private var is_Corschem_modify = (PaymentObj.OutCorschem != OutProp.Corschem);
+    private var is_TransferDate_modify = (PaymentObj.OutTransferDate != OutProp.TransferDate);
+
+    //TAM 05.02.13 C-12818
+    rmprop.paymentid = PaymentObj.paymentid;
+    getEQ(rmprop);
+
+    //если платеж fullpay был спозиционирован на SCBLUS33, то предупреждаем о перепозиционировании
+    if( (PaymentObj.dockind == PS_CPORDER) and (Index(rmprop.additionalinfo,"/REC/FULLPAY") != 0))
+        if(is_Corschem_modify and (GetPartyCodeByCorschem(PaymentObj.OutCorschem) == "SCBLUS33"))
+            if( not gettrue(true, "Платеж FULLPAY спозиционирован на SCBLUS33. Перепозиционировать?"));
+                msgbox("Вы отказались от перепозиционирования платежа.");
+                return 1;
+            end; 
+        end;
+    end;
+    //end C-12818
+
+    var carries : TArray,
+        carry   : TPaymentCarryInfo;
+
+    if((PaymentObj.OutCorschem == OutProp.Corschem) and (PaymentObj.OutTransferDate == OutProp.TransferDate))
+        if(GetOprStatus(OPR_PAYM_DO) == OPR_PM_ST_POS)
+
+            if(ПолучитьВсеПроводки(PaymentObj.PaymentID,@rs, 1/*CHAPT1*/) and rs.moveLast())
+                /* Если в последней проводке счет кредита (дебета для дебетового платежа) равен корсчету из исходящей корсхемы платежа 
+                   или является счетом СНР (имеет связь с категорией учета СНР)*/
+                if( ( (PaymentObj.DbFlag == UNSET_CHAR) and (carry.ReceiverAccount == Corschem.Account) ) OR
+                    ( (PaymentObj.DbFlag == SET_CHAR)   and (carry.PayerAccount    == Corschem.Account) ) )
+
+                    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_DISCHARGE))
+                        MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                        return 1;
+                    end;
+
+                elif( ( (PaymentObj.DbFlag == UNSET_CHAR) and IsUnfinAcc( carry.ReceiverFIID, carry.ReceiverAccount ) ) OR
+                      ( (PaymentObj.DbFlag == SET_CHAR)   and IsUnfinAcc( carry.PayerFIID, carry.PayerAccount       ) ) )
+
+                    PaymentObj.ValueDate = ValueDateForRmPosition(PaymentObj, cors); 
+                    if ( fdBank.is_PRBB )
+                        PaymentObj.ValueDate = {curdate};
+                    end;
+                    SetOprDate(29000000, PaymentObj.ValueDate);
+                    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_DISCHARGE))
+                        MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                        return 1;
+                    end;
+
+                else
+
+                    PaymentObj.ValueDate = ValueDateForRmPosition(PaymentObj, cors);
+                    if ( fdBank.is_PRBB )
+                        PaymentObj.ValueDate = {curdate};
+                    end;
+                    SetOprDate(29000000, PaymentObj.ValueDate);
+                    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                        MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                        return 1;
+                    end;
+                end;
+            end;
+        end;
+
+        if( ПлатежЗачисленНаСНР(PaymentObj) )
+            if ( fdBank.is_PRBB )
+                PaymentObj.ValueDate = {curdate};
+            end;
+            SetOprDate(29000000, PaymentObj.ValueDate);
+        end;
+
+        if( IsCarryPlanDocs() )
+            if ( not CarryPlanDocuments(PaymentObj.PaymentID) )
+                MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                return 1;
+            end;
+        end;
+
+        return 0;
+
+    elif ((is_Corschem_modify) or (is_TransferDate_modify))
+
+        if(ПлатежЗачисленНаСНР(PaymentObj))
+            if ((not is_Corschem_modify) 
+            and (PaymentObj.ValueDate < PaymentObj.OutTransferDate) 
+            and (PaymentObj.ValueDate < OutProp.TransferDate)) 
+                return 0;
+            end;
+        end;
+
+        PaymentObj.SetReceiverPI( PAYMENTS_GROUP_EXTERNAL, 
+                                  PaymentObj.ReceiverBankID, 
+                                  PaymentObj.ReceiverBankCodeKind, 
+                                  PaymentObj.ReceiverBankCode, 
+                                  PaymentObj.ReceiverBankName,
+                                  PaymentObj.ReceiverBankCorrAcc,
+                                  PaymentObj.ReceiverFIID, 
+                                  PaymentObj.chapter,
+                                  PaymentObj.ReceiverAccount, 
+                                  null, 
+                                  PaymentObj.ReceiverName, 
+                                  PaymentObj.ReceiverINN,
+                                  null,
+                                  null,
+                                  OutProp.Corschem, 
+                                  PM_CORRPOS_TYPE_USER); 
+
+        DeleteLastCarry(PaymentObj,1); //SDA - иначе формируется проводка переноса сальдо между СНР различных КС 
+        PaymentObj.OutTransferDate = OutProp.TransferDate;
+        SetOprDate(29000000, {curdate});
+        PaymentObj.ValueDate = {curdate};
+
+        //SDA 25.06.2012 
+        if ((OutProp.TransferDate > PaymentObj.ValueDate)) 
+            PaymentObj.FutureReceiverAccount = OutPaymentAccUnclosed(PaymentObj).RecreateAccount();
+        end;
+
+        if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;            
+
+        if (is_Corschem_modify) // если изменилась корсхема
+            if( НайтиКорсхему(PaymentObj.OutCorschem, PaymentObj.ReceiverFIID, cors))
+                MsgBox("Не найдена исходящая корсхема");
+                return 1;
+            //TAM 02,11,11 I-00034244-2 begin
+            else
+                //если корсхема найдена, необходимо обновить запись по сообщению в dwlmes_dbt
+                //получаем данные контрагента по новой схеме расчета
+                select = " select t_objectid, t_code from dobjcode_dbt where " +
+                         " (t_codekind = 6 and t_objectid in (select t_corrid from dcorschem_dbt " +
+                                                              " where t_number = :cor_schem)) ";
+                params = makeArray( SQLParam("cor_schem", OutProp.Corschem));
+                rs = execSQLselect(select, params, FALSE);
+                if (rs.moveNext())
+                    //данные нашли и запихиваем в таблицу для сформированного сообщения
+                    /*SDA 13.06.2012 небольшая коррекция для платежей которые уже пытались выгружать */
+                    cmd = RSDCommand("delete from  dwlpm_dbt where t_paymentid = "+ PaymentObj.PaymentID +
+                                     " and T_PROPSTATUS =32000 ").Execute();
+
+                    cmd = RSDCommand(
+                        "update dwlmes_dbt " +
+                        "   set t_outsideabonentid = ?, t_outsideabonentcode = ?, t_agentid = ?, t_agentcode = ? " +
+                        " where t_mesid = (select max(lnk.t_mesid) " +
+                                           " from dwlmeslnk_dbt lnk " +
+                                          " where lnk.t_objid = (select wlpm.t_wlpmid from dwlpm_dbt wlpm " +
+                                                                " where wlpm.t_paymentid = ?) " +
+                                            " and lnk.t_objkind = 501 )" 
+                            );
+                    cmd.addParam("abonent_id" ,RSDBP_IN, rs.value(0));
+                    cmd.addParam("abonent_code" ,RSDBP_IN, rs.value(1));
+                    cmd.addParam("agent_id" ,RSDBP_IN, rs.value(0));
+                    cmd.addParam("agent_code" ,RSDBP_IN, rs.value(1));
+                    cmd.addParam("payment_id" ,RSDBP_IN, PaymentObj.PaymentID);
+                    cmd.Execute();
+
+                end;
+            // TAM end
+            end;
+        end;
+    end; //((PaymentObj.OutCorschem == OutProp.Corschem) and (PaymentObj.OutTransferDate == OutProp.TransferDate))
+
+    if( PaymentObj.DocKind == DLDOC_MULTYPM )
+        MemoryError( 6235 ); //PM_MSG_REPOSITMULTY_NOTALLOW
+        DisplayError();
+        return 1;
+    end;
+
+    if( (PaymentObj.DbFlag == SET_CHAR) and ( PaymentObj.StartDepartment != PaymentObj.Department ) )
+        MsgBox("Дебетовые документы разрешено перепозиционировать только в начальном филиале");
+        return 1;
+    end;
+
+    if( GetOprStatus(OPR_PAYM_DIRECT) != OPR_PM_ST_DIR_OUT )
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT ) )
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;   
+    end;
+
+    return 0;
+/*SDA 20.03.2012 так и не смог понять глубины мысли того, что происходит ниже... возможно - ошибался.
+Но return - строкой выше */
+
+    /* Удаляем проводку по корсчёту */
+    carries = PM_GetAllCarries( PaymentObj.PaymentID, CHAPT1 );
+    if( carries.size )
+        carry = carries[carries.size-1];
+        var CarryRec:TRecHandler,
+            CarryStatus:integer = -1;
+      
+        if((PaymentObj.OutCorschem == Corschem.Number) and (PaymentObj.OutTransferDate != OutProp.TransferDate))
+            if(ПолучитьПроводкуПоКорсчету(PaymentObj.PaymentID,@rs) )
+
+                if( IsUnfinAcc( rs.value("t_ReceiverFIID"), carry.ReceiverAccount ) ) //Если в последней проводке счет кредита связан с КУ "Незавершенные расчеты" 
+                    if( PaymentObj.Department != PaymentObj.EndDepartment )
+                        if ( fdBank.is_PRBB )
+                            PaymentObj.ValueDate = {curdate};
+                        end;
+                        SetOprDate(29000000, {curdate});
+                    else
+                        AccountUnclosed=OutPaymentAccUnclosed(PaymentObj).FindAndOpenAccount();         
+                        if(AccountUnclosed != carry.ReceiverAccount)
+
+                            if(PaymentObj.ValueDate < {curdate})
+                                if ( fdBank.is_PRBB )
+                                    PaymentObj.ValueDate = {curdate};
+                                end;
+                                SetOprDate(29000000, {curdate});
+                            else
+                                if( PaymentObj.DeleteTransaction( carry.ACCTRNID, CarryRec, CarryStatus ) )
+                                    MemoryError( stat );
+                                    msgbox( "Ошибка удаления проводки по корсчёту | " + GetErrMsg() );
+                                    return 1;
+                                end;
+                            end;
+
+                            if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                                return 1;
+                            end;
+                        end;
+                    end;
+
+                elif( carry.ReceiverAccount == Corschem.Account )
+                    if( PaymentObj.DeleteTransaction( carry.ACCTRNID, CarryRec, CarryStatus ) )
+                        MemoryError( stat );
+                        msgbox( "Ошибка удаления проводки по корсчёту | " + GetErrMsg() );
+                        return 1;
+                    end;
+
+                    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                        MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                        return 1;
+                    end;            
+                end;
+            end; //ПолучитьПроводкуПоКорсчету
+
+        else //Если изменилась исходящая корхема платежа
+            if( НайтиКорсхему(PaymentObj.OutCorschem, PaymentObj.ReceiverFIID, cors))
+                MsgBox("Не найдена исходящая корсхема");
+                return 1 ;
+            //TAM 02,11,11 I-00034244-2 begin
+            else
+                //если корсхема найдена, необходимо обновить запись по сообщению в dwlmes_dbt
+                //получаем данные контрагента по новой схеме расчета
+                select = " select t_objectid, t_code from dobjcode_dbt where " +
+                         " (t_codekind = 6 and t_objectid in (select t_corrid from dcorschem_dbt " +
+                                                              " where t_number = :cor_schem)) ";
+                params = makeArray( SQLParam("cor_schem", OutProp.Corschem));
+                rs = execSQLselect(select, params, FALSE);
+                if (rs.moveNext())
+                    //данные нашли и запихиваем в таблицу для сформированного сообщения
+                    /*SDA 13.06.2012 небольшая коррекция для платежей которые уже пытались выгружать */
+                    cmd = RSDCommand("delete from  dwlpm_dbt where t_paymentid = "+ PaymentObj.PaymentID
+                                   + " and T_PROPSTATUS =32000 ").Execute();
+                    cmd = RSDCommand(
+                      " update dwlmes_dbt " +
+                      " set t_outsideabonentid = ?, t_outsideabonentcode = ?, t_agentid = ?, t_agentcode = ? " +
+                      " where t_mesid = (select max(lnk.t_mesid) " +
+                                          " from dwlmeslnk_dbt lnk " +
+                                          " where lnk.t_objid = (select wlpm.t_wlpmid from dwlpm_dbt wlpm " +
+                                                                " where wlpm.t_paymentid = ?) " +
+                                          " and lnk.t_objkind = 501 )" 
+                          );
+                    cmd.addParam("abonent_id" ,RSDBP_IN, rs.value(0));
+                    cmd.addParam("abonent_code" ,RSDBP_IN, rs.value(1));
+                    cmd.addParam("agent_id" ,RSDBP_IN, rs.value(0));
+                    cmd.addParam("agent_code" ,RSDBP_IN, rs.value(1));
+                    cmd.addParam("payment_id" ,RSDBP_IN, PaymentObj.PaymentID);
+                    cmd.Execute();
+                end;
+            // TAM end
+            end;
+
+            if( cors.Department != Corschem.Department ) //Если корсхема в другом узле ТС
+                if(УстановитьСтатусыПлатежа( OPR_PAYM_CABS, OPR_PM_ST_MFR_NO ))
+                    MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                    return 1;
+                end;
+                if(ПолучитьПроводкуПоКорсчету(PaymentObj.PaymentID,@rs))   
+                    if(PaymentObj.ValueDate < {curdate})
+                        if ( fdBank.is_PRBB )
+                            PaymentObj.ValueDate = {curdate};
+                        end;
+                        SetOprDate( 29000000, PaymentObj.ValueDate );
+                    else
+                        if( PaymentObj.DeleteTransaction( carry.ACCTRNID, CarryRec, CarryStatus ) )
+                            MemoryError( stat );
+                            msgbox( "Ошибка удаления проводки по корсчёту | " + GetErrMsg() );
+                            return 1;
+                        end;
+                    end;
+
+                    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                        MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                        return 1;
+                    end;            
+                end;
+            else
+
+                if(ПолучитьПроводкуПоКорсчету(PaymentObj.PaymentID,@rs))   
+                    //Если в последней проводке счет кредита связан с КУ "Незавершенные расчеты" 
+                    if( IsUnfinAcc( rs.value("t_ReceiverFIID"), carry.ReceiverAccount ) )
+                        AccountUnclosed=OutPaymentAccUnclosed(PaymentObj).RecreateAccount();         
+                        if(AccountUnclosed != carry.ReceiverAccount)
+                            if(PaymentObj.ValueDate < {curdate})
+                                PaymentObj.ValueDate = ValueDateForRmPosition(PaymentObj, cors);
+                                if ( fdBank.is_PRBB )
+                                    PaymentObj.ValueDate = {curdate};
+                                end;
+                                SetOprDate(29000000, PaymentObj.ValueDate);
+                            else
+                                if( PaymentObj.DeleteTransaction( carry.ACCTRNID, CarryRec, CarryStatus ) )
+                                    MemoryError( stat );
+                                    msgbox( "Ошибка удаления проводки по корсчёту | " + GetErrMsg() );
+                                    return 1;
+                                end;
+                            end;
+
+                            //входящий платеж идет на предобработку
+                            if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                                return 1;
+                            end;            
+                        end;
+                    elif( carry.ReceiverAccount == Corschem.Account)
+                        if( PaymentObj.DeleteTransaction( carry.ACCTRNID, CarryRec, CarryStatus ) )
+                            MemoryError( stat );
+                            msgbox( "Ошибка удаления проводки по корсчёту | " + GetErrMsg() );
+                            return 1;
+                        end;
+
+                        if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER))
+                            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                            return 1;
+                        end;            
+                    end; ////Если в последней проводке счет кредита связан с КУ "Незавершенные расчеты" 
+                end;//if(ПолучитьПроводкуПоКорсчету(PaymentObj.PaymentID,@rs))   
+            end;
+        end;//Если изменилась только исходящая ДПП платежа
+    end;
+
+    if( not Inner )//корсхему можно только исходящему менять
+        if( GetOprStatus(OPR_PAYM_DIRECT) != OPR_PM_ST_DIR_OUT )
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT ) )
+                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                return 1;
+            end;
+        end;
+    end;
+
+    if( IsCarryPlanDocs() )
+        if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+            MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+            return 1;
+        end;
+    end;            
+
+    return 0;
+end;
+
+
+/* -----------------------------------------------------------------------------
+   Массовое выполнение шага "Позиционирование"
+   ----------------------------------------------------------------------------- */
+
+var NewCorNumber:integer,
+    NewFIID:integer,
+    NewTransferDate:date,
+    IsSender: string;
+
+macro PM_MassRepositionExecute()
+
+    var ErrMsg:string = "";
+
+    var query = "select dc.t_PaymentID, "
+                       "dc.t_AccTrnID, "
+                       "t.t_ID_Operation, "
+                       "t.t_ID_Step "
+                  "from V_PMMASSOPFOREXE t, "
+                       "table( PM_REPOSSTEP.GetPmCarriesForDelete() ) dc "
+                 "where dc.t_PaymentID = t.t_OrderID ";
+
+    var rs:RsdRecordset = execSQLselect( query );
+
+    while( rs.moveNext() )
+
+        // Каждая проводка оборачивается в SAVEPOINT, чтобы если что, не откатывать все
+        execSQL( "SAVEPOINT MassReposition" );
+
+        if( not Opr_DeleteCarry( rs.value("t_AccTrnID"), rs.value("t_ID_Operation"), rs.value("t_ID_Step") ) )
+            ErrMsg = "Ошибка при удалении балансовых проводок";
+        end;
+
+        if( IsCarryPlanDocs() )
+            if( CB_CarryPlanDocuments(rs.value("t_PaymentID"), date(0,0,0), rs.value("t_ID_Operation"), rs.value("t_ID_Step")) )
+                ErrMsg = "Ошибка при помещении планируемой проводки в проведенные";
+            end;
+        end;
+
+        if( ErrMsg != "" )
+            /* Если проводка неудачная, откатываемся до SAVEPOINT'а */
+            execSQL( "ROLLBACK TO SAVEPOINT MassReposition" );
+            /* и исключаем документ из дальнейшей обработки */
+            execSQL( "update doprtemp_tmp "
+                        "set t_ErrorStatus = :ErrorStatus, "
+                            "t_ErrorMessage = :ErrorMessage "
+                      "where t_OrderID = :PaymentID",
+            makeArray( SQLParam( "ErrorStatus",  1                       ),
+                       SQLParam( "ErrorMessage", ErrMsg                  ),
+                       SQLParam( "PaymentID",    rs.value("t_PaymentID") ) ) );
+        end;
+
+    end;
+
+    return 0;
+end;
+
+/* -----------------------------------------------------------------------------
+   Предтранзакционные действия 
+   ----------------------------------------------------------------------------- */
+macro PrepMassExecuteStep() 
+
+    var p_IsCarryPlanDocs = IfThenElse( IsCarryPlanDocs(), 1, 0 );
+
+    var stat:integer = execStoredFunc( "PM_REPOSSTEP.MassStepPrepare", V_INTEGER, 
+                                        makeArray( SQLParam( "p_IsSender", IsSender ),
+                                                   SQLParam( "p_NewCorNumber", NewCorNumber ),
+                                                   SQLParam( "p_NewFIID", NewFIID ),
+                                                   SQLParam( "p_NewTransferDate", NewTransferDate ),
+                                                   SQLParam( "p_IsCarryPlanDocs", p_IsCarryPlanDocs ) ) );
+ 
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+onerror( x )
+
+    MemoryError( 1, RsbGetError( x ) );
+    return 1;
+
+end;
+
+/* -----------------------------------------------------------------------------
+   Транзакционные действия 
+   Всё, что напроверяли, отражается на статусах документа, платежа, операции 
+   ----------------------------------------------------------------------------- */
+macro MassExecuteStep()
+
+    var stat:integer = execStoredFunc( "PM_REPOSSTEP.MassStepExecute1", V_INTEGER );
+
+    if( not stat )
+        stat = PM_MassRepositionExecute();
+    end;
+
+    if( not stat )
+        stat = execStoredFunc( "PM_REPOSSTEP.MassStepExecute2", V_INTEGER );
+    end;
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+onerror( x )
+
+    MemoryError( 1, RsbGetError( x ) );
+    return 1;
+
+end;
+
+/* -----------------------------------------------------------------------------
+   Действия после транзакции
+   ----------------------------------------------------------------------------- */
+macro PostMassExecuteStep()
+
+    var stat:integer = execStoredFunc( "PM_REPOSSTEP.MassStepPost", V_INTEGER );
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+onerror( x )
+
+    MemoryError( 1, RsbGetError( x ) );
+    return 1;
+
+end;
+
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

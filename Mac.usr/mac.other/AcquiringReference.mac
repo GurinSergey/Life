@@ -1,0 +1,668 @@
+// KS 24.05.2012 C-10270 Проверка 101
+// Jushmanov 2013-09-13 C-22159 В скроллинг добавлены поля "задолженность" и "не детализировать по ТСП",
+//                              проверка на повторный ввод терминала, панель с историей задолженности (по F6),
+//                              отчёт о клиентах с задолженностями (по F7).
+
+import BankInter;
+import oralib, likepy, globals;
+import rcw;
+import "diver.mac";// KS 24.05.2012 C-10270 Проверка 101
+record acc (account);
+
+class TAcquiringReferenceRecord
+    var m_code_firm;
+    var m_open_close;
+    var m_name_firm;
+    var m_code_office;
+    var m_name_office;
+    var m_number_terminal;
+    var m_percent_value;
+    var m_acc_postuplen;
+    var m_acc_oplat;
+    var m_acc_percent;
+    var m_mfo_receiver;
+    var m_inn_receiver;
+    var m_kpp_receiver;
+    var m_account_receiver;
+    var m_number_dogovor;
+    var m_debt;
+    var m_no_tsp_detail;
+    var m_client_block;
+end;
+
+class TAcquiringReference
+    var global_rec_ID = 0;
+
+    var OldRecord = TAcquiringReferenceRecord;
+    var NewRecord = TAcquiringReferenceRecord;
+    var CurrentRecord;
+    
+    var lbr_directory;
+    var errCode;
+
+    var scroll_recordset;
+    var isWorking = true;
+    
+    const VK_SPACE  = 32,
+          VK_ENTER  = 13,
+          VK_ESC    = 27,
+          VK_TAB    = 9,
+          VK_LEFT   = 331,
+          VK_UP     = 328,
+          VK_RIGHT  = 333,
+          VK_DOWN   = 336,
+          VK_F2     = 316,
+          VK_F3     = 317,
+          VK_F6     = 320,
+          VK_F7     = 321,
+          VK_F8     = 322,
+          VK_F9     = 323,
+          CHAR_X    = 89,
+          V_SPECVAL = 26;
+    
+    var col = TArray;
+    var dlg;
+    
+    macro getSQLRecord ( POS_ID )
+        var sql = "select rownum, t_code_firm, t_open_close, t_name_firm, t_code_office, t_name_office,"
+                  "       t_number_terminal, t_percent_value, t_acc_postuplen, t_acc_oplat, t_acc_percent,"
+                  "       t_mfo_receiver, t_inn_receiver, t_kpp_receiver, t_account_receiver, t_number_dogovor,"
+                  "       t_reserve, t_no_tsp_detail, t_client_block,"
+                  "       nvl((select sum(t_debt_rest) from dacquiring_history_usr"
+                  "             where t_inn_receiver = s.t_inn_receiver and t_closed != 'X') ,0) t_debt"
+                  "  from dsprterm_usr s"
+                  " where t_number_terminal = :POS_ID";
+        sql = execSQLSelect (sql, makeArray (sqlParam ("POS_ID", POS_ID)), true);
+        
+        if (sql.moveNext)
+            return sql;
+        end;
+        
+        return null;
+    end;
+    
+    
+    macro RecordHasChanged ()
+       return ((OldRecord.m_code_firm        !=  NewRecord.m_code_firm       )
+            or (OldRecord.m_open_close       !=  NewRecord.m_open_close      )
+            or (OldRecord.m_name_firm        !=  NewRecord.m_name_firm       )
+            or (OldRecord.m_code_office      !=  NewRecord.m_code_office     )
+            or (OldRecord.m_name_office      !=  NewRecord.m_name_office     )
+            or (OldRecord.m_number_terminal  !=  NewRecord.m_number_terminal )
+            or (OldRecord.m_percent_value    !=  NewRecord.m_percent_value   )
+            or (OldRecord.m_acc_postuplen    !=  NewRecord.m_acc_postuplen   )
+            or (OldRecord.m_acc_oplat        !=  NewRecord.m_acc_oplat       )
+            or (OldRecord.m_acc_percent      !=  NewRecord.m_acc_percent     )
+            or (OldRecord.m_mfo_receiver     !=  NewRecord.m_mfo_receiver    )
+            or (OldRecord.m_inn_receiver     !=  NewRecord.m_inn_receiver    )
+            or (OldRecord.m_kpp_receiver     !=  NewRecord.m_kpp_receiver    )
+            or (OldRecord.m_account_receiver !=  NewRecord.m_account_receiver)
+            or (OldRecord.m_number_dogovor   !=  NewRecord.m_number_dogovor  )
+            or (OldRecord.m_debt             !=  NewRecord.m_debt            )
+            or (OldRecord.m_no_tsp_detail    !=  NewRecord.m_no_tsp_detail   )
+            or (OldRecord.m_client_block     !=  NewRecord.m_client_block    ));
+    end;
+    
+    macro ExitReport ( msg )
+        msgBox (msg);
+        Exit (1);
+    end;
+
+    macro AddCol (ar, ind, fld, head)
+        ar.value (ind * 6)      = fld;
+        ar.value (ind * 6 + 1)  = head;
+        ar.value (ind * 6 + 2)  = null; // width
+        ar.value (ind * 6 + 3 ) = 0;    // fldType
+        ar.value (ind * 6 + 4 ) = 2;    // decPoint
+        ar.value (ind * 6 + 5 ) = 0;    // reserv
+    end;
+
+    macro HistScroll (inn)
+        var col = TArray;
+        var hist_recordset;
+
+        AddCol (col, 0, "t_closed"      , "Закрыта"                            );
+        AddCol (col, 1, "t_inn_receiver", "ИНН получателя"                     );
+        AddCol (col, 2, "t_carrydate"   , "Дата проводки"                      );
+        AddCol (col, 3, "t_carryamount" , "Сумма задолженности"                );
+        AddCol (col, 4, "t_feeamount"   , "Сумма комиссии к возврату"          );
+        AddCol (col, 5, "t_debt_rest"   , "Непогашенный остаток задолженности" );
+        AddCol (col, 6, "t_fee_rest"    , "Непогашенный остаток комиссии"      );
+
+        hist_recordset = RSDRecordset (RsdCommand ( string (
+            "select t_id, t_inn_receiver, t_carrydate, t_carryamount, t_feeamount, t_closed, t_debt_rest, t_fee_rest " +
+            "  from dacquiring_history_usr " +
+            " where t_inn_receiver = '" + inn + "'" +
+            " order by t_carrydate asc" )),
+            RSDVAL_CLIENT,
+            RSDVAL_STATIC );
+
+        RunScroll (hist_recordset, (col.size)/6, col, "test", "EQHistoryEventHandler", "История задолженностей по эквайрингу", "~Esc~ Закрыть, ~F8~ Удалить, ~F9~ Ввод записи", false);
+
+    end;
+
+    macro DebtScroll ( )
+        var col = TArray;
+        var debt_recordset;
+
+        AddCol (col, 0, "t_name_firm"   , "Наименование клиента" );
+        AddCol (col, 1, "t_inn_receiver", "ИНН"                  );
+        AddCol (col, 2, "debt"          , "Сумма задолженности"  );
+        AddCol (col, 3, "carrydate"     , "Дата задолженности"   );
+
+        debt_recordset = RSDRecordset (RsdCommand ( string (
+            "select"
+        +"\n    nvl((select max(s.t_name_firm) from dsprterm_usr s where s.t_inn_receiver = h.t_inn_receiver)"
+        +"\n       ,'###Клиент отсутствует###') t_name_firm"
+        +"\n   ,h.t_inn_receiver"
+        +"\n   ,sum(h.t_debt_rest) debt"
+        +"\n   ,min(t_carrydate) carrydate"
+        +"\n   from dacquiring_history_usr h"
+        +"\n  where nvl(t_closed,chr(0)) != 'X'"
+        +"\n  group by h.t_inn_receiver"
+        //+"\n having sum(h.t_debt_rest) != 0"
+        +"\n  order by ascii(t_name_firm), t_name_firm" )),
+            RSDVAL_CLIENT,
+            RSDVAL_STATIC );
+
+        RunScroll (debt_recordset, (col.size)/6, col, "test", "EQDebtEventHandler", "Список клиентов с задолженностями по эквайрингу", "~Esc~ Закрыть", true);
+
+    end;
+
+
+    macro HistoryEventHandler ( )
+
+    end;
+
+
+    macro DebtEventHandler ( )
+
+    end;
+
+
+    macro NewPanelEventHandler (dlg, cmd, id, key) 
+        if   ( cmd == DLG_INIT )
+            dlg.rec.m_open_close       = strfor (0);
+            dlg.rec.m_code_firm        = "";
+            dlg.rec.m_name_firm        = "";
+            dlg.rec.m_code_office      = "";
+            dlg.rec.m_name_office      = "";
+            dlg.rec.m_number_terminal  = "";
+            dlg.rec.m_percent_value    = "";
+            dlg.rec.m_acc_postuplen    = "";
+            dlg.rec.m_acc_oplat        = "";
+            dlg.rec.m_acc_percent      = "";
+            dlg.rec.m_mfo_receiver     = "";
+            dlg.rec.m_inn_receiver     = "";
+            dlg.rec.m_kpp_receiver     = "";
+            dlg.rec.m_account_receiver = "";
+            dlg.rec.m_debt             = 0;
+            dlg.rec.m_number_dogovor   = "";
+            dlg.rec.m_no_tsp_detail    = strfor (1);
+            dlg.rec.m_client_block     = strfor (1);
+            updatefields(dlg);
+
+        elif ( cmd == DLG_KEY )
+        
+            if (key == VK_F9)
+
+                var debt;
+
+                var term_sql = RsdRecordSet(string(
+                   "select t_number_terminal"
+                +"\n  from dsprterm_usr"
+                +"\n where upper(rtrim(t_number_terminal,chr(255))) = '" + trim(dlg.rec.m_number_terminal) + "'" ));
+ 
+                if ((trim(dlg.rec.m_name_firm) == "")
+                     or (trim(dlg.rec.m_name_office) == ""))
+
+                    msgbox ("Не указано наименование организации или филиала");
+                    return CM_IGNORE;
+
+                elif (  (strlen (dlg.rec.m_acc_oplat) != 20) or
+                        (strlen (dlg.rec.m_account_receiver) != 20))
+                    msgbox ("Неверная длина счета оплаты или получателя");
+                    return CM_IGNORE;
+
+                elif ( term_sql.MoveNext )
+                    msgbox ("Терминал с таким номером уже существует");
+                    return CM_IGNORE;
+                end;
+
+                // При введении нового ТСП клиенту, у которого есть задолженность,
+                // в новом ТСП задолженность проставляется автоматически
+                term_sql = RsdRecordSet(string(
+                    "select max(t_debt) debt from dsprterm_usr ",
+                    " where t_inn_receiver = '" + dlg.rec.m_inn_receiver + "'" ));
+                term_sql.moveNext;
+
+                if ( valType(term_sql.value("debt")) == V_SPECVAL )
+                    debt = dlg.rec.m_debt;
+                else
+                    debt = term_sql.value("debt");
+                end;
+
+                var sql = "insert into dsprterm_usr "
+                        "\n            (t_open_close, t_code_firm, "
+                        "\n             t_name_firm, t_code_office, "
+                        "\n             t_name_office, t_number_terminal, "
+                        "\n             t_percent_value, t_acc_postuplen, "
+                        "\n             t_acc_oplat, t_acc_percent, "
+                        "\n             t_mfo_receiver, t_inn_receiver, "
+                        "\n             t_kpp_receiver, t_account_receiver, "
+                        "\n             t_number_dogovor, t_debt, "
+                        "\n             t_no_tsp_detail, t_client_block, t_reserve "
+                        "\n            ) "
+                        "\n     values (nvl (:m_open_close, chr (0)), nvl (:m_code_firm, chr (1)), "
+                        "\n             nvl (:m_name_firm, chr (1)), nvl (:m_code_office, chr (1)), "
+                        "\n             nvl (:m_name_office, chr (1)), nvl (:m_number_terminal, chr (1)), "
+                        "\n             nvl (:m_percent_value, chr (1)), nvl (:m_acc_postuplen, chr (1)), "
+                        "\n             nvl (:m_acc_oplat, chr (1)), nvl (:m_acc_percent, chr (1)), "
+                        "\n             nvl (:m_mfo_receiver, chr (1)), nvl (:m_inn_receiver, chr (1)), "
+                        "\n             nvl (:m_kpp_receiver, chr (1)), nvl (:m_account_receiver, chr (1)), "
+                        "\n             nvl (:m_number_dogovor, chr (1)), decode (:m_debt, '', 0, :m_debt), "
+                        "\n             nvl (:m_no_tsp_detail, chr (1)), nvl (:m_client_block, chr (1)), chr (1) "
+                        "\n            )";
+                          
+                execSQL (sql, makeArray (SQLParam ("m_open_close",       dlg.rec.m_open_close),
+                                         SQLParam ("m_code_firm",        dlg.rec.m_code_firm),
+                                         SQLParam ("m_name_firm",        dlg.rec.m_name_firm),
+                                         SQLParam ("m_code_office",      dlg.rec.m_code_office),
+                                         SQLParam ("m_name_office",      dlg.rec.m_name_office),
+                                         SQLParam ("m_number_terminal",  dlg.rec.m_number_terminal),
+                                         SQLParam ("m_percent_value",    dlg.rec.m_percent_value),
+                                         SQLParam ("m_acc_postuplen",    dlg.rec.m_acc_postuplen),
+                                         SQLParam ("m_acc_oplat",        dlg.rec.m_acc_oplat),
+                                         SQLParam ("m_acc_percent",      dlg.rec.m_acc_percent),
+                                         SQLParam ("m_mfo_receiver",     dlg.rec.m_mfo_receiver),
+                                         SQLParam ("m_inn_receiver",     dlg.rec.m_inn_receiver),
+                                         SQLParam ("m_kpp_receiver",     dlg.rec.m_kpp_receiver),
+                                         SQLParam ("m_account_receiver", dlg.rec.m_account_receiver),
+                                         SQLParam ("m_number_dogovor",   dlg.rec.m_number_dogovor),
+                                         SQLParam ("m_debt",             debt),
+                                         SQLParam ("m_debt_dup",         debt),
+                                         SQLParam ("m_no_tsp_detail",    dlg.rec.m_no_tsp_detail),
+                                         SQLParam ("m_client_block",     dlg.rec.m_client_block) ));
+                isWorking = true;
+                return CM_SELECT;
+
+            elif (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_open_close"))
+                dlg.rec.m_open_close    = strfor ( CHAR_X - codefor ( dlg.rec.m_open_close )); 
+                return CM_DEFAULT;
+
+            elif (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_no_tsp_detail"))
+                dlg.rec.m_no_tsp_detail = strfor ( CHAR_X - codefor ( dlg.rec.m_no_tsp_detail )); 
+                return CM_DEFAULT;
+
+            elif (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_client_block"))
+                dlg.rec.m_client_block  = strfor ( CHAR_X - codefor ( dlg.rec.m_client_block )); 
+                return CM_DEFAULT;
+                
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_postuplen"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_postuplen))
+                    dlg.rec.m_acc_postuplen = acc.account;
+                end;
+                return CM_DEFAULT;            
+            
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_percent"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_percent))
+                    dlg.rec.m_acc_percent = acc.account;
+                end;
+                return CM_DEFAULT;
+            
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_oplat"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_oplat))
+                    dlg.rec.m_acc_oplat = acc.account;
+                end;
+                return CM_DEFAULT;            
+
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_account_receiver"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_account_receiver))
+                    dlg.rec.m_account_receiver = acc.account;
+                end;
+                return CM_DEFAULT;
+
+            elif (((key == VK_TAB)   and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_LEFT)  and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_RIGHT) and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_DOWN)  and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_UP)    and (trim(fldname(dlg, id)) == "m_mfo_receiver")))
+                if ((trim(dlg.rec.m_mfo_receiver) == "") or (trim(dlg.rec.m_mfo_receiver) == {mfo_bank}))
+                    dlg.rec.m_no_tsp_detail = strfor(1);
+                else
+                    dlg.rec.m_no_tsp_detail = strfor(88);
+                end;
+                updatefields(dlg);
+                return CM_DEFAULT;
+
+            end;
+            
+        end;
+    end;
+
+    macro PanelEventHandler (dlg, cmd, id, key) 
+        currentRecord  = getSQLRecord (global_rec_ID);
+        var sql;
+        
+        if   ( cmd == DLG_INIT ) // инициализация полей панели
+            
+            dlg.rec.m_code_firm        = OldRecord.m_code_firm        = NewRecord.m_code_firm        = currentRecord.value ("t_code_firm");
+            dlg.rec.m_open_close       = OldRecord.m_open_close       = NewRecord.m_open_close       = currentRecord.value ("t_open_close");
+            dlg.rec.m_name_firm        = OldRecord.m_name_firm        = NewRecord.m_name_firm        = currentRecord.value ("t_name_firm");
+            dlg.rec.m_code_office      = OldRecord.m_code_office      = NewRecord.m_code_office      = currentRecord.value ("t_code_office");
+            dlg.rec.m_name_office      = OldRecord.m_name_office      = NewRecord.m_name_office      = currentRecord.value ("t_name_office");
+            dlg.rec.m_number_terminal  = OldRecord.m_number_terminal  = NewRecord.m_number_terminal  = currentRecord.value ("t_number_terminal");
+            dlg.rec.m_percent_value    = OldRecord.m_percent_value    = NewRecord.m_percent_value    = currentRecord.value ("t_percent_value");
+            dlg.rec.m_acc_postuplen    = OldRecord.m_acc_postuplen    = NewRecord.m_acc_postuplen    = currentRecord.value ("t_acc_postuplen");
+            dlg.rec.m_acc_oplat        = OldRecord.m_acc_oplat        = NewRecord.m_acc_oplat        = currentRecord.value ("t_acc_oplat");
+            dlg.rec.m_acc_percent      = OldRecord.m_acc_percent      = NewRecord.m_acc_percent      = currentRecord.value ("t_acc_percent");
+            dlg.rec.m_mfo_receiver     = OldRecord.m_mfo_receiver     = NewRecord.m_mfo_receiver     = currentRecord.value ("t_mfo_receiver");
+            dlg.rec.m_inn_receiver     = OldRecord.m_inn_receiver     = NewRecord.m_inn_receiver     = currentRecord.value ("t_inn_receiver");
+            dlg.rec.m_kpp_receiver     = OldRecord.m_kpp_receiver     = NewRecord.m_kpp_receiver     = currentRecord.value ("t_kpp_receiver");
+            dlg.rec.m_account_receiver = OldRecord.m_account_receiver = NewRecord.m_account_receiver = currentRecord.value ("t_account_receiver");
+            dlg.rec.m_number_dogovor   = OldRecord.m_number_dogovor   = NewRecord.m_number_dogovor   = currentRecord.value ("t_number_dogovor");
+            dlg.rec.m_debt             = OldRecord.m_debt             = NewRecord.m_debt             = currentRecord.value ("t_debt");
+            dlg.rec.m_no_tsp_detail    = OldRecord.m_no_tsp_detail    = NewRecord.m_no_tsp_detail    = currentRecord.value ("t_no_tsp_detail");
+            dlg.rec.m_client_block     = OldRecord.m_client_block     = NewRecord.m_client_block     = currentRecord.value ("t_client_block");
+
+            UpdateFields (dlg);
+
+        elif ( cmd == DLG_KEY ) // обработка нажатий клавиш
+            NewRecord.m_code_firm        = dlg.rec.m_code_firm;
+            NewRecord.m_open_close       = dlg.rec.m_open_close;
+            NewRecord.m_name_firm        = dlg.rec.m_name_firm;
+            NewRecord.m_code_office      = dlg.rec.m_code_office;
+            NewRecord.m_name_office      = dlg.rec.m_name_office;
+            NewRecord.m_number_terminal  = dlg.rec.m_number_terminal;
+            NewRecord.m_percent_value    = dlg.rec.m_percent_value;
+            NewRecord.m_acc_postuplen    = dlg.rec.m_acc_postuplen;
+            NewRecord.m_acc_oplat        = dlg.rec.m_acc_oplat;
+            NewRecord.m_acc_percent      = dlg.rec.m_acc_percent;
+            NewRecord.m_mfo_receiver     = dlg.rec.m_mfo_receiver;
+            NewRecord.m_inn_receiver     = dlg.rec.m_inn_receiver;
+            NewRecord.m_kpp_receiver     = dlg.rec.m_kpp_receiver;
+            NewRecord.m_account_receiver = dlg.rec.m_account_receiver;
+            NewRecord.m_number_dogovor   = dlg.rec.m_number_dogovor;
+            NewRecord.m_debt             = dlg.rec.m_debt;
+            NewRecord.m_no_tsp_detail    = dlg.rec.m_no_tsp_detail;
+            NewRecord.m_client_block     = dlg.rec.m_client_block;
+
+            if (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_open_close"))
+                dlg.rec.m_open_close    = strfor ( CHAR_X - codefor ( dlg.rec.m_open_close )); 
+            end;
+
+            if (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_no_tsp_detail"))
+                dlg.rec.m_no_tsp_detail = strfor ( CHAR_X - codefor ( dlg.rec.m_no_tsp_detail )); 
+            end;
+
+            if (( key == VK_SPACE ) and (trim(fldname(dlg, id)) == "m_client_block"))
+                dlg.rec.m_client_block  = strfor ( CHAR_X - codefor ( dlg.rec.m_client_block )); 
+            end;
+
+            if ((key == VK_F9) or (key == VK_F2))
+                if ( RecordHasChanged ()  and GetTrue (null, "Запись была изменена. Сохранить?"))
+
+                    if ((trim(dlg.rec.m_name_firm) == "")
+                         or (trim(dlg.rec.m_name_office) == ""))
+
+                        msgbox ("Не указано наименование организации или филиала");
+                        return CM_IGNORE;
+
+                    elif (    
+                            (strlen (dlg.rec.m_acc_oplat) != 20)
+                         or (strlen (dlg.rec.m_account_receiver) != 20))
+                        msgbox ("Неверная длина счета оплаты или получателя");
+                        return CM_IGNORE;
+                    end;
+                    
+                    sql =  "update dsprterm_usr "
+                           "   set t_code_firm        = nvl (:code_firm,        chr (1)), "
+                           "       t_open_close       = nvl (:open_close,       chr (0)), "
+                           "       t_name_firm        = nvl (:name_firm,        chr (1)), "
+                           "       t_code_office      = nvl (:code_office,      chr (1)), "
+                           "       t_name_office      = nvl (:name_office,      chr (1)), "
+                           "       t_number_terminal  = nvl (:number_terminal,  chr (1)), "
+                           "       t_percent_value    = nvl (:percent_value,    chr (1)), "
+                           "       t_acc_postuplen    = nvl (:acc_postuplen,    chr (1)), "
+                           "       t_acc_oplat        = nvl (:acc_oplat,        chr (1)), "
+                           "       t_acc_percent      = nvl (:acc_percent,      chr (1)), "
+                           "       t_mfo_receiver     = nvl (:mfo_receiver,     chr (1)), "
+                           "       t_inn_receiver     = nvl (:inn_receiver,     chr (1)), "
+                           "       t_kpp_receiver     = nvl (:kpp_receiver,     chr (1)), "
+                           "       t_account_receiver = nvl (:account_receiver, chr (1)), "
+                           "       t_number_dogovor   = nvl (:number_dogovor,   chr (1)), "
+                           "       t_debt             = nvl (:debt,             0),       "
+                           "       t_no_tsp_detail    = nvl (:no_tsp_detail,    chr (1)), "
+                           "       t_client_block     = nvl (:client_block,     chr (1))  "
+                           " where t_number_terminal = :n;";
+                        
+                    if (execSQL (sql, makeArray (sqlParam ("code_firm",        NewRecord.m_code_firm       ),
+                                                 sqlParam ("open_close",       NewRecord.m_open_close      ),
+                                                 sqlParam ("name_firm",        NewRecord.m_name_firm       ),
+                                                 sqlParam ("code_office",      NewRecord.m_code_office     ),
+                                                 sqlParam ("name_office",      NewRecord.m_name_office     ),
+                                                 sqlParam ("number_terminal",  NewRecord.m_number_terminal ),
+                                                 sqlParam ("percent_value",    NewRecord.m_percent_value   ),
+                                                 sqlParam ("acc_postuplen",    NewRecord.m_acc_postuplen   ),
+                                                 sqlParam ("acc_oplat",        NewRecord.m_acc_oplat       ),
+                                                 sqlParam ("acc_percent",      NewRecord.m_acc_percent     ),
+                                                 sqlParam ("mfo_receiver",     NewRecord.m_mfo_receiver    ),
+                                                 sqlParam ("inn_receiver",     NewRecord.m_inn_receiver    ),
+                                                 sqlParam ("kpp_receiver",     NewRecord.m_kpp_receiver    ),
+                                                 sqlParam ("account_receiver", NewRecord.m_account_receiver),
+                                                 sqlParam ("number_dogovor",   NewRecord.m_number_dogovor  ),
+                                                 sqlParam ("debt",             NewRecord.m_debt            ),
+                                                 sqlParam ("no_tsp_detail",    NewRecord.m_no_tsp_detail   ),
+                                                 sqlParam ("client_block",     NewRecord.m_client_block    ),
+                                                 sqlParam ("n",  currentRecord.value ("t_number_terminal"))), true))
+                        isWorking = true;
+
+                        //отдельно перезаписываем флаги "не детализировать по ТСП" и "клиент заблокирован" для всех ТСП клиента
+                        sql = "update dsprterm_usr"
+                              "   set t_no_tsp_detail    = nvl (:no_tsp_detail, chr (1)),"
+                              "       t_client_block     = nvl (:client_block , chr (1)),"
+                              "       t_account_receiver = nvl (:acc_receiver , chr (0)),"
+                              "       t_mfo_receiver     = nvl (:mfo_receiver , chr (0)) "
+                              //"      ,t_percent_value    = nvl (:percent_value, 0) "
+                              " where t_inn_receiver = :inn";
+                        execSQL (sql, makeArray (sqlParam ("no_tsp_detail", NewRecord.m_no_tsp_detail    ),
+                                                 sqlParam ("client_block",  NewRecord.m_client_block     ),
+                                                 sqlParam ("acc_receiver",  NewRecord.m_account_receiver ),
+                                                 sqlParam ("mfo_receiver",  NewRecord.m_mfo_receiver     ),
+                                                 //sqlParam ("percent_value", NewRecord.m_percent_value    ),
+                                                 sqlParam ("inn",           NewRecord.m_inn_receiver     ) ));
+
+            
+                    end; // if (sql == null)
+                end; // if ( RecordHasChanged () )
+                
+                return CM_DEFAULT;
+
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_postuplen"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_postuplen))
+                    dlg.rec.m_acc_postuplen = acc.account;
+                end;
+                return CM_DEFAULT;            
+            
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_percent"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_percent))
+                    dlg.rec.m_acc_percent = acc.account;
+                end;
+                return CM_DEFAULT;
+            
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_acc_oplat"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_acc_oplat))
+                    dlg.rec.m_acc_oplat = acc.account;
+                end;
+                return CM_DEFAULT;            
+
+            elif ((key == VK_F3) and (trim(fldname(dlg, id)) == "m_account_receiver"))
+                if (ListAccount (acc, 1, 0, dlg.rec.m_account_receiver))
+                    dlg.rec.m_account_receiver = acc.account;
+                end;
+                return CM_DEFAULT;
+
+            elif (key == VK_F6)
+                HistScroll( dlg.rec.m_inn_receiver );
+                isWorking = true;
+                return CM_DEFAULT;
+
+            elif (((key == VK_TAB)   and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_LEFT)  and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_RIGHT) and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_DOWN)  and (trim(fldname(dlg, id)) == "m_mfo_receiver"))
+              or  ((key == VK_UP)    and (trim(fldname(dlg, id)) == "m_mfo_receiver")))
+                if ((trim(dlg.rec.m_mfo_receiver) == "") or (trim(dlg.rec.m_mfo_receiver) == {mfo_bank}))
+                    dlg.rec.m_no_tsp_detail = strfor(1);
+                else
+                    dlg.rec.m_no_tsp_detail = strfor(88);
+                end;
+                updatefields(dlg);
+                return CM_DEFAULT;
+
+            end; 
+        end; 
+        
+        return CM_DEFAULT;
+    end;
+    
+    macro ScrollEventHandler (rs, cmd, id, key )
+
+        if ((cmd == DLG_KEY) and (key == VK_ENTER))
+            global_rec_ID = rs.value ("t_number_terminal");
+            RunDialog (dlg, "EQPanelEventHandler");
+
+            isWorking = false;            
+            updatescroll(rs);
+           
+            return CM_DEFAULT;
+        end;
+        
+        if ((cmd == DLG_KEY) and (key == VK_F8))
+            if (getTrue (false, "Вы действительно хотите удалить запись?"))
+                var sql = "delete from dsprterm_usr where t_number_terminal = :n";
+                execSQL (sql, makeArray (sqlParam ("n", rs.value ("t_number_terminal"))));
+            end;
+            
+            isWorking = true;
+            return CM_CANCEL;
+        end;
+        
+        if ((cmd == DLG_KEY) and (key == VK_F9))
+            global_rec_ID = rs.value ("t_number_terminal");
+            RunDialog (dlg, "EQNewPanelEventHandler");
+            isWorking = true;
+            return CM_SELECT;
+        end;
+
+        if ((cmd == DLG_KEY) and (key == VK_F6))
+            HistScroll( rs.value ("t_inn_receiver") );
+            return CM_DEFAULT;
+        end;
+
+        if ((cmd == DLG_KEY) and (key == VK_F7))
+            DebtScroll( );
+            return CM_DEFAULT;
+        end;
+        
+    end;
+    
+    
+    macro Init ( )
+
+        const LBR_REGISTRY_PATH = "BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/LBRDIR";
+        const LBR_NAME_FILE     = "zResLib.lbr";
+        const LBR_NAME_PANEL    = "acq_panl";
+        
+        if ( GetRegistryValue ( LBR_REGISTRY_PATH, V_STRING, lbr_directory, errCode ) and not errCode )
+            var lbr_fullpath = FindPath ( LBR_NAME_FILE, lbr_directory );
+            dlg              = TRecHandler ( LBR_NAME_PANEL, lbr_fullpath, TRUE );
+            
+            /*** Формируем пользовательский скроллинг для интерфейса справочника по эквайрингу ***/
+            
+            /* 1. Добавляем колонки к панели скроллинга */
+            AddCol (col, 0,  "t_client_block"    , "Б"                );
+            AddCol (col, 1,  "t_code_firm"       , "Код фирмы"        );
+            AddCol (col, 2,  "t_open_close"      , "З"                );
+            AddCol (col, 3,  "t_name_firm"       , "Название фирмы"   );
+            AddCol (col, 4,  "t_code_office"     , "Код филиала"      );
+            AddCol (col, 5,  "t_name_office"     , "Название филиала" );
+            AddCol (col, 6,  "t_number_terminal" , "Номер термиала"   );
+            AddCol (col, 7,  "t_debt"            , "Задолженность"    );
+            AddCol (col, 8,  "t_percent_value"   , "Комиссия"         );
+            AddCol (col, 9,  "t_acc_postuplen"   , "Счет поступления" );
+            AddCol (col, 10, "t_acc_oplat"       , "Счет оплат"       );
+            AddCol (col, 11, "t_acc_percent"     , "Счет комиссии"    );
+            AddCol (col, 12, "t_mfo_receiver"    , "БИК получателя"   );
+            AddCol (col, 13, "t_inn_receiver"    , "ИНН получателя"   );
+            AddCol (col, 14, "t_kpp_receiver"    , "КПП получателя"   );
+            AddCol (col, 15, "t_account_receiver", "Счет получателя"  );
+            AddCol (col, 16, "t_number_dogovor"  , "Номер договора"   );
+            AddCol (col, 17, "t_no_tsp_detail"   , "Без ТСП"          );
+           
+            /* 2. Запуск скроллинга */
+            while (isWorking)
+                isWorking = false;
+
+                /* SQL-запрос для формирования строк скроллинга */
+                scroll_recordset = RSDRecordset (RsdCommand ( 
+                    "select t_code_firm, t_open_close, t_name_firm, t_code_office, t_name_office,"
+                    "       t_number_terminal, t_percent_value, t_acc_postuplen, t_acc_oplat, "
+                    "       t_acc_percent, t_mfo_receiver, t_inn_receiver, t_kpp_receiver, "
+                    "       t_account_receiver, t_number_dogovor, t_reserve, t_no_tsp_detail, t_client_block, "
+                    "       nvl((select sum(t_debt_rest) from dacquiring_history_usr where t_inn_receiver = s.t_inn_receiver and t_closed != 'X'),0) t_debt"
+                    "  from dsprterm_usr s "
+                                                            ),
+                                                            RSDVAL_CLIENT,
+                                                            RSDVAL_STATIC );
+
+                RunScroll (scroll_recordset, (col.size)/6, col, "test", "EQScrollEventHandler", "Справочник по эквайрингу", "~Esc~ Отмена, ~Enter~ Выбор, ~F6~ История задолженности, ~F7~ Список должников, ~F8~ Удалить запись, ~F9~ Ввод записи", true);
+
+            end;
+
+            exit (1);
+        else
+            ExitReport ("Невозможно получить значение настройки реестра " + LBR_REGISTRY_PATH);
+        end;
+    end;
+
+end;
+
+
+/*--- | entry point | ----------------------------------------------------------------------------*/
+var obj = TAcquiringReference ();
+
+macro EQScrollEventHandler (rs, cmd, id, key )  /* обработчик скроллинга */
+    message ("Esc - выход из справочника, Enter - просмотр записи, F6 - история задолженности, F7 - Список должников, F8 - удалить запись, F9 - ввод записи");
+    return obj.ScrollEventHandler (rs, cmd, id, key );
+end;
+
+macro EQPanelEventHandler (dlg, cmd, id, key)   /* обработчик панели для редактирования */
+    message ("F3 - выбор счета, Esc - отмена, F6 - история задолженности, F9 - сохранить запись");
+    return obj.PanelEventHandler (dlg, cmd, id, key);
+end;
+
+macro EQNewPanelEventHandler (dlg, cmd, id, key) /* обработчик панели для ввода */
+    message ("F3 - выбор счета, Esc - отмена, F9 - сохранить запись");
+    return obj.NewPanelEventHandler (dlg, cmd, id, key);
+end;
+
+macro EQHistoryEventHandler (dlg, cmd, id, key )  /* обработчик скроллинга истории задолженностей */
+    message ("Esc - выход из справочника, F8 - удалить запись, F9 - добавить запись");
+    return obj.HistoryEventHandler ( );
+end;
+
+macro EQDebtEventHandler (rs, cmd, id, key )  /* обработчик скроллинга списка должников */
+    message ("Esc - выход из отчета");
+    return obj.DebtEventHandler ( );
+end;
+
+// KS 24.05.2012 C-10270 Проверка 101
+if(not ВходитВГруппу({oper},101))
+  msgbox("Вы не включены в группу \"101 - Работы по эквайрингу\" ");
+  return 1;
+end;
+// KS 24.05.2012 End C-10270
+
+/* отложенная инициализация объекта Справочника */
+obj.init ();

@@ -1,0 +1,386 @@
+/*Макрос печати справки о з/п по счету для клиента*/
+/*Опанасенко Ю.Ф. R-Style Ukraine, Kiev 22.07.2008*/
+/*Изменен 02/09/2008 Новиков С.С.*/
+/*Справка о выдаче средств на з/п*/
+/*Версия 1.0                                      */
+//02.08.2012 vihrov I-00215701-2
+// KS 25.11.2013 Адаптация под 31ю сборку
+
+import globals, oralib, likepy, repforms, KeyCodes, WordIntf, PTInter, rsexts, FIInter, CurrInter, RsbDataset, Reporting;
+import ConfAcc, SpLimAcc,Accconfex, SprTurnover, SprTurnoverSld, Refabs2, PTInter;
+/*Макросы справок ответов на запросы ИФНС для клиентов*/
+import SprIFNS,RefPrAbsAcc,RemAcc, "fg_Life_parm.mac";
+
+import "or_tools.mac"; // KS 03.12.2010 I-097083 Макрос с функцией получения имени месяца в родительном падеже
+
+MACRO put_log(str)
+
+var path:string;
+GetRegistryValue("PRBB\CB\SPRACCOUT",2,path);
+
+setoutput(path + "spr_acc_log."+{oper},true);
+println(str);
+setoutput(null,true);
+end;
+
+private macro CreateWordApplication()
+
+var startAX, WordApplication;
+
+  if (isStandAlone())
+     return ActiveX("Word.Application");
+  else
+     startAX = CreateObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone());
+     WordApplication = startAX.CreateComObject("Word.Application");
+     WordApplication.Visible = true;
+     return WordApplication;
+  end;
+
+end;
+
+private macro ShowReportOnTerminal( WordApp, WordDoc )
+  
+  var DocFileName : string, TermFileName : string;
+
+  DocFileName = SplitFile( GetTxtFileName("") );
+
+  DocFileName = MergeFile( DocFileName, "fm_prn_" + string(UserNumber), ".doc" );
+
+  DocFileName = MergeFile( GetCurDir(), DocFileName );
+
+  WordApp.visible = true; 
+end;
+
+/* EVG Ранее была описана в repforms.mac, но потом закомментирована там из-за переопределения
+   в АРМ. */
+private MACRO GetClientByAccount(account,chapter,code)
+private var rsc:object = Null, str="";
+
+    str=string(" select t.* from daccount_dbt t where t.t_chapter=",chapter," and t.t_account='",account,"' and t.t_code_currency=",code);    
+    rsc=execSQLselect(str);
+    if( rsc.moveNext())
+      return rsc.value("t_client");
+    else
+        msgbox ("Счет ",account," по главе ",chapter," не найден ");
+        return 0;
+    end;
+
+END;
+
+MACRO SprAccDialog(Acc, Branch, Client, Chapter, Code, NumOper) 
+   var Account = "",
+       BeginDate,
+       dkb,
+       EndDate;
+   var NumDep:string = "",
+       Dep:string = "";
+   
+   var path = "",
+    pathfile = "",
+    filen = "RSU.lbr";
+
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+   pathfile = FindPath(filen,path);
+	if (not pathfile)
+		msgbox("Не найдена LBR");
+		exit();
+	end;
+   var dlg = TRecHandler("spracc",pathfile,True);
+
+/*
+   record office(ptoffice);
+   record superior(ptoffice);
+*/
+
+   /*Процедура заполнения данными шаблона MSWord*/
+   MACRO PrintSprAcc()
+
+      var WordApp, WordDoc, tbl;
+      const RSL_Account_num = "Account_num";
+      const RSL_Chief_name  = "Chief_name";
+      const RSL_Client_name = "Client_name";
+      const RSL_Date_begin  = "Date_begin";
+      const RSL_Date_end    = "Date_end";
+      const RSL_Depart_name = "Depart_name";
+      const RSL_Result_Grid = "Result_Grid";
+      const RSL_d="d";
+      const RSL_mon="mon";
+      const RSL_year="year";
+
+       
+      var RegParam:string = "";
+      var Templ:string    = "";
+      
+      
+      var select:string = "";
+      var rs:object = null;
+      var stat:bool = false;
+      var Date_Carry       = TArray,
+          Account_Receiver = TArray,
+          Sum              = TArray;
+      
+      var n:integer = 0; /*Количество строк*/
+       
+      var i:integer = 2; /*Строка, с которой начинаем заполнять табличку*/
+      var j:integer = 0;
+      var temppath = "";
+      var ClientName:string = "";
+      var DepartName:string = "";
+      var OfficerName:string = "";
+      var d, mon, year;
+
+      
+
+      private macro day_open_c4et_date(a:string) //02.08.2012 vihrov I-00215701-2
+		private var ds1 = TRsbDataset("select t_open_date from daccount_dbt where t_account='"+a+"'");	
+		if (ds1.movenext())
+			return ds1.open_date;
+		else
+			msgbox("не смог выбрать дату открытия для счета "+a);
+		end;
+	  onerror(err)
+	     MsgBox("Ошибка получения даты открытия счета ", account," | ",Err.Message,"| at ",Err.Line,"|in ",Err.Module,   " | ",Err.AXMes);
+      end;
+
+      private var date_c4et_open:date = day_open_c4et_date(account); //02.08.2012 vihrov I-00215701-2
+
+      ClientName = GetClientName(Client);
+      DepartName = GetOfficerPost(Branch);
+      OfficerName= GetOfficerName(Branch);
+      
+      /* Если не получили данных по основным значениям - то не печатаем ничего вообще */
+      if ( (ClientName != 0) and (DepartName != 0) and (OfficerName != 0) )
+
+        select = " SELECT arh.t_date_carry, arh.t_account_receiver, symb.t_sum " +
+                 " FROM dacctrn_dbt arh " +
+                 "      inner join (select * " +
+                 "                  from dsymbcash_dbt " +
+                 "                  where trim(t_symbol) = '40') symb on " + 
+                 "      (arh.t_acctrnid = symb.t_acctrnid) " +
+                 " WHERE arh.t_account_payer = '" + Account + "' AND " +
+                 "       (arh.t_date_carry BETWEEN '" + BeginDate + "' AND '" + EndDate + "') AND " +
+                 "       substr(arh.t_account_receiver,1,8) = '20202810' " +
+                 " ORDER BY arh.t_date_carry, symb.t_sum ";
+/*         
+         select = "SELECT arh.t_date_carry, arh.t_account_receiver, symb.t_sum "+
+                  "FROM darhdoc_dbt arh, dsymbcash_dbt symb WHERE arh.t_account_payer = '"+Account+"' "+
+                  "AND (arh.t_date_value BETWEEN '"+BeginDate+"' AND '"+EndDate+"') AND substr(arh.t_account_receiver, 1, 8) = '20202810' "+
+                  "AND arh.t_applicationkey IN (select substr(symb.t_applicationkey,6) "+
+                  "FROM dsymbcash_dbt WHERE trim(symb.t_symbol) = '40') ORDER BY arh.t_date_carry, symb.t_sum ";
+*/               
+         rs = ExecSQLSelect(select);
+         
+         while (rs.moveNext())
+           Date_Carry(n)       = date(rs.Value("t_date_carry"));
+           Account_Receiver(n) = rs.Value("t_account_receiver");
+           Sum(n)              = rs.Value("t_sum");
+           n = n + 1;
+         end;
+
+         GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+
+
+         var fgBank = fg_life_subject({OurBank}); // KS 10.08.2010 I-058375 Шаблон ДБК нужен только для ПРББ
+         if ((dkb == True) and ((fgBank.is_PRBB) or (fgBank.is_GEB)))
+             if (n > 0)
+                 Templ = "SprAccClientDkb.dot";
+             else
+                 Templ = "SprAccNullDkb.dot";
+             end;
+         else
+             if (n > 0)
+                 Templ = "SprAccClient.dot";
+             else
+                 Templ = "SprAccNull.dot";
+             end;
+         end;
+         temppath = findpath(Templ,RegParam); 
+ /*        CreateDocFromTemplate(temppath);
+         DateSplit({curdate}, d, mon, year);
+         SetBookmarkText(RSL_d, d);
+         SetBookmarkText(RSL_mon, MonName(mon));
+         SetBookmarkText(RSL_year, year);
+         SetBookmarkText(RSL_Account_num, Account);
+         SetBookmarkText(RSL_Chief_name, OfficerName);
+         SetBookmarkText(RSL_Depart_name, DepartName);
+         SetBookmarkText(RSL_Client_name, ClientName);
+         SetBookmarkText(RSL_Date_begin, BeginDate );
+         SetBookmarkText(RSL_Date_end, EndDate );
+         while (n > j)
+               SetTableLine(RSL_Result_Grid,i,Date_Carry.Value(j),Account_Receiver.Value(j),string(Sum.Value(j):a));
+               i = i + 1;
+               j = j + 1;
+         end;
+         SetWordVisible(True);
+         GetWordObject().Activate();*/
+
+    DateSplit({curdate}, d, mon, year);
+    WordApp = CreateWordApplication();
+
+    if( WordApp )
+
+       fgBank = fg_life_subject({OurBank}); // KS 10.08.2010 Для разных банков немного по разному надо работать с шаблоном 
+       WordDoc = WordApp.Documents.Add( temppath );
+       if( WordDoc )
+          //Gurin S. 06.11.2014
+          if (not fgBank.is_EXV)
+             WordDoc.Bookmarks("d").Range.Text             =  mkstr( "0", 2 - strlen(string(d  )) ) + d; // KS 03.12.2010 I-097083 День с нулем
+             WordDoc.Bookmarks("mon").Range.Text           =  MonNameR(mon);                             // KS 03.12.2010 I-097083 Месяц в родительном падеже
+             WordDoc.Bookmarks("year").Range.Text          =  year;
+          end;
+          WordDoc.Bookmarks("Account_num").Range.Text   =  Account;
+          //Gurin S. 06.11.2014 Саратов и филиалы тоже
+          if (( fgBank.is_GEB ) or ( fgBank.is_VUZ ) or (fgBank.is_EXV)) // KS 10.08.2010 14.09.2010 I-065231 Нижняя дата для ГЭБ и ВУЗ
+            WordDoc.Bookmarks("Oper_name").Range.Text    =  GetOperName({oper});
+            WordDoc.Bookmarks("day_b").Range.Text        =  mkstr( "0", 2 - strlen(string(d  )) ) + d;
+            WordDoc.Bookmarks("mon_b").Range.Text        =  mkstr( "0", 2 - strlen(string(mon)) ) + mon;
+            WordDoc.Bookmarks("year_b").Range.Text       =  year;
+          else  // KS 10.08.2010 Для ГЭБ и ВУЗ не требуется
+            WordDoc.Bookmarks("Chief_name").Range.Text   =  OfficerName; 
+            WordDoc.Bookmarks("Depart_name").Range.Text  =  DepartName;
+          end;
+          WordDoc.Bookmarks("Client_name").Range.Text   =  ClientName;
+          if (date_c4et_open > BeginDate)  //02.08.2012 vihrov I-00215701-2
+          	WordDoc.Bookmarks("Date_begin").Range.Text    =  "даты открытия счета "+date_c4et_open;
+          else
+          	WordDoc.Bookmarks("Date_begin").Range.Text    =  BeginDate;
+          end;
+          WordDoc.Bookmarks("Date_end").Range.Text      =  EndDate;
+
+        tbl = WordApp.ActiveDocument.Tables.Item(2);
+        WHILE ((n > j))    
+           tbl.Cell(i, 1).Range.Text  = Date_Carry.Value(j);
+           tbl.Cell(i, 2).Range.Text  = Account_Receiver.Value(j);
+           tbl.Cell(i, 3).Range.Text  = string(Sum.Value(j):a);
+           i = i + 1;
+           j = j + 1;
+           tbl.Rows.Add();
+        END; // while
+ 
+        if( IsStandAlone() )
+          WordApp.Visible = TRUE;
+        else
+          ShowReportOnTerminal( WordApp, WordDoc );
+        end; 
+
+       end; /*if( WordDoc )*/
+    end;/*if( WordApp )*/
+//  end; 
+
+
+      end;
+
+   OnError(Err)
+     MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module,
+            "ActiveX Err:",Err.AXMes);
+     SetWordVisible(True);
+     GetWordObject().Activate();
+
+      
+   END;
+
+   /*Обработчик диалоговой панели ввода исходных данных для печати*/
+   MACRO Event (dlg, cmd, id, key) 
+
+      var mess = "~F2~ Продолжить  ~ESC~ Выход ";
+/*
+      var PartyID:integer = {OurBank};
+      var OrgDate:date = {curdate} + 1;
+      var NoChangeDate:bool = false;
+*/    
+
+      if(cmd == DLG_INIT)
+         dlg.rec.Acc       = Acc;
+         dlg.rec.BeginDate = {curdate};
+         dlg.rec.EndDate   = {curdate};
+//         dlg.NumDep = "";
+//         dlg.Dep = "По всем отделам" ;       
+
+         UpdateFields(dlg); 
+      end;
+      
+      if (cmd==DLG_SETFOCUS)
+
+        message(mess);        
+      end;
+      
+      if (cmd == DLG_REMFOCUS)
+        if (FldName(dlg,id)=="Acc")
+           if (StrLen(dlg.rec.acc) < 20)
+              MsgBox("Длина счета менее 20 символов");
+              return CM_CANCEL;
+           elif (not GetAccount(StrSubst(dlg.rec.acc, "'", "")))
+              MsgBox("Счет отсутствует в справочнике лицевых счетов");
+              return CM_CANCEL;
+           else
+              Client = GetClientByAccount(dlg.rec.acc, Chapter, Code);
+              Branch = GetBranchByAccount(dlg.rec.acc, Chapter, Code);
+           end;
+        elif (FldName(dlg,id)=="BeginDate")
+           if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+              MsgBox("Дата начала больше даты окончания отчетного периода");
+              return CM_CANCEL;
+           elif ( dlg.rec.BeginDate > {curdate} )
+              MsgBox("Дата начала больше даты текущего операционного дня"); 
+              return CM_CANCEL;
+           end;
+        elif (FldName(dlg,id)=="EndDate") 
+           if (dlg.rec.EndDate < dlg.rec.BeginDate )
+              MsgBox("Дата окончания меньше даты начала отчетного периода"); 
+              return CM_CANCEL;
+           elif ( dlg.rec.EndDate > {curdate} )
+              MsgBox("Дата окончания больше даты текущего операционного дня");
+              return CM_CANCEL;
+           end;
+        end;
+        UpdateFields(dlg); 
+      end; 
+   
+      if (cmd==DLG_KEY)
+        if (KEY==KEY_ESC)
+           return CM_CANCEL;
+        elif ( KEY==KEY_F2 )
+              Account = StrSubst(dlg.rec.acc, "'", "");
+              BeginDate = dlg.rec.BeginDate; 
+              EndDate = dlg.rec.EndDate;
+              if (dlg.rec.button == "X")
+                  dkb = True;
+              else
+                  dkb = False;
+              end;
+
+
+          /*02/09/2008 Новиков С. С. добавил возможность формирования отчета только при корректных значениях*/
+          if ((StrLen(dlg.rec.acc) == 20) and (dlg.rec.BeginDate <= dlg.rec.EndDate) and (dlg.rec.BeginDate <= {curdate})
+             and (dlg.rec.EndDate >= dlg.rec.BeginDate) and (dlg.rec.EndDate <= {curdate}) and (GetAccount(StrSubst(dlg.rec.acc, "'", "")))) 
+               Return CM_SAVE;
+          else
+            MsgBox("Не все поля корректны!");
+          end;
+         /***************************************************************************************************/
+        elif ( (KEY==KEY_ENTER) and (FldName(dlg,id)=="EndDate") )
+            SetFocus(dlg, 0);
+            Return CM_IGNORE;
+
+        elif (KEY==KEY_SPACE)
+            if(FldName(dlg,id)=="button")
+                if (dlg.rec.button == "")
+                    dlg.rec.button = "X";
+                else
+                    dlg.rec.button = "";
+                end;
+            end;
+        end;
+      END;
+    end;
+   if (RunDialog(dlg, "Event"))
+     if (Account != "")
+       //put_log("go");
+       PrintSprAcc();
+       //put_log("end");
+     end;
+   end;
+END;
+
+
+//SprAccDialog("40702810008110027589", 128,61799,1,0,2671);

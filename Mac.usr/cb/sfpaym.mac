@@ -1,0 +1,831 @@
+/*
+    Оплата ПЗО на шаге методом "платеж банка"
+                27.07.2001, Fr
+*/
+
+import sfpay_lib, lib_pm_check, lib_fg;;
+
+// zmp 15.09.2014 C-32626
+private macro check_over(account)
+   var sql = "select 1 from daccount_dbt where instr (t_type_account, 'О') > 0 and t_account = :account";
+   sql = execSqlSelect (sql, makeArray (SqlParam ("account", account)));
+   return (sql and sql.moveNext ());
+end;
+
+//Gurin S. 11.11.2014 I-00531176-1 <=
+private macro haveNotFreeRest(pid)                                                        
+   var sql = " SELECT   nvl(max(1), 0)                                                                                                      "+
+             "   FROM   dpmpaym_dbt pm, dpmrmprop_dbt pr                                                                                    "+
+             "  WHERE   PM.T_PAYMENTID = " + pid + " AND PM.T_PAYMENTID = Pr.T_PAYMENTID                                                    "+
+             "          AND PM.T_baseAMOUNT <=                                                                                              "+
+             "                (  (SELECT   usr_get_rest (PM.T_PAYERACCOUNT, rsbsessiondata.curdate - 1) FROM   DUAL)                        "+
+             "                 + (SELECT   NVL (SUM (trn1.T_SUM_NATCUR), 0)                                                                 "+
+             "                      FROM   dacctrn_dbt trn1                                                                                 "+
+             "                     WHERE   trn1.T_ACCOUNT_RECEIVER = PM.T_PAYERACCOUNT                                                      "+
+             "                             AND trn1.t_date_carry = rsbsessiondata.curdate                                                   "+
+             "                             AND NOT SUBSTR (trn1.T_ACCOUNT_PAYER, 1, 3) BETWEEN '452' AND  '458')                            "+
+             "                 - (SELECT   NVL (SUM (trn2.T_SUM_NATCUR), 0)                                                                 "+
+             "                      FROM   dpmdocs_dbt docs,                                                                                "+
+             "                             usr_over_comiss com,                                                                             "+
+             "                             dacctrn_dbt trn2                                                                                 "+
+             "                     WHERE       DOCS.T_PAYMENTID = COM.T_PAYMENTID                                                           "+
+             "                             AND trn2.T_ACCTRNID = DOCS.T_ACCTRNID                                                            "+
+             "                             AND trn2.T_ACCOUNT_PAYER = PM.T_PAYERACCOUNT                                                     "+
+             "                             AND trn2.T_DATE_CARRY = rsbsessiondata.curdate)                                                  "+
+             "                 - (SELECT   USR_ACCREST.GET_CLAIMS (PM.T_PAYERACCOUNT, rsbsessiondata.curdate, PR.T_PRIORITY) FROM   DUAL))  ";                                                                                                                                                           
+
+   sql = rsdrecordset(sql);                                                                                    
+   sql.movenext();                                                                      
+   return sql.value(0, null, v_integer) == 0;
+onError
+   return false;
+end;
+
+// joy
+macro GetRefID(pP)
+   if (pP.objectType == 663) // удержан. период. комиссия
+      return 1000663;
+   end;
+  
+   if (pP.objectType == 664) // удержан. разовая комиссия
+      return 1000664;
+   end;
+  
+   if (pP.objectType == 665) // удержан. единовр. комиссия
+      return 1000665;
+   end;
+end;
+
+macro SfFillBankPayment( Paym, PayDate )
+
+  Paym.Purpose            = PM_PURP_BANKPAYMENT;
+  Paym.PaymStatus         = PM_READIED;
+  Paym.NumberPack         = 995;
+  Paym.PayerBankEnterDate = PayDate;
+  Paym.ToBackOffice       = "";
+
+  Paym.Date               = PayDate;
+  Paym.PayDate            = PayDate;
+  Paym.ClientDate         = PayDate;
+  Paym.PaymentKind        = "Н";
+  Paym.Priority           = 5;
+  Paym.ComissCharges      = 0;
+  if( Paym.DocKind == DLDOC_BANKCLAIM )
+    Paym.ShifrOper        = "02";
+  else
+    Paym.ShifrOper        = "01";
+  end;
+
+  return 0;
+end;
+
+/*
+        ----------------- Оплата платежом ------------------------------
+*/
+macro SfFormBankPaymentExt( sidebet, sicredit, sfcomiss, payParams:TSfPayParams, 
+                            PaymStatus, sfinvlnk, SumInInvFIID,
+                            IsBatchMode, oprchild )
+
+  var Payment     : RsbPayment;
+  var BankPaym:object; 
+  var Number      : string;
+  var RefID;
+
+  var PmAmount = payParams.paySum;
+  if( (SumInInvFIID != null) AND (sidebet.rec.FIID != payParams.payFIID) )
+    PmAmount = SumInInvFIID;
+  end;
+
+  /* все проверки плат. и получ. в sfpay.mac.
+  if( sidebet.Rec.BankID != {OurBank} )
+    MsgBox("При оплате ПЗО платежом банка|плательщик должен быть в нашем банке");
+    return 1;
+  end;
+  */
+
+  if( (payParams.payFIID == NATCUR) AND (sidebet.rec.FIID == NATCUR) AND (sicredit.rec.FIID == NATCUR) )
+    BankPaym = RsbBankPayment(0);
+    Payment = BankPaym.Payment;
+
+    /* EVG */
+     if( payParams.ground == "" )
+       Payment.Ground = "Комиссия за обслуживание";
+     else
+       Payment.Ground = payParams.ground;
+     end;
+
+    BankPaym.Origin     = MEMORDER_FDOC_SF;
+    BankPaym.Oper       = {oper}; 
+    BankPaym.Status     = 1 /*MEMORDER_STATUS_POST*/;
+    BankPaym.LaunchOper  = true;
+
+    Payment.DocKind     = DLDOC_BANKPAYMENT;
+    Payment.Purpose     = PM_PURP_BANKPAYMENT;
+    
+    if( SfFillPaymentExt( Payment, sidebet, sicredit, sfcomiss, payParams, PmAmount )) 
+      return 1; 
+    end;
+    if( SfFillBankPayment( Payment, payParams.PayDate ))
+      return 1; 
+    end;
+
+  else
+    BankPaym = GenObject( "RsbBbCpOrder", 0 );
+    Payment = BankPaym.Payment;
+
+    BankPaym.Origin       = CP_OR_SF;
+    BankPaym.Oper         = {oper}; 
+    BankPaym.CurrentState = 0 /*CP_ST_DEFERRED*/;
+    BankPaym.LaunchOper  = true;
+
+    Payment.PayerFIID   = sidebet.rec.FIID; 
+    Payment.DocKind     = BBANK_CPORDER;
+    Payment.Purpose     = PM_PURP_BANKPAYMENT;
+
+    if( SfFillPaymentExt( Payment, sidebet, sicredit, sfcomiss, payParams, PmAmount )) 
+      return 1; 
+    end;
+    if( SfFillBankPayment( Payment, payParams.PayDate ))
+      return 1; 
+    end;
+    
+  end;
+
+  /* EVG Перенёс выше
+  if( payParams.ground == "" )
+    Payment.Ground = "Комиссия за обслуживание";
+  else
+    Payment.Ground = payParams.ground;
+  end;*/
+
+  if( GetReferenceIDByType( 
+        OBJTYPE_PSPAYORD, /*Рублевый платежный документ*/
+        REFOBJ_SVORDER,   /*ObjectType = 500; номер требования банка к клиентам (РКО)*/
+        RefID ) != 0 )
+
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  end;
+
+  // joy
+  if (_bank.is_VUZ or _bank.is_GEB or _bank.is_SLD or _bank.is_PRBB)
+     RefID = GetRefID(payParams);
+  end;
+
+  if( GenerateReference( RefID, Number ) != 0 )
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  else
+    Payment.Number = Number;
+  end;
+
+  if( PaymStatus != null )
+    Payment.PaymStatus = PaymStatus;
+  end;
+
+  if( sfinvlnk != null )
+    Payment.LinkSfInvoice( sfinvlnk.rec.InvoiceID, sfinvlnk.rec.PayAmount, sfinvlnk.rec.PaidNDS, sfinvlnk.rec.PayFIID );
+  end;
+
+  Payment.FeeType = payParams.feeType;
+  if( payParams.objectID != null )
+    Payment.DefComID = payParams.objectID;
+  end;
+
+  if( (IsBatchMode != null) AND (IsBatchMode == true) )
+    
+    BankPaym.ConnectToOperation( oprchild.ID_Operation, oprchild.ID_Step );
+
+    if( BankPaym.Update() != 0 )
+      return 1;
+    end;
+
+    oprchild.Child_DocKind    = Payment.DocKind;
+    oprchild.Child_DocumentID = PM_MakeDocumentID( Payment.DocKind, Payment.DocumentID );
+  end;
+
+  return 0;
+   
+end;
+
+macro SfFormBankPayment( sidebet, sicredit, sfcomiss, payDate, ground, paySum, taxSum, payFIID, PaymStatus, sfinvlnk, 
+                         PlusCalc_Account, PlusCalcNDS_Account, feeType, DefComID, SumInInvFIID,
+                         IsBatchMode, ID_Operation, ID_Step, ChildDocKind:@integer, ChildDocID:@string )
+
+  var payParams = TSfPayParams;
+
+
+  payParams.payDate = payDate;
+  payParams.ground = ground; 
+  payParams.paySum = paySum; 
+  payParams.taxSum = taxSum;
+  payParams.payFIID = payFIID;
+
+  payParams.PlusCalc_Account = PlusCalc_Account;
+  payParams.PlusCalcNDS_Account = PlusCalcNDS_Account;
+  
+  payParams.feeType = feeType;
+  payParams.objectID = DefComID;
+
+  return SfFormBankPaymentExt( sidebet, sicredit, sfcomiss, payParams, PaymStatus, sfinvlnk, SumInInvFIID,
+                               IsBatchMode, ID_Operation, ID_Step, @ChildDocKind, @ChildDocID );
+
+end;
+
+macro SfFormMemorialOrder( sidebet, sicredit, sfcomiss, PayDate, ground, paySum, taxSum, FIID, sfinvlnk, 
+                           PlusCalc_Account, PlusCalcNDS_Account, DefComID, SumInInvFIID )
+
+  const MCDOC_STATUS_POST = 1;
+
+  var Payment:object;
+  var Memorial:object; /*RsbMemorialOrder*/;
+  var Multy:object;
+  var Number      : string;
+  var RefID;
+
+  var PmAmount = paySum;
+  if( (SumInInvFIID != null) AND (sidebet.rec.FIID != FIID) )
+    PmAmount = SumInInvFIID;
+  end;
+
+  if( sidebet.rec.FIID == sicredit.rec.FIID )
+
+    Memorial = GenObject( "RsbMemorialOrder", 0 );
+    Payment  = Memorial.Payment();
+
+    Memorial.State         = 0; /*CB_DOC_STATE_DEFERRED*/;
+    Memorial.Oper          = {oper};
+    Memorial.Chapter       = 1; /*CHAPT1*/;
+    Memorial.Code_Currency = FIID;
+
+    /* EVG
+    Memorial.Kind_Oper     = " 4";*/
+    Memorial.Kind_Oper     = " 6";
+    
+    /* EVG Происхождение "Создан автоматически".
+    Memorial.Origin        = CB_DOC_ORIGIN_MANUAL;*/
+    Memorial.Origin        = CB_DOC_ORIGIN_AUTO;
+
+    Memorial.LaunchOper    = true;
+    Memorial.Kind_Operation= 24001;     // "Платёжный документ"
+
+    Payment.DocKind        = DLDOC_MEMORIALORDER;
+    Payment.Purpose        = PM_PURP_MEMORDER;
+    Payment.ShifrOper      = "09";
+
+  else
+    Multy = GenObject( "RsbMultyDoc", 0 );
+    Payment  = Multy.Payment();
+
+    Multy.Oper    = {oper};
+    Multy.Chapter = 1;    
+    Multy.Origin  = MULTYDOC_ORIGIN_AUTO;
+    Multy.Status  = MCDOC_STATUS_POST;
+    Multy.LaunchOper = true;
+
+    Payment.DocKind    = CB_MULTYDOC;
+    Payment.Purpose    = PM_PURP_MULTYDOC;
+    Payment.ShifrOper  = "09";
+
+  end;
+
+  /* EVG */
+  Payment.NumberPack = 1;
+  
+  if( SfFillPayment( Payment, sidebet, sicredit, sfcomiss, PayDate, paySum, taxSum, FIID, 
+                     PlusCalc_Account, PlusCalcNDS_Account, PmAmount )) 
+    return 1; 
+  end;
+
+  if( ground == "" )
+    Payment.Ground = "Комиссия за обслуживание";
+  else
+    Payment.Ground = ground;
+  end;
+
+  if( GetReferenceIDByType( 
+        OBJTYPE_PSPAYORD, /*Рублевый платежный документ*/
+        REFOBJ_SVORDER,   /*ObjectType = 500; номер требования банка к клиентам (РКО)*/
+        RefID ) != 0 )
+
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  end;
+
+  if( GenerateReference( RefID, Number ) != 0 )
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  else
+    Payment.Number = Number;
+  end;
+
+  if( sfinvlnk != null )
+    Payment.LinkSfInvoice( sfinvlnk.rec.InvoiceID, sfinvlnk.rec.PayAmount, sfinvlnk.rec.PaidNDS, sfinvlnk.rec.PayFIID );
+  end;
+
+  Payment.FeeType = sfcomiss.feeType;
+  if( DefComID != null )
+    Payment.DefComID = DefComID;
+  end;
+
+  return 0;
+
+end;
+
+
+macro SfFormBankOrderExt( sidebet, sicredit, sfcomiss, payParams:TSfPayParams, sfinvlnk, SumInInvFIID,
+                          IsBatchMode, oprchild )
+
+  const MCDOC_STATUS_POST = 1;
+
+  var BankOrder:object;
+  
+  var Number:string;
+  var RefID;
+
+  var PmAmount = payParams.paySum;
+  if( (SumInInvFIID != null) AND (sidebet.rec.FIID != payParams.payFIID) )
+    PmAmount = SumInInvFIID;
+  end;
+
+  BankOrder = GenObject( "RsbBankOrder", 0 );
+
+  BankOrder.Oper    = {oper};
+  BankOrder.LaunchOper    = true;
+  BankOrder.PrimDocOrigin = PD_OR_SF;
+
+  BankOrder.ShifrOper = SF_SHIFR_OPER_BANK_ORDER;
+  BankOrder.NumberPack = 1; //SDA 12.02.2012  по просьбе Г. Байдуловой
+
+  /* EVG */
+  if( payParams.ground == "" )
+    BankOrder.Ground = "Комиссия за обслуживание";
+  else
+    BankOrder.Ground = payParams.ground;
+  end;
+
+  if( SfFillPaymentExt( BankOrder, sidebet, sicredit, sfcomiss, payParams, PmAmount )) 
+    return 1; 
+  end;
+
+  /* EVG Перенёс выше
+  if( payParams.ground == "" )
+    BankOrder.Ground = "Комиссия за обслуживание";
+  else
+    BankOrder.Ground = payParams.ground;
+  end;*/
+ 
+  if( GetReferenceIDByType( 
+        OBJTYPE_PSPAYORD, /*Рублевый платежный документ*/
+        REFOBJ_SVORDER,   /*ObjectType = 500; номер требования банка к клиентам (РКО)*/
+        RefID ) != 0 )
+
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  end;
+
+  // joy
+  if (_bank.is_VUZ or _bank.is_GEB or _bank.is_SLD or _bank.is_PRBB)
+     RefID = GetRefID(payParams);
+  end;
+
+  if( GenerateReference( RefID, Number ) != 0 )
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  else
+    BankOrder.Number = Number;
+  end;
+
+  if( sfinvlnk != null )
+    BankOrder.LinkSfInvoice( sfinvlnk.rec.InvoiceID, sfinvlnk.rec.PayAmount, sfinvlnk.rec.PaidNDS, sfinvlnk.rec.PayFIID );
+  end;
+
+  BankOrder.FeeType = payParams.feeType;
+  if( payParams.ObjectID != null )
+    BankOrder.DefComID = payParams.ObjectID;
+  end;
+
+  if( (IsBatchMode != null) AND (IsBatchMode == true) )
+
+    BankOrder.ConnectToOperation( oprchild.ID_Operation, oprchild.ID_Step );
+
+    if( BankOrder.Update() != 0 )
+      return 1;
+    end;
+
+    //zmp 15.09.2014 C-32626  
+    if( _bank.is_vuz and (haveNotFreeRest(BankOrder.PaymentID)) and (check_over(BankOrder.PayerAccount))  and inlist(BankOrder.FeeType, 1, 3)) 
+       BankOrder.Categories.ConnectAttr(1051, 1, null, null, {curdate});     
+       BankOrder.Categories.save();
+       PM_InsertOverComiss(BankOrder.PaymentID);
+    end;
+
+    oprchild.Child_DocKind    = BankOrder.DocKind;
+    oprchild.Child_DocumentID = PM_MakeDocumentID( BankOrder.DocKind, BankOrder.DocumentID );
+  end;
+
+  return 0;
+
+end;
+
+macro SfFormBankOrder( sidebet, sicredit, sfcomiss, payDate, ground, paySum, taxSum, payFIID, sfinvlnk, 
+                       PlusCalc_Account, PlusCalcNDS_Account, feeType, DefComID, SumInInvFIID,
+                       IsBatchMode, ID_Operation, ID_Step, ChildDocKind:@integer, ChildDocID:@string )
+  var payParams = TSfPayParams;
+
+  payParams.payDate = payDate;
+  payParams.ground = ground; 
+  payParams.paySum = paySum; 
+  payParams.taxSum = taxSum;
+  payParams.payFIID = payFIID;
+  
+  payParams.feeType = feeType;
+  payParams.objectID = DefComID;
+
+  payParams.PlusCalc_Account = PlusCalc_Account;
+  payParams.PlusCalcNDS_Account = PlusCalcNDS_Account;
+
+  return SfFormBankOrderExt( sidebet, sicredit, sfcomiss, payParams, sfinvlnk, SumInInvFIID,
+                             IsBatchMode, ID_Operation, ID_Step, @ChildDocKind, @ChildDocID );
+end;
+
+
+
+/* EVG 14/02/2012 Перенесено */
+
+/*
+ А.Киселев 13.04.2011 
+ Наряд №I-00012707
+ Технология Экспресс-Волга, контактное лицо М.Журавлев
+*/
+
+
+
+//класс реквизитов для шаманства чтобы не портить СПИ
+Class TSi(F_Si:@TRecHandler,S_Si:@TRecHandler)
+var
+    v_BankID,
+    v_BankCodeKind,
+    v_BankCode,
+    v_BankName,
+    v_CorrAcc,
+    v_FIID,
+    v_Account,
+    v_PartyID,                  
+    v_PartyName,
+    v_PartyINN,
+    v_PartyCodeKind,
+    v_PartyCode,
+    v_ReceiverNDSAccount;
+//конструктор по умолчанию и с параметрами
+ if( not ValType(F_Si.rec.BankID) ) v_BankID = 0;
+ else v_BankID = F_Si.rec.BankID; end;
+ if( not ValType(F_Si.rec.BankCodeKind) ) v_BankCodeKind = 0;
+ else v_BankCodeKind = F_Si.rec.BankCodeKind; end;
+ if( not ValType(F_Si.rec.BankCode) ) v_BankCode = "";
+ else v_BankCode = F_Si.rec.BankCode; end;
+ if( not ValType(F_Si.rec.BankName) ) v_BankName = "";
+ else v_BankName = F_Si.rec.BankName; end;
+ if( not ValType(F_Si.rec.CorrAcc) ) v_CorrAcc = "";
+ else v_CorrAcc = F_Si.rec.CorrAcc; end;
+ if( not ValType(F_Si.rec.FIID) ) v_FIID = 0;
+ else v_FIID = F_Si.rec.FIID; end;
+ if( not ValType(F_Si.rec.Account) ) v_Account = "";
+ else v_Account = F_Si.rec.Account; end;
+ if( not ValType(F_Si.rec.PartyID) ) v_PartyID = 0;
+ else v_PartyID = F_Si.rec.PartyID; end;
+ if( not ValType(F_Si.rec.PartyName) ) v_PartyName = "";
+ else v_PartyName = F_Si.rec.PartyName; end;
+ if( not ValType(F_Si.rec.PartyINN) ) v_PartyINN = "";
+ else v_PartyINN = F_Si.rec.PartyINN; end;
+ if( not ValType(F_Si.rec.PartyCodeKind) ) v_PartyCodeKind = 0;
+ else v_PartyCodeKind = F_Si.rec.PartyCodeKind; end;
+ if( not ValType(F_Si.rec.PartyCode) ) v_PartyCode = "";
+ else v_PartyCode = F_Si.rec.PartyCode; end;
+ if( not ValType(F_Si.rec.ReceiverNDSAccount) ) v_ReceiverNDSAccount = "";
+ else v_ReceiverNDSAccount = F_Si.rec.ReceiverNDSAccount; end;
+//конструктор по умолчанию и с параметрами
+
+ macro SetDefaultParam (F_Si:@TRecHandler); 
+  F_Si.rec.BankID = v_BankID;
+  F_Si.rec.BankCodeKind = v_BankCodeKind;
+  F_Si.rec.BankCode = v_BankCode;
+  F_Si.rec.BankName = v_BankName;
+  F_Si.rec.CorrAcc = v_CorrAcc;
+  F_Si.rec.FIID = v_FIID;
+  F_Si.rec.Account = v_Account;
+  F_Si.rec.PartyID = v_PartyID;                         
+  F_Si.rec.PartyName = v_PartyName;
+  F_Si.rec.PartyINN = v_PartyINN;
+  F_Si.rec.PartyCodeKind = v_PartyCodeKind;
+  F_Si.rec.PartyCode = v_PartyCode;
+  F_Si.rec.ReceiverNDSAccount = v_ReceiverNDSAccount;
+ end;
+
+ macro ExchangeParamS_F(F_Si:@TRecHandler,S_Si:@TRecHandler);
+  F_Si.rec.BankID = S_Si.rec.BankID;
+  F_Si.rec.BankCodeKind = S_Si.rec.BankCodeKind;
+  F_Si.rec.BankCode = S_Si.rec.BankCode;
+  F_Si.rec.BankName = S_Si.rec.BankName;
+  F_Si.rec.CorrAcc = S_Si.rec.CorrAcc;
+//  F_Si.rec.FIID = F_Si.rec.FIID;
+//  F_Si.rec.Account = F_Si.rec.Account;
+  F_Si.rec.PartyID = S_Si.rec.PartyID;                  
+  F_Si.rec.PartyName = S_Si.rec.PartyName;
+  F_Si.rec.PartyINN = S_Si.rec.PartyINN;
+  F_Si.rec.PartyCodeKind = S_Si.rec.PartyCodeKind;
+  F_Si.rec.PartyCode = S_Si.rec.PartyCode;
+//  F_Si.rec.ReceiverNDSAccount = S_Si.rec.ReceiverNDSAccount;
+  S_Si.rec.BankID = v_BankID;
+  S_Si.rec.BankCodeKind = v_BankCodeKind;
+  S_Si.rec.BankCode = v_BankCode;
+  S_Si.rec.BankName = v_BankName;
+  S_Si.rec.CorrAcc = v_CorrAcc;
+//  S_Si.rec.FIID = v_FIID;
+//  S_Si.rec.Account = v_Account;
+  S_Si.rec.PartyID = v_PartyID;                         
+  S_Si.rec.PartyName = v_PartyName;
+  S_Si.rec.PartyINN = v_PartyINN;
+  S_Si.rec.PartyCodeKind = v_PartyCodeKind;
+  S_Si.rec.PartyCode = v_PartyCode;
+//  S_Si.rec.ReceiverNDSAccount = v_ReceiverNDSAccount;
+ end;
+
+ macro SetParamFByS(F_Si:@TRecHandler,S_Si:@TRecHandler);
+  F_Si.rec.BankID = S_Si.rec.BankID;
+  F_Si.rec.BankCodeKind = S_Si.rec.BankCodeKind;
+  F_Si.rec.BankCode = S_Si.rec.BankCode;
+  F_Si.rec.BankName = S_Si.rec.BankName;
+  F_Si.rec.CorrAcc = S_Si.rec.CorrAcc;
+//  F_Si.rec.FIID = F_Si.rec.FIID;
+//  F_Si.rec.Account = F_Si.rec.Account;
+  F_Si.rec.PartyID = S_Si.rec.PartyID;                  
+  F_Si.rec.PartyName = S_Si.rec.PartyName;
+  F_Si.rec.PartyINN = S_Si.rec.PartyINN;
+  F_Si.rec.PartyCodeKind = S_Si.rec.PartyCodeKind;
+  F_Si.rec.PartyCode = S_Si.rec.PartyCode;
+//  F_Si.rec.ReceiverNDSAccount = S_Si.rec.ReceiverNDSAccount;
+ end;
+
+
+end;
+//класс реквизитов для шаманства чтобы не портить СПИ
+
+
+
+macro SfFillPayment_ForEXV(FlagNDS, Paym, sidebet, sicredit, sfcomiss, PayDate, paySum, taxSum, FIID, 
+                     PlusCalc_Account, PlusCalcNDS_Account, PmAmount )
+
+  const SFCOMISS_CALCCOMISSSUMALG_CALC      = 1; /*на день расчета*/
+  const SFCOMISS_CALCCOMISSSUMALG_PAY       = 2;
+  const SFCOMISS_CALCCOMISSSUMALG_BEFOREPAY = 3;
+
+  record MinusNDSAccount( account );
+
+  var stat;
+  var BaseRateDate = date(0, 0, 0);
+  
+  var taxSumInPmFIID = $0;
+  var paySumInPmFIID = $0;
+  var PayerAmount = $0, PayerAmount1 = $0;
+
+
+// если счет дебета не соответствует id-клиента по счету заполняем реквизиты из СПИ кредита
+// если счет кредита не соответствует id-клиента по счету заполняем реквизиты из СПИ дебета
+
+// конвертация сумм комиссии и НДС в ФИ получателя
+  if( ConvSum( taxSumInPmFIID, taxSum, PayDate, FIID, sidebet.Rec.FIID, 0 ) != 0 ) 
+    MsgBox("Не найден основной курс ",ПолучитьКодФинИн(FIID), " относительно ",ПолучитьКодФинИн(sidebet.Rec.FIID), " за ", PayDate);
+    return 1;
+  end;
+
+  if( ConvSum( paySumInPmFIID, PmAmount, PayDate, FIID, sidebet.Rec.FIID, 0 ) != 0 )
+    MsgBox("Не найден основной курс ",ПолучитьКодФинИн(FIID), " относительно ",ПолучитьКодФинИн(sidebet.Rec.FIID), " за ", PayDate);
+    return 1;
+  end;
+
+  if ( not FlagNDS )
+
+//Проверка если субъект счета не соответствует субъекту СПИ меняем реквизиты субъекта в ПИ платежа на реквизиты другой СПИ
+   Paym.SetPayerPI
+   ( 
+     PAYMENTS_GROUP_UNDEF,
+     sidebet.Rec.BankID,
+     sidebet.Rec.BankCodeKind,
+     sidebet.Rec.BankCode,
+     "", /*substr( sidebet.Rec.BankName, 1, BankNameLen ),*/
+     sidebet.Rec.CorrAcc,
+     sidebet.Rec.FIID,
+     1/*CHAPT1*/,
+     sidebet.Rec.Account,
+     sidebet.Rec.PartyID,                       
+     substr( sidebet.Rec.PartyName, 1, BankNameLen ),
+     sidebet.Rec.PartyINN,
+     sidebet.Rec.PartyCodeKind,
+     sidebet.Rec.PartyCode
+   );
+
+
+   Paym.SetReceiverPI
+   ( 
+     PAYMENTS_GROUP_UNDEF,
+     sicredit.Rec.BankID,
+     sicredit.Rec.BankCodeKind,
+     sicredit.Rec.BankCode,
+     "", /*substr( sicredit.Rec.BankName, 1, BankNameLen ),*/
+     sicredit.Rec.CorrAcc,
+     sicredit.Rec.FIID,
+     1/*CHAPT1*/,
+     sicredit.Rec.Account,
+     sicredit.Rec.PartyID,
+     substr( sicredit.Rec.PartyName, 1, BankNameLen ),
+     sicredit.Rec.PartyINN,
+     sicredit.Rec.PartyCodeKind,
+     sicredit.Rec.PartyCode
+   );
+
+//  Paym.PayerAmount    = PayerAmount;
+//  Paym.ReceiverAmount = paySum; taxSum;
+
+//   paySumInPmFIID;
+   Paym.BaseAmount     = paySum;
+  else
+   Paym.SetPayerPI
+   ( 
+     PAYMENTS_GROUP_UNDEF,
+     sidebet.Rec.BankID,
+     sidebet.Rec.BankCodeKind,
+     sidebet.Rec.BankCode,
+     "", /*substr( sidebet.Rec.BankName, 1, BankNameLen ),*/
+     sidebet.Rec.CorrAcc,
+     sidebet.Rec.FIID,
+     1/*CHAPT1*/,
+     sidebet.Rec.ReceiverNDSAccount,
+     sidebet.Rec.PartyID,
+     substr( sidebet.Rec.PartyName, 1, BankNameLen ),
+     sidebet.Rec.PartyINN,
+     sidebet.Rec.PartyCodeKind,
+     sidebet.Rec.PartyCode
+   );
+
+
+   Paym.SetReceiverPI
+   ( 
+     PAYMENTS_GROUP_UNDEF,
+     sicredit.Rec.BankID,
+     sicredit.Rec.BankCodeKind,
+     sicredit.Rec.BankCode,
+     "", /*substr( sicredit.Rec.BankName, 1, BankNameLen ),*/
+     sicredit.Rec.CorrAcc,
+     sicredit.Rec.FIID,
+     1/*CHAPT1*/,
+     sicredit.Rec.ReceiverNDSAccount,
+     sicredit.Rec.PartyID,
+     substr( sicredit.Rec.PartyName, 1, BankNameLen ),
+     sicredit.Rec.PartyINN,
+     sicredit.Rec.PartyCodeKind,
+     sicredit.Rec.PartyCode
+   );
+
+
+//   SfGetCategoryAccount( sfcomiss, /*OBJROLE_SFCOMISS_TAX_ACC*/ 2, MinusNDSAccount );
+// конвертация НДС в нац. ФИ 
+   if ( sicredit.Rec.FIID != NATCUR )
+     Paym.ReceiverFIID= NATCUR;
+//   if( sicredit.Rec.ReceiverNDSAccount == MinusNDSAccount.Account )
+     if( ConvSum( Paym.ReceiverAmount, taxSum, PayDate, FIID, NATCUR, 0 ) != 0 )
+       MsgBox("Не найден основной курс ",ПолучитьКодФинИн(FIID), " относительно ",ПолучитьКодФинИн(NATCUR), " за ", PayDate);
+       return 1;
+     end;
+
+   end;
+
+
+
+   Paym.BaseAmount     = taxSum;
+   Paym.Ground = "НДС " + Paym.Ground;
+
+//  Paym.PayerAmount    = PayerAmount;
+
+
+  end;
+
+  Paym.CryptoAction( string("Автоматическое_формирование_платежей") );
+
+
+  Paym.BaseFIID = FIID;
+  Paym.ValueDate      = 
+  Paym.Date           = {curdate};//PayDate;
+  Paym.PayerBankEnterDate = 
+  Paym.ClientDate         = {curdate};
+  Paym.IsPlanPaym     = "X";
+  Paym.PaymentKind    = "Н";
+  Paym.Priority       = 5;
+
+  return 0;
+end;
+
+
+
+macro SfFormMemorialOrder_ForEXV(FlagNDS, sidebet, sicredit, sfcomiss, PayDate, ground, paySum, taxSum, FIID, sfinvlnk, 
+                           PlusCalc_Account, PlusCalcNDS_Account, DefComID, SumInInvFIID )
+
+  const MCDOC_STATUS_POST = 1;
+
+  var Payment:object;
+  var Memorial:object; /*RsbMemorialOrder*/;
+  var Multy:object;
+  var Number      : string;
+  var RefID;
+
+  var PmAmount = paySum;
+  if( (SumInInvFIID != null) AND (sidebet.rec.FIID != FIID) )
+    PmAmount = SumInInvFIID;
+  end;
+
+
+  if( sidebet.rec.FIID == sicredit.rec.FIID )
+
+    Memorial = GenObject( "RsbMemorialOrder", 0 );
+    Payment  = Memorial.Payment();
+
+    Memorial.State         = 0; /*CB_DOC_STATE_DEFERRED*/;
+    Memorial.Oper          = {oper};
+    Memorial.Chapter       = 1; /*CHAPT1*/;
+    Memorial.Code_Currency = FIID;
+
+    /* EVG
+    Memorial.Kind_Oper     = " 4";*/
+    Memorial.Kind_Oper     = " 6";
+    
+    Memorial.Origin        = CB_DOC_ORIGIN_AUTO;
+
+    Memorial.LaunchOper    = true;
+    Memorial.Kind_Operation= 24001;     // "Платёжный документ"
+
+    Payment.DocKind        = DLDOC_MEMORIALORDER;
+    Payment.Purpose        = PM_PURP_MEMORDER;
+    Payment.ShifrOper      = "17";
+
+  else
+    Multy = GenObject( "RsbMultyDoc", 0 );
+    Payment  = Multy.Payment();
+
+    Multy.Oper    = {oper};
+    Multy.Chapter = 1;    
+    Multy.Origin  = MULTYDOC_ORIGIN_AUTO;
+    Multy.Status  = MCDOC_STATUS_POST;
+    Multy.LaunchOper = true;
+
+    Payment.DocKind    = CB_MULTYDOC;
+    Payment.Purpose    = PM_PURP_MULTYDOC;
+    Payment.ShifrOper  = "17";
+
+
+  end;
+
+  /* EVG */
+  Payment.NumberPack = 1;
+
+  /* EVG */
+  if( ground == "" )
+    Payment.Ground = "Комиссия за обслуживание";
+  else
+    Payment.Ground = ground;
+  end;
+
+  if( SfFillPayment_ForEXV(FlagNDS, Payment, sidebet, sicredit, sfcomiss, PayDate, paySum, taxSum, FIID, 
+                     PlusCalc_Account, PlusCalcNDS_Account, PmAmount )) 
+    return 1; 
+  end;
+
+
+
+  if( GetReferenceIDByType( 
+        OBJTYPE_PSPAYORD, /*Рублевый платежный документ*/
+        REFOBJ_SVORDER,   /*ObjectType = 500; номер требования банка к клиентам (РКО)*/
+        RefID ) != 0 )
+
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  end;
+
+  if( GenerateReference( RefID, Number ) != 0 )
+    MsgBox( "Ошибка при генерации номера требования" );
+    return 1;
+  else
+    Payment.Number = Number;
+  end;
+
+  if( sfinvlnk != null )
+    Payment.LinkSfInvoice( sfinvlnk.rec.InvoiceID, sfinvlnk.rec.PayAmount, sfinvlnk.rec.PaidNDS, sfinvlnk.rec.PayFIID );
+  end;
+
+  Payment.FeeType = sfcomiss.feeType;
+  if( DefComID != null )
+    Payment.DefComID = DefComID;
+  end;
+
+  return 0;
+
+end;

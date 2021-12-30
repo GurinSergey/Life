@@ -1,0 +1,703 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29055 - "Картотека ожидания разрешения"
+// Шаг      : 620    - "Списание платежа из картотеки ОР"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+// Gurin S. C-17880 05.08.2013
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov 2014-02-25 C-19151 Логгирование массово выполненных шагов
+import InsCarryDoc, OprInter, FIInter, BankInter, payconst, payinter, catfdoc, pm_common, pm_setst, cbsttls, "mpckvit.mac";
+import oralib; //Jushmanov 2014-02-25 C-19151
+
+// обязательные параметры макроса
+private var action;     // Выполняемое действие шага
+private var IsProcMass; // Признак выполнения шага из процедуры массовой оплаты(Ctrl+F2)
+
+var PaymentObj:RsbPayment;
+/* Виды проводок по документу */
+private const ПроводкаПоПолномуСписанию    = 0;
+private const ПроводкаПоЧастичномуСписанию = 1;
+private const ПроводкаПоОтзыву             = 2;
+
+/*Результаты основных проверок*/
+private var ЕстьБолееПриоритетныеДокументыКОР :bool;
+private var ЕстьЧастичныеОплатыДокумента      :bool;
+
+/*Запросы к пользователю*/
+private const СписатьБезИсполнения = "В картотеке есть более приоритетные документы.|Документ может быть списан из картотеки без исполнения и помещен в картотеку №2.";
+private const СписатьС_Исполнением = "В картотеке есть более приоритетные документы.|Списать?";
+/* и ответы */
+private const Списать  = "Списать"  , _Списать  = 0;
+private const Оставить = "Оставить" , _Оставить = 1;
+
+/* Виды списания из КОР */
+private const БезИсполнения = 0;
+private const С_Исполнением = 1;
+
+
+/* Заполнение общих параметров и актуализация внебалансовой проводки*/
+private macro ЗаполнитьИ_ВыполнитьПроводку( paymtr:@RsbAccTransaction, TransactionKind:integer, Amount:money ):integer
+  
+    if( paymtr == NULL )
+        MsgBox("Ошибка при создании проводки по платежу");
+        return 1;
+    end;
+
+    var SfContrID = PM_GetSfContrID(PaymentObj);
+    if( SfContrID == 0 )
+        msgbox("Не найден договор обслуживания счета плательщика.");
+        return 1;
+    end;
+
+    var СчетКт = TIndexWPPrimDoc(SfContrID, PaymentObj.PaymentID).FindAndOpenSysAccount( "Карт ОР", IsOprMultiExec() );
+    var СчетДт = NotBalCorrAcc_FirstDoc( "П" ).FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );                                  
+
+//Лавренов: для конвертированныхдокументов ОР даем воззможность задать правильный внеалансовый счет, если бдруг выбрвнный системой не удовлетворяет  
+    if (PaymentObj.PayerBankEnterDate <= date("16.10.2009"))
+        if(msgboxex("Выбран след внебалансовый счет ОР: "+СчетКт+". ||Желаете изменить?",MB_YES+MB_NO,
+                     IND_NO,"Выбор внебалансового счета") == IND_YES)
+            getstring(СчетКт,"Задайте счет К1",20);
+        end;
+    end;
+
+    paymtr.Chapter         = 3;                                            
+    paymtr.Date_Carry      = {curdate};
+    paymtr.Number_Pack     = PaymentObj.NumberPack;
+    paymtr.Numb_Document   = PaymentObj.Number;
+    paymtr.Kind_Oper       = " 1";
+    paymtr.Shifr_Oper      = "09";
+    paymtr.Department      = PaymentObj.Department;
+    paymtr.AccountPayer    = СчетДт;
+    paymtr.AccountReceiver = СчетКт;
+    paymtr.FIID            = NATCUR;
+    if( PaymentObj.DocKind == PS_INRQ ) 
+        paymtr.Sum         = PaymentObj.FutureReceiverAmount;
+    else
+        paymtr.Sum         = 
+        paymtr.SumPayer    =
+        paymtr.SumReceiver = Amount;
+    end;
+    if( TransactionKind == ПроводкаПоПолномуСписанию )
+        paymtr.Ground          = "Списание";
+        paymtr.ResultCarry     = OBIWPOUTCARRY;
+    elif( TransactionKind == ПроводкаПоЧастичномуСписанию )
+        paymtr.Ground          = "Частичное списание";
+        paymtr.ResultCarry     = IWPPARTOUTPLACE;
+    elif( TransactionKind == ПроводкаПоОтзыву )
+        paymtr.Ground          = "Отзыв";
+        paymtr.ResultCarry     = IWPDOCDELETE;
+    end;
+    paymtr.Ground = paymtr.Ground + " с картотеки ОР документа № " + string(PaymentObj.Number) + 
+                                    " от "                         + string(PaymentObj.Date)   + 
+                                    " к счету "                    + string(PaymentObj.PayerAccount);
+
+    if( not paymtr.Carry )
+        MsgBox("Ошибка при актуализации платежа");
+        return 1;
+    end;
+
+    return 0;
+end;
+
+
+//--------------------------------------------------------------------------------------------------
+//             Проверки по платежу
+//--------------------------------------------------------------------------------------------------
+/* Проверка "наличие в картотеке документов с более высоким приоритетом" (проверяется картотека 2 или картотека ОР)*/
+private macro ЕстьБолееПриоритетныеДокументы( PaymStatus:integer, Amount:@money ):bool
+
+    var Priority = 0, EnterDate = date(0,0,0);
+    var PriorityWhere = "", DateWhere = "";
+
+    if({ResidentCountryCode} == "RUS")
+        PriorityWhere = " decode( rm.t_Priority, 4, 3, rm.t_Priority ) ";
+        Priority = IfThenElse(PaymentObj.Priority == 4, 3, PaymentObj.Priority);
+    else
+        PriorityWhere = " rm.t_Priority ";
+        Priority = PaymentObj.Priority;
+    end;
+
+    if( PaymentObj.PayerBankEnterDate == date(0,0,0) )
+        DateWhere = "pm.t_ValueDate";
+        EnterDate = PaymentObj.ValueDate;
+    else
+        DateWhere = "pm.t_PayerBankEnterDate";
+        EnterDate = PaymentObj.PayerBankEnterDate;
+    end;
+
+    var select = "select SUM(pm.t_amount) "+
+                 "  from dpmpaym_dbt pm, dpmrmprop_dbt rm    " +   
+                 " where pm.t_paymstatus = :status           " +
+                 "   and pm.t_payeraccount = :acc            " +
+                 "   and pm.t_paymentid = rm.t_paymentid     " +
+                 "   and ( ( " + PriorityWhere + " < :pr1 )                                  or " +
+                 "         ( " + PriorityWhere + " = :pr2 and " + DateWhere + " < :EnterDate ) )" +                              
+                 " having SUM(pm.t_amount) > 0";
+
+    var params:TArray = makeArray( SQLParam( "status"      , PaymStatus              ), 
+                                   SQLParam( "acc"         , PaymentObj.PayerAccount ),
+                                   SQLParam( "pr1"         , Priority                ),
+                                   SQLParam( "pr2"         , Priority                ),
+                                   SQLParam( "EnterDate"   , EnterDate               ) );
+
+    var rs = execSQLselect( select, params, false );
+
+    if( rs and rs.moveNext() )
+        SetParm( 2, rs.value(0) );
+        return true;
+    end;
+
+    return false;
+end;
+
+
+private macro ПоДокументуБылиЧастичныеОплаты():bool
+
+    var select = "select pmlink.t_PurposePayment " +
+                 " from  dpmlink_dbt pmlink      " +
+                 "where  pmlink.t_InitialPayment  = :PrimPaymID " +
+                 "  and  pmlink.t_InitialPayment != pmlink.t_PurposePayment " +
+                 "  and  pmlink.t_LinkKind        = 2 ";
+    var params:TArray = makeArray( SQLParam( "PrimPaymID" , PaymentObj.PaymentID ) );
+    var rset = execSQLselect( select, params, false );
+
+    if( rset.moveNext() and ( rset.value(0) > 0 ) )
+        return true;
+    end;
+
+    return false;
+end;
+
+
+//--------------------------------------------------------------------------------------------------
+//  Куда направляется основной платеж           
+//--------------------------------------------------------------------------------------------------
+private macro ОсновнойПлатежВ_К2():integer
+
+    if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_2 ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    // Установить дату начала операции равной дате операционного дня пользователя
+    SetOprDate(29000000, PaymentObj.ValueDate);
+
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_WORKING );
+    PaymentObj.PaymStatus = PM_READIED; 
+
+    //Gurin S. I-00443187-2 15.11.2013
+    var rstmp = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and t_fromKOR = 'X'",  makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+    if (not rstmp.movenext())
+       MsgBox("Документ на неоплаченную сумму помещен в картотеку №2");
+    end;
+    return 0;
+end;
+
+
+private macro ОсновнойПлатежНаПредобработку():integer
+
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_WORKING );
+    PaymentObj.PaymStatus = PM_READIED; 
+    if( УстановитьСтатусыПлатежа(OPR_PAYM_DO, OPR_PM_ST_PREP, OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO, OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    if(PaymentObj.CheckTerror != CHT_NOTNEED)
+        PaymentObj.CheckTerror = CHT_NOTCHECK;
+    end;
+    // Установить дату начала операции равной дате операционного дня пользователя
+    SetOprDate(29000000, PaymentObj.ValueDate);
+    PaymentObj.OutTransferDate = PmGetDefaultOutTransferDate( PaymentObj ); 
+
+    return 0;
+end;
+
+
+private macro ЗакрытьОсновнойПлатеж():integer
+
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_CLOSED );
+    PaymentObj.PaymStatus = PM_FINISHED; 
+    if( УстановитьСтатусыПлатежа(OPR_PAYM_STATE, OPR_PM_ST_CLOSE) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+    return 0;
+end;
+
+
+//--------------------------------------------------------------------------------------------------
+//  Списание из КОР 
+//--------------------------------------------------------------------------------------------------
+private macro ЗапросНаСписание( isNeedCached:bool ):integer
+
+    Array Text, Buttons;
+    Text(0) = IfThenElse( ЕстьЧастичныеОплатыДокумента , СписатьБезИсполнения, СписатьС_Исполнением );
+    Buttons( _Списать    ) = Списать;
+    Buttons( _Оставить   ) = Оставить;
+
+    var DialogFlag = TSetDialogFlag(1);
+    var ВыборДействия = ConfWin( Text, Buttons ); 
+    // если в массовом режиме, то кэшируем, иначе - не надо
+    SetParm( 0, IfThenElse( IsOprMultiExec(), true, false ) );
+
+    return ВыборДействия;
+end;
+
+
+private macro СписатьПлатеж( вид_списания:integer ):integer
+
+    if( вид_списания == БезИсполнения )
+        ОсновнойПлатежВ_К2();
+    else
+        ОсновнойПлатежНаПредобработку();
+    end;
+
+    var paymtr = PaymentObj.MakeTransaction();
+
+    return ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, PaymentObj.FuturePayerAmount );
+end;
+
+
+private macro СписатьИзКОР():integer
+
+    var вид_списания:integer = IfThenElse( ЕстьЧастичныеОплатыДокумента, БезИсполнения, С_Исполнением ); 
+    // в массовом режиме в К2 списываем без запроса
+    if( ( вид_списания == БезИсполнения ) and IsOprMultiExec() )
+        SetCachedVar( string(вид_списания) + "ВидСписанияИзКОР" + PaymentObj.PayerAccount, _Списать );
+    end;
+    var ВыборДействия = GetCachedVar( string(вид_списания) + "ВидСписанияИзКОР" + PaymentObj.PayerAccount, "ЗапросНаСписание" );
+
+    if( ВыборДействия == _Списать )
+        return СписатьПлатеж( вид_списания );
+    elif( ВыборДействия == _Оставить )
+        MsgBox("Пользователь прервал выполнение операции");
+    end;
+
+    return 1;
+end;
+
+
+private macro ValueDateForPayOffFromIWP(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+    elif( GetParentOrEqualDocKindFromList(DocKind, DLDOC_BANKORDER) )
+        ValueDate = PM_GetOperDay_Balance(Paym.Department);
+    end;
+
+    return ValueDate;
+end;
+
+
+private macro СформироватьДокументОплаты( Amount:money, SkipArest:bool ):integer
+
+    var obj:object;
+    var PayOrderObj :RsbPsPayOrder = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+    var PartDocObj  :object = NULL; // первичка частичной оплаты
+    var PartPaymentObj;             // платеж частичной оплаты
+    var PartPayments:TArray = TArray();  // массив частичных оплат
+    var i = 0, isCashRequest = (PaymentObj.DocKind == PS_PAYORDER) and (PayOrderObj.DocKind == PSPOKIND_CASH_REQUEST); 
+
+    if( SkipArest == NULL )
+        SkipArest = false;
+    end;
+
+    if( isCashRequest
+    and ( PaymentObj.CashSymbolCredit != " 40" )
+    and ( PaymentObj.CashSymbolCredit != " 41" )
+    and ( PaymentObj.CashSymbolCredit != " 42" ) )
+        msgbox( "Нельзя оплатить заявление на выдачу наличных" );
+        return 10142;
+    end;
+
+    var ValueDate = ValueDateForPayOffFromIWP(PaymentObj);
+    if( not MakePartOrders( PaymentObj.PaymentID, PaymentObj.DocKind, Amount, ValueDate ) )
+        msgbox("Ошибка создания частичного платежа");
+        return 1;
+    end;
+
+    PartPayments = PaymentObj.PartPayments(true);
+
+    while(i < PartPayments.size())
+
+        PartPaymentObj = PartPayments[i];
+
+        var err_mes : string = "";
+        if( ReDefinePartPaymShifrOper(PartPaymentObj, @err_mes) != 0 )
+            msgbox(err_mes);
+            return 1;
+        end;
+
+        if( not isCashRequest )
+            PartDocObj = GenObject( "RsbPsPayOrder", PartPaymentObj.PaymentID );
+            if( (not IsOprMultiExec()) and (PartPayments.size() == 1))
+                if( PartDocObj.PayOrderPanelReview( "Документ оплаты картотеки ОР" ) )
+                    MsgBox( "Пользователь прервал выполнение операции " );
+                    return 1;
+                end;
+            end;
+            if( GetOprStatus( OPR_PAYM_PERMISSION ) == OPR_PAYM_ST_PERMISSION_YES )
+                PartDocObj.AddOprState( OPR_PAYM_PERMISSION, OPR_PAYM_ST_PERMISSION_YES );
+            end;
+        else
+            PartDocObj = GenObject( "RsbPSOutCashOrder", PartPaymentObj.PaymentID );
+            if( (not IsOprMultiExec()) and (PartPayments.size() == 1))
+                if( PartDocObj.CashOrderPanelReview( "Документ оплаты картотеки ОР", "ESC Отмена F2 Проводка" ) )
+                    MsgBox( "Пользователь прервал выполнение операции " );
+                    return 1;
+                end;
+            end;
+        end;
+
+        PartDocObj.LaunchOper = true;
+        PartPaymentObj.Date = {curdate};
+
+        if( CheckRestAndMakeReserve(PartPaymentObj, true, true, true, false, NULL, SkipArest, true) )
+            return 1;
+        end;
+
+        // Если основной платеж из модуля "Проценты" - свяжем с ним планируемую оплату
+        if( IsPrcPayment( PaymentObj ) )
+            if( PrcKvitLinkPayments( PaymentObj.PaymentID, PartPaymentObj.PaymentID ) )
+                return 1;
+            end;
+        end;
+
+        i = i + 1;
+    end;
+
+    return 0;
+end;
+
+
+private macro ИсполнениеНевозможно(ReasonID):integer
+
+    var select  = "select ac.t_Priority "
+                    "from dacclaim_dbt ac "
+                    "where ac.t_ClaimID = :ReasonID ";
+    var rset;
+
+    if( ReasonID <= 0 )
+        MsgBox("На счет плательщика наложено ограничение операций.|Исполнение документа невозможно.");
+    else
+        rset = execSQLselect( select, makeArray( SQLParam( "ReasonID" , ReasonID ) ), false );
+        if( rset.moveNext() )
+            MsgBox("На счет плательщика наложено ограничение операций для документов с очередностью больше, чем " +
+                    rset.value(0) + ".|Исполнение документа невозможно.");
+        else
+            MsgBox("На счет плательщика наложено ограничение операций.|Исполнение документа невозможно.");
+        end;
+    end;
+
+    return 1;
+end;
+
+
+//--------------------------------------------------------------------------------------------------
+//  Ветки алгоритма для разных action           
+//--------------------------------------------------------------------------------------------------
+private macro ИсполнитьДокумент():integer
+
+    var paymtr     :RsbAccTransaction;
+    var part_paymtr:RsbAccTransaction;
+
+    var FuturePayerAmount = PaymentObj.FuturePayerAmount;
+    var SkipArest;
+    var ДоступныйОстатокСчета;
+
+    var ReasonID = 0, isCashRequest = false, DlgFlag;
+    var PayOrderObj:object = NULL;
+    if( PaymentObj.DocKind == PS_PAYORDER )
+        PayOrderObj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+        isCashRequest = PayOrderObj.DocKind == PSPOKIND_CASH_REQUEST;
+    end;
+
+    var choise = GetCachedVar( "PmIdxWP20" + PaymentObj.PayerAccount );
+    Array Text;
+    Array Buttons;
+
+    //Gurin S. 17.06.2013 C-17880-6
+    var rs1 = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and t_fromK2  = 'X' and t_flag = 'X'",  makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+    var rs2 = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and t_fromKOR = 'X' and t_flag is null",  makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+    if (rs1 and rs1.movenext())
+        return ОсновнойПлатежВ_К2();
+    elif (rs2 and rs2.movenext())
+        //Gurin S. 22.08.2013 по просьбе Ивановой И. К.
+        return ОсновнойПлатежВ_К2();
+        //идем дальше
+    //Lavrenov I-00024410: отправляем при необходимости документ на К2 
+    elif (msgboxex("Отправить документ на К2?",MB_YES+MB_NO,IND_NO,"Отправка на К2") == IND_YES)
+        return ОсновнойПлатежВ_К2();
+    end;
+
+    if( ValType( choise ) == V_UNDEF )
+
+        if( CheckPmI2Placed_ByObj( PaymentObj, 0 ) )
+            DlgFlag = TSetDialogFlag(1);debugbreak;
+            Text[0] = "К счету " + PaymentObj.PayerAccount + 
+                      " есть неоплаченные документы|в картотеке №2 с более высоким приоритетом.|Продолжить?";
+            Buttons[0] = "Да";
+            Buttons[1] = "Нет";
+
+            choise = ConfWin( Text, Buttons );
+            if( IsOprMultiExec() )
+                SetCachedVar( "PmIdxWP20" + PaymentObj.PayerAccount, choise );
+            end;
+        end;
+    end;
+    if( choise == 1 ) /*Нет*/
+        return 1;
+    end;
+
+    if( GetOprStatus(OPR_PAYM_PERMISSION) == OPR_PAYM_ST_PERMISSION_YES )
+        SkipArest = true;
+    else
+        SkipArest = false;
+    end;
+
+    PaymentObj.CheckRest( PaymentObj.PayerAccount, 1/*CHAPT1*/, PaymentObj.PayerFIID, PaymentObj.FuturePayerAmount, PaymentObj.ValueDate,
+                          true, true, true, false, SkipArest, @ДоступныйОстатокСчета, ReasonID );
+
+    if( ДоступныйОстатокСчета <= 0 )
+
+        if( ReasonID > 0 )
+            return ИсполнениеНевозможно(ReasonID);
+        else
+            paymtr = PaymentObj.MakeTransaction();
+            if( ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, PaymentObj.FuturePayerAmount ) )
+                return 1;
+            end;
+            if( ЕстьЧастичныеОплатыДокумента or isCashRequest )
+                return ОсновнойПлатежВ_К2();
+            else
+                /* EVG Это вариант, когда при недостаточности средств платёж идёт через "Ожидающие поступлений".
+                   Нам необходимо сразу ставить на К2, поэтому эта веточка не нужна.
+                return ОсновнойПлатежНаПредобработку();*/
+                return ОсновнойПлатежВ_К2();
+            end;
+        end;
+
+    elif( ДоступныйОстатокСчета >= PaymentObj.FuturePayerAmount )
+
+        if( (not IsProcMass) and ЕстьБолееПриоритетныеДокументыКОР )
+            msgbox("Нельзя оплатить документ картотеки ОР. Есть документы с большим приоритетом");
+            return 1;
+        end;
+
+        paymtr = PaymentObj.MakeTransaction();
+        if( ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, PaymentObj.FuturePayerAmount ) )
+            return 1;
+        end;
+        if( isCashRequest or ЕстьЧастичныеОплатыДокумента )
+            if( СформироватьДокументОплаты( PaymentObj.FuturePayerAmount ) == 0 )
+                return ЗакрытьОсновнойПлатеж();
+            else
+                return 1;
+            end;
+        else
+            if( ОсновнойПлатежНаПредобработку() == 0 )
+                return CheckRestAndMakeReserve(PaymentObj, true, true, true, false, NULL, SkipArest, true);
+            end;
+            return 1;
+        end;
+
+  elif( ДоступныйОстатокСчета < PaymentObj.FuturePayerAmount) 
+
+        if( (not IsProcMass) and ЕстьБолееПриоритетныеДокументыКОР )
+            msgbox("Нельзя оплатить документ картотеки ОР. Есть документы с большим приоритетом");
+            return 1;
+        end;
+
+        if( СформироватьДокументОплаты( ДоступныйОстатокСчета ) ) 
+            return 1;
+        end;
+
+        part_paymtr = PaymentObj.MakeTransaction();
+        if( ЗаполнитьИ_ВыполнитьПроводку( @part_paymtr, ПроводкаПоЧастичномуСписанию, ДоступныйОстатокСчета ) )
+            return 1;
+        end;
+
+        // Установить дату начала операции равной дате операционного дня пользователя
+        SetOprDate(29000000, PaymentObj.ValueDate);
+
+        if( ReasonID > 0 )
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_WP_MEET ) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+            return 0;// Должен запланироваться опять блок "Списание с картотеки ОР"
+        else
+            if( ОсновнойПлатежВ_К2() )
+                return 1;
+            end;
+            paymtr = PaymentObj.MakeTransaction();
+            return ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, PaymentObj.FuturePayerAmount );            
+        end;
+    end;
+
+    return 0;
+end;
+
+
+private macro ИсполнитьС_Разрешением():integer
+
+    var PayOrderObj   :RsbPsPayOrder = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+    var NewPayOrderObj:RsbPsPayOrder;
+
+    var paymtr     :RsbAccTransaction;
+    var part_paymtr:RsbAccTransaction;
+    var ОстатокПоСчету;
+
+    PaymentObj.CheckRest( PaymentObj.PayerAccount, 1/*CHAPT1*/, PaymentObj.PayerFIID, PaymentObj.FuturePayerAmount, PaymentObj.ValueDate,
+                          true, true, true, false, false/* Gurin S. 21.02.2014 I-00453508-4 true*/, @ОстатокПоСчету );
+
+    var FuturePayerAmount = PaymentObj.FuturePayerAmount;
+
+    if( УстановитьСтатусыПлатежа(OPR_PAYM_PERMISSION, OPR_PAYM_ST_PERMISSION_YES ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    if( ОстатокПоСчету >= PaymentObj.FuturePayerAmount )
+
+        if( СформироватьДокументОплаты( PaymentObj.FuturePayerAmount, true ) ) 
+            return 1;
+        end;
+
+        paymtr = PaymentObj.MakeTransaction();
+        return IfThenElse( ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, FuturePayerAmount ) or 
+                           ЗакрытьОсновнойПлатеж(), 1, 0 );
+    elif( ОстатокПоСчету > 0 )
+
+        if( СформироватьДокументОплаты( ОстатокПоСчету, true ) ) 
+            return 1;
+        end;
+
+        part_paymtr = PaymentObj.MakeTransaction();
+
+        if( ЗаполнитьИ_ВыполнитьПроводку( @part_paymtr, ПроводкаПоЧастичномуСписанию, ОстатокПоСчету ) or ОсновнойПлатежВ_К2() )
+            return 1;
+        end;
+        // Установить дату начала операции равной дате операционного дня пользователя
+        SetOprDate(29000000, PaymentObj.ValueDate);
+        paymtr = PaymentObj.MakeTransaction();
+        return ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, FuturePayerAmount  - ОстатокПоСчету );
+
+    else /* нулевой остаток -> в К2 */
+
+        if( ОсновнойПлатежВ_К2() )
+            return 1;
+        end;
+        paymtr = PaymentObj.MakeTransaction();
+        return ЗаполнитьИ_ВыполнитьПроводку(@paymtr, ПроводкаПоПолномуСписанию, PaymentObj.FuturePayerAmount );
+
+    end;
+
+    return 0;
+end;
+
+
+private macro ОтозватьДокумент():integer
+
+    // Выдать панель ввода отказа от платежа
+    if( not PM_DenialPanel( PaymentObj, PAYMENTS_INDEX_WP, true ) )
+        msgbox( "Пользователь прервал выполнение" );
+        return 1;
+    end;
+
+    // Установить примечание "Причина отказа (возврата)" равным причине отказа,
+    // введенной в панели отказа
+    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, PaymentObj.DenialGround() ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+    end;
+    // Внебалансовая проводка по отзыву
+    var paymtr:RsbAccTransaction = PaymentObj.MakeTransaction();
+
+    if( ЗаполнитьИ_ВыполнитьПроводку( @paymtr, ПроводкаПоОтзыву, PaymentObj.DenialAmount ) )
+        return 1;
+    end;
+
+    return ЗакрытьОсновнойПлатеж();
+end;
+
+
+macro ExecuteStep( doc, payorder, DocKind:integer, ID_Operation:integer, ID_Step:integer )
+
+    if(CheckDateStartOpr(ID_Operation))
+        return 1;
+    end;
+
+    if(IsArestDebetAcc( PaymentObj.PayerAccount, PaymentObj.PayerFIID ))
+        msgbox("Запрещено дебетование счета плательщика");
+        return 1;
+    end;
+
+    PaymentObj.ValueDate = ValueDateForPayOffFromIWP(PaymentObj);
+
+    if( action != PS_OUTPLACEIWP_ACTION_RECALL )
+        ЕстьЧастичныеОплатыДокумента      = ПоДокументуБылиЧастичныеОплаты();
+    end;
+    if( action == PS_OUTPLACEIWP_ACTION_EXECUTE )
+        ЕстьБолееПриоритетныеДокументыКОР = ЕстьБолееПриоритетныеДокументы( PM_IWPPLACED, 0 );
+    end;
+
+    if  ( action == PS_OUTPLACEIWP_ACTION_EXECUTE      )    return ИсполнитьДокумент();
+    elif( action == PS_OUTPLACEIWP_ACTION_EXEANDPERMIT )    return ИсполнитьС_Разрешением();
+    elif( action == PS_OUTPLACEIWP_ACTION_RECALL       )    return ОтозватьДокумент();
+    else                                                    msgbox("Ошибочные параметры шага.");
+    end;
+
+    return 1;
+end;
+
+
+macro PostStepAction( message,     /* данный параметр может принимать следующие       */
+                                   /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                      errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                                   /* произошла ошибка                                */
+                      FirstDoc,    /* указатель на первичный документ                 */
+                      ID_Oper,     /* внутренний идентификатор операции               */
+                      Num_Step,    /* Номер шага операции (из настроек)               */
+                      KindOper,    /* номер вида операции                             */
+                      KindDoc,     /* номер вида первичного документа                 */
+                      KindStep,    /* вид шага операции                               */
+                      ID_Step )    /* внутренний идентификатор шага операции          */
+    var cmd, rs;
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    //Jushmanov 2014-02-25 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    //Gurin S. 22.08.2013 Комментирую по просьбе Ивановой И. К.
+    /*if( message == OP_EXECUTE_STEP )
+            cmd = RsdCommand ("SELECT   pm.t_purposepayment paymid, dpm.t_dockind dockind "
+                              "  FROM   dpmlink_dbt pm, dpmpaym_dbt dpm "
+                              " WHERE       pm.t_initialpayment = :id "
+                              "         AND dpm.t_paymentid = pm.t_purposepayment "
+                              "         AND dpm.t_paymstatus != 32000 "
+                              "         AND pm.t_paymlinkid = "                                  
+                              "               (SELECT   MAX (t_paymlinkid) "
+                              "                  FROM   dpmlink_dbt "
+                              "                 WHERE   t_initialpayment = pm.t_initialpayment)");
+            cmd.AddParam("id", RSDBP_IN, PaymentObj.PaymentID);
+            cmd.execute();
+            rs = RsdRecordset(cmd);
+            if (rs and rs.movenext())
+                PM_ExecuteOperation(rs.value("paymid"), rs.value("dockind"));    
+            end;
+            setdialogflag(1);
+    end;*/
+
+    return 0;
+end;

@@ -1,0 +1,218 @@
+/*
+А.Киселев 13.04.2011
+
+Шаг оплаты Разовой комиссии за услуги инкассации Наряд №I-00012707
+Технология Экспресс-Волга, контактное лицо М.Журавлев
+
+*/
+
+import sfpay, sfground, sfcomcat, OprInter, BilFacturaInter;
+
+private const SFDOC_DEF_ONCE = 52;
+private const PlusCalc_CatCode = "+Расчеты"; 
+private const PlusCalcNDS_CatCode = "+Расчеты НДС"; 
+private const MinusNDSAccrual_CatCode = "-НДС начисленный";
+/* EVG */
+import "sf_prbb.mac";
+
+//private const SFDOC_DEF_ONCE = 52;
+
+/*record sfcontrRec( "sfcontr.dbt") key 0*/;
+file sfcomissFile( "sfcomiss.dbt"  ) key 0;
+
+record documentRec( "acctrn.dbt" );
+
+/* EVG 13/02/2012 To 2030 Другая структура.
+record sfsingdfRec( "sfsingdf.dbt" );*/
+record sfsingdfRec( "sfdef.dbt" );
+
+private macro SfSingAccrue( SfSingPD, sfsingdfRec, sfcomiss, sicredit )  
+  
+  var PayerAccount:string, ReceiverAccount:string;
+  var SumPayer = $0, SumNDS = $0;
+  var Ground = string( "За разовые услуги." );
+  var err = 0;
+  var carryDate = sfsingdfRec.DateFee;
+  var payFIID = sfsingdfRec.FIID_paySum;
+
+  PayerAccount = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, CALC_SFSI_KIND, PlusCalc_CatCode, carryDate, payFIID );
+  ReceiverAccount = sicredit.Account;
+  
+  if( ConvSum( SumPayer, sfsingdfRec.sum, carryDate, sfsingdfRec.FIID_Sum, payFIID, sfcomiss.Ratetype ) == 0 )
+    err = CountComissAsIncome( carryDate, payFIID, PayerAccount, sicredit.FIID, ReceiverAccount, SumPayer, Ground );
+  else
+    err = 1;
+  end;
+  
+  if( (err == 0) AND (sfsingdfRec.sumNDS > 0) )
+    Ground = string("НДС за разовые услуги.");
+    PayerAccount = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, CALCNDS_SFSI_KIND, PlusCalcNDS_CatCode, carryDate, payFIID );
+    ReceiverAccount 
+      = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, NDSACRUAL_SFSI_KIND, MinusNDSAccrual_CatCode, carryDate, payFIID );
+    if( ConvSum( SumNDS, sfsingdfRec.sumNDS, carryDate, sfsingdfRec.FIID_Sum, payFIID, sfcomiss.Ratetype ) == 0 )
+      err = CountComissAsIncome( carryDate, payFIID, PayerAccount, payFIID, ReceiverAccount, SumNDS, Ground );
+    else
+      err = 1;
+    end;
+  end;
+
+  if( err == 0 )
+    sfsingdfRec.IsIncluded = "X";
+  end;
+
+  return err;
+end;
+
+macro ExecuteStep( outBuff, primIn )
+
+   var stat = 0;
+   setbuff( documentRec, outBuff );
+   setbuff( sfsingdfRec, primIn  );
+   
+
+   file sfcontr( "sfcontr.dbt") key 0;
+   var sfcontr_found = false;
+
+   if( sfsingdfRec.SfContrID > 0 )
+     sfcontr.ID = sfsingdfRec.SfContrID;
+     if( getEQ(sfcontr) )
+       sfcontr_found = true;
+     end;
+   end;
+
+   var bilfDocArray = TArray;
+
+   sfcomissFile.FeeType = sfsingdfRec.FeeType;
+   sfcomissFile.Number  = sfsingdfRec.CommNumber;
+
+   if( not getEQ( sfcomissFile ) )
+      MsgBox("Не найдена комиссия");
+      return 1;
+   end;
+
+   var ground = "";
+   if( sfcontr_found )
+     ground = BuildGround( sfsingdfRec, sfcomissFile, sfcontr );
+   else
+     ground = BuildGround( sfsingdfRec, sfcomissFile );
+   end;
+
+   var SfAccrueRegVal = SfComAccrueGetRegValue();
+      
+   var sidebet = TRecHandler("sfsi.dbt");
+   var sicredit = TRecHandler("sfsi.dbt");
+   sidebet.Clear;
+   sicredit.Clear;
+   if(SfGetSI_Uni( 664, sfsingdfRec, sidebet, sicredit ))  /*ObjectType = OBJTYPE_SFSINGDF = 664*/
+      MsgBox("Ошибка при взятии платежных инструкций");
+      return 1;
+   end;
+
+   var SfSingPD = null;
+
+
+   var payMethod = SF_PAY_METHOD_PAYM;
+   if( sfcomissFile.receiverID == {HeadBankID} )
+    PayMethod = 89; //А.Киселев для формирования мем.ордера оплаты комиссии без НДС и мем.ордера оплаты НДС
+     
+     /* EVG Класс ПД инициализируется всегда */
+     SfSingPD = SfSingDfPrimDoc( SFDOC_DEF_ONCE, sfsingdfRec );
+
+     if( (SfAccrueRegVal == 0) OR ((SfAccrueRegVal == 2) AND (sfsingdfRec.sumNds > 0)) )
+       // EVG SfSingPD = SfSingDfPrimDoc( SFDOC_DEF_ONCE, sfsingdfRec );
+       SfSingAccrue( SfSingPD, sfsingdfRec, sfcomissFile, sicredit.rec );
+     end;
+   end;
+  
+   var payDate = sfsingdfRec.DateFee;
+   if( sfsingdfRec.CalcComissSumAlg == 3 ) /*SFCOMISS_CALCCOMISSSUMALG_BEFOREPAY*/
+     payDate = sfsingdfRec.DateFee - 1;
+   end;
+
+   stat = SfFormDocs( documentRec, sidebet, sicredit, sfcomissFile,
+                      payDate, ground,
+                      sfsingdfRec.sum, sfsingdfRec.sumNDS, sfsingdfRec.FIID_Sum,
+                      SFDOC_DEF_ONCE, sfsingdfRec.id, OBJTYPE_SFSINGDF, sfsingdfRec, payMethod,
+                      SfSingPD, sfsingdfRec.IsIncluded, false, sfsingdfRec.FacturaID, @bilfDocArray, null );
+                      
+/*  if(stat == 0)                   
+     if( (sfsingdfRec.FacturaID > 0) AND (bilfDocArray.Size > 0) )       
+       if(not CreateBilBookEntry(sfsingdfRec.FacturaID, payDate, bilfDocArray) )  
+         MsgBox("Не удалось связать оплату комиссии с СФ");
+       end;
+     end;
+  end;
+*/
+
+
+                      
+  return stat;
+end;                      
+
+
+
+macro CheckStepAction ( mes, outBuff, KindDoc, ID_Operation )
+var cmd, DataSet;
+
+debugbreak;
+//нужен id комиссии или экземпляр операции
+ if ( mes == OP_BACKOUT_STEP )
+//Отвязать платеж и разовую комиссию
+
+// Удалить запись из книги продаж для СФ если оплата внешний платеж
+  cmd = RSDCommand(" SELECT A.T_PAYMENTID, A.T_DEFCOMID, A.T_FEETYPE, C.T_FACTURAID, D.T_BOOKENTRYID " + 
+                   " FROM dpmpaym_dbt A, doproper_dbt B, dsfsingdf_dbt C, dbilbookentry_dbt D " +
+                   " WHERE A.T_DEFCOMID = TO_NUMBER(B.T_DOCUMENTID) AND A.T_FEETYPE = ? AND B.T_ID_OPERATION = ? " +
+                   "  AND C.T_ID = A.T_DEFCOMID AND D.T_FACTURAID = C.T_FACTURAID " +
+                   "  AND NOT EXISTS( SELECT 1 FROM doprdocs_dbt C WHERE  C.T_ID_OPERATION = B.T_ID_OPERATION " +
+                   "  AND C.T_DOCUMENTID = LPAD(TO_CHAR(A.T_PAYMENTID),34,'0') ) "
+                   );
+
+  cmd.addParam("FeeType", RSDBP_IN, 6);
+  cmd.addParam("ID_Operation", RSDBP_IN, ID_Operation);
+  DataSet = RSDRecordset(cmd);
+  if(DataSet.MoveNext())
+   if ( not BFDeleteBilBookEntry(DataSet.value(4)) )
+     MsgBox("Не удалось удалить запись ID " + string(DataSet.value(4)) + " в книге продаж.");        
+   end;
+  end;
+// Удалить запись из книги продаж для СФ если оплата внешний платеж
+
+
+// Отвязать платеж T_DEFCOMID, T_FEETYPE
+  cmd = RSDCommand(" UPDATE dpmpaym_dbt " +
+                   " SET T_DEFCOMID = 0, T_FEETYPE = 0 " +
+                   " WHERE T_PAYMENTID in " +
+                   "  (SELECT A.T_PAYMENTID FROM dpmpaym_dbt A, doproper_dbt B " +
+                   "   WHERE A.T_DEFCOMID = TO_NUMBER(B.T_DOCUMENTID) AND A.T_FEETYPE = ? AND B.T_ID_OPERATION = ? " +
+                   "     AND NOT EXISTS( SELECT 1 FROM doprdocs_dbt C WHERE  C.T_ID_OPERATION = B.T_ID_OPERATION " +
+                   "     AND C.T_DOCUMENTID = LPAD(TO_CHAR(A.T_PAYMENTID),34,'0') ) " +
+                   "  ) "
+                   );
+
+  cmd.addParam("FeeType", RSDBP_IN, 6);
+  cmd.addParam("ID_Operation", RSDBP_IN, ID_Operation);
+  cmd.execute();
+// Отвязать платеж T_DEFCOMID, T_FEETYPE
+
+
+//Отвязать платеж и разовую комиссию
+ 
+ 
+ 
+  /* EVG 14/03/2012 При откате шага оплаты сделаем статус разовой комиссии "Открыт", т.к. сишка этого не делает. */
+  cmd = rsdcommand(" UPDATE DsfDef_dbt s SET s.t_Status = 20 " +
+                   "  WHERE s.t_FeeType = 6  " +
+                   "    AND s.t_Status  = 40 " +
+                   "    AND s.t_Id      = ( SELECT ltrim( t_DocumentId, '0' ) FROM DoprOper_dbt " +
+                   "                         WHERE t_Kind_Operation = 4602 " +
+                   "                           AND t_DocKind        = 52   " +
+                   "                           AND t_ID_Operation   = ? )  " );
+  //msgbox (cmd.cmdtext, " | ", ID_Operation);
+  cmd.addparam("id", RSDBP_IN, ID_Operation );
+  cmd.execute();
+  //msgbox (1);
+ 
+ end;
+ return 0;
+End; 

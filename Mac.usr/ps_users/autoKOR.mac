@@ -1,0 +1,211 @@
+// -----------------------------------------------------------------------------------------------------------------
+// @filename: autoKOR.mac
+// @author  : Гурин С.
+// @desc    : Ведение картотеки документов, ожидающих разрешение на проведение (КОР)(Положение №385-П Банка России)
+//            Автоматическое списание с К2/KOP
+// @request : C-17880 
+// @modify  : Gurin S. 23.01.2014 R-317985-2 (проверялись очередности документов 5 и 6, теперь 4 и 5, 
+//                                            в связи с внесением изменений в статью 855 ГК)
+//          : Gurin S. 17.02.2014 C-26931 (в процедуре переноса между картотеками не учавствуют документы 
+//                                          со счетом получателя 40101* и приоритетов 5)
+//          : Gurin S. 26.02.2014 R-337130-2 (документы со счетом получателя 40101* исключены из процедуры)
+// -----------------------------------------------------------------------------------------------------------------
+import rsd, PaymInter, lib_sqltools;
+import "autoKOR_K2_common.mac", "lib_types.mac";
+
+const desc_SUCCESS_KOR = "Помещен в КОР";
+const desc_SUCCESS_K2  = "Помещен в К2";
+const desc_FAILURE     = "Ошибка";
+
+var arrayID      : TArray = TArray();
+var procprotocol : TArray = TArray();
+private var i 	= 0;
+
+class Rec(_ID_Operation, _PaymentID, _Step, _DocKind)
+    var m_ID_Operation = _ID_operation;
+    var m_PaymentID    = _Paymentid;
+    var m_Step         = _Step;
+    var m_DocKind      = _DocKind;
+end;
+
+class ForProtocol(_Acc, _PaymID, _ValDate, _State)
+    var m_Acc     = _Acc;
+    var m_PaymID  = _PaymID;
+    var m_ValDate = _ValDate;
+    var m_State   = _State;
+end;
+
+// @desc    : Протокол процедуры автоматического списания с КОР и К2.
+// @return  : none
+macro ProtocolTransferProcedure ()
+    var reportName = getTxtFileName ("autoKOR_K2");
+    var table = CTableReport();
+    var i = 0;
+
+    setoutput(reportName,false);
+    println (string ("Отчет о выполнении процедуры автоматического проведения документов "):c:100);
+    println (string ("                           Дата - ", date, ", время - ", time):c:70);
+
+    table.addColumn ("Номер счета",            22, AL_LEFT);
+    table.addColumn ("ИД платежа",             15, AL_LEFT);
+    table.addColumn ("Дата платежа",           15, AL_LEFT);
+    table.addColumn ("Состояние документа",    50, AL_LEFT);
+
+    table.printHead ();
+
+    if (procprotocol.size() > 0)
+        while (i < procprotocol.size ())
+            table.printStringTransferByWord(procprotocol[i].m_Acc, procprotocol[i].m_PaymID, procprotocol[i].m_ValDate, procprotocol[i].m_State);
+            i = i + 1;
+        end;
+     
+        table.printSeparator ();
+        table.printStringTransferByWord ("Всего документов:", i);
+        table.printBottom ();
+        SetOutput (NULL, true);
+        viewfile(reportName);
+    end;
+
+    procprotocol = TArray();
+end;
+
+macro TransferInKORFromK2(acc) 
+    var cmd, rs;
+    cmd = RsdCommand(" SELECT   dopr.t_id_operation opid, dpm.t_paymentid payid, dstep.t_id_step step, dpm.t_dockind dockind, "
+                     "          to_char(dpm.t_valuedate,'dd.mm.yyyy') valuedate "
+                     "   FROM   dpmpaym_dbt dpm, dpmrmprop_dbt dpmrm, dpsinprop_dbt dps, doproper_dbt dopr, doprstep_dbt dstep "
+                     "  WHERE       dpm.t_paymentid = dpmrm.t_paymentid "
+                     "          AND dpm.t_paymentid = dps.t_paymentid "
+                     "          AND dopr.t_documentid = LPAD (dpm.t_paymentid, 34, '0')"
+                     "          AND dopr.t_dockind = dpm.t_dockind "
+                     "          AND dpm.t_origin <> 2 "
+                     "          AND dstep.t_id_operation = dopr.t_id_operation "
+                     "          AND dstep.t_id_step = "
+                     "                (SELECT    t_id_step "
+                     "                   FROM    doprstep_dbt "
+                     "                  WHERE    t_id_operation = dopr.t_id_operation "
+                     "                       AND t_symbol = 'Ж' "
+                     "                       AND t_isexecute = 'R') "
+                     "          AND dps.t_account = :acc "
+                     //Gurin S. 23.01.2014 адаптация 2031
+                     //"          AND dps.t_priority IN (5, 6) ");
+                     "          AND dps.t_priority IN (4, 5) "
+                     //"          AND not (SUBSTR (dpm.t_receiveraccount, 1, 5) = '40101' "
+                     //"               AND dps.t_priority = 5)" 
+                     "          AND SUBSTR (dpm.t_receiveraccount, 1, 5) != '40101' ");
+    cmd.AddParam("acc", RSDBP_IN, acc);
+    cmd.execute();
+    rs = RsdRecordset(cmd);
+    while (rs and rs.movenext())
+        arrayID(arrayID.size()) = Rec(rs.value("opid"),rs.value("payid"),rs.value("step"),rs.value("dockind"));
+    end;
+    //return  arrayID;
+ 
+    while (i < arrayID.size())
+        if (InsertChain(arrayID(i).m_ID_Operation, arrayID(i).m_Step, 10000166, 610))
+            LogProcedure(arrayID(i).m_PaymentID, null, "X", null, "X");
+            if (PM_ExecuteOperation(arrayID(i).m_PaymentID, arrayID(i).m_DocKind))
+                procprotocol(procprotocol.size()) = ForProtocol(acc, rs.value("payid"), rs.value("valuedate"), NamePaymStep(rs.value("payid")));
+            else
+                msgbox(GetErrMsg); 
+            end;
+        end;
+        i = i + 1;
+    end;
+
+onError(er)
+   execSql("insert into USR_AutoKorLog (err) values(:err)", 
+           makeArray(SQLParam("err", string("Макрос: ", er.module, ", cтрока: ", er.line))));
+end;
+
+
+macro TransferFromKOR(acc, cond) 
+    var cmd, rs;
+    debugbreak;
+    //cond == True - это отбор платежей которые были помещены в КОР автоматически
+    if (isNull(cond)) cond = false; end;
+    if (cond)
+        cmd = RsdCommand(" SELECT   dopr.t_id_operation opid, dpm.t_paymentid payid, dstep.t_id_step step, "
+                         "          dpm.t_dockind dockind, TO_CHAR (dpm.t_valuedate, 'dd.mm.yyyy') valuedate "
+                         "   FROM   dpmpaym_dbt dpm, doproper_dbt dopr, doprstep_dbt dstep, USR_AUTO_K2_KOR usr, dpmrmprop_dbt rm "
+                         "  WHERE       dpm.t_paymentid = usr.t_id "
+                         "          AND dpm.t_paymentid = rm.t_paymentid "
+                         "          AND usr.t_fromk2 = 'X' "
+                         "          AND dopr.t_documentid = LPAD (dpm.t_paymentid, 34, '0') "
+                         "          AND dopr.t_dockind = dpm.t_dockind "
+                         "          AND dpm.t_origin <> 2 "
+                         "          AND dstep.t_id_operation = dopr.t_id_operation "
+                         "          AND dstep.t_id_step = "
+                         "                (SELECT   t_id_step "
+                         "                   FROM   doprstep_dbt "
+                         "                  WHERE       t_id_operation = dopr.t_id_operation "
+                         "                          AND t_symbol = '5' "
+                         "                          AND t_isexecute = 'R') "
+                         "          AND dpm.t_payeraccount = :acc"
+                         //Gurin S. 23.01.2014 адаптация 2031
+                         //"          AND rm.t_priority IN (5, 6)" );
+                         "          AND rm.t_priority IN (4, 5) " 
+                         //"          AND NOT (SUBSTR (dpm.t_receiveraccount, 1, 5) = '40101' "
+                         //"                   AND rm.t_priority = 5)" 
+                         "          AND SUBSTR (dpm.t_receiveraccount, 1, 5) != '40101' ");
+    else
+        cmd = RsdCommand(" SELECT   dopr.t_id_operation opid, dpm.t_paymentid payid, dstep.t_id_step step, "
+                         "          dpm.t_dockind dockind, TO_CHAR (dpm.t_valuedate, 'dd.mm.yyyy') valuedate "
+                         "  FROM    dpmpaym_dbt dpm, doproper_dbt dopr, doprstep_dbt dstep, dpmrmprop_dbt rm "
+                         " WHERE        dopr.t_documentid = LPAD (dpm.t_paymentid, 34, '0') "
+                         "          AND dpm.t_paymstatus = 2100 "
+                         "          AND dopr.t_dockind = dpm.t_dockind "
+                         "          AND dpm.t_paymentid = rm.t_paymentid "
+                         "          AND dpm.t_origin <> 2 "
+                         "          AND dstep.t_id_operation = dopr.t_id_operation "
+                         "          AND dstep.t_id_step = "
+                         "                (SELECT   t_id_step "
+                         "                   FROM   doprstep_dbt "
+                         "                  WHERE       t_id_operation = dopr.t_id_operation "
+                         "                          AND t_symbol = '5' "
+                         "                          AND t_isexecute = 'R') "
+                         "          AND dpm.t_payeraccount = :acc "
+                         //Gurin S. 23.01.2014 адаптация 2031
+                         //"          AND rm.t_priority IN (5, 6) "
+                         "          AND rm.t_priority IN (4, 5) "
+                         //"          AND NOT (SUBSTR (dpm.t_receiveraccount, 1, 5) = '40101' "
+                         //"                   AND rm.t_priority = 5) "
+                         "          AND SUBSTR (dpm.t_receiveraccount, 1, 5) != '40101' "
+                         "          AND NOT EXISTS (SELECT   t_id "
+                         "                            FROM   USR_AUTO_K2_KOR "
+                         "                           WHERE   t_id = dpm.t_paymentid AND t_fromK2 = 'X') ");
+    end;
+    cmd.AddParam("acc", RSDBP_IN, acc);
+    cmd.execute();
+    rs = RsdRecordset(cmd);
+    while (rs and rs.movenext())
+        arrayID(arrayID.size()) = Rec(rs.value("opid"),rs.value("payid"),rs.value("step"),rs.value("dockind"));
+    end;
+    //return  arrayID;
+
+    //procprotocol(procprotocol.size()) = ForProtocol("1", "asd", "asd", "asd");
+    while (i < arrayID.size())
+        if (cond) LogProcedure(arrayID(i).m_PaymentID, null, null, "X", "X");
+        else      LogProcedure(arrayID(i).m_PaymentID, null, null, "X", null);
+        end;
+        if (PM_ExecuteOperation(arrayID(i).m_PaymentID, arrayID(i).m_DocKind))
+            procprotocol(procprotocol.size()) = ForProtocol(acc, rs.value("payid"), rs.value("valuedate"), NamePaymStep(rs.value("payid")));
+        else
+            msgbox(GetErrMsg); 
+        end;
+        i = i + 1;
+    end;
+
+onError(er)
+   execSql("insert into USR_AutoKorLog (err) values(:err)", 
+           makeArray(SQLParam("err", string("Макрос: ", er.module, ", cтрока: ", er.line))));
+end;
+
+//TransferInKORFromK2("40702810500000010272");
+//ProtocolTransferProcedure();
+//TransferFromKOR("40702810500000010272");
+//ProtocolTransferProcedure();
+//TransferInKORFromK2("40702810808150068041");
+//TransferFromKOR("40702810500000010272");
+
+

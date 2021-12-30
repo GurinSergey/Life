@@ -1,0 +1,100 @@
+// --------------------------------------------------------------------
+// @filename: DownloadFromGisGateway.mac
+// @author  : Teleshova A. 29.10.2013 C-23435
+// @desc    : Получение статусов по сообщениям и логирование
+// @changes : none
+// ---------------------------------------------------------------------
+
+import rcw;
+import "wluftool.mac", "fg_Life_parm.mac";
+
+//Константы
+const LOGIN    = "rsbank";
+const PASSWORD = "k1nda!pass";
+const RESULT_SUCCESS = 9500;
+// Коды статусов
+const SET_IN_QUEUE             = 0;
+const ANSWER_IS_READY          = 1;
+const ANSWER_IS_NOT_READY      = 2;
+const NO_REQUEST_FOUND         = 3;
+const SERVICE_IS_NOT_AVAILABLE = 4;
+const SYSTEM_ERROR             = 99;
+
+//Сохраняем информация о результатах обработки сервисом сообщений ГИС ГМП
+macro UpdateInfoForGisMonitor(response, err_code, err_desc, status)
+   var command, rsdcmd;
+   command = " UPDATE   usr_gis_gmp_monitor_dbt gis                                  " +
+             " SET      GIS.T_STATUS = ?, GIS.T_ERROR_CODE = ?, GIS.T_ERROR_DESC = ? " +
+             " WHERE   GIS.T_RESPONSE_ID = ?                                         ";
+   rsdcmd = RSDCommand(command);
+   rsdcmd.addparam("status"   , RSDBP_IN, status);
+   rsdcmd.addparam("err_code" , RSDBP_IN, err_code);
+   rsdcmd.addparam("err_desc" , RSDBP_IN, err_desc);
+   rsdcmd.addparam("response" , RSDBP_IN, response);
+   rsdcmd.execute();
+end;
+
+macro Get_Response(SmevRequestId):bool 
+   //debugbreak;
+   var ret, GenNumber;
+   private var jvm = CreateObject ("rsjvm", "TJavaHost", "GlobalJavaHost");
+   //private var jrequest = jvm.createJavaObject ("ru.softlab.integration.ws.SmevRequest");
+   private var jloginData = jvm.createJavaObject ("ru.softlab.integration.ws.LoginData");
+   jloginData.login = LOGIN;
+   jloginData.password = PASSWORD;
+   private var jservice = jvm.createJavaObject ("ru.softlab.integration.ws.SmevService_Service");
+   private var jcaller = jservice.getSmevServicePort();
+   var result = jcaller.wsuGetStatusQueueRequestSmevResponse(jloginData, SmevRequestId);
+   //Разбор статусов
+   if   (result.status == ANSWER_IS_READY)
+      var xml:object = ActiveX( "MSXML.DOMDocument" );
+      if ( not xml.loadXML(result.message) )
+         msgbox("Ошибка создания MSXML.DOMDocument!");
+         return false;
+      end;
+      
+      var atr_RequestProcessResult_ErrorCode = trim(ReadNodeText(xml, "Body/UnifoTransferMsg/MessageData/AppData/ImportDataResponse/Ticket/RequestProcessResult/ErrorCode", false));
+      var atr_RequestProcessResult_ErrorDesc = trim(ReadNodeText(xml, "Body/UnifoTransferMsg/MessageData/AppData/ImportDataResponse/Ticket/RequestProcessResult/ErrorDescription", false));
+      
+      if ( atr_RequestProcessResult_ErrorCode != "" )
+         UpdateInfoForGisMonitor(SmevRequestId, atr_RequestProcessResult_ErrorCode, atr_RequestProcessResult_ErrorDesc, result.status);
+      else
+         var atr_SenderIdentifier = ReadNodeText(xml, "Body/UnifoTransferMsg/MessageData/AppData/ImportDataResponse/Ticket/PostBlock/SenderIdentifier", false);
+         if (atr_SenderIdentifier != RESULT_SUCCESS)
+            UpdateInfoForGisMonitor(SmevRequestId, atr_SenderIdentifier, "SenderIdentifier не равен 9500", result.status);
+         else
+            UpdateInfoForGisMonitor(SmevRequestId, int(atr_SenderIdentifier), "Ошибок нет", result.status);
+         end;
+      end;
+   elif (result.status == ANSWER_IS_NOT_READY)
+      var rsdcmd = RSDCommand(" UPDATE usr_gis_gmp_monitor_dbt gis SET GIS.T_STATUS = ? WHERE GIS.T_RESPONSE_ID = ?");
+      rsdcmd.addparam("status"   , RSDBP_IN, result.status);
+      rsdcmd.addparam("err_code" , RSDBP_IN, string(SmevRequestId)); //LAO 08.05.2014 был FULL SCAN по таблице
+      rsdcmd.execute();
+   elif (result.status == NO_REQUEST_FOUND)
+      UpdateInfoForGisMonitor(SmevRequestId, 666, "Запрос не найден ", result.status);
+   elif (result.status == SYSTEM_ERROR)
+      UpdateInfoForGisMonitor(SmevRequestId, 99 , "Системная ошибка" , result.status);
+   elif (result.status == SERVICE_IS_NOT_AVAILABLE)
+   end;
+end;
+
+//Отправка запроса о состоянии для всех необработанных запросов
+macro StartProcessing()
+   var select : string;
+   var rs     : object;
+   var rsdcmd;
+   select = "SELECT GIS.T_RESPONSE_ID response_id FROM   usr_gis_gmp_monitor_dbt gis WHERE   GIS.T_STATUS NOT IN (1, 3, 99, 666)";
+   rsdcmd = RSDCommand(select);
+   rs = RSDRecordset(rsdcmd, null, RSDVAL_STATIC);
+   while( rs and rs.moveNext() )
+      Get_Response(int(rs.value("response_id")));
+   end;
+   //TAM 07.04.2014 C-28260 после получения статусов актуализируем состояние объектов в РС
+   /*var com = string(" begin usr_update_gis_status (to_date('",{curdate},"','dd.mm.yyyy')); end;");
+   rsdcmd = RSDCommand(com);
+   rsdcmd.Execute();*/
+end;
+
+//Точка входа
+StartProcessing();

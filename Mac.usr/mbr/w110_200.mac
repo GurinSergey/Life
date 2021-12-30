@@ -1,0 +1,999 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29005  - "Выгрузка в МБР"
+// Шаг       : 200    - "Квитовка"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+//-----------------------------------------------------------------------------
+/*SDA адаптация для 31-й*/
+import InsCarryDoc, OprInter, BankInter, PaymInter, "wldoc.mac", "wlkvit.mac", "cbsttls.mac", "pm_opr.mac";
+import "pm_tools.mac", "pmcarfun.mac", "fg_Life_parm.mac";
+import oralib; //Jushmanov 2014-02-24 C-19151
+
+RECORD Corschem( corschem );
+
+private var fgBank = fg_life_subject({OurBank});
+var PaymentObj:RsbPayment;
+
+const Menu1      = "Поместить в картотеку";
+const Menu2      = "Вернуть отправителю";
+const Menu3      = "Перепозиционировать";
+const ActionName = "Действие при квитовке отказом:";
+
+macro IsClosedOperDay( payment )
+    var select:string = " select t_IsClosed " +
+                        "   from dcurdate_dbt " +
+                        "  where t_Branch = :Department " +
+                        "    and t_CurDate = :ValueDate ";
+
+    var params:TArray = makeArray( SQLParam( "NextDepartment", {OperDprt}          ),
+                                   SQLParam( "ValueDate"     , payment.ValueDate ) );
+    var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+    if( rset and rset.moveNext() and (rset.value("t_IsClosed") == "X"))
+        return true;
+    end;
+    return false;
+end;
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first )
+
+    var KvitSum       = Moneyl(0),
+        KvitDate:date,
+        UserBreak:bool = false,
+        Cancel:string = KVIT_NORMAL,
+        menu_item,
+        Description   = "";
+    var ClaimOrder:object = null;
+
+    var accUncs = null;
+    var AccountCarry = "";
+
+    var   Choise;
+    array Text, Buttons;
+    // Проводка
+    var paymtr:RsbPaymTransaction;
+    var rs:RsdRecordset; /*SDA 03/02/2012*/
+
+    PaymentObj.FreeReserve( PaymentObj.PayerAccount, 1, PaymentObj.PayerFIID );
+
+    if ( not CarryPlanDocuments(PaymentObj.PaymentID) )
+        MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+        return 1;
+    end;
+
+    if (((PaymentObj.FuturePayerAccount != PaymentObj.FutureReceiverAccount) or
+         (PaymentObj.FuturePayerFIID  != PaymentObj.FutureReceiverFIID))
+    and ((ПолучитьВсеПроводки(PaymentObj.PaymentID,@rs, 1/*CHAPT1*/) 
+    and  rs.moveLast()
+    /*SDA - это не ошибка, в строке ниже идет приравнивание для функции ПлатежЗачисленНаСНР */
+    and (PaymentObj.FuturePayerAccount = rs.value("t_ReceiverAccount")))  
+    and (ПлатежЗачисленНаСНР(PaymentObj))))
+
+        PaymentObj.ValueDate = PaymentObj.OutTransferDate;
+        paymtr = PaymentObj.MakeTransaction();
+
+        if( paymtr == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;     
+
+        paymtr.Chapter         = PaymentObj.Chapter;
+        paymtr.Date_Carry      =
+        paymtr.Date_Document   = {curdate};
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 1;
+        paymtr.Kind_Oper       = " 1";
+
+        if (PaymentObj.ShifrOper != "")
+            paymtr.Shifr_Oper  = PaymentObj.ShifrOper;
+        else
+            paymtr.Shifr_Oper  = "09";
+        end;
+
+        paymtr.Ground          = PaymentObj.Ground;
+        paymtr.Department      = PaymentObj.Department;
+        paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+        paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+        paymtr.SumPayer        = PaymentObj.PayerAmount; 
+        paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+        paymtr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+        paymtr.SumReceiver     = PaymentObj.PayerAmount;
+        paymtr.ClaimID         = PaymentObj.ClaimID;
+
+        if( PaymentObj.CoverAmount != $0 ) 
+            paymtr.SumEquivalentCarry = PaymentObj.CoverAmount;
+        end;
+
+        if( not paymtr.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;  
+    end;
+
+    //Gurin S. 11.08.2015
+    if (Corschem.IsKvitOutPaym != "X")
+       // Установить статусы
+       if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+          MsgBox("Возникла ошибка при смене статусов операции платежа");
+          return 1;
+       end;
+
+       PaymentObj.PropStatus = PM_PROP_CLOSED;
+       PaymentObj.Paymstatus = PM_FINISHED;
+
+       return 0;
+    end;
+
+    /* Требуется квитовка исходящего платежа с ответным подтверждением */
+    if( Corschem.IsKvitOutPaym == "X" )       
+        if( not ПолучитьСуммуКвитовки( PaymentObj, KvitSum, Cancel, Description ) )
+            return 1; //  Ошибка создана
+        end;
+        if( Cancel == KVIT_CALL_BACK )
+            MsgBox( "Нельзя квитовать с подтверждением отзывом" );
+            return 1;
+        end;
+    end;
+
+    /* Пришло подтверждение отказом */
+    if( Cancel == KVIT_CANCEL )
+
+        if( PaymentObj.DocKind != DLDOC_MULTYPM )
+            if( (PaymentObj.DocKind == DLDOC_BANKCLAIM) AND (GetOprStatus( OPR_PAYM_ACCEPT ) == OPR_PAYM_ST_ACPT_NEED) )
+
+                ClaimOrder            = GenObject( "RsbBankClaim", PaymentObj.DocumentID );
+                ClaimOrder.Status     = 4 /*MEMORDER_STATUS_REJECTED*/;
+                PaymentObj.PaymStatus = PM_REJECTED;
+
+                if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_REJECTED,
+                                              OPR_PAYM_STATE,  OPR_PM_ST_REJECT ) )
+                    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                    return 1;
+                end;
+
+                // Установить примечание "Причина отказа (возврата)" равным "Отказ от акцепта"
+                // Заполнить примечание
+                if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, "Отказ от акцепта" ) != 0 )
+                    msgbox( "Ошибка при вставке примечания платежа" );
+                    return 1;
+                end;
+
+                return 0;
+
+            end;
+
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_CANCEL ) )
+                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                return 1;
+            end;
+
+            if( not IsMoveDocSpecialScrol() )
+
+                if( not ExecRefusalDocument( PaymentObj, Corschem, Description ) )
+                    return 1;
+                end;
+
+            else
+                if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_EXEC_REFUSAL ) )
+                    MsgBox("Возникла ошибка при смене статусов операции платежа");
+                    return 1;
+                end;
+                if( Description != "" )
+                    // Заполнить примечание
+                    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, Description ) != 0 )
+                        msgbox( "Ошибка при вставке примечания платежа" );
+                        return 1;
+                    end;
+                end;
+            end;
+
+        else
+            if(Description != "")
+                // Заполнить примечание
+                if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, Description ) != 0 )
+                    msgbox( "Ошибка при вставке примечания платежа" );
+                    return 1;
+                end;
+            end;
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+                MsgBox("Возникла ошибка при смене статусов операции платежа");
+                return 1;
+            end;
+            return 0;
+        end;
+    else  /* Получено успешное подтверждение */
+
+        if( PaymentObj.OutTransferDate > {curdate} )
+            msgbox( "ДПП по исходящей схеме расчетов еще не наступила" );
+            return 1;
+        end;
+
+        if( PaymentObj.DocKind != DLDOC_MULTYPM )
+
+            KvitDate = WldGetKvitDate( PaymentObj, @UserBreak );
+            if( UserBreak )
+                return 1;
+            elif( KvitDate == date( 0, 0, 0 ) )
+                MsgBox( string( "Не найден операционный день ДПП подтверждения ", GetConfTransferDate():f,
+                                " или в этом дне невозможна проводка" ) );
+                return 1;
+            end;
+
+            PaymentObj.FreeReserve( PaymentObj.PayerAccount, 1, PaymentObj.PayerFIID );
+
+            if( ( PaymentObj.FuturePayerAccount == PaymentObj.FutureReceiverAccount ) and
+                ( PaymentObj.ValueDate == KvitDate ) 
+              )
+                // Провести все плановые проводки
+                if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+                    MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                    return 1;
+                end;
+
+            elif( ( PaymentObj.FuturePayerAccount == PaymentObj.FutureReceiverAccount ) and 
+                  ( PaymentObj.ValueDate != KvitDate )
+                )
+
+                if( CheckUnFin(PaymentObj, false) OR IsClosedOperDay( PaymentObj ))
+                    CarryPaymOnNewDate( PaymentObj, KvitDate ); // Перепровести все проводки платежа датой wlconf.TransferDate 
+                else
+                    // Провести все плановые проводки
+                    if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+                        MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                        return 1;
+                    end;
+                    // Перепровести проводку зачисления на счет СНР
+                    accUncs = OutPaymentAccUnclosed( PaymentObj );
+                    AccountCarry = accUncs.FindAndOpenAccount( PaymentObj.ValueDate );
+                    if( CarryPaymOnNewAccount( PaymentObj, 
+                                               PRT_Credit, 
+                                               1, 
+                                               PaymentObj.FutureReceiverFIID, 
+                                               PaymentObj.FutureReceiverAccount, 
+                                               PaymentObj.FutureReceiverFIID,
+                                               AccountCarry,
+                                               ACCTRN_STATUS_DOCUMENT,
+                                               KvitDate ) )
+                        return 1;
+                    end;
+
+                    PaymentObj.ValueDate = KvitDate;
+
+                    // обычная завершающая проводка FuturePayerAccount->FutureReceiverAccount
+                    paymtr = PaymentObj.MakeTransaction();
+
+                    paymtr.Chapter         = 1;                                            
+                    paymtr.Date_Carry      = PaymentObj.ValueDate;
+                    paymtr.Number_Pack     = PaymentObj.NumberPack;
+                    paymtr.Numb_Document   = PaymentObj.Number;
+                    paymtr.ResultCarry     = 1;
+                    paymtr.Kind_Oper       = " 1";
+
+                    if (PaymentObj.ShifrOper != "")
+                        paymtr.Shifr_Oper  = PaymentObj.ShifrOper;
+                    else
+                        paymtr.Shifr_Oper  = "09";
+                    end;
+
+                    paymtr.Ground          = PaymentObj.Ground;
+                    paymtr.Department      = PaymentObj.Department;
+                    paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+                    paymtr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+                    paymtr.SumPayer        = PaymentObj.FuturePayerAmount;
+                    paymtr.SumReceiver     = PaymentObj.FutureReceiverAmount;
+                    paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+                    paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+                    paymtr.ClaimID         = PaymentObj.ClaimID;
+
+                    if( ( PaymentObj.CoverAmount != $0            ) and 
+                        ( PaymentObj.PIList(PRT_Debet ).Size == 0 ) and 
+                        ( PaymentObj.PIList(PRT_Credit).Size == 0 ) ) 
+                        paymtr.SumEquivalentCarry = PaymentObj.CoverAmount;
+                    end;
+
+                    if( not paymtr.Carry )
+                        MsgBox("Ошибка при актуализации платежа");
+                        return 1;
+                    end;  
+                end;
+
+            elif( ( ПлатежЗачисленНаСНР( PaymentObj ) ) and 
+                  ( PaymentObj.ValueDate == KvitDate ) 
+                )
+                // Провести все плановые проводки
+                if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+                    MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                    return 1;
+                end;
+
+                // Иначе перепровести проводку зачисления на счет СНР
+                accUncs = OutPaymentAccUnclosed( PaymentObj );
+                AccountCarry = accUncs.FindAndOpenAccount();
+                if( CarryPaymOnNewAccount( PaymentObj,
+                                           PRT_Credit, 
+                                           1,
+                                           PaymentObj.FutureReceiverFIID, 
+                                           AccountCarry,
+                                           PaymentObj.FutureReceiverFIID,
+                                           PaymentObj.FutureReceiverAccount,
+                                           ACCTRN_STATUS_DOCUMENT ) )
+                    return 1;
+                end;
+
+            elif( ( ПлатежЗачисленНаСНР( PaymentObj ) ) and 
+                  ( PaymentObj.ValueDate != KvitDate ) )
+
+                // Провести все плановые проводки
+                if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+                    MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                    return 1;
+                end;
+
+                PaymentObj.ValueDate = KvitDate;
+
+                // обычная завершающая проводка FuturePayerAccount->FutureReceiverAccount
+                paymtr = PaymentObj.MakeTransaction();
+
+                paymtr.Chapter       = 1;                                            
+                paymtr.Date_Carry    = PaymentObj.ValueDate;
+                paymtr.Number_Pack   = PaymentObj.NumberPack;
+                paymtr.Numb_Document = PaymentObj.Number;
+                paymtr.ResultCarry   = 1;
+                paymtr.Kind_Oper     = " 1";
+
+                if (PaymentObj.ShifrOper != "")
+                    paymtr.Shifr_Oper      = PaymentObj.ShifrOper;
+                else
+                    paymtr.Shifr_Oper      = "09";
+                end;
+
+                paymtr.Ground          = PaymentObj.Ground;
+                paymtr.Department      = PaymentObj.Department;
+                paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+                paymtr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+                paymtr.SumPayer        = PaymentObj.FuturePayerAmount;
+                paymtr.SumReceiver     = PaymentObj.FutureReceiverAmount;
+                paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+                paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+                paymtr.ClaimID         = PaymentObj.ClaimID;
+
+                if( ( PaymentObj.CoverAmount != $0            ) and 
+                    ( PaymentObj.PIList(PRT_Debet ).Size == 0 ) and 
+                    ( PaymentObj.PIList(PRT_Credit).Size == 0 ) ) 
+                    paymtr.SumEquivalentCarry = PaymentObj.CoverAmount;
+                end;
+
+                if( not paymtr.Carry )
+                    MsgBox("Ошибка при актуализации платежа");
+                    return 1;
+                end;  
+
+            end;
+
+        end;
+
+        if( (PaymentObj.DocKind == DLDOC_BANKCLAIM) AND (GetOprStatus( OPR_PAYM_ACCEPT ) == OPR_PAYM_ST_ACPT_NEED) )
+
+            ClaimOrder            = GenObject( "RsbBankClaim", PaymentObj.DocumentID );
+            ClaimOrder.Status     = 3 /*MEMORDER_STATUS_CLOSE*/;
+            PaymentObj.PaymStatus = PM_FINISHED;
+
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT,
+                                          OPR_PAYM_ACCEPT,   OPR_PAYM_ST_ACPT_ACCEPTED,
+                                          OPR_PAYM_STATE,    OPR_PM_ST_CLOSE ) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+
+            return 0;
+
+        end;
+
+        // Освободить все резервы по платежу
+        PaymentObj.FreeReserve( PaymentObj.PayerAccount, PaymentObj.Chapter, PaymentObj.PayerFIID );
+
+        PaymentObj.ValueDate = KvitDate;
+
+        // Установить статусы
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+            MsgBox("Возникла ошибка при смене статусов операции платежа");
+            return 1;
+        end;
+        PaymentObj.Paymstatus = PM_FINISHED;
+        PaymentObj.PropStatus = PM_PROP_KVITED;
+        PaymentObj.StatusInfo = "Исполнен";
+    end;
+
+    return 0;
+end;
+
+macro PrepMassExecuteStep() 
+    return execStoredFunc( "WLD_KVTOUTSTEP.MassKvitOutStepPrepare", V_INTEGER );
+end;
+
+macro MassExecuteStep()
+    var retval = 0;
+    var select, select_;
+    var params:TArray = TArray();
+    var rs:RsdRecordset;
+    var strSQL, ErrorMessage;
+    var accUncs;
+    var AccountCarry;
+    RECORD pmpaym(pmpaym);
+    var Carry:RsbPaymTransaction;
+
+    params = makeArray(SQLParam( "p_ID_Operation", 1 ),
+                       SQLParam( "p_Oper", {oper} ));
+    retval = execStoredFunc( "WLD_KVIT.KvitPmTrn", V_INTEGER, params);
+
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    execSQL( "UPDATE doprtemp_tmp "
+                "SET t_SkipDocument = 2 "
+              "WHERE t_SkipDocument = 0 "
+                "and t_ErrorStatus = 0" );
+
+    /*1.Обработка платежей зачисленных на СНР, у которых ДПП подтвержения совпадает c датой валютирования платежа*/
+    select = " select oprtemp.t_OrderID,"+
+                     " pmpaym.t_FuturePayerAccount,"+
+                     " pmpaym.t_FIID_FuturePayAcc,"+
+                     " pmpaym.t_FutureReceiverAccount,"+
+                     " pmpaym.t_FIID_FutureRecAcc,"+
+                     " pmpaym.t_Chapter,"+
+                     " oprtemp.t_ID_Operation, "+
+                     " oprtemp.t_ID_Step "+
+               " from doprtemp_tmp oprtemp, dwlkvtlnk_tmp kvtlnk, dwlconf_dbt conf, dpmpaym_dbt pmpaym"+
+              " where oprtemp.t_OrderID = kvtlnk.t_PaymentID"+
+                " and kvtlnk.t_Type = chr(0)" +
+                " and oprtemp.t_ErrorStatus = 0"+
+                " and conf.t_ConfID = kvtlnk.t_ConfID"+
+                " and pmpaym.t_PaymentID = oprtemp.t_OrderID"+
+                " and pmpaym.t_ValueDate = WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department )"+
+                " and pmpaym.t_FuturePayerAccount <> pmpaym.t_FutureReceiverAccount";
+    rs = execSQLselect( select, NULL, false );
+    /*Для каждой записи выполнить перепроводку со счета pmpaym.FuturePayerAccount (старый счет) на корсчет pmpaym.FutureReceiverAccount (новый счет)*/
+    while(rs.moveNext())
+        if( CarryPaymOnNewAccountMass(rs.value("t_OrderID"),
+                                      rs.value("t_ID_Operation"),
+                                      rs.value("t_ID_Step"),
+                                      1,      
+                                      rs.value("t_Chapter"),   
+                                      rs.value("t_FIID_FuturePayAcc"),   
+                                      rs.value("t_FuturePayerAccount"),
+                                      rs.value("t_FIID_FutureRecAcc"),   
+                                      rs.value("t_FutureReceiverAccount")))
+            return 1;
+        end;
+    end;
+
+    /*Заполнить временную таблицу pmcarryacc по записям pmpaym из выборки:*/
+    strSQL = " INSERT INTO dpmcarryacc_tmp (t_PaymentID, t_PayerAccount, t_PayerAmount, t_PayerFIID, t_ReceiverAccount, t_ReceiverAmount, t_ReceiverFIID, t_Chapter) "+
+             " ( SELECT pmpaym.t_PaymentID,"+
+                      " pmpaym.t_FuturePayerAccount,"+
+                      " pmpaym.t_FuturePayerAmount,"+
+                      " pmpaym.t_FIID_FuturePayAcc,"+
+                      " pmpaym.t_FutureReceiverAccount,"+
+                      " pmpaym.t_FutureReceiverAmount,"+
+                      " pmpaym.t_FIID_FutureRecAcc,"+
+                      " pmpaym.t_Chapter"+
+                 " FROM dpmpaym_dbt pmpaym, doprtemp_tmp oprtemp, dwlkvtlnk_tmp kvtlnk, dwlconf_dbt conf "+
+                " WHERE oprtemp.t_OrderID = kvtlnk.t_PaymentID"+
+                  " and kvtlnk.t_Type = chr(0)" +
+                  " and oprtemp.t_ErrorStatus = 0"+
+                  " and conf.t_ConfID = kvtlnk.t_ConfID"+
+                  " and pmpaym.t_PaymentID = oprtemp.t_OrderID"+
+                  " and conf.t_TransferDate = pmpaym.t_ValueDate"+
+                  " and pmpaym.t_FuturePayerAccount <> pmpaym.t_FutureReceiverAccount)";
+
+    execSQL(strSQL, NULL);            
+
+    /*Выполнить процедуру смены тех.полей платежа с привязкой к шагу*/
+    retval = execStoredFunc( "PM_CARFUN.ChangePMFutureFields", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    /*Очистить таблицу pmcarryacc*/
+    execSQL("DELETE FROM dpmcarryacc_tmp");
+
+    /*2.Обработка платежей зачисленных на корсчет, у которых ДПП подтвержения не совпадает c датой валютирования платежа и они могут быть зачислены на СНР*/
+    select_= " select oprtemp.t_OrderID, "+
+                    " oprtemp.t_ID_Operation, "
+                    " oprtemp.t_ID_Step, "
+                    " pmpaym.t_FIID_FuturePayAcc, "
+                    " pmpaym.t_FuturePayerAccount, "
+                    " pmpaym.t_FuturePayerAmount, "
+                    " pmpaym.t_FIID_FutureRecAcc, "
+                    " pmpaym.t_FutureReceiverAccount, "
+                    " pmpaym.t_FutureReceiverAmount, "
+                    " WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department ) as t_TransferDate, "
+                    " rm.t_ShifrOper, "
+                    " pmpaym.t_Chapter, "
+                    " rm.t_Number, "
+                    " pmpaym.t_NumberPack, "
+                    " rm.t_Ground, "
+                    " pmpaym.t_Department, "
+                    " pmpaym.t_ValueDate, "
+                    " nvl(nvpi.t_CoverAmount, 0) as t_CoverAmount ";
+     select =       " from doprtemp_tmp oprtemp,"
+                    " dwlkvtlnk_tmp kvtlnk,"
+                    " dwlconf_dbt conf,"
+                    " dpmpaym_dbt pmpaym,"
+                    " dpmprop_dbt db,"
+                    " dpmprop_dbt cr,"
+                    " dpmrmprop_dbt rm,"
+                    " dpmnvpi_dbt nvpi"
+              " where oprtemp.t_OrderID = kvtlnk.t_PaymentID"
+                " and kvtlnk.t_Type = chr(0)" 
+                " and oprtemp.t_ErrorStatus = 0"
+                " and conf.t_ConfID = kvtlnk.t_ConfID"
+                " and pmpaym.t_PaymentID = oprtemp.t_OrderID"
+                " and pmpaym.t_ValueDate <> WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department )"
+                " and pmpaym.t_FuturePayerAccount = pmpaym.t_FutureReceiverAccount"
+                " and db.t_PaymentID = pmpaym.t_PaymentID"
+                " and db.t_DebetCredit = 0"
+                " and cr.t_PaymentID = pmpaym.t_PaymentID"
+                " and cr.t_DebetCredit = 1"
+                " and rm.t_PaymentID = pmpaym.t_PaymentID"
+                " and PM_DPPFUN.MayPlaceToSNR( db.t_Group,"
+                                             " db.t_IsSender,"
+                                             " cr.t_Group,"
+                                             " cr.t_IsSender,"
+                                             " pmpaym.t_Department,"
+                                             " pmpaym.t_StartDepartment ) = 1"
+                " and NOT EXISTS( select 1 "
+                                  " from dcurdate_dbt cd"
+                                 " where cd.t_Branch = " + {OperDprt} +
+                                   " and cd.t_CurDate = pmpaym.t_ValueDate "
+                                   " and cd.t_IsClosed = 'X') "
+                " and nvpi.t_PaymentID(+) = oprtemp.t_OrderID ";
+    rs = execSQLselect( select_ + select );
+    /*Для каждой записи */
+    while(rs.moveNext())
+        /*выполнить перепроводку с корсчета pmpaym.FutureReceiverAccount (старый счет) на счет  СНР*/
+        accUncs = OutPaymentAccUnclosed(rs.value("t_OrderID"),rs.value("t_OrderID"));
+        AccountCarry = accUncs.FindAndOpenAccount(date(rs.value("t_ValueDate")));
+        if( CarryPaymOnNewAccountMass(rs.value("t_OrderID"),
+                                      rs.value("t_ID_Operation"),
+                                      rs.value("t_ID_Step"),
+                                      1,      
+                                      rs.value("t_Chapter"),   
+                                      rs.value("t_FIID_FutureRecAcc"),   
+                                      rs.value("t_FutureReceiverAccount"),
+                                      rs.value("t_FIID_FutureRecAcc"),   
+                                      AccountCarry,
+                                      rs.value("t_TransferDate")))
+            return 1;
+        end;
+
+
+        /* Выполнить фактическую проводку:
+           Счет дебета: pmpaym.FuturePayerAccount
+           Счет кредита: pmpaym.FutureReceiverAccount
+           Сумма: сумма платежа к оплате
+           Дата: wlconf.TransferDate*/
+        Carry = RsbPaymTransaction( rs.value("t_OrderID") );
+
+        Carry.Chapter         = rs.value("t_Chapter");
+        Carry.Date_Carry      = rs.value("t_TransferDate");
+        Carry.Number_Pack     = rs.value("t_NumberPack");
+        Carry.Numb_Document   = rs.value("t_Number");
+        Carry.ResultCarry     = 1;
+        Carry.Kind_Oper       = " 1";
+        Carry.Shifr_Oper      = rs.value("t_ShifrOper");
+        Carry.Ground          = rs.value("t_Ground");
+        Carry.Department      = rs.value("t_Department");
+        Carry.FIID            = rs.value("t_FIID_FutureRecAcc");
+        Carry.Sum             = rs.value("t_FutureReceiverAmount");
+        Carry.AccountPayer    = AccountCarry;
+        Carry.AccountReceiver = rs.value("t_FutureReceiverAccount");
+        Carry.ID_Operation    = rs.value("t_ID_Operation");
+        Carry.ID_Step         = rs.value("t_ID_Step");
+        Carry.Reason          = PM_CARRY_REASON_EXECUTION;
+
+        if( rs.value("t_CoverAmount") > $0 )
+            Carry.SumEquivalentCarry = rs.value("t_CoverAmount");
+        end;
+
+        if( not Carry.Carry( NULL, ErrorMessage ) )
+            return 1;
+        end;
+
+    end;
+
+    /* В массвом режиме для данной выборки cменить дату валютирования платежей на ДПП подтверждения*/
+    strSQL = "update doprtemp_tmp SET t_SkipDocument = 0"+
+             " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+
+    retval = execStoredFunc( "WLD_KVIT.ChangeVD2DPP", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    retval = execStoredFunc( "PM_OPERATION.PmWriteLogMass", V_INTEGER, makeArray(SQLParam( "p_Message", "Средства проведены по корсчету датой подтверждения через счет незавершенных расчетов")));  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    strSQL = " update doprtemp_tmp SET t_SkipDocument = 2"+
+              " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+
+
+    /*3.Обработка платежей зачисленных на корсчет, у которых ДПП подтвержения не совпадает c датой валютирования платежа и они не могут быть зачислены на СНР*/
+    select_ = " select oprtemp.t_OrderID,"+
+                    " WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department ) as t_TransferDate,"+
+                    " oprtemp.t_ID_Operation,"+
+                    " oprtemp.T_ID_Step";
+    select  =  " from doprtemp_tmp oprtemp,"
+                    " dwlkvtlnk_tmp kvtlnk,"
+                    " dwlconf_dbt conf,"
+                    " dpmpaym_dbt pmpaym,"
+                    " dpmprop_dbt db,"
+                    " dpmprop_dbt cr"
+              " where oprtemp.t_OrderID = kvtlnk.t_PaymentID"+
+                " and kvtlnk.t_Type = chr(0)" +
+                " and oprtemp.t_ErrorStatus = 0"+
+                " and conf.t_ConfID = kvtlnk.t_ConfID"+
+                " and pmpaym.t_PaymentID = oprtemp.t_OrderID"+
+                " and pmpaym.t_ValueDate <> WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department )"+
+                " and pmpaym.t_FuturePayerAccount = pmpaym.t_FutureReceiverAccount"+
+                " and db.t_PaymentID = pmpaym.t_PaymentID"
+                " and db.t_DebetCredit = 0"
+                " and cr.t_PaymentID = pmpaym.t_PaymentID"
+                " and cr.t_DebetCredit = 1"
+                " and ( PM_DPPFUN.MayPlaceToSNR( db.t_Group,"
+                                               " db.t_IsSender,"
+                                               " cr.t_Group,"
+                                               " cr.t_IsSender,"
+                                               " pmpaym.t_Department,"
+                                               " pmpaym.t_StartDepartment ) <> 1"
+                      " OR EXISTS( select 1 "
+                                   " from dcurdate_dbt cd"
+                                  " where cd.t_Branch = " + {OperDprt} +
+                                    " and cd.t_CurDate = pmpaym.t_ValueDate "
+                                    " and cd.t_IsClosed = 'X' ) )";
+    rs = execSQLselect( select_ + select );
+    /*Для каждой записи */
+    while(rs.moveNext())
+        /* Перепровести все проводки платежа датой wlconf.TransferDate*/
+        if( CarryPaymOnNewDateMass(rs.value("t_OrderID"), rs.value("t_TransferDate"), rs.value("t_ID_Operation"), rs.value("t_ID_Step")) )
+            return 1;
+        end;
+    end;
+
+    /* В массoвом режиме для данной выборки cменить дату валютирования платежей на ДПП подтверждения*/
+    strSQL = "update doprtemp_tmp SET t_SkipDocument = 0"+
+             " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+
+    retval = execStoredFunc( "WLD_KVIT.ChangeVD2DPP", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+    strSQL = " update doprtemp_tmp SET t_SkipDocument = 2"+
+              " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+
+    retval = execStoredFunc( "PM_OPERATION.PmWriteLogFromQueryPmIDMass", V_INTEGER,
+                             makeArray(SQLParam( "p_Message", "Средства перепроведены по корсчету датой подтверждения" ),
+                                       SQLParam( "p_select",  "select oprtemp.t_OrderID as t_PaymentID " + select )));
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    /*4. Обработка платежей зачисленных на СНР, у которых ДПП подтвержения не совпадает c датой валютирования платежа*/
+
+    select_= " select oprtemp.t_OrderID,"
+                    " oprtemp.t_ID_Operation, "
+                    " oprtemp.t_ID_Step, "
+                    " pmpaym.t_FIID_FuturePayAcc, "
+                    " pmpaym.t_FuturePayerAccount, "
+                    " pmpaym.t_FuturePayerAmount, "
+                    " pmpaym.t_FIID_FutureRecAcc, "
+                    " pmpaym.t_FutureReceiverAccount, "
+                    " pmpaym.t_FutureReceiverAmount, "
+                    " WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department ) as t_TransferDate, "
+                    " rm.t_ShifrOper, "
+                    " pmpaym.t_Chapter, "
+                    " rm.t_Number, "
+                    " pmpaym.t_NumberPack, "
+                    " rm.t_Ground, "
+                    " pmpaym.t_Department, "
+                    " decode( oprtemp.t_DocKind, 15, md.t_Type_Document, 70, mo.t_TypeDocument, '' ) as t_Type_Document, "
+                    " nvl(nvpi.t_CoverAmount, 0) as t_CoverAmount";
+    select = " from doprtemp_tmp oprtemp,"
+                  " dwlkvtlnk_tmp kvtlnk,"
+                  " dwlconf_dbt conf,"
+                  " dpmpaym_dbt pmpaym,"
+                  " dpmrmprop_dbt rm,"
+                  " dcb_doc_dbt   mo,"
+                  " dmultydoc_dbt md,"
+                  " dpmnvpi_dbt nvpi,"
+                  " dpmaddpi_dbt addpi "
+              " where oprtemp.t_OrderID = kvtlnk.t_PaymentID"
+                " and kvtlnk.t_Type = chr(0)" 
+                " and oprtemp.t_ErrorStatus = 0"
+                " and conf.t_ConfID = kvtlnk.t_ConfID"
+                " and pmpaym.t_PaymentID = oprtemp.t_OrderID"
+                " and pmpaym.t_ValueDate <> WLD_KVIT.GetKvitDate( conf.t_TransferDate, pmpaym.t_Department )"
+                " and pmpaym.t_FuturePayerAccount <> pmpaym.t_FutureReceiverAccount"
+                " and mo.t_DocumentID(+) = oprtemp.t_OrderID "
+                " and md.t_AutoKey(+)    = oprtemp.t_OrderID"
+                " and rm.t_PaymentID = pmpaym.t_PaymentID"
+                " and nvpi.t_PaymentID(+) = oprtemp.t_OrderID"
+                " and addpi.t_PaymentID(+) = oprtemp.t_OrderID";
+    rs = execSQLselect( select_+select, NULL, false );
+
+    while(rs.moveNext())
+        /* Выполнить проводку:
+           Счет дебета: pmpaym.FuturePayerAccount
+           Счет кредита: pmpaym.FutureReceiverAccount
+           Сумма: сумма платежа к оплате
+           Дата: wlconf.TransferDate 
+    */
+        Carry = RsbPaymTransaction( rs.value("t_OrderID") );
+
+        Carry.Chapter         = rs.value("t_Chapter");
+        Carry.Date_Carry      = rs.value("t_TransferDate");
+        Carry.Number_Pack     = rs.value("t_NumberPack");
+        Carry.Numb_Document   = rs.value("t_Number");
+        Carry.ResultCarry     = 1;
+        Carry.Kind_Oper       = " 1";
+        Carry.Shifr_Oper      = rs.value("t_ShifrOper");
+        Carry.Ground          = rs.value("t_Ground");
+        Carry.Department      = rs.value("t_Department");
+        if( rs.value("t_FIID_FuturePayAcc") == rs.value("t_FIID_FutureRecAcc") )
+            Carry.FIID = rs.value("t_FIID_FuturePayAcc");
+            Carry.Sum  = rs.value("t_FuturePayerAmount");
+        else
+            Carry.FIIDPayer     = rs.value("t_FIID_FuturePayAcc");
+            Carry.FIIDReceiver  = rs.value("t_FIID_FutureRecAcc");
+            Carry.SumPayer      = rs.value("t_FuturePayerAmount");
+            Carry.SumReceiver   = rs.value("t_FutureReceiverAmount");
+        end;
+        Carry.AccountPayer    = rs.value("t_FuturePayerAccount");
+        Carry.AccountReceiver = rs.value("t_FutureReceiverAccount");
+        Carry.TypeDocument    = rs.value("t_Type_Document");
+        Carry.ID_Operation    = rs.value("t_ID_Operation");
+        Carry.ID_Step         = rs.value("t_ID_Step");
+        Carry.Reason          = PM_CARRY_REASON_EXECUTION;
+
+        if( rs.value("t_CoverAmount") > $0 )
+            Carry.SumEquivalentCarry = rs.value("t_CoverAmount");
+        end;
+
+        if( not Carry.Carry(NULL,ErrorMessage) )
+            return 1;
+        end;
+
+    end;
+
+
+    strSQL = "update doprtemp_tmp SET t_SkipDocument = 0"+
+             " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+    /* Сменить дату валютирования платежей на ДПП подтверждения*/
+    retval = execStoredFunc( "WLD_KVIT.ChangeVD2DPP", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    /*Заполнить временную таблицу pmcarryacc по записям pmpaym из выборки:*/
+    strSQL = " INSERT INTO dpmcarryacc_tmp (t_PaymentID, t_PayerAccount, t_PayerAmount, t_PayerFIID, t_ReceiverAccount, t_ReceiverAmount, t_ReceiverFIID, t_Chapter) "+
+             " ( SELECT pmpaym.t_PaymentID,"+
+                      " pmpaym.t_FuturePayerAccount,"+
+                      " pmpaym.t_FuturePayerAmount,"+
+                      " pmpaym.t_FIID_FuturePayAcc,"+
+                      " pmpaym.t_FutureReceiverAccount,"+
+                      " pmpaym.t_FutureReceiverAmount,"+
+                      " pmpaym.t_FIID_FutureRecAcc,"+
+                      " pmpaym.t_Chapter"+
+                 " FROM dpmpaym_dbt pmpaym, doprtemp_tmp oprtemp, dwlkvtlnk_tmp kvtlnk, dwlconf_dbt conf "+
+                " WHERE oprtemp.t_OrderID = kvtlnk.t_PaymentID"+
+                  " and kvtlnk.t_Type = chr(0)" +
+                  " and oprtemp.t_ErrorStatus = 0"+
+                  " and conf.t_ConfID = kvtlnk.t_ConfID"+
+                  " and pmpaym.t_PaymentID = oprtemp.t_OrderID"+
+                  " and conf.t_TransferDate <> pmpaym.t_ValueDate"+
+                  " and pmpaym.t_FuturePayerAccount <> pmpaym.t_FutureReceiverAccount)";
+    execSQL(strSQL, NULL);            
+
+    /*Выполнить процедуру смены тех.полей платежа с привязкой к шагу*/
+    retval = execStoredFunc( "PM_CARFUN.ChangePMFutureFields", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    /*Очистить таблицу pmcarryacc*/
+    execSQL("DELETE FROM dpmcarryacc_tmp");
+  
+  
+    strSQL = " update doprtemp_tmp SET t_SkipDocument = 2"+
+              " where t_OrderID in ( select oprtemp.t_OrderID " + select + ")";
+    execSQL( strSQL, params );
+
+
+
+
+    /* 5. Обработка сквитовавшихся платежей  */
+    select_ = " select oprtemp.t_OrderID, oprtemp.t_ID_Operation, oprtemp.t_id_Step";           
+    select =   " from doprtemp_tmp oprtemp, dwlkvtlnk_tmp kvtlnk, dpmpaym_dbt pmpaym"+
+              " where oprtemp.t_OrderID = kvtlnk.t_PaymentID"+
+                " and kvtlnk.t_Type = chr(0)" +
+                " and oprtemp.t_ErrorStatus = 0"+
+                " and pmpaym.t_PaymentID = oprtemp.t_OrderID";
+    rs = execSQLselect( select_+select, NULL, false );
+
+    while(rs.moveNext())
+        /*выполнить проводку*/
+        retval = CB_CarryPlanDocuments(rs.value(0),date(0,0,0),rs.value(1),rs.value(2));
+        if(retval)
+            MemoryError(retval);
+            return 1;
+        end;
+    end;
+
+    retval = execStoredFunc( "WLD_KVTOUTSTEP.MassKvitOutStepExecute", V_INTEGER );  
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+/* joy 20.05.2015 Код есть в дистрибутивном макросе, но не было в пользовательском, возможно, потому что не используется, поэтому переношу, закомментировав
+  // Для платежей, включенных в сводный, если значение сегмента статуса "Квитовка" 
+  // равно "Отказ", то скопировать из сводного примечание "Причина отказа (возврата) платежа" 
+  select_ = " SELECT oprtmp.t_OrderID, oprtmp.t_ID_Operation, oprtmp.t_ID_Step, "
+            "        rsb_kernel.ExtractText(nt.t_text) as t_NoteValue ";
+  select  =   " FROM doprtemp_tmp oprtmp, doprcurst_dbt oprcurst, "+
+              "      dpmlink_dbt pmlink, dpmpaym_dbt pm, dnotetext_dbt nt "+
+             " WHERE oprtmp.t_ErrorStatus    = 0 "+
+               " AND pmlink.t_PurposePayment = oprtmp.t_OrderID "+
+               " AND pmlink.t_LinkKind       = :PMLINK_KIND_MULTYPM "+
+               " AND pmlink.t_InitialPayment = pm.t_PaymentID "+
+               " AND pm.t_DocKind            = :DLDOC_MULTYPM "+
+               " AND oprcurst.t_ID_Operation = oprtmp.t_ID_Operation "+
+               " AND oprcurst.t_DocKind      = oprtmp.t_DocKind "+
+               " AND oprcurst.t_StatusKindID = :OPR_PAYM_OUT_KVIT "+
+               " AND oprcurst.t_NumValue     = :OPR_PM_ST_CANCEL "+
+               " AND nt.t_ObjectType         = 501  "+
+               " AND nt.t_DocumentID         = lpad(pmlink.t_InitialPayment, 10, '0') "+
+               " AND nt.t_NoteKind           = :PM_NOTEKIND_DENIALGROUND "+
+               " AND nt.t_Date              <= :curdate1 "+
+               " AND nt.t_ValidToDate       >= :curdate2 ";
+
+  params = makeArray(SQLParam( "PMLINK_KIND_MULTYPM",      PMLINK_KIND_MULTYPM ),
+                     SQLParam( "DLDOC_MULTYPM",            DLDOC_MULTYPM ),
+                     SQLParam( "OPR_PAYM_OUT_KVIT",        OPR_PAYM_OUT_KVIT ),
+                     SQLParam( "OPR_PM_ST_CANCEL",         OPR_PM_ST_CANCEL ),
+                     SQLParam( "PM_NOTEKIND_DENIALGROUND", PM_NOTEKIND_DENIALGROUND),
+                     SQLParam( "curdate1",                 {curdate} ),
+                     SQLParam( "curdate2",                 {curdate} ));
+
+  rs = execSQLselect( select_ + select, params );
+
+  while(rs and rs.moveNext())
+    ClearRecord(pmpaym);    
+    pmpaym.PaymentID = rs.value("t_OrderID");
+    retval = AddNoteForObject( OBJTYPE_PAYMENT, 
+                               makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 
+                               PM_NOTEKIND_DENIALGROUND, 
+                               rs.value("t_NoteValue"), 
+                               NULL, 
+                               rs.value("t_ID_Operation"), 
+                               rs.value("t_ID_Step") );
+    if(retval)
+      MemoryError(retval);
+      return 1;
+    end;
+  end;
+
+  // Обработка сводных, сквитовавшихся отказом
+  select_ = " SELECT oprtmp.t_OrderID, oprtmp.t_ID_Operation, oprtmp.t_ID_Step, "
+            "        conf.t_Description as t_NoteValue ";
+  select  =   " FROM doprtemp_tmp oprtmp, dwlkvtlnk_tmp kvtlnk, "+
+              "      dwlconf_dbt conf, dpmpaym_dbt pm "+
+             " WHERE oprtmp.t_ErrorStatus    = 0 "+
+               " AND pm.t_PaymentID          = oprtmp.t_OrderID "+
+               " AND pm.t_DocKind            = :DLDOC_MULTYPM "+
+               " AND kvtlnk.t_PaymentID      = oprtmp.t_OrderID "+
+               " AND kvtlnk.t_Type           = :WLD_KVIT_CANCEL "+
+               " AND conf.t_ConfID           = kvtlnk.t_ConfID "+
+               " AND conf.t_Description is not null "+
+               " AND conf.t_Description     != chr(1) ";
+
+  params = makeArray(SQLParam( "DLDOC_MULTYPM",   DLDOC_MULTYPM ),
+                     SQLParam( "WLD_KVIT_CANCEL", KVIT_CANCEL ));
+
+  rs = execSQLselect( select_ + select, params );
+
+  while(rs and rs.moveNext())
+    ClearRecord(pmpaym);    
+    pmpaym.PaymentID = rs.value("t_OrderID");
+    retval = AddNoteForObject( OBJTYPE_PAYMENT, 
+                               makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 
+                               PM_NOTEKIND_DENIALGROUND, 
+                               rs.value("t_NoteValue"), 
+                               NULL, 
+                               rs.value("t_ID_Operation"), 
+                               rs.value("t_ID_Step") );
+    if(retval)
+      MemoryError(retval);
+      return 1;
+    end;
+  end;
+  ----- end joy */
+
+    /*8. Обработка сквитовавшихся отказом акцептных требований*/
+
+    select_ = " SELECT oprtmp.t_OrderID, oprtmp.t_ID_Operation, oprtmp.t_ID_Step ";
+    select  =   " FROM doprtemp_tmp oprtmp, dmemorder_dbt mem, doprcurst_dbt oprcurst, dwlkvtlnk_tmp kvtlnk "+
+               " WHERE oprtmp.t_ErrorStatus    = 0 "+
+                 " AND mem.t_OrderID           = oprtmp.t_OrderID "+
+                 " AND mem.t_DocKind           = :DLDOC_BANKCLAIM "+
+                 " AND oprcurst.t_ID_Operation = oprtmp.t_ID_Operation "+
+                 " AND oprcurst.t_DocKind      = oprtmp.t_DocKind "+
+                 " AND oprcurst.t_StatusKindID = :OPR_PAYM_ACCEPT "+
+                 " AND oprcurst.t_NumValue     = :OPR_PAYM_ST_ACPT_NEED "+
+                 " AND oprtmp.t_OrderID        = kvtlnk.t_PaymentID "+
+                 " AND kvtlnk.t_Type           = :WLD_KVIT_CANCEL";
+    params = makeArray(SQLParam( "DLDOC_BANKCLAIM", DLDOC_BANKCLAIM ),
+                       SQLParam( "OPR_PAYM_ACCEPT", OPR_PAYM_ACCEPT ),
+                       SQLParam( "OPR_PAYM_ST_ACPT_NEED", OPR_PAYM_ST_ACPT_NEED ),
+                       SQLParam( "WLD_KVIT_CANCEL", KVIT_CANCEL));
+    rs = execSQLselect( select_ + select, params, false );
+
+    /*Для каждой записи установить примечанию "Причина отказа (возврата)" значение "Отказ от акцепта"*/
+    while(rs.moveNext())
+        ClearRecord(pmpaym);    
+        pmpaym.PaymentID = rs.value(0);
+        retval = AddNoteForObject( OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), PM_NOTEKIND_DENIALGROUND, "Отказ от акцепта", NULL, rs.value(1), rs.value(2));
+        if(retval)
+            MemoryError(retval);
+            return 1;
+        end;
+    end;
+
+    return 0;
+end;
+
+macro PostMassExecuteStep()
+    return 0;
+end;
+
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

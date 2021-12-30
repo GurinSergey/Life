@@ -1,0 +1,373 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : fns_p.mac                                                    */
+/*  Created     : 13.11.2012                                                   */
+/*  Programmer  : Gurin S. N.                                                  */
+/*  Description : Макрос генерации пожтверджения в ФНС, через                  */
+/*                пользовательскую функцию Ctrl+Z                              */
+/*                Заявка: I-00139964-1                                         */
+/*      Изменен : Gurin S. N. I-00153612-1                                     */
+/*      Изменен : Gurin S. N. Вынес чтение настроек                            */
+/*      Изменен : 02.05.2012 Chesnokov D.S. Запись в лог по C-10486            */
+/*      Изменен : 28.06.2012 Lavrenov A.A. I-00214316-1                        */
+/*              : 11.07.2012 Chesnokov D.S. Заявка I-00137708 при выборе НО    */
+/*               в скролинге отображается код вида 28                          */
+/*******************************************************************************/
+import BankInter, FiInter, Reporting, RSD, Календарь, PsInter, rsexts, SfInter;
+import "wlmnstls.mac", "FNS_lib.mac", "globals.mac", "repforms.mac",  "fns_const.mac", "likepy.mac";
+
+import oralib, likepy;
+
+private var path, TxtFileDir, resname = "fns_ppp.lbr", pathfile, ExpPath;
+private var refnumber, errCode, docnumber, CodeClient, CodeNO,PartyID,mesform;
+        array amesform1;
+private var col=TArray;
+private var dlg_p;
+private var persn;
+
+const VK_ENTER=13;
+
+private macro ПрочитатьНастройки
+      
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TxtFileDir, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR");
+    return false;
+  end;
+  
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",V_STRING, path, errCode);
+  pathfile = FindPath(resname, path);
+  if (not pathfile)
+    msgbox("Не найдена LBR с именем " + resname);
+    exit();
+  end;
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR");
+    exit();
+  end; 
+  
+  
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ ВРУЧНУЮ\\ДИРЕКТОРИЯ ВЫГРУЗКИ", V_STRING, ExpPath, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ ВРУЧНУЮ\\ДИРЕКТОРИЯ ВЫГРУЗКИ");
+    return false;
+  end;
+
+  dlg_p = TRecHandler("fns_ppp", pathfile, True);
+  persn = Tbfile("persn.dbt", "r");
+
+  return true;
+end;
+
+/*Обработчик RunScroll*/
+private macro EvProc (rs, cmd, id, key )
+    if ((cmd == DLG_KEY) and (key == VK_ENTER) )
+        return CM_SELECT;
+    end;
+end;
+
+private macro AddCol (ar,ind, num, text)
+    ar.value (ind * 6)     = num;
+    ar.value (ind * 6 + 1) = text;
+  end;
+
+
+private macro strYYYYMMDD(str)
+
+  str = string(str);
+  
+  var dd = trim(string(substr(str, 1, 2)));
+  var mm = string(substr(str, 4, 2));
+  var yyyy = string(substr(str, 7, 4));
+  
+  if (StrLen(DD) < 2)
+    dd = "0" + dd;
+  end;
+  
+  return string(yyyy +mm +dd);
+  
+end;
+
+private macro GetAddrSoun(PartyID, Adress, Soun)
+
+  var select = RsdCommand(" SELECT DECODE (adr.t_adress, CHR (1), CHR (0), adr.t_adress) AS t_adress, "
+                          "        NVL (code.t_code, '0000') AS t_soun " +
+                          "   FROM dadress_dbt adr, dobjcode_dbt code " +
+                          "  WHERE code.t_objectid(+) = adr.t_partyid " +
+                          "    AND adr.t_partyid = :Partyid " +
+                          "    AND code.t_codekind(+) = 28 " +
+                          "    AND code.t_objecttype(+) = 3 " +
+                          "    AND code.t_state(+) = 0 ");
+                          
+      select.AddParam("PartyID", RSDBP_IN, PartyID);
+  var rs = RsdRecordSet(select);
+  
+  if (rs.Movenext)
+    SetParm(1, rs.value(0));
+    SetParm(2, rs.value(1))
+  else
+    SetParm(1, "");
+    SetParm(2, "0000");
+  end;
+  
+end;
+
+private macro cutTextFNS(_str) // для кода подтверждения 15
+  var mas:Tarray=tarray();
+  var i:integer = 0;
+  
+  mas(mas.size) = ",";
+  i=0;
+  var f = split(trim(_str),mas(i));
+     while (i<f.size(f))
+      println(dlg_p.rec.kodFNS,";",trim(f(i)));
+      i = i + 1;      
+     end;
+end;
+
+/*Создание файла подтверждения*/
+macro CreateP(dlg_p, Account, Client, FiID)
+
+  //Lavrenov: 28.06.2012 I-00214316-1 Поменял расширение с .vrb на .txt
+  /*Переопределим вывод в нужный нам файл*/
+  SetOutPut(TxtFileDir  + "\\" + dlg_p.rec.shablonFNS + ".txt", false);
+    
+  println(substr(dlg_p.rec.shablonFNS,5),"###");
+  
+  if (dlg_p.rec.kodFNS==10)
+    println(dlg_p.rec.kodFNS,"@@@");
+  elif (dlg_p.rec.kodFNS==15)
+    cutTextFNS(dlg_p.rec.textFNS);
+    println("@@@");
+  else
+    println(dlg_p.rec.kodFNS,";",dlg_p.rec.textFNS,"@@@");
+  end;
+
+  println(ToDateStr(dlg_p.rec.begindate),"@@@");
+  println(Time,"@@@");
+  println("===");
+  
+  SetOutput(null, true);
+  if (CopyFile(dlg_p.rec.shablonFNS  + ".txt", ExpPath + "\\" + dlg_p.rec.shablonFNS  + ".txt"))
+    msgbox("Создан файл ", dlg_p.rec.shablonFNS , ".txt в каталоге ", ExpPath);
+    INSERT_MES365_LOG_manual(dlg_p.rec.shablonFNS, ".txt", NalSounCode);
+  else
+    msgbox("Не удалось скопировать файл ", dlg_p.rec.shablonFNS  + ".txt| в каталог ", ExpPath + "\\" + dlg_p.rec.shablonFNS  + ".txt");
+  end;
+end;
+
+macro GenFnsP(Acc,
+               Branch,
+               Client,
+               acbalance,
+               chapter,
+               code,
+               NumOper) 
+
+  private var party = TRecHandler("party.dbt");
+  
+  macro HandleEvent (dlg, cmd, id, key)
+  
+  var const_message = "~F2~ Выполнить ";
+  var rs;
+  
+    if (cmd == DLG_INIT)
+      
+      GetNalOrg(Client, NalOrgName, NalOrgAddr, NalSounCode);
+      CodeClient = ПолучитьКодСубъекта (Client, 1, errCode);
+      mesform = "ZNO";
+      
+      dlg.rec.BeginDate = {curdate};
+      dlg.rec.NumInFile = "000001";
+      dlg.rec.NumRevisionInp = "1";
+      dlg.rec.NumRevisionOut = "1";
+      dlg.rec.NameFNS = NalOrgName; 
+      dlg.rec.AdrFNS = NalOrgAddr;
+      dlg.rec.kodFNS = "";
+      dlg.rec.textFNS = "";
+      dlg.rec.shablonFNS = "PB"+ dlg.rec.NumRevisionOut +"_"+
+                         mesform + dlg.rec.NumRevisionInp + 
+                         SubStr( {MFO_Bank}, 3, 7 )+ "_" 
+                         + NalSounCode + strYYYYMMDD(dlg.rec.BeginDate) +
+                         "_" + dlg.rec.NumInFile;
+
+      UpdateFields(dlg);
+      
+    elif (cmd == DLG_SETFOCUS)
+      
+      if (FldName(dlg, id) == "BeginDate")
+        message(const_message + "~F3~ Календарь");
+      elif(FldName(dlg, id) == "NameFNS")
+        message(const_message + "~F3~ выбор налогового органа")
+      else
+        message(const_message);
+      end;
+    
+    elif (cmd == DLG_REMFOCUS)
+      
+      if (FldName(dlg,id)=="BeginDate")
+        if ( dlg.rec.BeginDate > {curdate} )
+           MsgBox("Дата начала периода больше даты текущего операционного дня"); 
+           return CM_CANCEL;
+        end;
+     
+      
+      elif (FldName(dlg, id) == "NumInFile")
+        if (StrLen(dlg.rec.NumInFile) != 6)
+          msgbox("Поле номер входящего файла должно содержать 6 знаков");
+          return CM_CANCEL;
+        elif (IsDigitalNumber(dlg.rec.NumInFile) == 1)
+          msgbox("Поле номер входящего файла должно содержать только числовые символы");
+          return CM_CANCEL;
+        end;
+        
+      elif (FldName(dlg, id) == "NumRevisionInp")
+         if (IsDigitalNumber(dlg.rec.NumRevisionInp) == 1)
+           msgbox("Поле ревизия входящего файла может содержать только числовые значения");
+           return CM_CANCEL;
+         end;
+        
+      elif (FldName(dlg, id) == "KodFNS")
+        if (IsDigitalNumber(dlg.rec.kodFNS) == 1)
+           msgbox("Поле код результата проверки может содержать только числовые значения");
+           return CM_CANCEL;
+        end;
+  
+      end;
+ 
+     dlg.rec.shablonFNS = "PB"+  dlg.rec.NumRevisionOut +"_"+
+                         mesform + dlg.rec.NumRevisionInp + 
+                         SubStr( {MFO_Bank}, 3, 7 )+ "_" 
+                         + NalSounCode + strYYYYMMDD(dlg.rec.BeginDate) +
+                         "_" + dlg.rec.NumInFile;
+      UpdateFields(dlg);
+    
+    elif (cmd == DLG_KEY)
+      if (key == KEY_ESC)
+        if (GetTrue(TRUE,"Вы действительно хотите выйти?"))
+          exit(1);
+          return  CM_CANCEL;
+        else
+          return  CM_IGNORE;    
+        end;
+        
+      elif (key == KEY_F3)
+        if (FldName(dlg, id) == "BeginDate")
+          dlg.rec.BeginDate = GetDateByCalendar({curdate});
+         
+            
+        elif (FldName(dlg, id) == "NameFNS")
+          if (ListPT(party, PTCK_ALL, CodeNO, PTLIST_TAXINSTITUTE, 0, PTCK_MNS))
+            dlg.rec.NameFNS = party.rec.name;
+            GetAddrSoun(party.rec.partyid, dlg.rec.AdrFNS, NalSounCode);
+            dlg.rec.shablonFNS = "PB"+  dlg.rec.NumRevisionOut +"_" +
+                               mesform + dlg.rec.NumRevisionInp + 
+                               SubStr( {MFO_Bank}, 3, 7 )+ "_" 
+                               + NalSounCode + strYYYYMMDD(dlg.rec.BeginDate) +
+                               "_" + dlg.rec.NumInFile;
+          end;
+        
+        elif (FldName(dlg, id) == "KodFNS")
+            /*пользовательский скроллинг*/
+            cmd = RsdCommand ("select to_char(10) t_num, 'положительный результат проверки' t_text from dual " 
+                              "union all " 
+                              "select to_char(11) t_num, 'отрицательный результат расшифрования зашифрованного файла' t_text from dual " 
+                              "union all " 
+                              "select to_char(12) t_num, 'отрицательный результат проверки КА' t_text from dual "
+                              "union all " 
+                              "select to_char(13) t_num, 'невозможно разархивировать файл' t_text from dual "
+                              "union all " 
+                              "select to_char(14) t_num, 'несоответствие структуры наименования файла' t_text from dual "
+                              "union all " 
+                              "select to_char(15) t_num, 'отрицательный результат проверки формата електронного документа, сформированного налоговым органом' t_text from dual "
+                              "union all "
+                              "select to_char(31) t_num, 'электроный документ ошибочно направлен налоговым органом не в тот банк (филиал банка)' t_text from dual " 
+                              "union all "
+                              "select to_char(32) t_num, 'в банке (филиалу банка) отсутствует номер счета клиента указанного в электронном документе' t_text from dual " 
+                              "union all "
+                              "select to_char(33) t_num, 'наименование клиента не соответствует номеру счета клиента указанного в электронном документе' t_text from dual " 
+                              "union all "
+                              "select to_char(34) t_num, 'невозможно исполнение поручения налогового органа в установленый срок в связи отсутсвия денежных средств на кореспондентском счете банка (филиала банка)' t_text from dual " 
+                              "union all "
+                              "select to_char(35) t_num, 'другие случаи' t_text from dual ");
+
+            rs = RSDRecordset(cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+            
+            AddCol (col, 0, "t_num",    "Номер", 10 , true);
+            AddCol (col, 1, "t_text",   "Наименование", 100, true);
+            
+            if (rs.moveNext () )
+              if (RunScroll (rs, 2, col, "test", "EvProc", "Выбор", "~Esc~ Выйти", true))
+                println(rs.value("t_num"):2," | ",rs.value("t_text"):50);  
+                dlg.rec.KodFNS =rs.Value (0);
+                  if ((dlg.rec.KodFNS!="15") and (dlg.rec.KodFNS!="35"))
+                    dlg.rec.textFNS =rs.Value (1);
+                  end;
+              end;
+            end;
+         
+        elif (FldName(dlg, id) == "shablonFNS")
+              
+              amesform1(0) = ФормаZNO; 
+              amesform1(1) = ФормаRPO; 
+              amesform1(2) = ФормаROO;
+              amesform1(3) = ФормаPNO; 
+              amesform1(4) = ФормаTRB; 
+              amesform1(5) = ФормаTRG; 
+              
+              Choise = menu(amesform1,"Выберите форму сообщения ");
+              if (Choise == 0)
+                  mesform =  amesform1(0);
+              elif(Choise == 1)
+                  mesform =  amesform1(1);
+              elif(Choise == 2)
+                  mesform =  amesform1(2);
+              elif(Choise == 3)
+                  mesform =  amesform1(3);
+              elif(Choise == 4)
+                  mesform =  amesform1(4);
+              elif(Choise == 5)
+                  mesform =  amesform1(5);    
+              end;
+               dlg.rec.shablonFNS = "PB"+ dlg.rec.NumRevisionOut +"_"+
+                               mesform + dlg.rec.NumRevisionInp + 
+                               SubStr( {MFO_Bank}, 3, 7 )+ "_" 
+                               + NalSounCode + strYYYYMMDD(dlg.rec.BeginDate) +
+                               "_" + dlg.rec.NumInFile;
+        end;  
+      elif (key == KEY_F2)
+        if (dlg.rec.NameFNS == "")
+          msgbox("Не указано наименование налогового органа");
+          return CM_IGNORE;
+        elif (dlg.rec.AdrFNS == "")
+          msgbox("Не указан адрес налогового органа");
+          return CM_IGNORE;
+       elif (dlg.rec.kodFNS == "")
+          msgbox("Не указан код результата проверки");
+          return CM_IGNORE;
+       elif (dlg.rec.textFNS == "")
+          msgbox("Не указано текстовое пояснение");
+          return CM_IGNORE;   
+        end;
+        return CM_SAVE;
+      elif (key == KEY_F9)
+        return CM_IGNORE;
+      end;
+      
+      UpdateFields(dlg);
+    else
+      UpdateFields(dlg);
+    end;
+    UpdateFields(dlg);
+  end;
+  
+  if (ПрочитатьНастройки)
+   if (RunDialog(dlg_p, "HandleEvent"))
+     CreateP(dlg_p, Acc, Client, Code);
+   end;
+  end;
+
+end;
+
+  

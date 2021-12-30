@@ -1,0 +1,1016 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   Гуцу Е.В.
+
+   Имя файла: CrPermPayments.mac
+
+   Создан:    20.04.2016
+
+   Описание:  Процедура формирования платежей по постоянным перечислениям
+
+   ChangeLog:
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+26/4/2016 Е.Гуцу Реализация процедуры в виде постоянно работающего обработчика
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+import globals, rsexts, activex, PaymInter, PTInter, OprInter, cb_sql;
+import "ContractScroll.mac";
+
+
+
+var nameout = "..\\txtfile\\CrPermPayments_" + random();
+var repDate = {CurDate};
+var ind = 1;
+var separator = ";", text = "";
+var ReadyToExecute = false;
+var glPeriodKind, glCicleCount, glProcessedCount, glProcPeriod;
+var ContractRecHandler;
+
+CONST RECEIVER_BANK_BIC = "044525058";  // Филиала "Бизнес" ПАО "Совкомбанк"
+
+// EVG 24/5/2016 Скорректирована маска счетов, остаток по которым должен быть ненулевой 
+// CONST OTHER_ACCOUNTS_MASC = " 451*, 452*, 453*, 454*, 458*, 459*, 61212*, 60323*, 47427*, 47423*, 91604* ";
+CONST OTHER_ACCOUNTS_MASC = " 45101*, 45201*, 45301*, 45401*, 458*, 459*, 61212*, 60323*, 47427*, 47423*, 91604* ";
+
+CONST STATUS_KIND_READY     = "Готов к запуску",
+      STATUS_KIND_WAITING   = "Ожидаем обработки",
+      STATUS_KIND_EXECUTING = "Выполняется";
+
+// Виды значений для периода запуска
+CONST TM_KIND_SECONDS = 0,
+      TM_KIND_MINUTES = 1,
+      TM_KIND_HOURS   = 2;
+
+// Минимальный период запуска
+CONST MINIMAL_PERIOD = 10000;   // (10 сек)
+      
+
+
+/* Библиотека диалогов */
+var DlgLbrPath, DlgLbrName;
+GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR", V_STRING, DlgLbrPath );
+DlgLbrName = "ExecI2.lbr";
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//DlgLbrPath = "\\\\172.16.22.180\\C$\\RSB_Exv\\mac.usr\\DebugMacro\\EVG\\" + DlgLbrName;
+DlgLbrPath = FindPath(DlgLbrName, DlgLbrPath);
+
+var dlg = tRecHandler( "PermPaym", DlgLbrPath, true );
+
+
+/* Класс для работы с Excel, заимствован из rep_corschem.mac */
+PRIVATE CLASS myExcelReport
+
+  private var myWorkBook;
+  private var myWorkExcel;
+  private var myWorkSheet;
+  var numSheet = 1;
+
+  private var myRecord = null;
+ 
+  var cntRecord = 0;
+  var amountRecord = $0.0;
+
+  macro ClearSymble(str, split_char)
+      str = StrSubst(str, strfor(13), "" );
+      str = StrSubst(str, strfor(10), "" );
+      str = StrSubst(str, split_char, " ");
+      return string(str);   
+  end;
+
+  private macro SetTypeColumns();
+      var result_arr = TArray(true), i;
+ 
+      for(i, 1, 4)
+        var templs_arr = TArray(true);         
+        templs_arr(0) = i;
+        templs_arr(1) = 2;
+        if( i == 4 )
+           templs_arr(1) = 1;
+        end;
+
+        result_arr(i - 1) = templs_arr;
+      end; 
+
+      return result_arr;
+  end;
+
+  private macro GetWorkDirName() : string
+      var DirName:string = "", 
+          StrErr :string = "";
+
+      GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, DirName, StrErr );        
+      if( DirName )     
+        if( SubStr(DirName, 1, 1) == "." ) DirName = "$" + GetCurDir(TRUE) + strSubst (DirName, "..",""); end;     
+        if (existFile(DirName))  return DirName;  end;
+      end;
+
+      DirName = "$" + GetEnv("TEMP");
+
+      if( NOT DirName ) DirName = "$" + GetEnv("TMP"); end;
+      if (existFile(DirName)) return DirName; end;
+
+      msgbox("Ошибка поиска папки для временных файлов на терминале");
+
+      return "";
+  end;
+
+  private macro myCopyFile (Name_file)
+      var Templs_Dir_Term = GetWorkDirName();
+
+      var TermFileName = toAnsi(Name_file);
+      var SPFileName;
+
+      if ( Templs_Dir_Term == "" )  return "";  end;
+      SPFileName = "..\\txtfile\\" + Name_file; 
+
+      if (not existFile(SPFileName)) MsgBox(string("Транспортный временный файл не найден: |", SPFileName)); return ""; end;
+      if( not CopyFile(SPFileName, Templs_Dir_Term + "\\" + TermFileName) ) RunError("Ошибка при передаче файла на терминал\n" + Templs_Dir_Term + "\\" + TermFileName); end;
+
+      return subStr(Templs_Dir_Term + "\\" + TermFileName, 2);      
+  end;
+
+  private macro OpenExcel()
+      private var objectXls, WorkExcel;
+
+      objectXls = CreateObject ("rsax", "TRsAxServer", string("RsAxServer", UserNumber()), IsStandAlone());
+      WorkExcel = objectXls.CreateComObject ("Excel.Application"); 
+
+      myWorkExcel = WorkExcel;
+
+      return true;
+
+  OnError(er)
+      msgbox(er.Message); 
+      return false;
+  end;
+
+  private macro SetHeaderExcelTable()
+      var i; 
+      myWorkBook.Sheets(numSheet);
+      myWorkSheet = myWorkBook.ActiveSheet();
+
+      myWorkSheet.Cells(1, 1).Value  = "Протокол процедуры формирования документов по Заявлениям на Постоянное перечисление";
+      myWorkSheet.Cells(1, 1).HorizontalAlignment = 3;
+      myWorkSheet.Cells(1, 1).VerticalAlignment = 2;
+
+      myWorkSheet.Range("A1:G1").merge;
+      myWorkSheet.Rows("1:1").RowHeight = 40;
+      myWorkSheet.Range("A1:G1").font.size = 13;
+
+      myWorkSheet.Cells(3, 1).Value = "№ п/п";
+      myWorkSheet.Cells(3, 2).Value = "Счет плательщика";
+      myWorkSheet.Cells(3, 3).Value = "Наименование плательщика";
+      myWorkSheet.Cells(3, 4).Value = "Остаток";
+      myWorkSheet.Cells(3, 5).Value = "Свободный остаток";
+      myWorkSheet.Cells(3, 6).Value = "Сумма претензий";
+      myWorkSheet.Cells(3, 7).Value = "Результат обработки";
+
+      for (i, 1, 7)
+        myWorkSheet.Cells(3, i).HorizontalAlignment = 3;
+        myWorkSheet.Cells(3, i).Font.Bold = true; 
+
+        if( i != 7 )
+           myWorkSheet.Columns(i).EntireColumn.AutoFit;
+        else
+           myWorkSheet.Columns(i).ColumnWidth = 50;
+           myWorkSheet.Columns(i).WrapText = true;
+        end;
+      end;
+
+      //myWorkSheet.Range("A" + (cntRecord + 3) + ":D" + (cntRecord + 3)).Font.Bold = true; 
+      myWorkSheet.Range("A3:G" + (cntRecord+3) ).Borders.Weight = 2;  
+      myWorkSheet.Range("A3:G3").Interior.Color = #B5B5B5; 
+
+      myWorkSheet.Columns(6).HorizontalAlignment = 4;
+
+      myWorkSheet.columns(2).Entirecolumn.NumberFormat = "@";
+      myWorkSheet.columns(3).Entirecolumn.NumberFormat = "@";
+      myWorkSheet.columns(4).Entirecolumn.NumberFormat = "# ##0,00р.";
+      myWorkSheet.columns(5).Entirecolumn.NumberFormat = "# ##0,00р.";
+      myWorkSheet.columns(6).Entirecolumn.NumberFormat = "# ##0,00р.";
+
+      return true;
+
+   OnError
+       return false;
+   end;     
+
+   macro CopyValueToExcel( myFileName )
+       initprogress(-1, "", "Подготовка файла Excel");
+       myFileName = myCopyFile(myFileName); 
+
+       if ( OpenExcel() and  myFileName != "")      
+        
+         myWorkExcel.Workbooks.OpenText (myFileName, 866, 1, 1, 2, false, false, false, false, false, true, ";", SetTypeColumns(), 1, "."," ", true, false);
+         myWorkBook = myWorkExcel.Workbooks.Application;
+
+         SetHeaderExcelTable();
+
+         remprogress;
+         //MsgBox("Файл успешно записан");
+         myWorkExcel.Visible = true;
+
+         var wb = myWorkExcel.Workbooks.item(1);
+         //wb.SaveAs( myFileName, 56 );         // xls
+         wb.SaveAs( myFileName + "_" + random() + ".xls", 51 );           // xlsx
+
+       end;                
+   OnError(er)
+       msgBox(er.Message);
+   end;     
+
+END;
+
+// Инициализируем отчёт
+var my_report = myExcelReport();
+
+
+/* Просмотр отчёта. Может быть в любой момент вызван из обработчика диалога */
+MACRO ViewReport()
+
+   setoutput(null, true);                 
+   my_report.cntRecord = ind-1;
+   my_report.CopyValueToExcel( NameOut );
+   setOutput(nameout, true);
+
+END;
+
+
+// Клон процедуры из cb_sql.mac
+MACRO MY_CopyRSetToFBuff( fbuff, rset, FldAliasPrefix )
+    DefaultParm(FldAliasPrefix, "");
+
+    var wrkBuff = fbuff,
+        idx   = 0,
+        nflds = wrkBuff.FldNumber(),
+        val,
+        NullConv;
+
+    wrkBuff.Clear();
+
+    if (IsEqClass("RsdRecordset", rset))
+        NullConv = rset.Command.NullConversion;
+        rset.Command.NullConversion = true;
+    end;
+
+    if (IsEqClass("RsbDataSet", rset))
+        NullConv = rset.NullConversion;
+        rset.NullConversion = true;
+    end;
+
+    if ( FldAliasPrefix == "" )
+        FldAliasPrefix = "t_";
+    end;
+
+    while( idx < nflds )
+         val = rset.value( FldAliasPrefix + wrkBuff.FldName( idx ) );
+
+         if ( ValType( wrkBuff.item( idx ) ) == V_STRING )
+             wrkBuff.item( idx ) = SQL_ConvTypeStr( val );
+         elif( val != NULL )
+             wrkBuff.item( idx ) = rset.value( FldAliasPrefix + wrkBuff.FldName( idx ), null, ValType( wrkBuff.item( idx ) ) );
+         end;
+
+        idx = idx + 1;
+    end;
+
+    if (IsEqClass("RsdRecordset", rset))
+        rset.Command.NullConversion = NullConv;
+    end;
+
+    if (IsEqClass("RsbDataSet", rset))
+        rset.NullConversion = NullConv;
+    end;
+
+    Copy(fbuff, wrkBuff);
+END;
+
+
+MACRO InitRecHandler()
+
+var vFldInfo = TArray();
+
+  vFldInfo(vFldInfo.Size) = "contr_id";                 vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "account";                  vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 25;   vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "client_id";                vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contragent_id";            vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contragent_acc";           vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 25;   vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contragent_kpp";           vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 9;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contrbank_id";             vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contr_number";             vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 10;   vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contr_date";               vFldInfo(vFldInfo.Size) = V_DATE;     vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "enter_date";               vFldInfo(vFldInfo.Size) = V_DATE;     vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contr_end_date";           vFldInfo(vFldInfo.Size) = V_DATE;     vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "max_contr_amount";         vFldInfo(vFldInfo.Size) = V_MONEY;    vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 2;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "sum_by_oblig";             vFldInfo(vFldInfo.Size) = V_MONEY;    vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 2;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "sum_by_once";              vFldInfo(vFldInfo.Size) = V_MONEY;    vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 2;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "sum";                      vFldInfo(vFldInfo.Size) = V_MONEY;    vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "last_day_pay";             vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 1;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "pay_day";                  vFldInfo(vFldInfo.Size) = V_DATE;     vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "periodical_basis";         vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "last_pay";                 vFldInfo(vFldInfo.Size) = V_DATE;     vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "paid_amount";              vFldInfo(vFldInfo.Size) = V_MONEY;    vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 2;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "form_pay";                 vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "ground";                   vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 300;  vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "bound_account";            vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 25;   vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "add_info";                 vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 600;  vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "get_acc_rest";             vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 1;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contragent_name";          vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 320;  vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "contragent_inn";           vFldInfo(vFldInfo.Size) = V_STRING;   vFldInfo(vFldInfo.Size) = 15;   vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "payment_priority";         vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+  vFldInfo(vFldInfo.Size) = "code_currency";            vFldInfo(vFldInfo.Size) = V_INTEGER;  vFldInfo(vFldInfo.Size) = 4;    vFldInfo(vFldInfo.Size) = 0;  vFldInfo(vFldInfo.Size) = 10;
+
+  /*
+  contr_id          number(10)                not null,
+  account           varchar2(25 byte)         not null,
+  client_id         number(10)                not null,
+  contragent_id     number(10)                not null,
+  contragent_acc    varchar2(25 byte),
+  contragent_kpp    varchar2(9 byte),
+  contrbank_id      number(10)                not null,
+  contr_number      varchar2(10 byte)         not null,
+  contr_date        date,
+  enter_date        date,
+  contr_end_date    date,
+  max_contr_amount  number(32,12),
+  sum_by_oblig      number(32,12),
+  sum_by_once       number(32,12),
+  sum               number(32,12)             not null,
+  last_day_pay      char(1 byte),
+  pay_day           date                      not null,
+  periodical_basis  number(1),
+  last_pay          date,
+  paid_amount       number(32,12),
+  form_pay          number(1)                 not null,
+  ground            varchar2(300 byte)        not null,
+  bound_account     varchar2(25 byte),
+  add_info          varchar2(600 byte),
+  get_acc_rest      char(1 byte),
+  contragent_name   varchar2(320 byte),
+  contragent_inn    varchar2(15 byte),
+  payment_priority  number(5)                 not */
+
+  ContractRecHandler = TRecHandler( "rc", vFldInfo, false );
+
+END;
+
+
+
+MACRO ExistsIndex2( pAccount )
+
+  var query, cmd, rs;
+
+  query = " Select 1 from DAccount_dbt       "+
+          "  Where t_Chapter        = 1      "+
+          "    and t_Code_currency  = 0      "+
+          "    and t_Index2        != Chr(0) "+
+          "    and t_Account        = ?      ";
+  cmd = rsdCommand( query );
+  cmd.AddParam( "", RSDBP_IN, pAccount );
+
+  rs = rsdRecordSet( cmd );
+  if (rs and rs.moveNext())
+     return true;
+  end;
+
+  return false;
+
+END;
+
+
+MACRO CheckOtherAccountsRest( vClientId )
+
+  var query, cmd, rs;
+  var vAccMasc = ConvertMaskToSQLFormat( OTHER_ACCOUNTS_MASC, "ac.t_account" ),
+      vAccRest = $0;
+
+  query = " Select nvl( sum( abs( rs.t_rest ) ), 0) from daccount_dbt ac, drestdate_dbt rs             "+
+          "  Where ac.t_client = ?                                                              "+
+          "    and " + vAccMasc                                                                  +
+          "    and rs.t_accountid    = ac.t_accountid                                           "+
+          "    and rs.t_restcurrency = ac.t_code_currency                                       "+
+          "    and rs.t_restdate     = ( Select max( rs1.t_restdate ) from drestdate_dbt rs1    "+
+          "                               Where rs1.t_accountid = rs.t_accountid                "+
+          "                                 and rs1.t_restcurrency = rs.t_restcurrency          "+
+          "                                 and rs1.t_restdate <= ? )                           ";
+
+  cmd = rsdCommand( query );
+  cmd.AddParam( "", RSDBP_IN, vClientId );
+  cmd.AddParam( "", RSDBP_IN, repDate );
+
+  rs = rsdRecordSet( cmd );
+  if( rs and rs.moveNext() )
+     vAccRest = rs.Value( 0, NULL, V_MONEY );
+  end;
+
+  if( vAccRest )
+     return false;
+  end;
+
+  return true;
+END;
+
+
+MACRO GetBankData( pBankId, retName:@string, retCorAcc:@string )
+
+  var query, cmd, rs;
+
+  query = " Select pt.t_name, dp.t_coracc from dparty_dbt pt, dbankdprt_dbt dp "+
+          "  Where pt.t_partyid = ?                                            "+
+          "    and dp.t_partyid = pt.t_partyid                                 ";
+  cmd = rsdCommand( query );
+  cmd.AddParam( "", RSDBP_IN, pBankId );
+
+  rs = rsdRecordSet( cmd );
+  if (rs and rs.moveNext())
+     retName   = rs.value( 0, null, V_STRING );
+     retCoracc = rs.value( 1, null, V_STRING );
+  end;
+
+END;
+
+
+MACRO UpdateContractData( pPrimDoc )
+  var cmd = rsdCommand( " Update usr_regular_contr_dbt Set t_last_pay = ?, t_paid_amount = t_paid_amount + ? "
+                        "  Where t_contr_id = ?" );
+  cmd.AddParam( "", RSDBP_IN, pPrimDoc.Payment.ValueDate  );
+  cmd.AddParam( "", RSDBP_IN, pPrimDoc.Payment.BaseAmount );
+  cmd.AddParam( "", RSDBP_IN, pPrimDoc.UserField1         );
+  cmd.Execute();
+
+END;
+
+
+MACRO MakeReportLine( pPrimDoc, pAccFreeAmount, pResult )
+
+  var Sum1, Sum2, rpSimpleRest, rpFreeAmount, rpClaimSum;
+
+  rpSimpleRest = RestA( pPrimDoc.Payment.PayerAccount, repDate );
+  AccGetFreeAmount( rpFreeAmount, null, pPrimDoc.Payment.PayerAccount, 1/*CHAPT1*/, pPrimDoc.Payment.BaseFiid, repDate, pPrimDoc.Payment.Priority, 0 );
+
+  GetSumArrestClaim( pPrimDoc.Payment.PayerAccount, 1/*Chapter*/, pPrimDoc.Payment.BaseFiid, repDate, pPrimDoc.Payment.Priority, Sum1 );
+  GetSumSpecialClaim( pPrimDoc.Payment.PayerAccount, 1/*Chapter*/, pPrimDoc.Payment.BaseFiid, repDate, Sum2 );
+
+  rpClaimSum = Sum1 + Sum2;
+
+  text = my_report.ClearSymble(string( ind                              ), ";") + separator +
+         my_report.ClearSymble(string( pPrimDoc.Payment.PayerAccount    ), ";") + separator +
+         my_report.ClearSymble(string( pPrimDoc.Payment.PayerName       ), ";") + separator +
+         my_report.ClearSymble(string( rpSimpleRest                     ), ";") + separator +
+         my_report.ClearSymble(string( rpFreeAmount                     ), ";") + separator +
+         my_report.ClearSymble(string( rpClaimSum                       ), ";") + separator +
+         my_report.ClearSymble(string( pResult                          ), ";") + separator ;
+
+  println(text);        
+  ind = ind + 1;
+
+END;
+
+
+
+/* Формирование рекордсета / подсчёт записей */
+MACRO CriarRecordSet( isCount )
+
+  var sql, cmd, rs;
+  var SelectClause, CommonConditionsClause, RecCount;
+
+  RecCount = 0;
+
+  CommonConditionsClause = "    AND cntr.t_contr_date <= ?                                          "+
+                           "    AND (   cntr.t_contr_end_date  = to_date('01.01.0001','dd.mm.rrrr') "+
+                           "         OR cntr.t_contr_end_date >= ? )                                "+
+                           "    AND cntr.t_last_pay < ?                                             ";
+
+
+  SelectClause = " SELECT cntr.*, ac.t_code_currency                  "+
+                 "   FROM usr_regular_contr_dbt cntr, daccount_dbt ac "+
+                 "  WHERE ac.t_account = cntr.t_account               "+
+                 CommonConditionsClause;
+
+  if( RECEIVER_BANK_BIC )
+
+     SelectClause = " SELECT cntr.*, ac.t_code_currency                                   "+
+                    "   FROM usr_regular_contr_dbt cntr, dobjcode_dbt cd, daccount_dbt ac "+
+                    "  WHERE cd.t_codekind   = 3                                          "+
+                    "    AND cd.t_objecttype = 3                                          "+
+                    "    AND cd.t_state      = 0                                          "+
+                    "    AND cd.t_code       = ?                                          "+
+                    "    AND cntr.t_contrbank_id = cd.t_objectid                          "+
+                    "    AND ac.t_account        = cntr.t_account                         "+
+                    CommonConditionsClause;
+
+  end;
+        
+  sql = SelectClause;
+  if( isCount )
+     sql = " SELECT count(0) FROM ( " + SelectClause + " ) ";
+  end;
+
+
+  cmd = rsdCommand( sql );
+  if( RECEIVER_BANK_BIC )
+     cmd.AddParam( "", RSDBP_IN, RECEIVER_BANK_BIC );
+  end;
+  cmd.AddParam( "", RSDBP_IN, repDate );
+  cmd.AddParam( "", RSDBP_IN, repDate );
+  cmd.AddParam( "", RSDBP_IN, repDate );
+
+  if( not isCount )
+     cmd.execute;
+     //rs = tRsbDataSet( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+     rs = RsdRecordSet( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+     return rs;
+  end;
+
+  rs = rsdRecordSet( cmd );
+  if( rs and rs.moveNext() )
+     RecCount = rs.value( 0, null, V_INTEGER );
+  end;
+
+  return RecCount;
+
+END;
+
+
+
+MACRO MyDebugbreak()
+   return;
+END;
+
+
+MACRO MainProcedureExecute( pIsFirstTime )
+
+  var sql, cmd, rs, rs1;
+
+  var i = 1, vCount;
+  var DlgFlag, stat;
+  var stpState, stpName;
+
+  var prcFreeAmount, prcPayerName, prcPayerCode, prcPayerINN, prcReceiverINN, prcReceiverBankBIC,
+      prcReceiverCode, prcCorBankName, prcCorBankAcc, prcCreateResult, prcRunResult;
+  var vPayOrder, vPayment;
+
+  var CurTime = time();         // Запомнили время начала
+
+
+  /* Функция ждёт, чтобы с момента начала выполнения процедуры прошло не менее указанного времени */
+  macro Wait( pStartTime )
+
+     /* 3 сек. Заметил, что этого времени достаточно для того, чтобы диалоговая панель смогла повторно обновиться.
+        Если при тестировании на Продакшн окажется, что такого интервала недостаточно, придётся его увеличить.
+        Но нужно помнить, что при увеличении данного интервала может потребоваться увеличить и минимальный интервал 
+        вызова процедуры MINIMAL_PERIOD. Сейчас он равен 10 сек, и если процедура в него не будет укладываться
+        (с учётом, естественно, и данной функции), то начнутся накладки. */
+     const MIN_TIME = time(0,0,3);
+
+     while( ( time - pStartTime ) < time(0,0,3) )
+        continue;
+     end;
+
+     return;
+  end;
+
+
+
+
+  // Если не нажата F2, выходим
+  if( not ReadyToExecute )
+     return;
+  end;
+
+
+  // При первом запуске перед сменой статуса нужно подождать, т.к. он только что менялся в обработчике панели,
+  // и сразу же повторно обновиться панель так быстро не успеет.
+  if( pIsFirstTime )
+     Wait( CurTime );
+     CurTime = time();
+  end;
+
+
+  // Счётчик запусков процедуры
+  glCicleCount = glCicleCount + 1;
+
+
+  // Устанавливаем статус "Выполняется"
+  dlg.rec.fStatus  = STATUS_KIND_EXECUTING;
+  UpdateFields( dlg );
+
+  //vCount = CriarRecordSet( true );
+  //initprogress( vCount, "Выполнение процедуры...", "Обрабатываем договоры на постоянные перечисления" );
+
+  rs = CriarRecordSet( false );
+  while( rs and rs.moveNext() )
+
+     ContractRecHandler.Clear();
+     MY_CopyRSetToFBuff( ContractRecHandler, rs );
+
+     // Свободный остаток
+     AccGetFreeAmount( prcFreeAmount, null, ContractRecHandler.rec.Account, 1/*CHAPT1*/, ContractRecHandler.rec.Code_Currency, repDate, ContractRecHandler.rec.Payment_Priority, 0 );
+
+     if( prcFreeAmount >= ContractRecHandler.rec.Sum )
+
+        if( not ExistsIndex2( ContractRecHandler.rec.Account ) and CheckOtherAccountsRest( ContractRecHandler.rec.Client_Id ) )
+
+           vPayOrder = GenObject( "RsbPSPayOrder", 0 );
+           vPayment  = vPayOrder.Payment;
+
+           //vPayOrder.Origin  = PSPO_OR_AUTO;
+           vPayOrder.Origin  = 3400;    //Постоянные перечисления
+           vPayOrder.Oper    = {oper}; 
+           vPayOrder.CurrentState  = 0 /*CP_ST_DEFERRED*/;
+           vPayOrder.DocKind = PSPOKIND_ORDER;
+           vPayOrder.LaunchOper = true;    
+           vPayOrder.UserField1 = ContractRecHandler.rec.Contr_Id;
+
+           vPayment.DocKind = PS_PAYORDER;
+           vPayment.Purpose = PM_PURP_POPRIMARY;
+           vPayment.ShifrOper = "01";
+
+           // Референс 15 "Номера рублевых платежных документов"
+           if( GenerateReference( 15, vPayment.Number ) )
+              vPayment.Number = "1";
+           end;
+
+           // Сумма операции
+           vPayment.BaseAmount = vPayment.PayerAmount = vPayment.ReceiverAmount = ContractRecHandler.rec.Sum;
+
+           /* Убрал формирование платежа на сумму остатка на счёте, когда для полной оплаты не хватает средств - вряд ли это понадобится. 
+              Проверка на достаточность остатка на счёте для выполнения операции чуть выше.
+           if( prcFreeAmount >= ContractRecHandler.rec.Sum )
+              vPayment.BaseAmount = vPayment.PayerAmount = vPayment.ReceiverAmount = ContractRecHandler.rec.Sum;
+           else
+              vPayment.BaseAmount = vPayment.PayerAmount = vPayment.ReceiverAmount = prcFreeAmount;
+           end;*/
+
+           prcPayerName       = GetNameClient( "PS\\PAYORDER\\ORDER\\FILLNAME", ContractRecHandler.rec.Account, 1 /*Chapter*/, ContractRecHandler.rec.Code_currency, true, true );
+           prcPayerCode       = ПолучитьКодСубъекта( ContractRecHandler.rec.Client_Id, PTCK_CONTR );
+           prcPayerINN        = ПолучитьКодСубъекта( ContractRecHandler.rec.Client_Id, PTCK_INN );
+           prcReceiverBankBIC = ПолучитьКодСубъекта( ContractRecHandler.rec.ContrBank_Id, PTCK_BIC );
+
+           prcReceiverCode = "";
+           if( ContractRecHandler.rec.Contragent_Id )
+              prcReceiverCode = ПолучитьКодСубъекта( ContractRecHandler.rec.Contragent_Id, PTCK_CONTR );
+           end;
+
+
+           prcReceiverINN = "";
+           if( valType(ContractRecHandler.rec.Contragent_INN) != V_UNDEF )
+              prcReceiverINN = ContractRecHandler.rec.Contragent_INN;
+           end;
+           if( valType(ContractRecHandler.rec.Contragent_KPP) != V_UNDEF )
+              prcReceiverINN = prcReceiverINN + "/" + ContractRecHandler.rec.Contragent_KPP;
+           end;
+
+
+           GetBankData( ContractRecHandler.rec.ContrBank_Id, @prcCorBankName, @prcCorBankAcc );
+
+           vPayment.SetPayerPI
+           ( 
+             PAYMENTS_GROUP_UNDEF,
+             {OurBank},                 //sidebet.Rec.BankID,
+             PTCK_BIC,                  //sidebet.Rec.BankCodeKind,
+             {MFO_Bank},                //sidebet.Rec.BankCode,
+             {Name_Bank},               //substr( sidebet.Rec.BankName, 1, BankNameLen ),
+             {CORAC_Bank},              //sidebet.Rec.CorrAcc,
+             ContractRecHandler.rec.Code_currency,          //sidebet.Rec.FIID,
+             1,                         //CHAPT1,
+             ContractRecHandler.rec.Account,                //sidebet.Rec.Account,
+             ContractRecHandler.rec.Client_Id,              //sidebet.Rec.PartyID,
+             prcPayerName,              //substr( sidebet.Rec.PartyName, 1, BankNameLen ),
+             prcPayerINN,               //sidebet.Rec.PartyINN,
+             PTCK_CONTR,                //sidebet.Rec.PartyCodeKind,
+             prcPayerCode               //sidebet.Rec.PartyCode
+           );
+
+           vPayment.SetReceiverPI
+           ( 
+             PAYMENTS_GROUP_EXTERNAL,
+             ContractRecHandler.rec.ContrBank_Id,           //sicredit.Rec.BankID,
+             PTCK_BIC,                  //sicredit.Rec.BankCodeKind,
+             prcReceiverBankBIC,        //sicredit.Rec.BankCode,
+             prcCorBankName,            //substr( sicredit.Rec.BankName, 1, BankNameLen ),
+             prcCorBankAcc,             //sicredit.Rec.CorrAcc,
+             ContractRecHandler.rec.Code_currency,          //sicredit.Rec.FIID,
+             1,                         //CHAPT1,
+             ContractRecHandler.rec.Contragent_Acc,         //sicredit.Rec.Account
+             ContractRecHandler.rec.Contragent_Id,
+             ContractRecHandler.rec.Contragent_Name,
+             prcReceiverINN,
+             PTCK_CONTR,
+             prcReceiverCode
+           );
+           //Paym.SetReceiverAccount( sicredit.Rec.FIID, 1, sicredit.Rec.Account);
+
+
+           vPayment.BaseFIID = vPayment.PayerFIID = vPayment.ReceiverFIID = ContractRecHandler.rec.Code_currency;
+           vPayment.ValueDate = vPayment.Date = vPayment.PayDate = vPayment.PayerBankEnterDate = vPayment.ClientDate = repDate ;
+
+           vPayment.Ground   = ContractRecHandler.rec.Ground;
+           vPayment.Priority = ContractRecHandler.rec.Payment_Priority;
+
+           vPayment.IsPlanPaym  = "X";
+           vPayment.PaymentKind = "Э";
+
+           stat = vPayOrder.Update();
+
+           if( stat )
+              prcCreateResult = getErrMsg;
+           else
+
+              // Счётчик созданных платежей
+              glProcessedCount = glProcessedCount + 1;
+
+              prcCreateResult = "Платеж создан успешно.\n";
+
+
+              ReplaceMacro( "DebugBreak", "MyDebugbreak" );
+
+              //DlgFlag = setDialogFlag( 0 );
+              stat    = PM_ExecuteOperation( vPayOrder.OrderId, vPayment.DocKind );
+              //setDialogFlag( DlgFlag );
+
+              ReplaceMacro( "DebugBreak" );
+
+
+              if( stat ) 
+
+                 prcRunResult = "Операция выполнена успешно. ";
+
+                 // Определим, на каком шаге остановился платёж
+                 stpName = ""; stpState = "";
+                 cmd = rsdCommand( " Select sd.t_name, st.t_isexecute                                               "
+                                   "   From doproper_dbt op, doprstep_dbt st, doprostep_dbt sd                      "
+                                   "  Where op.t_dockind      = ?                                                   "
+                                   "    and op.t_documentid   = lpad( ?, 34, '0' )                                  "
+                                   "    and st.t_id_operation = op.t_id_operation                                   "
+                                   "    and st.t_id_step      = ( Select max( st1.t_id_step ) From doprstep_dbt st1 "
+                                   "                               Where st1.t_id_operation = st.t_id_operation     "
+                                   "                                 and st1.t_isexecute in( 'X', 'R' ) )           "
+                                   "    and sd.t_blockid      = st.t_blockid                                        "
+                                   "    and sd.t_number_step  = st.t_number_step                                    " );
+                 cmd.AddParam( "", RSDBP_IN, vPayment.DocKind  );
+                 cmd.AddParam( "", RSDBP_IN, vPayOrder.OrderId );
+                 rs1 = rsdRecordSet( cmd );
+                 if( rs1 and rs1.movenext() )
+                    stpName  = rs1.value( 0, null, V_STRING );
+                    stpState = rs1.value( 1, null, V_STRING );
+
+                    if( stpState == "R" )
+                       prcRunResult = prcRunResult + "Платеж помещен на шаг \"" + stpName + "\".";
+                    elif( stpState == "X" )
+                       prcRunResult = prcRunResult + "Платеж закрыт.";
+                    else
+                       prcRunResult = prcRunResult + "Состояние платежа неизвестно.";
+                    end;
+
+                 end;
+
+              else
+                 prcRunResult = getErrMsg;
+              end;
+
+           end;
+
+           UpdateContractData( vPayOrder );
+
+           MakeReportLine( vPayOrder, prcFreeAmount, prcCreateResult + prcRunResult );
+
+        end;
+
+     end;
+
+     //useProgress( i );
+     i = i + 1;      
+
+     /* Нужно запомнить время в конце работы цикла, т.к. похоже, что
+        после отработки сишных процедур тоже должно пройти какое-то время, 
+        иначе диалог не успевает перерисоваться. */
+     CurTime = time();
+  end;
+
+
+  //remProgress();
+
+  //setoutput(null, true);                 
+  //my_report.cntRecord = ind-1;
+  //my_report.CopyValueToExcel( pFileName );
+
+  /* Насильственно возвращаем интерфейсный режим, т.к. при выполнении 
+     операции внутри сишки что-то съезжает, и тогда не обновляется диалог. */
+  setDialogFlag( 1 );
+
+
+  /* Вызываем процедуру ожидания минимального времени между началом 
+     и окончанием выполнения процедуры */ 
+  Wait( CurTime );
+
+  // По окончании выполнения итерации, устанавливаем статус "Ожидание"
+  dlg.rec.fStatus    = STATUS_KIND_WAITING;
+  dlg.rec.fCounter   = glCicleCount;
+  dlg.rec.fProcessed = glProcessedCount;
+  UpdateFields( dlg );
+
+END;
+
+
+
+MACRO CalcPeriod( pKind, pLength )
+ 
+  var vInterval;
+
+  if( pKind == TM_KIND_SECONDS )
+     vInterval = pLength * 1000;
+
+  elif( pKind == TM_KIND_MINUTES )
+     vInterval = pLength * 60 * 1000;
+
+  elif( pKind == TM_KIND_HOURS )
+     vInterval = pLength * 3600 * 1000;
+
+  end;
+
+  return vInterval;
+END;
+
+
+
+MACRO EventHandler( _dlg, cmd, id, key )
+  var st;
+  var vMenu, vChoice, vProcPeriod, vExit;
+
+  if ( cmd == DLG_INIT )
+
+      dlg.rec.fStatus    = STATUS_KIND_READY;
+      dlg.rec.fCounter   = 0;
+      dlg.rec.fProcessed = 0;
+      dlg.rec.fPeriod    = 30;
+      dlg.rec.fTmKind    = "секунд";
+
+      glPeriodKind = TM_KIND_SECONDS;
+
+      glCicleCount = glProcessedCount = 0;
+
+      UpdateFields( dlg );
+      message( "~Esc~ - Выход ~F2~ - Запуск ~F6~ - Просмотр списка действующих заявлений ~F7~ - Просмотр текущего протокола" );
+
+
+  elif( cmd == DLG_TIMER ) 
+
+      MainProcedureExecute( false );
+
+  elif( cmd == DLG_KEY ) //Проверки на нажатие клавиш
+
+     if (KEY == KEY_ESC)
+
+        // Выход - только если процедура остановлена
+        if( ReadyToExecute )
+           return CM_IGNORE;
+        end;
+
+        vExit = false;
+
+        GetTrue( vExit, "Выйти из обработчика?" );
+        if( vExit ) exit(1) end;
+
+        return CM_IGNORE;
+
+     elif( key == KEY_ENTER )
+
+        /* При нажатии Enter в последнем поле не закрывать окно */
+        if (id == dlg.fldNumber()-1)
+           SetFocus(dlg, 0);
+           return CM_IGNORE;
+        end;
+
+     elif( key == KEY_F2 )
+
+        // Если процедура уже запущена, просто выходим из обработчика
+        if( ReadyToExecute )
+           return CM_IGNORE;
+        end;
+
+        // Определяем и проверяем период запуска
+        //vProcPeriod = CalcPeriod( glPeriodKind, dlg.rec.fPeriod );
+        glProcPeriod = CalcPeriod( glPeriodKind, dlg.rec.fPeriod );
+        if( glProcPeriod < MINIMAL_PERIOD )
+           msgbox( "Указанный период выполнения слишком маленький.|"+
+                   "Пожалуйста, введите период побольше и постарайтесь, чтобы он не был менее " + MINIMAL_PERIOD/1000 + " секунд.");
+           return CM_IGNORE;
+        end;
+
+        DisableFields( dlg, FldIndex( dlg, "fPeriod" ) );
+        DisableFields( dlg, FldIndex( dlg, "fTmKind" ) );
+        UpdateFields( dlg );
+
+        msgbox("Запуск процедуры выполнен");
+        message( "~Esc~ - Выход ~F6~ - Просмотр списка действующих заявлений ~F7~ - Просмотр текущего протокола ~F8~ - Остановка" );
+
+        // При запуске процедуру выполняем сразу...
+        ReadyToExecute = true;
+        MainProcedureExecute( true );
+
+        // Далее она продолжает выполняться по таймеру с указанным интервалом
+        SetTimer( dlg, glProcPeriod, true );
+
+        return CM_IGNORE;
+
+     elif( key == KEY_F3 )
+
+        // Если процедура уже запущена, просто выходим из обработчика
+        if( ReadyToExecute )
+           return CM_IGNORE;
+        end;
+
+        if( FldName(_dlg, id) == "fTmKind" )
+           vMenu = TArray(0);
+           vMenu(0) = "секунд";
+           vMenu(1) = "минут";
+           vMenu(2) = "часов";
+           vChoice = Menu( vMenu );
+           if( vChoice >= 0 )
+
+              glPeriodKind = vChoice;
+
+              dlg.rec.fTmKind = vMenu( vChoice );
+              UpdateFields( dlg );
+
+           end;
+        end;
+
+     elif( key == KEY_F6 )
+
+        ro_RunContractsScroll();
+        return CM_IGNORE;
+
+     elif( key == KEY_F7 )
+
+        ViewReport();
+        return CM_IGNORE;
+
+     elif( key == KEY_F8 )
+
+        // Если процедура не запущена, просто выходим из обработчика
+        if( not ReadyToExecute )
+           return CM_IGNORE;
+        end;
+
+        // Останавливаем таймер
+        SetTimer( dlg, glProcPeriod, false );
+
+        // Меняем статус на Готов к запуску
+        dlg.rec.fStatus  = STATUS_KIND_READY;
+        ReadyToExecute = false;
+
+        msgbox("Процедура остановлена");
+        message( "~Esc~ - Выход ~F2~ - Запуск ~F6~ - Просмотр списка действующих заявлений ~F7~ - Просмотр текущего протокола ~Alt-F8~ - Сброс счетчиков" );
+
+        EnableFields( dlg, FldIndex( dlg, "fPeriod" ) );
+        EnableFields( dlg, FldIndex( dlg, "fTmKind" ) );
+        UpdateFields( dlg );
+
+     elif( key == KEY_ALT_F8 )
+
+        // Сброс выполняем только на незапущенной процедуре
+        if( ReadyToExecute )
+           return CM_IGNORE;
+        end;
+
+        dlg.rec.fCounter   = 0;
+        dlg.rec.fProcessed = 0;
+        UpdateFields( dlg );
+
+        ind = 1;
+        glCicleCount = glProcessedCount = 0;
+
+        // Убираем данные из текстового файла
+        setOutput(null, false);
+        println(" ");
+        setOutput(nameout, false);
+        println(separator);println(separator);println(separator);
+
+     end;
+
+  end;
+  return CM_DEFAULT;
+
+  onError()
+     //msgbox(2);
+
+END;
+
+
+/* Протокол начинаем с 3 строки */
+setOutput(nameout);
+println(separator);println(separator);println(separator);
+
+// Инициализация структуры для польз. таблицы
+InitRecHandler();
+
+//MainProcedureExecute( nameout );
+if( RunDialog(dlg, "EventHandler") )
+   msgbox("done");
+end;
+
+exit( 1 );

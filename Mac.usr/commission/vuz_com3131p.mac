@@ -1,0 +1,201 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: com3131p.mac
+// @author  : 2012-04-14 zip_z. C-10090
+// @desc    : Макрос расчета периодической комиссии 3.13.1 "За платежи сверх лимита по комиссиям 3.12.х"
+// @changes : 2012-05-18 zip_z. * изменения в алгоритме расчета комиссии за превышение документооборота 
+//                                (анализируется отметка времени Интербанк: если дата списания со счета 
+//                                 плательщика не равна дате поступления из ИБ, то отбираем платеж как пакетный.
+//                                Если дата списания со счета плательщика равна дате поступления из ИБ,  
+//                                то анализируем отметку времени: если она < времени окончания операционного дня 
+//                                (настройка реестра), платеж пакетный
+//
+// EVG 15/10/2012 Отключил макрос vuz_com3131p.mac от комиссии 3.13.1 в банке ВУЗ как устаревший. Используется 
+//		  общий макрос com3131p.mac.
+// -------------------------------------------------------------------------------------------------
+
+import sfinter, ctinter, lib_packetCommission, lib_sqltools;
+
+macro calcServiceSum (sfcontr_addr, beginDate, endDate, sAddr, sfcontrStruc)
+    private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+    private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+    DebugBreak ();
+    record sfcontr (sfcontr);
+    record sfbassum ("sfbassum.str");
+
+    var sql = execSQLSelect ("select 1 from dcurdate_dbt where t_branch = 1 and t_curdate >= :d", makeArray (SQLParam ("d", endDate)));
+    if (not sql.moveNext)
+        return; // мы пытаемся начислить комиссию "вперед". 
+                // Это некорректно - выбрасываемся из макроса.
+    end;
+    
+    if (valType (sfcontr_addr) != V_UNDEF)
+        setBuff (sfcontr, sfcontr_addr);
+    else
+        copy (sfcontr, sfcontrStruc);
+    end;
+
+    // X - количество платежей в пакете клиента. Система анализирует состояние комиссий 3.12.x
+    //     и возвращает количество платежей той комиссии, состояние которой <Начисляется>;
+    var x = 0;
+    
+    // Проанализируем комиссии договора: смотрим на комиссии с привязкой к пакетам и возвращаем параметры той
+    // комиссии, состояние которой = "Начисляется". Одновременно начисляться может только одна
+    // (если по договору начисляются несколько таких комиссий - это ошибка настройки и нужно бить в колокол.
+    DebugBreak ();
+    sql = "SELECT /*+leading (nt com cc)*/ cc.t_feetype, com.t_code, com.t_number, cc.t_status, UTL_RAW.cast_to_binary_integer (nt.t_text, 2) m_payment_count"
+          "  FROM dsfconcom_dbt cc, dsfcomiss_dbt com, dnotetext_dbt nt"
+          " WHERE com.t_feetype = 1 AND com.t_feetype = cc.t_feetype AND com.t_number = cc.t_commnumber"
+          "   AND com.t_code IN (SELECT REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullname, '<objattr:id>\\d+.\\d+.\\d+</objattr:id>'), '\\d+.\\d+.\\d+')"
+          "                        FROM dobjattr_dbt"
+          "                       WHERE t_objecttype = 3 AND t_groupId = 200)"
+          "   AND cc.t_status = 0 AND cc.t_objectid = :contrid AND cc.t_objecttype = 659 AND nt.t_objectType = 650 AND nt.t_noteKind = 200"
+          "   AND nt.t_documentID = CONCAT (LPAD (TO_CHAR (com.t_feetype), 5, '0'), LPAD (TO_CHAR (com.t_number), 5, '0'))"
+          "   AND nt.t_validToDate = TO_DATE ('31.12.9999', 'dd.mm.yyyy')";
+    sql = execSQLSelect (sql, makeArray (SQLParam ("contrid", sfcontr.id)));
+    if (sql.moveNext ())
+        x = sql.value ("m_payment_count", null, V_INTEGER);
+    end;
+
+    // N - общее количество платежей видов 3.4.1-3.4.5, 3.4.7 с начала текущего месяца 
+    // по endDate включительно
+    var n = 0;
+    // K - общее количество платежей видов 3.4.1-3.4.5, 3.4.7 за endDate
+    var k = 0;
+    
+    var dd, mm, yyyy;
+    dateSplit (beginDate, dd, mm, yyyy);
+    var firstday = date (1, mm, yyyy);
+    
+    // Не делайте круглые глаза. Это чтоб было проще копировать SQL. Функционал зашит в lib_sqltools.mac
+    startQueryCapture ();
+[SELECT (SELECT NVL (COUNT (DISTINCT pm.t_paymentid), 0) n
+          FROM darhdoc_dbt ad, dpmdocs_dbt pd, dpmpaym_dbt pm, dpmrmprop_dbt rm,
+               daccount_dbt ac, dpspayord_dbt ord
+         WHERE :acc1 IN (ad.t_account_payer, ad.t_account_receiver)
+           AND ad.t_chapter = 1
+           AND ad.t_date_carry BETWEEN :firstday AND :cdate1
+           AND ad.t_applicationkey = pd.t_applicationkey
+           AND ad.t_iapplicationkind = pd.t_applicationkind
+           AND pm.t_payeraccount = ac.t_account
+           AND ac.t_chapter = 1
+           AND ac.t_code_currency = 0
+           AND INSTR (ac.t_usertypeaccount, 'Z') = 0
+           AND REGEXP_INSTR (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+           AND REGEXP_INSTR (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+           AND NOT (    REGEXP_INSTR (pm.t_receiveraccount, '^(30232|47422)') = 1
+                    AND (   REGEXP_INSTR (rm.t_ground, '(40817|40820)[0-9. ]{15,}') != 0
+                         OR REGEXP_INSTR (rm.t_ground, '(423|426)[0-9. ]{17,}') != 0
+                        )
+                   )
+           AND rm.t_shifroper != '16'
+           AND pm.t_paymentid = pd.t_paymentid
+           AND pm.t_paymstatus = 32000
+           AND pm.t_dockind = 201
+           AND pm.t_payerbankid != pm.t_receiverbankid
+           AND pm.t_paymentid = rm.t_paymentid
+           AND rm.t_taxauthorstate = CHR (1)
+           AND pm.t_paymentid = ord.t_orderid
+           AND (   (t_date_carry >
+                       TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                     TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                    ),
+                                'dd.mm.yyyy'
+                               )
+                   )
+                OR (    t_date_carry =
+                           TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                         TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                        ),
+                                    'dd.mm.yyyy'
+                                   )
+                    AND TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}:\d{2}:\d{2}'),
+                                      '00:00:00'
+                                     ),
+                                 'hh24:mi:ss'
+                                ) <= TO_DATE (:operDayEndTime, 'hh24:mi')
+                   )
+               )) AS n,
+       (SELECT NVL (COUNT (DISTINCT pm.t_paymentid), 0) n
+          FROM darhdoc_dbt ad, dpmdocs_dbt pd, dpmpaym_dbt pm, dpmrmprop_dbt rm,
+               daccount_dbt ac, dpspayord_dbt ord
+         WHERE :acc2 IN (ad.t_account_payer, ad.t_account_receiver)
+           AND ad.t_chapter = 1
+           AND ad.t_date_carry = :cdate2
+           AND ad.t_applicationkey = pd.t_applicationkey
+           AND ad.t_iapplicationkind = pd.t_applicationkind
+           AND pm.t_payeraccount = ac.t_account
+           AND ac.t_chapter = 1
+           AND ac.t_code_currency = 0
+           AND INSTR (ac.t_usertypeaccount, 'Z') = 0
+           AND REGEXP_INSTR (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+           AND REGEXP_INSTR (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+           AND NOT (    REGEXP_INSTR (pm.t_receiveraccount, '^(30232|47422)') = 1
+                    AND (   REGEXP_INSTR (rm.t_ground, '(40817|40820)[0-9. ]{15,}') != 0
+                         OR REGEXP_INSTR (rm.t_ground, '(423|426)[0-9. ]{17,}') != 0
+                        )
+                   )
+           AND rm.t_shifroper != '16'
+           AND pm.t_paymentid = pd.t_paymentid
+           AND pm.t_paymstatus = 32000
+           AND pm.t_dockind = 201
+           AND pm.t_payerbankid != pm.t_receiverbankid
+           AND pm.t_paymentid = rm.t_paymentid
+           AND rm.t_taxauthorstate = CHR (1)
+           AND pm.t_paymentid = ord.t_orderid
+           AND (   (t_date_carry >
+                       TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                     TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                    ),
+                                'dd.mm.yyyy'
+                               )
+                   )
+                OR (    t_date_carry =
+                           TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                         TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                        ),
+                                    'dd.mm.yyyy'
+                                   )
+                    AND TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}:\d{2}:\d{2}'),
+                                      '00:00:00'
+                                     ),
+                                 'hh24:mi:ss'
+                                ) <= TO_DATE (:operDayEndTime, 'hh24:mi')
+                   )
+               )) AS k
+  FROM DUAL ];
+    
+    sql = endQueryCapture ();
+    sql = execSQLSelect (sql, makeArray (SQLParam ("acc1",            sfcontr.object         ),
+                                         SQLParam ("firstday",        firstday               ),
+                                         SQLParam ("cdate1",          endDate                ), 
+                                         SQLParam ("operDayEndTime1", PC_getOperDayEndTime ()), 
+                                         SQLParam ("acc2",            sfcontr.object         ),
+                                         SQLParam ("cdate2",          endDate                ), 
+                                         SQLParam ("operDayEndTime2", PC_getOperDayEndTime ())), false);
+    if (sql.moveNext ())
+        n = sql.value ("n", null, V_INTEGER); 
+        k = sql.value ("k", null, V_INTEGER);
+    end;
+    
+    // по ТЗ:
+    var CommQuont = 0;
+    if (n > x)
+        if ((n - k) < x) CommQuont = (n - x);
+        else             CommQuont = k;
+        end;
+    end;
+    
+    if ( valType (sfcontrStruc) != V_UNDEF )
+        return (CommQuont > 0);
+    end;
+    clearRecord(sfbassum);
+
+    sfbassum.baseType   = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont  = CommQuont;
+    sfbassum.baseType2  = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont2 = CommQuont;
+
+    if( insertSumList(sfbassum) )
+        msgBox("Ошибка при вставке базовой суммы");
+    end;
+end;

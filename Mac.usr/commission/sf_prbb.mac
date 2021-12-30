@@ -1,0 +1,941 @@
+/********************************************************************************************************************************************
+  MEV, RSSL, 13/05/2009
+  Процедура поиска счёта клиента для погашения комиссии
+  Обновление СПИ по удержанной комиссии найденным счётом
+  
+  Процедура должна быть единой и работать одинаково для всех видов комиссий - периодических, разовых и единовременных.
+  Погашение комиссии может быть произведено с любого из счетов клиента, рублёвых или валютных, на котором есть достаточный 
+  для погашения рассчитанной комиссии остаток. Приоритет перебора счетов клиента следующий:
+               счёт, указанный в СПИ договора обслуживания;
+               остальные рублёвые счета клиента;
+               остальные валютные счета клиента.
+  Если ни на одном из счетов клиента средств для оплаты комиссии недостаточно, для оплаты используется счёт с наибольшим 
+  остатком (впоследствии документ будет штатными средствами помещён в картотеку 2 (рубли) или в список ожидающих оплаты 
+  (валюта)); Выбранный счёт должен сохраняться в СПИ плательщика по рассчитанной комиссии, дальнейшая обработка комиссии 
+  должна выполняться штатными средствами.
+  
+  //RR 30.07.2012 Исправил передачу параметра в запрос, в строке 264
+  zip_z. 2012-08-09 Добавил обработку runtime error. Пользователи не должны видеть сообщения непонятные технические сообщения об ошибках.
+  17-09-2012 I-00251107-2 Жаворонкова Н. (joy) Изменила способ формирования имени глобальной переменной
+  //RR & EVG 07.05.2014 в selectAccountForSfPay добавлена проверка на заполненность буфера FoundedAcc, если буфер пустой то возвращается счет ДО
+********************************************************************************************************************************************/
+import FIInter, BankInter, SfInter, "globals.mac","cb_sql.mac";
+
+/* EVG Функции для определения банка группы */
+import "fg_Life_parm.mac";
+
+
+private const NOTE_REQUIREDACCOUNT = 117; /*Вид примечания для счета списания комиссии*/
+private var 
+        FoundedAcc = null,      /* Найденный счёт, с которого нужно выполнять погашение комиссии */
+        enougthRest = null,             /* ?Достаточно ли остатка для оплаты комиссии */
+        KindComm,                       /* Вид комиссии: разовая, единовременная, периодическая */
+        PartyID,                        /* Идентификатор клиента */
+        IdComm,                         /* Идентификатор комиссии */
+        ContrAcc,                       /* Счёт, указанный в договоре */
+        SumComm,                        /* Сумма, необходимая для оплаты комисии */
+        FiidComm,                       /* Валюта комисси */
+        DateComm,                       /* Дата комиссии */
+        RequiredAccount;                /* Счет обязательный из примечания для клиента */
+
+/* EVG Счёт, по которому рассчитывается комиссия */
+var ContrAccount = "";
+
+/* Процедуры сортировки списка счетов
+- -1 - если первый элемент меньше второго;
+- 0 - если элементы равны;
+- 1 - если первый элемент больше второго.
+*/
+/* валюта/рубли, затем - остаток, затем - номер счёта */
+private macro cmpCURRestAsc(a, b)
+        var fa = (a.fiid!=NATCUR), fb = (b.fiid!=NATCUR);
+        
+        if (fa and (not fb))    /* первый - больше */
+                return -1;
+        elif (fa and fb)                /* пока равны */
+                if   ( a.getRest() < b.getRest() )
+                        return -1;
+                elif ( a.getRest() > b.getRest() )
+                        return 1;
+                else
+                        return 0;
+                end;            
+        else                                    /* первый - меньше */
+                return 1;
+        end;
+end;
+
+/* валюта/рубли, затем - остаток, затем - номер счёта */
+private macro cmpRUBRestAsc(a, b)
+        var fa = (a.fiid==NATCUR), fb = (b.fiid==NATCUR);
+        
+        /* EVG 01.12.2010 Счёт-объект по договору всегда имеет приоритет */
+                //msgbox (a.account(), " - ", b.account(), "|", ContrAccount);
+        if ( a.account() == ContrAccount )
+           return -1;
+        elif ( b.account() == ContrAccount )
+           return 1;
+        end;
+
+
+        if (fa and (not fb))    /* первый - больше */
+                return -1;
+        elif (fa and fb)                /* пока равны */
+        
+        //msgbox (a.account(), " - ", a.getRest(), "|", b.account(), " - ", b.getRest());
+
+                if   ( a.getRest() < b.getRest() )
+                        return -1;
+                elif ( a.getRest() > b.getRest() )
+                        return 1;
+                else
+                        return 0;
+                end;            
+        else                                    /* первый - меньше */
+                return 1;
+        end;
+end;
+
+/* остаток, сначала рублёвые, затем - валютные */
+private macro cmpRestDesc(a, b)
+        var fa = (a.fiid==NATCUR), fb = (b.fiid==NATCUR);
+        
+        /* EVG 01.11.2011 В этой функции тоже необходима данная доработка.
+           Счёт-объект по договору всегда имеет приоритет */
+                //msgbox (a.account(), " - ", b.account(), "|", ContrAccount);
+        if ( a.account() == ContrAccount )
+           return -1;
+        elif ( b.account() == ContrAccount )
+           return 1;
+        end;
+
+        
+        if (fa and (not fb))    /* первый - больше */
+                return -1;
+        elif (fa and fb)                /* пока равны */
+                if   ( a.getRest() < b.getRest() )
+                        return 1;
+                elif ( a.getRest() > b.getRest() )
+                        return -1;
+                else
+                        return 0;
+                end;            
+        else                                    /* первый - меньше */
+                return 1;
+        end;
+
+/*        if (a.getRest()<b.getRest())
+                return 1;
+        elif (a.getRest()>b.getRest())
+                return -1;
+        else
+                return 0;
+        end;            */
+end;
+
+class TAcc4SfPay(_account, _fiid, _rest, _byContr, _FiidCom)
+        var
+                account, fiid, rest=$0, byContr;
+
+        /*DONE: Конвертировать остаток в валюту комиссии на дату*/
+        private macro getRestOnFiidComm(_rest, _fiid)
+                var rest=$0;
+                
+                if (ConvSum(rest, _rest, DateComm, _fiid, FiidComm)!=0)
+                        rest = $0;
+                end;
+                
+                return rest;
+        end;
+
+        
+        private macro Init(_account, _fiid, _rest, _byContr, _FiidCom)
+        if (ValType(_byContr)==V_UNDEF)
+            _byContr = false;
+        end;
+        if (ValType(_FiidCom)==V_UNDEF)
+                _FiidCom = FiidComm;
+        end;
+                account =       _account;
+                fiid    =   _fiid;
+                byContr =       _byContr;
+                if (fiid==_FiidCom)
+                        rest    =       _rest;
+                else    
+            rest = getRestOnFiidComm(_rest, _fiid);
+                end;
+        end;
+
+        macro getRest()
+                return rest;
+        end;
+        
+        Init(_account, _fiid, _rest, _byContr, _FiidCom);
+end;
+
+class TAccounts4SfPay(_SumComm, _FiidComm, _DateComm, _Contr)
+        private const
+                        SELECT_RUR = 1,
+                        SELECT_CUR = 2,
+                        SELECT_BY_REST = 3;
+
+        private var 
+                        foundRubAccs = false,
+                        foundCurAccs = false,
+                        Accounts = TArray(),
+                        selectNextMode,
+                        i,
+                        Contr;
+        
+        private macro notFound(_account, _fiid, _rest, _byContr)
+                var 
+                        size = Accounts.Size(), i=0, Acc, notfound = true;
+                
+                while ((i<size) and notfound)
+                    Acc = Accounts[i];
+                    if ((Acc.account==_account) and (Acc.fiid==_fiid))
+                        /* Обновить остаток и признак счёта из СПИ */
+                        Accounts[i].rest = _rest;
+                        Accounts[i].byContr = _byContr;
+                        notfound = false;
+                    end;
+                        i = i+1;
+                end;
+
+                return notfound;
+        end;
+
+        private macro AddAcc(_account, _fiid, _rest, _byContr)
+                if (_byContr)
+                        ContrAcc = null;
+                        ContrAcc = TAcc4SfPay(_account, _fiid, _rest, _byContr);
+                end;
+                if (notFound(_account, _fiid, _rest, _byContr))
+                        Accounts[Accounts.Size()] = TAcc4SfPay(_account, _fiid, _rest, _byContr);
+                end;
+        end; 
+        
+        private macro enumerateRubAccounts()    /* DONE: Отобрать все подходящие рублёвые счета клиента */
+                var sql, rs, rest = 0;
+
+                /* EVG Инициализация банка группы */
+                var fgBank = fg_life_subject({OurBank});
+                
+                if (not foundRubAccs) 
+                    /* Рублёвые счета */
+                    SQL = " SELECT ac.t_account account, ac.t_code_currency fiid ";
+
+                    /* EVG Лимит */
+                    /* EVG 3/12/2013 В 2031 лимит ушел из daccount_dbt, поэтому его лучше получать функцией (хотя и запрещенной :) ). Я доработал скрипт, но оставил эту строчку 
+                       в комменте, т.к. лимит всё равно не используется для комиссий, и лишний раз запрос лучше не усложнять.
+                    SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, ac.t_limit) limit ";
+                    SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, RSI_RSB_ACCOUNT.GetAccLimit( ac.t_account, ac.t_chapter, ac.t_code_currency, '" + DateComm + "') ) limit ";*/
+
+                    SQL = SQL + "  FROM daccount_dbt ac ";
+                    SQL = SQL + " WHERE (   ac.t_balance IN ('40802', '40807') ";
+                    SQL = SQL + "        OR SUBSTR (ac.t_balance, 1, 3) IN ('405', '406', '407') ";
+                    SQL = SQL + "       ) ";
+                    /* EVG Не счета СКС */
+                    SQL = SQL + "   AND ( SUBSTR (ac.t_account, 11, 1) != '9' ";
+                    /* EVG 18/04/2012 Обработка пользовательского типа H "Не СКС" */
+                    SQL = SQL + "         OR INSTR (ac.t_usertypeaccount, 'H') <> 0 ) ";
+                    SQL = SQL + "   AND ac.t_open_close != 'З' ";
+                    SQL = SQL + "   AND ac.t_chapter = 1 ";
+                    /* EVG Не нужно учитывать счета с арестом на дебет */
+                    SQL = SQL + "   AND INSTR (ac.t_type_account, 'Т') = 0 ";
+                    SQL = SQL + "   AND INSTR (ac.t_type_account, 'П') = 0 ";
+                    SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, '5') = 0 ";
+                    SQL = SQL + "   AND ac.t_client = " + PartyID;
+
+                    /* EVG 3/12/2013 Адаптация под 2031, все счета теперь живут в daccount_dbt, валютных и покрытий больше нет */
+                    SQL = SQL + "   AND ac.t_code_currency = 0 ";
+
+                    /* EVG Для банка ВУЗ условия немного отличаются */
+                    if (fgBank.is_VUZ)
+                       SQL = " SELECT ac.t_account account, ac.t_code_currency fiid ";
+
+                      /* EVG 3/12/2013 В 2031 лимит ушел из daccount_dbt, поэтому его лучше получать функцией (хотя и запрещенной :) ). Я доработал скрипт, но оставил эту строчку 
+                         в комменте, т.к. лимит всё равно не используется для комиссий, и лишний раз запрос лучше не усложнять.
+                       SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, ac.t_limit) limit ";
+                       SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, RSI_RSB_ACCOUNT.GetAccLimit( ac.t_account, ac.t_chapter, ac.t_code_currency, '" + DateComm + "') ) limit ";*/
+
+                       SQL = SQL + "  FROM daccount_dbt ac ";
+                       SQL = SQL + " WHERE (   ac.t_balance IN ('40802', '40807') ";
+                       SQL = SQL + "        OR SUBSTR (ac.t_balance, 1, 3) IN ('405', '406', '407') ";
+                       SQL = SQL + "       ) ";
+                       SQL = SQL + "   AND ac.t_open_close != 'З' ";
+                       SQL = SQL + "   AND ac.t_chapter = 1 ";
+                       /* EVG Клиент не равен 010000060079 "Накопительные счета" */
+                       SQL = SQL + "   AND ac.t_Client != 19844 ";      // PartyID
+                       /* EVG Не счета СКС */
+                       SQL = SQL + "   AND SUBSTR (ac.t_account, 11, 1) != '9' ";
+                       SQL = SQL + "   AND SUBSTR (ac.t_account, 11, 3) != '111' ";
+                       SQL = SQL + "   AND INSTR (ac.t_type_account, 'П') = 0 ";
+                       SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, '5') = 0 ";
+                       SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, 'Н') = 0 ";
+                       SQL = SQL + "   AND ac.t_client = " + PartyID;
+
+                       /* EVG 3/12/2013 Адаптация под 2031, все счета теперь живут в daccount_dbt, валютных и покрытий больше нет */
+                       SQL = SQL + "   AND ac.t_code_currency = 0 ";
+                    end;
+                    
+                    
+                    //debugbreak;
+                    if (RequiredAccount != "")
+                       SQL = SQL + "   AND ac.t_account = '"+string(RequiredAccount) +"'";//RR 30.07.2012 Фикс, нужно передавать апострофы, иначе оракл считает счет числом
+                    end; 
+                    /*MsgBox(sql);*/
+                    rs = TRsbDataSet(sql);
+                    while(rs.movenext())
+                            foundRubAccs = true;
+                            /* EVG 24/08/2011 To 2030 У AccGetFreeAmount() в 2030 изменилась параметризация.
+                            rest = AccGetFreeAmount(rs.value("account"), 1, rs.value("fiid"), 6, 0, DateComm);*/
+                            AccGetFreeAmount( rest, null, rs.value("account"), 1/*CHAPT1*/, rs.value("fiid"), DateComm, 6, 0 );
+                                   /* EVG 2/12/2010 Всё, для оплаты комиссий овердрафт больше не используется.
+                                   /* EVG К свободному остатку счёта добавляется лимит, если есть */
+                                   + rs.value("limit", null, V_MONEY);*/
+                            AddAcc(rs.value("account"), rs.value("fiid"), rest);
+                            //msgbox (rs.value("account"), "|", rs.value("limit", null, V_MONEY), "|", rest);
+                    end;
+                end;
+                return foundRubAccs;
+        end;
+
+        private macro enumerateCurAccounts()    /* DONE: Отобрать все подходящие валютные счета клиента */
+                var sql, rs, rest = 0;
+
+                /* EVG Инициализация банка группы */
+                var fgBank = fg_life_subject({OurBank});
+                
+                if (not foundCurAccs) 
+                   /* Валютные счета */
+                   //debugbreak;
+                   SQL = " SELECT ac.t_account account, ac.t_code_currency fiid ";
+
+                   /* EVG Лимит */
+                   /* EVG 3/12/2013 В 2031 лимит ушел из daccount_dbt, поэтому его лучше получать функцией (хотя и запрещенной :) ). Я доработал скрипт, но оставил эту строчку 
+                      в комменте, т.к. лимит всё равно не используется для комиссий, и лишний раз запрос лучше не усложнять.
+                   SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, ac.t_limit) limit ";
+                   SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, RSI_RSB_ACCOUNT.GetAccLimit( ac.t_account, ac.t_chapter, ac.t_code_currency, '" + DateComm + "') ) limit ";*/
+
+                   /* EVG 3/12/2013 daccount$_dbt больше нет
+                   SQL = SQL + "  FROM daccount$_dbt ac ";*/
+                   SQL = SQL + "  FROM daccount_dbt ac ";
+
+                   SQL = SQL + " WHERE (    (   ac.t_balance IN ('40802', '40807') ";
+                   SQL = SQL + "             OR SUBSTR (ac.t_balance, 1, 3) IN ('405', '406', '407') ";
+                   SQL = SQL + "            ) ";
+                   SQL = SQL + "        AND SUBSTR (ac.t_account, 14, 1) != '1' ";
+                   /* EVG Не счета СКС */
+                   SQL = SQL + "        AND ( SUBSTR (ac.t_account, 11, 1) != '9' ";
+                   /* EVG 18/04/2012 Обработка пользовательского типа H "Не СКС" */
+                   SQL = SQL + "              OR INSTR (ac.t_usertypeaccount, 'H') <> 0 ) ";
+                   SQL = SQL + "       ) ";
+                   SQL = SQL + "   AND ac.t_open_close != 'З' ";
+                   SQL = SQL + "   AND ac.t_chapter = 1    ";
+                   /* EVG Не нужно учитывать счета с арестом на дебет */
+                   SQL = SQL + "   AND INSTR (ac.t_type_account, 'Т') = 0 ";
+                   SQL = SQL + "   AND INSTR (ac.t_type_account, 'П') = 0 ";
+                   SQL = SQL + "   AND INSTR (ac.t_type_account, 'Y') = 0 ";
+                   SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, '5') = 0 ";
+                   SQL = SQL + "   AND ac.t_client = " + PartyId;
+
+                   /* EVG 3/12/2013 Адаптация под 2031, все счета теперь живут в daccount_dbt, валютных и покрытий больше нет */
+                   SQL = SQL + "   AND ac.t_code_currency > 0 ";
+                  
+                   /* EVG Для банка ВУЗ условия немного отличаются */
+                   if (fgBank.is_VUZ)
+                      SQL = " SELECT ac.t_account account, ac.t_code_currency fiid ";
+
+                      /* EVG 3/12/2013 В 2031 лимит ушел из daccount_dbt, поэтому его лучше получать функцией (хотя и запрещенной :) ). Я доработал скрипт, но оставил эту строчку 
+                         в комменте, т.к. лимит всё равно не используется для комиссий, и лишний раз запрос лучше не усложнять.
+                      SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, ac.t_limit) limit ";
+                      SQL = SQL + " DECODE (INSTR (ac.t_type_account, 'О'), 0, 0, RSI_RSB_ACCOUNT.GetAccLimit( ac.t_account, ac.t_chapter, ac.t_code_currency, '" + DateComm + "') ) limit ";*/
+
+                      /* EVG 3/12/2013 daccount$_dbt больше нет
+                      SQL = SQL + "  FROM daccount$_dbt ac ";*/
+                      SQL = SQL + "  FROM daccount_dbt ac ";
+
+                      SQL = SQL + " WHERE (   ac.t_balance IN ('40802', '40807') ";
+                      SQL = SQL + "        OR SUBSTR (ac.t_balance, 1, 3) IN ('405', '406', '407') ";
+                      SQL = SQL + "       ) ";
+                      SQL = SQL + "   AND ac.t_open_close != 'З' ";
+                      SQL = SQL + "   AND ac.t_chapter = 1 ";
+                      /* EVG Клиент не равен 010000060079 "Накопительные счета" */
+                      SQL = SQL + "   AND ac.t_Client != 19844 ";      // PartyID
+                      /* EVG Не счета СКС */
+                      SQL = SQL + "   AND SUBSTR (ac.t_account, 11, 1) != '9' ";
+                      SQL = SQL + "   AND SUBSTR (ac.t_account, 11, 3) != '111' ";
+                      SQL = SQL + "   AND INSTR (ac.t_type_account, 'П') = 0 ";
+                      SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, '5') = 0 ";
+                      SQL = SQL + "   AND INSTR (ac.t_usertypeaccount, 'Н') = 0 ";
+                      SQL = SQL + "   AND ac.t_client = " + PartyID;
+
+                      /* EVG 3/12/2013 Адаптация под 2031, все счета теперь живут в daccount_dbt, валютных и покрытий больше нет */
+                      SQL = SQL + "   AND ac.t_code_currency > 0 ";
+                   end;
+                   
+                   if (RequiredAccount != "")
+                      SQL = SQL + "   AND ac.t_account = "+GetSQLString(RequiredAccount);
+                   end; 
+
+                   /*MsgBox(sql);*/
+                   rs = TRsbDataSet(sql);
+                   while(rs.movenext())
+                      foundCurAccs = true;
+                      /* EVG 24/08/2011 To 2030 У AccGetFreeAmount() в 2030 изменилась параметризация.
+                      rest = AccGetFreeAmount(rs.value("account"), 1, rs.value("fiid"), 6, 0, DateComm);*/
+                      AccGetFreeAmount( rest, null, rs.value("account"), 1/*CHAPT1*/, rs.value("fiid"), DateComm, 6, 0 );
+                             /* EVG 2/12/2010 Всё, для оплаты комиссий овердрафт больше не используется.
+                             /* EVG К свободному остатку счёта добавляется лимит, если есть */
+                             + rs.value("limit", null, V_MONEY);*/
+                      AddAcc(rs.value("account"), rs.value("fiid"), rest);
+                   end;
+
+                end;
+                return foundCurAccs;
+        end;
+        
+        private macro selectAccOnContr()        /* DONE: Найти счёт по договору */
+                /*var sql, rs;
+                sql = "";
+                rs = TRsbDataSet(sql);
+                if (rs!=null and rs.movenext())
+                        AddAcc(rs.value("account"), rs.value("fiid"), rs.value("rest"), true);
+                end;*/
+        /* Тестовые данные
+        AddAcc("40702_по_договору", 0, $300, true);
+        
+        ContrAcc = Contr;
+        */
+                if (foundRubAccs) 
+                        foundRubAccs = false; 
+                end;
+                if (foundCurAccs) 
+                        foundCurAccs = false; 
+                end;
+        end;
+
+        /* Счёт из СПИ до договору обслуживания */
+        /*macro getAccByContr()
+                return ContrAcc;
+        end;*/
+
+        macro Init(_SumComm, _FiidComm, _DateComm, _Contr)
+                Accounts = null;
+                Accounts = TArray();
+
+                SumComm         = _SumComm; 
+                FiidComm        = _FiidComm;
+                DateComm        = _DateComm;
+                Contr           = _Contr; 
+                
+        /* Сначала только найти счёт по договору - остальные могут и не понадобиться */
+        selectAccOnContr();
+                /* Выбрать в базе все подходящие счета */
+                /*enumerateAccounts();*/
+        end; 
+
+        macro getCurrAcc()
+                return Accounts[i];
+        end;
+
+        macro selectNext()
+                var 
+                        found = true, Acc;
+
+                i = i+1;
+
+                if (i>=Accounts.Size())
+                        found = false;
+                else
+                Acc = getCurrAcc();
+                if (selectNextMode == SELECT_RUR)
+                        if (Acc.fiid!=NATCUR)
+                                found = false;
+                        end;
+                elif (selectNextMode == SELECT_CUR)
+                        if (Acc.fiid==NATCUR)
+                                found = false;
+                        end;
+                end;
+        end;
+
+                return found;
+        end;
+
+        macro sortRestsDesc()
+        /* 1. Счета уже выбраны на предыдущих шагах */
+        /* 2. Для разовых комиссий пока не перебирать рублёвые счета */
+                /*enumerateRubAccounts();
+                enumerateCurAccounts();*/
+
+                var stat = false;
+
+                i = -1;
+                if (foundRubAccs or/* FIV Изменил условие на OR иначе даже при наличии рублевого счета счет не возвращается and*/ foundCurAccs)
+                    qsort(Accounts, @cmpRestDesc);
+                    
+                    selectNextMode = SELECT_BY_REST;
+                    
+                    stat = selectNext();
+                end;
+                return stat;
+        end;
+
+        macro sortRUBRestAsc()
+                var stat = false;
+                enumerateRubAccounts();
+                
+                i = -1;
+                if (foundRubAccs)
+                    qsort(Accounts, @cmpRUBRestAsc);
+                    
+                    selectNextMode = SELECT_RUR;
+                    stat = selectNext();
+
+                end;
+
+                
+                /*
+                // EVG Чтобы просмотреть массив найденных счетов
+                
+                var i = 0;
+                while (i < Accounts.size)
+                   msgbox (Accounts(i).account, " - ", Accounts(i).fiid, " - ", Accounts(i).rest, " - ", Accounts(i).byContr);
+                   i = i + 1;
+                end;*/
+                
+                
+                return stat;
+        end;
+
+        macro sortCURRestAsc()
+                var stat = false;
+                enumerateCurAccounts();
+                
+                i = -1;
+                if (foundCurAccs)
+                    qsort(Accounts, @cmpCURRestAsc);
+                    
+                    selectNextMode = SELECT_CUR;
+                    
+                    stat = selectNext();
+                end;
+                return stat;
+        end;
+
+        Init(_SumComm, _FiidComm, _DateComm, _Contr);
+end;
+
+private var 
+        Accs = TAccounts4SfPay();
+
+/*
+private macro getAccountOnContr(SumComm, FiidComm, DateComm, Contr)
+        /* Отобрать все подходящие счета клиента */
+        Accs.Init(SumComm, FiidComm, DateComm, Contr);
+    /* Выбрать номер счёта из СПИ по договору */
+        return Accs.getAccByContr();
+end;
+
+/* Найти ID клиента для счёта */
+private macro getPartyIDFromAccount(Contr)
+        var sql, rs, partyid=-1;
+
+    SQL = " SELECT t_client partyid ";
+    if (Contr.fiid==NATCUR)
+        SQL = SQL + "  FROM daccount_dbt ";
+    else
+        SQL = SQL + "  FROM daccount$_dbt ";
+    end;
+    SQL = SQL + " WHERE t_account = '"+Contr.account+"' ";
+    SQL = SQL + "   AND t_chapter = 1 ";
+    SQL = SQL + "   AND t_code_currency = 0 ";
+    /*MsgBox(sql);*/
+
+    rs = TRsbDataSet(sql);
+    if ((rs!=null) and rs.movenext())
+        partyid = rs.value("partyid");
+    end;
+
+    return partyid;
+end;
+*/
+
+private macro initAccSelect(SumComm, FiidComm, DateComm, ContrID, Mode, id)
+        var acc, rest, enought = true;
+
+        KindComm = Mode;        /* В зависимости от вида комиссии обновление СПИ выполняется по-разному */
+        IdComm = id;
+        PartyID = ContrID;
+        Accs.Init(SumComm, FiidComm, DateComm, ContrId);
+        /*
+        PartyID = getPartyIDFromAccount(Contr);
+        /* 1. Найти счёт из СПИ по договору */
+        acc = getAccountOnContr(SumComm, FiidComm, DateComm, Contr);
+    /* 2. Найти остаток счёта */
+    rest = acc.getRest();
+    /* 3. Проверить остаток счёта */
+    if (rest<SumComm)
+        enought = false;
+    end;
+    
+    return enought;
+    */
+end;
+
+/* DONE: Обновить разовую комиссию по итогам изысканий */
+/* Сохранить оригинальный счёт в UserField2 */
+/* Заменить счёт */
+/* Если меняется валюта счёта - что делать? */
+/* 1. Ничего - с сообщением пользователю */
+/* 2. Обновлять разовую комиссиию с пересчётом суммы и НДС в валюту счёта? */
+/* 2.1. Пересчитать сумму+НДС */
+/* 2.2. Пересчитать НДС */
+/* 2.3. Сумма комиссии = Всего минус НДС (обе - в валюте счёта)*/
+private macro updateOnceSfSi(Acc)
+        /* EVG Нужна
+        /* [!] 19/05/09 Для разовых комиссий процедура не нужна*/
+        */
+        var sql;
+        
+        if (Acc.fiid==NATCUR)
+        sql = "UPDATE dsfsingdf_dbt "+
+                  " SET t_userfield2 = t_accountpayer, "+
+              "         t_accountpayer = '"+Acc.account + "'"
+              "WHERE t_id = "+string(IdComm);
+
+            /*MsgBox(sql);*/
+            SQL_Execute(sql);
+        else
+                /* Вариант 1: ничего не делать */
+                MsgBox("В разовой комиссии необходимо изменить валюту комиссии!!!");
+        /* Вариант 2: не реализовано */
+        end;
+end;
+
+/* DONE: Обновить СПИ по единовременной комиссии */
+private macro updateSingleSfSi(Acc)
+        var sql;
+
+    SQL = " UPDATE dsfsi_dbt ";
+    SQL = SQL + "   SET t_account = '"+Acc.account+"', ";
+    SQL = SQL + "       t_fiid = "+string(Acc.fiid)+", ";
+    /* EVG */
+    SQL = SQL + "       t_bankid = "+{OurBank};
+    SQL = SQL + " WHERE t_objecttype = 665 AND t_objectid = LPAD("+string(IdComm)+", 10, '0') AND t_debetcredit=0";
+
+    /*MsgBox(SQL);*/
+    if (IdComm<0)
+        /* Необходимо выполнить обновление структуры sidebet, т.к. вся информация по комиссиям пока находится в памяти */
+    else
+        SQL_Execute(sql);
+    end;
+end;
+
+/* DONE: Обновить СПИ по периодической комиссии */
+private macro updatePeriodicSfSi(Acc)
+
+    /* EVG 17/3/2014 В 2031 реализация снова изменилась, и теперь нам есть что менять.
+       EVG 5/12/2011 В 2030 на моментвыполнения операции СПИ ещё не сохранена в БД,
+       поэтому апдейтить нечего :(
+    */
+    var sql;
+    SQL = " UPDATE dsfsi_dbt ";
+    SQL = SQL + "   SET t_account = '"+Acc.account+"', ";
+    SQL = SQL + "       t_fiid = "+string(Acc.fiid)+", ";
+    /* EVG */
+    SQL = SQL + "       t_bankid = "+{OurBank};
+    SQL = SQL + " WHERE t_objecttype = 663 AND t_objectid = LPAD("+string(IdComm)+", 10, '0') AND t_debetcredit=0";
+
+        /*MsgBox(sql);*/
+    SQL_Execute(sql);
+
+    /* EVG 17/3/2014 Это больше не нужно
+    /* Сохраняем счёт и ФИ в кеше */
+    /* 17-09-2012 I-00251107-2 Жаворонкова Н. (joy) Изменила способ формирования имени глобальной переменной, чтобы она не дублировалась по разным клиентам */
+     /*
+    SetGlobalParameter( "PeriodComm_" + string(IdComm) + "a_", Acc.Account );
+    SetGlobalParameter( "PeriodComm_" + string(IdComm) + "b_", Acc.Fiid ); 
+    */
+    SetGlobalParameter( "PeriodComm_" + string(partyID) + "a_", Acc.Account );
+    SetGlobalParameter( "PeriodComm_" + string(partyID) + "b_", Acc.Fiid ); 
+    /* joy end*/
+    */
+end;
+
+private macro UpdateSfSi(Acc)
+        /*DONE: Обновление платёжных инструкций по указанной комиссии */
+    if (KindComm==SF_FEE_TYPE_ONCE)             /* разовые */
+        updateOnceSfSi(Acc);
+    elif (KindComm==SF_FEE_TYPE_SINGLE) /* единовременные*/
+        /* 1. Найти СПИ плательщика для комиссии */
+        /* 2. Обновить счёт и валюту в СПИ */
+        updateSingleSfSi(Acc);
+    elif (KindComm==SF_FEE_TYPE_PERIOD) /* периодические */
+        /* 1. Найти СПИ плательщика для комиссии */
+        /* 2. Обновить счёт и валюту в СПИ */
+        updatePeriodicSfSi(Acc);
+    end;
+    /*println("Found:\nAccount="+Acc.account+"\nFiid="+string(Acc.fiid)+"\nRest="+string(Acc.rest));*/
+end;
+
+/* Достаточен ли остаток на найденном счёте для оплаты комиссии */
+macro isEnougthRest4Comm()      
+        return enougthRest;
+end;
+
+private macro checkRUBAccs()
+        var
+                stat, found = false, Acc;
+        
+    /* Отсортировать все рублёвые счета по возрастанию остатка */
+    stat = Accs.sortRUBRestAsc();
+
+    /* Выбрать первый счёт с подходящим остатком */
+    while(stat)
+        Acc = null;
+        Acc = Accs.getCurrAcc();
+        if (Acc.getRest>=SumComm)
+                        /* Обновить СПИ в комиссии */
+                        FoundedAcc = Acc;
+                        UpdateSfSi(Acc);
+                found = true;
+        end;
+        stat = (not found) and Accs.selectNext();
+    end;
+
+    if (found) 
+        enougthRest = true;     /* Найден счёт с достаточным для оплаты комиссии остатком */
+    end;
+    
+    return found;
+end;
+
+private macro checkCURAccs()
+        var
+                stat, found = false, Acc;
+
+        /* Отсортировать все валютные счета по возрастанию остатка (остаток уже в валюте комиссии) */
+        stat = Accs.SortCURRestAsc();
+    /* Выбрать первый счёт с подходящим остатком */
+    while(stat)
+        Acc = null;
+        Acc = Accs.getCurrAcc();
+        if (Acc.getRest>=SumComm)
+                        /* Обновить СПИ в комиссии */
+                        FoundedAcc = Acc;
+                        UpdateSfSi(Acc);
+                found = true;
+        end;
+        stat = (not found) and Accs.selectNext();
+    end;
+    
+    if (found) 
+        enougthRest = true;     /* Найден счёт с достаточным для оплаты комиссии остатком */
+    end;
+
+    return found;
+end;
+
+private macro selectAccountWMaxRest()
+        //DebugBreak;
+        enougthRest = false;
+        if (Accs.sortRestsDesc())   /* сортировать по убыванию остатка */
+                FoundedAcc = Accs.getCurrAcc();
+                UpdateSfSi(Accs.getCurrAcc());
+        end;
+end;
+
+/* Если было обновление СПИ - возвращает параметры найденного счёта, иначе - null */
+/* Другими словами - если на счёте из договора средств достаточно, вернёт null */
+macro getFoundedAcc()
+        return FoundedAcc;
+end;
+
+/* Параметры:
+         - сумма комиссии, 
+         - валюта комисии,
+         - дата комиссии (для пересчёта сумм в разных валютах)
+         - PartyID клиента (используется при поиске счетов 
+     - Вид комиссии (единовременная, разовая, периодическая). СПИ для каждого вида обновляются особым образом
+     - Идентификатор текущей комиссии (пока имеет смысл только для периодических комиссий) 
+*/
+/*FIV Получаем счет из примечания к клиенту*/
+private macro GetRequiredAccount(ContrId)
+   record _Client("party");
+    ПолучитьСубъекта(ContrID, _Client);
+    
+    RequiredAccount = readNoteForObject(OBJTYPE_PARTY, UniID(_Client, OBJTYPE_PARTY), NOTE_REQUIREDACCOUNT);
+
+    /* EVG Если примечание не задано, readNoteForObject ничего не возвращает и RequiredAccount остаётся Undefined */
+    if ( ValType(RequiredAccount) == V_UNDEF )
+       RequiredAccount = "";
+    end;
+
+end;
+
+
+/* EVG Функция возвращает счёт-объект по договору обслуживания */
+/* EVG 7/05/2014 Доработка: возврат валюты ДО */
+macro GetSfContrObject( ConID, ConFI:@integer )
+   var query, rs;
+
+   ConFI = 0;
+
+   query = " Select t_Object, t_Fiid From DSfContr_dbt " +
+           "  Where t_Id = " + ConID;
+   rs = rsdRecordSet( query );
+   if ( rs and rs.MoveNext() )
+      ConFI = rs.Value( 1, null, V_INTEGER );
+      return rs.Value( 0, null, V_STRING );
+   end;
+   return "";
+end;
+
+/* EVG 01.12.2010 Сделал приём ID ДО */
+/* EVG 19.03.2014 Сделал возврат кода валюты */
+macro selectAccountForSfPay(SumComm, FiidComm, DateComm, ContrId, Mode, id, SfContrID, retFIcode:@integer)
+        debugbreak;
+        debugbreak;
+        debugbreak;
+        FoundedAcc = null;
+        GetRequiredAccount(ContrId);
+
+        /* EVG Получим счёт, по которому рассч. комиссия */
+        /* EVG  7/05/2014 Передал retFIcode для возврата */
+        ContrAccount = GetSfContrObject( SfContrID, @retFIcode );
+
+        //DebugBreak;
+        initAccSelect(SumComm, FiidComm, DateComm, ContrId, Mode, id);
+    /* 2. Если средств недостаточно - перебрать рублёвые счета */
+        if (not checkRUBAccs())
+    /* 3. Если средств недостаточно - перебрать валютные счета (только для периодических и единовременных) */
+                if (Mode!=SF_FEE_TYPE_ONCE)
+                   if (not checkCURAccs())
+    /* 4. Если ни на одном из счетов клиента средств недостаточно, для оплаты используется счёт с наибольшим остатком*/                         
+                        selectAccountWMaxRest();
+                   end;
+                else
+                   selectAccountWMaxRest();
+                end;
+        end;
+
+
+        /* EVG 17/03/2014 Сделал возврат полученного счёта, чтобы обыграть специфику пакетного формирования комиссий в 2031.
+           EVG 19/03/2014 ... и валюты */
+        /* EVG  7/05/2014 Возможен случай, когда система не сможет найти счёт для оплаты комиссии (все арестованы и т.п.),
+           тогда FoundedAcc будет неопределён, и обращение к нему будет выдавать ошибку. В этом случае нужно вернуть счёт
+           и код валюты объекта по ДО.
+        retFIcode = FoundedAcc.fiid;
+        return FoundedAcc.account();*/
+
+        var retAccount = ContrAccount;
+        if( FoundedAcc )
+           retFIcode  = FoundedAcc.fiid;
+           retAccount = FoundedAcc.account();
+        end;
+
+        return retAccount;
+end;
+
+/* найти клиента Договора обслуживания */
+macro getClientOnContr(ConID)
+        var sql, rs, ret = -1;
+    SQL = " SELECT t_partyid ";
+    SQL = SQL + "  FROM dsfcontr_dbt ";
+    SQL = SQL + " WHERE t_id = "+string(ConID);
+
+        rs = TRsbDataSet(sql);
+        if ((rs!=null) and (rs.movenext()))
+                ret = rs.value("t_partyid");
+        end;
+
+        return ret;
+end;
+
+/* найти клиента счёта */
+macro getClient4Account(acc, fiid)
+        var sql, rs, partyid=-1;
+
+    SQL = " SELECT t_client partyid ";
+    if (fiid==NATCUR)
+        SQL = SQL + "  FROM daccount_dbt ";
+    else
+        SQL = SQL + "  FROM daccount$_dbt ";
+    end;
+    SQL = SQL + " WHERE t_account = '"+acc+"' ";
+    SQL = SQL + "   AND t_chapter = 1 ";
+    SQL = SQL + "   AND t_code_currency = "+string(fiid);
+    /*MsgBox(sql);*/
+
+    rs = TRsbDataSet(sql);
+    if ((rs!=null) and rs.movenext())
+        partyid = rs.value("partyid");
+    end;
+
+    return partyid;
+end;
+
+/* Сохранить информацию для обновления комиссии в макросе постобработки */
+macro prepareSingleCommSi(id_op, id_step, commnum, account, code_currency)
+        var sql;
+    SQL = "INSERT INTO prbbsftmp_tmp ";
+    SQL = SQL + "            (t_id_operation, t_id_step, t_oprcommnumber, t_code_currency, ";
+    SQL = SQL + "             t_account ";
+    SQL = SQL + "            ) ";
+    SQL = SQL + "     VALUES ("+string(id_op)+", "+string(id_step)+", "+string(commnum)+", "+string(code_currency)+", '";
+    SQL = SQL + trim(account);
+    SQL = SQL + "'            ) ";
+    SQL_Execute(sql);
+onerror end;
+
+private macro updateSingleCommSi(id_op, id_step, commnum, account, fiid)
+    var sql;
+
+    SQL = " UPDATE dsfsi_dbt ";
+    SQL = SQL + "   SET t_account = '"+account+"', ";
+    SQL = SQL + "       t_fiid = "+string(fiid);
+    SQL = SQL + " WHERE t_objecttype = 665 ";
+    SQL = SQL + "   AND t_debetcredit = 0 ";
+    SQL = SQL + "   AND t_objectid = ";
+    SQL = SQL + "          (SELECT LPAD (sf.t_id, 10, '0') ";
+    SQL = SQL + "             FROM doprsfcom_dbt sf ";
+    SQL = SQL + "            WHERE sf.t_id_operation = "+string(id_op);
+    SQL = SQL + "              AND sf.t_id_step = "+string(id_step);
+    SQL = SQL + "              AND sf.t_oprcommnumber = "+string(commnum)+") ";
+
+    SQL_Execute(sql);
+onerror end;
+
+private macro clearTempTable(id_op, id_step)
+    var sql;
+
+    SQL = " DELETE FROM prbbsftmp_tmp ";
+    SQL = SQL + "      WHERE t_id_operation = "+string(id_op)+" AND t_id_step = "+string(id_step);
+
+    SQL_Execute(sql);
+onerror end;
+
+/* Обновить СПИ в единовременных комиссиях по данным из временной таблицы */
+macro UpdateAllSingleCommSi(id_op, id_step)
+    var sql, rs, stat, work = false;
+
+    SQL = " SELECT t_oprcommnumber commnum, t_code_currency code_currency, t_account account";
+    SQL = SQL + "  FROM prbbsftmp_tmp ";
+    SQL = SQL + " WHERE t_id_operation = "+string(id_op)+" AND t_id_step = "+string(id_step);
+
+    rs = TRsbDataSet(sql);
+    stat = ((rs!=null) and rs.movenext());
+    while (stat)
+        work = true;
+        updateSingleCommSi(id_op, id_step, rs.value("commnum"), rs.value("account"), rs.value("code_currency"));
+        stat = rs.movenext();
+    end;
+
+    if (work)
+        clearTempTable(id_op, id_step);
+    end;
+onerror end;
+

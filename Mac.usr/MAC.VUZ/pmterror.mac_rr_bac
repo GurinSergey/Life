@@ -1,0 +1,186 @@
+//-----------------------------------------------------------------------------
+// Описание : Проверка на причастность к терроризму
+//-----------------------------------------------------------------------------
+//RR 30.12.2013 C-26027 - Костыль по 3063-У Приостановка операций клиент
+//Yushmanov 2014-01-23 C-19151 Добавлено логгирование шагов, выполненных в массовом (пакетном) режиме
+//RR 12.03.2014 Переношу макрос, делаю функции приватными(из-за переопределния части функци pmfm.mac), работает только в ВУЗе
+import PaymInter, FMInter, oralib, likepy, cbsttls, pm_opr, Globals, RSD, "lib_pm_check.mac";
+import "pm_chkrst.mac", OprInter;
+private var PaymentObj:RsbPayment;
+
+PRIVATE MACRO ExecuteStep( doc, paymDoc, DocKind:integer, ID_Operation:integer, ID_Step:integer )
+var stat, retval;
+    debugbreak;
+    if(CheckExistsFMOprForPayment(PaymentObj))
+        retval = 1;
+    else
+        stat = УстановитьСтатусыПлатежа(OPR_PAYM_DO, OPR_PM_ST_ENTER);
+        if (stat != 0)
+            msgbox("Ошибка при установке сегмента статуса операции");
+            retval = 1;
+        else
+            retval = 0;
+        end;
+    end;
+    return retval;
+END;
+ 
+PRIVATE macro IsCloseTransePayment( PaymentObj:RsbPayment ):bool
+
+    var objFDoc;
+
+    if( ( PaymentObj.DocKind == DLDOC_BANKPAYMENT ) )                  /* Рублевые платежи ББ         */
+
+        objFDoc = GenObject( "RsbBankPayment", PaymentObj.DocumentID );
+        return ( objFDoc.Origin == MEMORDER_FDOC_CLOSTRANS );
+
+    elif( ( PaymentObj.DocKind == BBANK_CPORDER     ) )                  /* Валютные платежи ББ         */
+
+        objFDoc = GenObject( "RsbBbCpOrder", PaymentObj.DocumentID );
+        return ( objFDoc.Origin == CP_OR_CLOSTRANS );
+
+    end;      
+
+    return false;
+end;
+
+PRIVATE MACRO ПроверкаНачалаЗакрытия( Payment:RsbPayment, ВходящийПлатеж: bool ): integer
+    var stat:integer, i = 0,
+        regStr: string;
+    array Text;
+    array Buttons;
+    GetRegistryValue( "COMMON\\ПРЕДОБРАБОТКА\\CheckTerror_PermintPayType", V_STRING, regStr, stat );
+    if( stat != 0 )
+        regStr = "1,2";
+    end;
+  
+    var val: TArray = split(regStr, ",");
+    var need = true;
+
+    while (i < val.size)
+        if (Payment.GetPM_PAYM().rec.PayType == int(val[i]))
+            need = false;
+            break;
+        end;
+        i = i + 1;
+    end;
+    if ((not ВходящийПлатеж) and need and (IsPrcPayment(Payment) or IsCloseTransePayment(Payment)))
+        need = false;
+    end;
+    if(need)
+        regStr = "select 1 from dreqclosa_dbt where t_Code_currency = ? and t_Account = ? and t_SubKind = 4 and t_State <> 0";
+        var rs, Acc = "";
+        if (not ВходящийПлатеж)
+            if (Payment.GetDEBET().rec.Group == 0)
+                rs = execSQLselect(regStr, makeArray(SQLParam("", Payment.FIID), SQLParam("", Payment.PayerAccount)));
+                if (rs and rs.moveNext())
+                    Acc = "плательщика " + Payment.PayerAccount;
+                end;
+            end;
+        end;
+        if ((Acc == "" ) and (Payment.GetCREDIT().rec.Group == 0))
+            rs = execSQLselect(regStr, makeArray(SQLParam("", Payment.PayFIID), SQLParam("", Payment.ReceiverAccount)));
+            if (rs and rs.moveNext())
+                Acc = "получателя " + Payment.ReceiverAccount;
+            end;
+        end;
+        if (Acc != "")
+            var res = IfThenElse(ВходящийПлатеж and (Payment.DemandIsESID == "X"), 2, 1);
+            if (not IsOprMultiExec())
+                Text(0) = string("Счет ", Acc, " закрывается на основании п.5.2 ст.7 закона №115-ФЗ ",
+                       "\"О противодействии легализации (отмыванию) доходов, полученных преступным путем, и финансированию терроризма\".|",
+                       "Операции с участием такого счета могут быть незаконны.|Продолжить выполнение операции по платежу?");
+                Buttons(0) = "Продолжить";
+                Buttons(1) = "Отвергнуть";
+                if ( ВходящийПлатеж )
+                    Buttons(2) = "На ручную обработку";
+                end;
+                res = ConfWin(Text, Buttons, res);
+            end;
+            if (res == 1)
+                stat = RejectPayment(Payment, string(IfThenElse(ВходящийПлатеж, "35;", ""),"Счет ", Acc, " закрывается на основании п.5.2 ст.7 закона №115-ФЗ ",
+                              "\"О противодействии легализации (отмыванию) доходов, полученных преступным путем, и финансированию терроризма\""));
+                if (stat == 0)
+                    return 1;
+                else
+                    return -1;
+                end;
+            elif (res == 2)
+                //RR 26.12.2013 По непонятным причинам pm_chkrst.mac отказываеться импортиться, времени разбираться нет, посколько проверка не используется
+                //              отключаю ее.
+                /*stat = PM_ToManual(Payment, "Счет ", Acc, " закрывается на основании п.5.2 ст.7 закона №115-ФЗ ",
+                              "\"О противодействии легализации (отмыванию) доходов, полученных преступным путем, и финансированию терроризма\""); */
+                if (stat == 0)
+                    return 1;
+                else
+                    return -1;
+                end;
+            end;
+        end;
+    end;
+    return 0;
+END;
+
+PRIVATE MACRO ПроверкаПричастностиТерроризму( Payment:RsbPayment, NeedCheckClose: bool ):integer
+
+    if( (Payment.CheckTerror == CHT_NOTNEED) )
+        return 0;
+    end;
+
+    if( ValType(NeedCheckClose) == V_UNDEF )
+        NeedCheckClose = true;
+    end;
+    var stat: integer;
+    if( NeedCheckClose )
+        stat = ПроверкаНачалаЗакрытия( Payment, false );
+        if (stat != 0)
+            return stat;
+        end;
+    end;
+
+    stat = FM_CheckPayment( Payment.PaymentID );
+
+    if( stat == OPCONTR_CHECK_DEFER )
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_TERR, OPR_PAYM_ST_TERR_NEED ) )
+            MsgBox("Ошибка при установке сегментов статуса экземпляра операции");
+            return -1;
+        end; 
+        return 1;
+    elif( stat == OPCONTR_CHECK_STOP )
+        return -1;
+    elif( stat == OPCONTR_CHECK_ERROR )
+        MsgBox("Ошибка при проверке на причастности к терроризму");
+        return -1;
+    end;
+
+    Payment.CheckTerror = CHT_APPROVED;
+
+    return 0;
+END;
+
+PRIVATE macro MassCheckTerrorPrepare()
+
+    var stat:integer = execStoredFunc( "PM_TERROR.MassCheckTerrorPrepare1", V_INTEGER );
+
+    if((stat == 0) and (FM_CheckTerorDocumentMass() == false))
+        stat = 1;
+    end;  
+
+    if(stat == 0)
+        stat = execStoredFunc( "PM_TERROR.MassCheckTerrorPrepare2", V_INTEGER );
+    end;
+
+    return stat;
+end;
+
+PRIVATE macro MassCheckTerrorExecute()
+  
+    var stat:integer = execStoredFunc( "PM_TERROR.MassCheckTerrorExecute", V_INTEGER );
+
+    if((stat == 0) and (FM_InsertTerorOperationMass() == true))
+        stat = 1;
+    end;
+
+    return stat;
+
+end;

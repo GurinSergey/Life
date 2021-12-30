@@ -1,0 +1,707 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: lib_packetCommission.mac
+// @author  : 2012-04-30 zip_z. C-10090, C-11436
+// @desc    : библиотека процедур для функционала пакетных комиссий
+// @changes : 2012-05-04 zip_z. * изменен механизм отбора в PC_countExternalPayments, старый закомментирован
+//                              + добавлены функции для учета превышения операционного времени 
+//                                (PC_getOperDayEndTime, PC_operDayEndTime_FormatError)
+//            2012-05-17 zip_z. * изменен алгоритм определения ошибки форматной строки PC_operDayEndTime_FormatError
+//                              * изменена логика отбора пакетных комиссий 3.12.x PC_countExternalPayments
+//            2012-07-27 zip_z. + добавлена функция PC_countExternalPaymentsNew для разделения платежей, превышающих установленный пакет,
+//                                на категории 3.4.1-3.4.5 (k1) и 3.4.7 (k2) 
+//            08-11-2012 Жаворонкова Н. (joy) I-00281192-4 Убрана проверка на заполненность статуса составителя
+//            05-02-2014 Жаворонкова Н. (joy) Перенос C-25038 Из поиска платежей исключены имеющие происхождение "Счет на оплату" 
+//                                              (везде: and ord.t_origin != 3201)
+//RR 20.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+//RR 20.02.2014 Адаптирую под 2031(daccount$_dbt -> NULL)
+//joy 14.08.2014 Жаворонкова Н. С-31392 Добавлены новые условия по исключению платежей на счета ФЛ
+// -------------------------------------------------------------------------------------------------
+
+import bankInter, lib_sqltools;
+
+// @desc  : подключена ли пакетность владельцу счета m_object на дату m_date ?
+// @return: true, если подключена 
+macro isConnectedPacketCommissionOnDate (m_object:string, m_date:date):bool
+    var sql = "    SELECT   1" + "\n" + 
+              "  FROM   dobjatcor_dbt ac, dsfcontr_dbt sf" + "\n" + 
+              " WHERE       ac.t_objecttype = 3 AND ac.t_groupid = 200" + "\n" + 
+              "         AND LPAD (TO_CHAR (sf.t_partyid), 10, '0') = ac.t_object" + "\n" + 
+              "         AND sf.t_object = :m_object" + "\n" + 
+              "         AND ac.t_validfromdate <= :m_validfromdate" + "\n";
+    var param = makeArray (SQLParam ("m_object", m_object), 
+                           SQLParam ("m_date"  , m_date  ));
+    sql = execSQLSelect (sql, param, false);
+    return sql.moveNext ();
+
+onError
+    return false;
+end;
+
+// @desc  : проставлена ли категория catNum на договоре обслуживания для субъекта с partyid = sf_partyid
+// @return: true - если проставлена
+macro isSetCategory (sf_partyid:string, catNum:integer)//RR:boolean
+    var sql = "SELECT 1 FROM dobjatcor_dbt WHERE t_objecttype = 3 AND t_groupid = :catNum AND t_object = lpad (:partyid, 10, '0')";
+    sql = execSQLSelect (sql, makeArray (SQLParam ("catNum", catNum), SQLParam ("partyid", sf_partyid)));
+    return sql.moveNext ();
+end;
+
+// @desc  : анализируем, были ли ошибки в формате строки с датой окончания ОД.
+//          если операционисты начнут глючить и вводить совсем уж некорректные данные в реестр, 
+//          функцию можно будет доработать для более полной проверки;
+//          корректная строка - ненулевая, вида 01:00 и обязательно содержит разделитель "двоеточие".
+// @return: true в случае ошибки формата
+macro PC_operDayEndTime_FormatError (str)
+    var correctFormat = (     ((strlen (trim (str)) != 0) and (index  (str, ":") != 0 )) 
+                          and ((strlen (trim (str))) == strlen ("hh:mi"))
+                        );
+    return (not correctFormat); 
+end;
+
+// @desc  : получение окончание операционного времени из настройки PRBB/СЕРВИС ГКБО/ПРОДЛЕНИЕ ОПЕРДНЯ
+// @return: окончание операционного времени (string)
+macro PC_getOperDayEndTime ()
+    var error = 0, operDayEndTime;
+    getRegistryValue ("PRBB/СЕРВИС ГКБО/ПРОДЛЕНИЕ ОПЕРДНЯ", V_STRING, operDayEndTime, error);
+    if ((error) or (PC_operDayEndTime_FormatError (operDayEndTime)))
+        operDayEndTime = "16:00";
+    else 
+        operDayEndTime = trim (operDayEndTime);
+    end;
+    return operDayEndTime;
+end;
+
+//RR 13.02.2014 Адаптирую для 31
+macro getCom313xRSD (m_account, m_first_day, m_end_date)
+    startQueryCapture ();
+    [SELECT (SELECT NVL (COUNT (DISTINCT pm.t_paymentid), 0) n
+              FROM dacctrn_dbt ad, dpmdocs_dbt pd, dpmpaym_dbt pm, dpmrmprop_dbt rm,
+                   daccount_dbt ac, dpspayord_dbt ord
+             WHERE :acc1 IN (ad.t_account_payer, ad.t_account_receiver)
+               AND ad.t_chapter = 1
+               AND ad.t_date_carry BETWEEN :firstday AND :cdate1
+               AND AD.T_ACCTRNID = PD.T_ACCTRNID
+               AND pm.t_payeraccount = ac.t_account
+               AND ac.t_chapter = 1
+               AND ac.t_code_currency = 0
+            --   AND INSTR (ac.t_usertypeaccount, 'Z') = 0
+            --   AND REGEXP_INSTR (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+               AND REGEXP_INSTR (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+            --   AND NOT (    REGEXP_INSTR (pm.t_receiveraccount, '^(30232|47422)') = 1
+            --            AND (   REGEXP_INSTR (rm.t_ground, '(40817|40820)[0-9. ]{15,}') != 0
+            --                 OR REGEXP_INSTR (rm.t_ground, '(423|426)[0-9. ]{17,}') != 0
+            --                )
+            --        )
+            AND ( (substr (pm.t_receiveraccount, 1, 3) not in ('423', '426') 
+                  and substr (pm.t_receiveraccount, 1, 5) not in ('40817', '40820') 
+                  and not (substr (pm.t_receiveraccount, 1, 5) in ('30232', '47422', '30301') 
+                           and (  regexp_like (rm.t_ground, '(40817|40820\\d{15})') 
+                               or regexp_like (rm.t_ground, '(423|426)\\d{17}') 
+                               or regexp_like (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' )  
+                               or regexp_like (rm.t_ground, '\\sп/к\\s')
+                               or regexp_like ( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) ))) 
+               OR ( (  (SUBSTR( pm.t_receiveraccount, 1, 3 )  IN ('423', '426') 
+                       or SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('40817', '40820') )  
+                     AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+                     ) 
+                   OR (SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('30232','47422', '30301')  
+                      AND (REGEXP_LIKE (rm.t_ground, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.t_ground, '(423|426)\\d{17}' ) 
+                           or regexp_like (rm.t_ground, '\\sп/к\\s')
+                           OR REGEXP_LIKE( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) 
+                           OR REGEXP_LIKE (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' ) )  
+                   AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+               ) ) )
+               AND rm.t_shifroper != '16'
+               AND pm.t_paymentid = pd.t_paymentid
+               AND pm.t_paymstatus = 32000
+               and ord.t_origin != 3201 
+               AND pm.t_dockind = 201
+               AND pm.t_payerbankid != pm.t_receiverbankid
+               AND pm.t_paymentid = rm.t_paymentid
+               --AND rm.t_taxauthorstate = CHR (1) /*joy 08-11-2012*/
+               AND pm.t_paymentid = ord.t_orderid
+               AND (   (t_date_carry >
+                           TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                         TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                        ),
+                                    'dd.mm.yyyy'
+                                   )
+                       )
+                    OR (    t_date_carry =
+                               TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                             TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                            ),
+                                        'dd.mm.yyyy'
+                                       )
+                        AND TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}:\d{2}:\d{2}'),
+                                          '00:00:00'
+                                         ),
+                                     'hh24:mi:ss'
+                                    ) <= TO_DATE (:operDayEndTime, 'hh24:mi')
+                       )
+                   )) AS n,
+           (SELECT NVL (COUNT (DISTINCT pm.t_paymentid), 0) n
+              FROM dacctrn_dbt ad, dpmdocs_dbt pd, dpmpaym_dbt pm, dpmrmprop_dbt rm,
+                   daccount_dbt ac, dpspayord_dbt ord
+             WHERE :acc2 IN (ad.t_account_payer, ad.t_account_receiver)
+               AND ad.t_chapter = 1
+               AND ad.t_date_carry = :cdate2
+               AND AD.T_ACCTRNID = PD.T_ACCTRNID
+               AND pm.t_payeraccount = ac.t_account
+               AND ac.t_chapter = 1
+               AND ac.t_code_currency = 0
+            --   AND INSTR (ac.t_usertypeaccount, 'Z') = 0
+            --  AND REGEXP_INSTR (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+               AND REGEXP_INSTR (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+            --  AND NOT (    REGEXP_INSTR (pm.t_receiveraccount, '^(30232|47422)') = 1
+            --          AND (   REGEXP_INSTR (rm.t_ground, '(40817|40820)[0-9. ]{15,}') != 0
+            --               OR REGEXP_INSTR (rm.t_ground, '(423|426)[0-9. ]{17,}') != 0
+            --              )
+            --          )
+            AND ( (substr (pm.t_receiveraccount, 1, 3) not in ('423', '426') 
+                  and substr (pm.t_receiveraccount, 1, 5) not in ('40817', '40820') 
+                  and not (substr (pm.t_receiveraccount, 1, 5) in ('30232', '47422', '30301') 
+                           and (  regexp_like (rm.t_ground, '(40817|40820\\d{15})') 
+                               or regexp_like (rm.t_ground, '(423|426)\\d{17}') 
+                               or regexp_like (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' )  
+                               or regexp_like (rm.t_ground, '\\sп/к\\s')
+                               or regexp_like ( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) ))) 
+               OR ( (  (SUBSTR( pm.t_receiveraccount, 1, 3 )  IN ('423', '426') 
+                       or SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('40817', '40820') )  
+                     AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+                     ) 
+                   OR (SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('30232','47422', '30301')  
+                      AND (REGEXP_LIKE (rm.t_ground, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.t_ground, '(423|426)\\d{17}' ) 
+                           or regexp_like (rm.t_ground, '\\sп/к\\s')
+                           OR REGEXP_LIKE( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) 
+                           OR REGEXP_LIKE (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' ) )  
+                   AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+               ) ) )
+               AND rm.t_shifroper != '16'
+               AND pm.t_paymentid = pd.t_paymentid
+               AND pm.t_paymstatus = 32000
+               and ord.t_origin != 3201
+               AND pm.t_dockind = 201
+               AND pm.t_payerbankid != pm.t_receiverbankid
+               AND pm.t_paymentid = rm.t_paymentid
+               --AND rm.t_taxauthorstate = CHR (1) /*joy 08-11-2012*/
+               AND pm.t_paymentid = ord.t_orderid
+               AND (   (t_date_carry >
+                           TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                         TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                        ),
+                                    'dd.mm.yyyy'
+                                   )
+                       )
+                    OR (    t_date_carry =
+                               TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}.\d{2}.\d{4}'),
+                                             TO_CHAR (t_date_carry, 'dd.mm.yyyy')
+                                            ),
+                                        'dd.mm.yyyy'
+                                       )
+                        AND TO_DATE (NVL (REGEXP_SUBSTR (ord.t_userfield1, '\d{2}:\d{2}:\d{2}'),
+                                          '00:00:00'
+                                         ),
+                                     'hh24:mi:ss'
+                                    ) <= TO_DATE (:operDayEndTime, 'hh24:mi')
+                       )
+                   )) AS k
+      FROM DUAL ];
+        
+    var sql = endQueryCapture ();
+    return execSQLSelect (sql, makeArray (SQLParam ("acc1",            m_account               ),
+                                          SQLParam ("firstday",        m_first_day             ),
+                                          SQLParam ("cdate1",          m_end_date              ), 
+                                          SQLParam ("operDayEndTime1", PC_getOperDayEndTime () ), 
+                                          SQLParam ("acc2",            m_account               ),
+                                          SQLParam ("cdate2",          m_end_date              ), 
+                                          SQLParam ("operDayEndTime2", PC_getOperDayEndTime () )), false);
+    
+end;
+
+macro PC_countExternalPaymentsNew (m_account, m_date, m_is347, m_boundLimit)
+    startQueryCapture ();
+    [with t as
+         (select   count (1) over (partition by null) t_total, row_number () over (order by ord.t_orderid) t_row
+                  ,case
+                       when ((t_date_carry >
+                                  to_date (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}.\d{2}.\d{4}'
+                                                              )
+                                               ,to_char (t_date_carry, 'dd.mm.yyyy')
+                                               )
+                                          ,'dd.mm.yyyy'
+                                          )
+                             )
+                             or (t_date_carry =
+                                     to_date
+                                          (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}.\d{2}.\d{4}'
+                                                              )
+                                               ,to_char (t_date_carry, 'dd.mm.yyyy')
+                                               )
+                                          ,'dd.mm.yyyy'
+                                          )
+                                 and to_date
+                                          (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}:\d{2}:\d{2}'
+                                                              )
+                                               ,'00:00:00'
+                                               )
+                                          ,'hh24:mi:ss'
+                                          ) <= to_date (:operdayendtime, 'hh24:mi')
+                                )
+                            )
+                       and ord.t_origin = 2 then 1
+                       else 0
+                   end is347
+                  ,pm.t_paymentid, pm.t_receiveraccount, pm.t_amount
+                  ,to_date (nvl (regexp_substr (ord.t_userfield1
+                                               ,'\d{2}:\d{2}:\d{2}'
+                                               )
+                                ,'00:00:00'
+                                )
+                           ,'hh24:mi:ss'
+                           ) datecarry_ib
+                  ,ord.t_origin
+              from dacctrn_dbt ad
+                  ,dpmdocs_dbt pd
+                  ,dpmpaym_dbt pm
+                  ,dpmrmprop_dbt rm
+                  ,daccount_dbt ac
+                  ,dpspayord_dbt ord
+             where :acc in (ad.t_account_payer, ad.t_account_receiver)
+               and ad.t_chapter = 1
+               and ad.t_date_carry = :cdate
+               AND AD.T_ACCTRNID = PD.T_ACCTRNID
+               and pm.t_payeraccount = ac.t_account
+               and ac.t_chapter = 1
+               and ac.t_code_currency = 0
+               --and instr (ac.t_usertypeaccount, 'Z') = 0
+               --and regexp_instr (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+               and regexp_instr (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+               --and not (regexp_instr (pm.t_receiveraccount, '^(30232|47422)') = 1
+               --         and (regexp_instr (rm.t_ground, '(40817|40820)[0-9. ]{15,}') !=
+               --                                                                    0
+               --              or regexp_instr (rm.t_ground, '(423|426)[0-9. ]{17,}') !=
+               --                                                                    0
+               --             )
+               --        )
+            AND ( (substr (pm.t_receiveraccount, 1, 3) not in ('423', '426') 
+                  and substr (pm.t_receiveraccount, 1, 5) not in ('40817', '40820') 
+                  and not (substr (pm.t_receiveraccount, 1, 5) in ('30232', '47422', '30301') 
+                           and (  regexp_like (rm.t_ground, '(40817|40820\\d{15})') 
+                               or regexp_like (rm.t_ground, '(423|426)\\d{17}') 
+                               or regexp_like (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' )  
+                               or regexp_like (rm.t_ground, '\\sп/к\\s')
+                               or regexp_like ( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) ))) 
+               OR ( (  (SUBSTR( pm.t_receiveraccount, 1, 3 )  IN ('423', '426') 
+                       or SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('40817', '40820') )  
+                     AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+                     ) 
+                   OR (SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('30232','47422', '30301')  
+                      AND (REGEXP_LIKE (rm.t_ground, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.t_ground, '(423|426)\\d{17}' ) 
+                           or regexp_like (rm.t_ground, '\\sп/к\\s')
+                           OR REGEXP_LIKE( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) 
+                           OR REGEXP_LIKE (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' ) )  
+                   AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+               ) ) )
+               and rm.t_shifroper != '16'
+               and pm.t_paymentid = pd.t_paymentid
+               and pm.t_paymstatus = 32000
+               and ord.t_origin != 3201
+               and pm.t_dockind = 201
+               and pm.t_payerbankid != pm.t_receiverbankid
+               and pm.t_paymentid = rm.t_paymentid
+               --and rm.t_taxauthorstate = chr (1) /*joy 08-11-2012*/
+               and pm.t_paymentid = ord.t_orderid
+          order by ord.t_orderid)
+    select nvl ((select   count (1) n
+                     from t
+                    where t_row > t_total - :m_boundLimit_k2 and is347 = 1
+                 group by is347), 0) k2
+          ,nvl ((select   count (1) n
+                     from t
+                    where t_row > t_total - :m_boundLimit_k1 and is347 = 0
+                 group by is347), 0) k1
+      from dual];
+
+    var sql = endQueryCapture ();
+    sql = execSQLSelect (sql, makeArray (SQLParam ("operDayEndTime", PC_getOperDayEndTime ),
+                                         SQLParam ("acc",            m_account            ),
+                                         SQLParam ("cdate",          m_date               ),
+                                         SQLParam ("m_boundLimit_k2",   m_boundLimit         ),
+                                         SQLParam ("m_boundLimit_k1",   m_boundLimit         )), false);
+    var retval = 0;
+    if (sql.moveNext)
+        if ( m_is347 == 1)
+            retval = sql.value ("k2");
+        else
+            retval = sql.value ("k1");
+        end;
+    end;
+    
+    return retval;
+end;
+
+// @desc  : считаем все внешние платежи кроме налоговых. Рублевый клиентский платеж.
+//          - польз. тип счёта плательщика не содержит Z (зарплатный проект);
+//          - счёт получателя не принадлежит промежутку 401 - 404;
+//          - счёт получателя не равен: 423, 426, 40817, 40820;
+//          - НЕ удовлетворяется условие: 
+//                        (счёт получателя равен 30232, 47422 И 
+//                        в назначении платежа присутствует упоминание  счетов 40817, 40820, 423, 426 (незавершенные расчёты по платежам на физлиц));
+//          - платёж закрыт (статус 32000);
+//          - банк плательщика не равен банку получателя (платёж внешний);
+//          - шифр не равен 16 (не частичная оплата К2);
+// @return: количество платежей (integer)
+
+macro PC_countExternalPayments (account:string, dateBegin:date, dateEnd:date):integer
+    var retVal = 0;
+    startQueryCapture ();
+    [   select nvl (count (distinct pm.t_paymentid), 0) n
+          from dacctrn_dbt ad
+              ,dpmdocs_dbt pd
+              ,dpmpaym_dbt pm
+              ,dpmrmprop_dbt rm
+              ,daccount_dbt ac
+              ,dpspayord_dbt ord
+         where :acc in (ad.t_account_payer, ad.t_account_receiver)
+           and ad.t_date_carry between :begdate and :enddate
+           and ((t_date_carry >
+                                  to_date (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}.\d{2}.\d{4}'
+                                                              )
+                                               ,to_char (t_date_carry, 'dd.mm.yyyy')
+                                               )
+                                          ,'dd.mm.yyyy'
+                                          )
+                             )
+                             or (t_date_carry =
+                                     to_date
+                                          (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}.\d{2}.\d{4}'
+                                                              )
+                                               ,to_char (t_date_carry, 'dd.mm.yyyy')
+                                               )
+                                          ,'dd.mm.yyyy'
+                                          )
+                                 and to_date
+                                          (nvl (regexp_substr (ord.t_userfield1
+                                                              ,'\d{2}:\d{2}:\d{2}'
+                                                              )
+                                               ,'00:00:00'
+                                               )
+                                          ,'hh24:mi:ss'
+                                          ) <= to_date (:operdayendtime, 'hh24:mi')
+                                )
+                            )
+           and ad.t_chapter = 1
+           AND AD.T_ACCTRNID = PD.T_ACCTRNID
+           and pm.t_payeraccount = ac.t_account
+           and ac.t_chapter = 1
+           and ac.t_code_currency = 0
+           --and instr (ac.t_usertypeaccount, 'Z') = 0
+           --and regexp_instr (pm.t_receiveraccount, '^(423|426|40817|40820)') = 0
+           and regexp_instr (pm.t_receiveraccount, '^40[1-4]{1}') = 0
+           --and not (regexp_instr (pm.t_receiveraccount, '^(30232|47422)') = 1
+           --         and (regexp_instr (rm.t_ground, '(40817|40820)[0-9. ]{15,}') != 0
+           --              or regexp_instr (rm.t_ground, '(423|426)[0-9. ]{17,}') != 0
+           --             )
+           --       )
+            AND ( (substr (pm.t_receiveraccount, 1, 3) not in ('423', '426') 
+                  and substr (pm.t_receiveraccount, 1, 5) not in ('40817', '40820') 
+                  and not (substr (pm.t_receiveraccount, 1, 5) in ('30232', '47422', '30301') 
+                           and (  regexp_like (rm.t_ground, '(40817|40820\\d{15})') 
+                               or regexp_like (rm.t_ground, '(423|426)\\d{17}') 
+                               or regexp_like (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' )  
+                               or regexp_like (rm.t_ground, '\\sп/к\\s')
+                               or regexp_like ( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) ))) 
+               OR ( (  (SUBSTR( pm.t_receiveraccount, 1, 3 )  IN ('423', '426') 
+                       or SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('40817', '40820') )  
+                     AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+                     ) 
+                   OR (SUBSTR( pm.t_receiveraccount, 1, 5 ) IN ('30232','47422', '30301')  
+                      AND (REGEXP_LIKE (rm.t_ground, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.t_ground, '(423|426)\\d{17}' ) 
+                           or regexp_like (rm.t_ground, '\\sп/к\\s')
+                           OR REGEXP_LIKE( '\\s'||lower(rm.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта' ) 
+                           OR REGEXP_LIKE (rm.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( rm.T_RECEIVERNAME, '(423|426)\\d{17}' ) )  
+                   AND REGEXP_LIKE  ('\\s' || LOWER (rm.t_ground), '(зар\\.плата|заработн.{0,}\\sплат.{0,}|зарплат.{0,}|аванс.{0,}|пособи[а-я]|стипенд[а-я][а-я])|алимент.{0,}|беременност.{0,}|дивиденд.{0,}|погашен.{0,}\\sкредита|кредитн.{0,}\\sдоговор.{0,}|отпуск.{0,}|премия|премии|премиальн.{0,}|больничн.{0,}|з/п|материаль.{0,}\\sпомощь|увольнен.{0,}|\\sзп\\s') 
+               ) ) )
+           and rm.t_shifroper != '16'
+           and pm.t_paymentid = pd.t_paymentid
+           and pm.t_paymstatus = 32000
+           and ord.t_origin != 3201
+           and pm.t_dockind = 201
+           and pm.t_payerbankid != pm.t_receiverbankid
+           and pm.t_paymentid = rm.t_paymentid
+           --and rm.t_taxauthorstate = chr (1) /*joy 08-11-2012*/
+           and pm.t_paymentid = ord.t_orderid ];
+           
+    var sql = endQueryCapture ();
+    
+    sql = execSQLSelect (sql, makeArray (SQLParam ("acc",            account  ),
+                                         SQLParam ("begdate",        dateBegin),
+                                         SQLParam ("enddate",        dateEnd  ),
+                                         SQLParam ("operDayEndTime", PC_getOperDayEndTime ) ), true);
+    if (sql.moveNext)
+        retVal = sql.value ("n", null, V_INTEGER);
+    end;
+    return retVal;
+end;
+
+
+
+/* EVG 5/09/2012 Реализована функция PC_countExternalPayments_Uni() - более универсальный аналог 
+   PC_countExternalPayments(), позволяющий работать с различными видами документов и гибко настраивать
+   фильтрацию. 
+   Особенность: платежи отбираются не по счёту, а по клиенту (для того, чтобы учитывалисть платежи по
+   всем счетам клиента).
+*/
+macro PC_countExternalPayments_Uni( client:integer, fiid:integer, dateBegin:date, dateEnd:date, CustomAccFilter:string, CustomAcTypeFilter:string ):integer
+    var retVal = 0;
+    var AccountFiltering = "",
+        AccTypeFiltering = "";
+    var AccDocTableClause = "";
+    var DocKind, NATCUR;
+
+
+    AccountFiltering = CustomAccFilter;
+    if( valType(CustomAccFilter) == V_UNDEF )
+       AccountFiltering = " and regexp_instr( pm.t_receiveraccount, '^(40705|706)' ) = 0 " +
+                          " and regexp_instr( pm.t_payeraccount,    '^(40705|706)' ) = 0 ";
+    end;
+    
+
+    AccTypeFiltering = CustomAcTypeFilter;
+    if( valType(CustomAcTypeFilter) == V_UNDEF )
+       AccTypeFiltering = " and regexp_instr( ac.t_type_account, 'X' ) > 0 ";
+    end;
+
+
+    DocKind = 201;
+    AccDocTableClause = " ,daccount_dbt ac, dacctrn_dbt ad, dpspayord_dbt ord ";
+    
+    if( fiid != NATCUR )
+       DocKind = 202;
+       /* RR to 2031AccDocTableClause = " ,daccount$_dbt ac, darhdoc$_dbt ad, dpscpord_dbt ord ";*/
+    end; 
+           
+    
+    
+    startQueryCapture ();
+    [   select nvl (count (distinct pm.t_paymentid), 0) n
+
+          from dpmdocs_dbt   pd
+              ,dpmpaym_dbt   pm
+              ,dpmrmprop_dbt rm
+    ];  print( AccDocTableClause );
+    [
+         where pm.t_payer                               = :client
+           and pm.t_paymstatus                          = 32000
+           and pm.t_dockind                             = :dockind
+
+           --and pm.t_fiid                                = :curcode
+           and pm.t_fiid                                > 0
+
+           and pm.t_payerbankid                        != pm.t_receiverbankid
+
+           and rm.t_paymentid                           = pm.t_paymentid
+           and rm.t_shifroper                          != '16'
+           
+           and ord.t_orderid                            = pm.t_paymentid
+           and ord.t_origin                            != 3201
+           
+           and ac.t_account                             = pm.t_payeraccount
+           and ac.t_chapter                             = 1
+           and ac.t_code_currency                       = pm.t_fiid
+           and instr (ac.t_usertypeaccount, 'Z')        = 0
+         
+           and pd.t_paymentid                           = pm.t_paymentid
+           AND AD.T_ACCTRNID                            = PD.T_ACCTRNID
+           and ad.t_chapter                             = 1
+           and ad.t_date_carry                    between :begdate 
+                                                      and :enddate
+           and ( ( ad.t_date_carry >
+                          to_date( nvl( regexp_substr( ord.t_userfield1, '\d{2}.\d{2}.\d{4}' ),
+                                        to_char( ad.t_date_carry, 'dd.mm.yyyy' )
+                                      )
+                                   ,'dd.mm.yyyy'
+                                 )
+                 )
+                 or 
+                 ( ad.t_date_carry =
+                          to_date( nvl( regexp_substr( ord.t_userfield1, '\d{2}.\d{2}.\d{4}' ),
+                                        to_char( ad.t_date_carry, 'dd.mm.yyyy' )
+                                      )
+                                   ,'dd.mm.yyyy'
+                                 )
+                   and to_date( nvl( regexp_substr( ord.t_userfield1, '\d{2}:\d{2}:\d{2}' ),
+                                     '00:00:00' 
+                                   )
+                                ,'hh24:mi:ss'
+                              )                        <= to_date (:operdayendtime, 'hh24:mi')
+                 )
+               )
+    ];  Print( AccountFiltering + AccTypeFiltering);
+    var sql = endQueryCapture ();
+
+       /*
+       setoutput ("d:\\12345.txt", false);
+       println(sql);
+       setoutput (null, true);
+       */
+    
+    
+    sql = execSQLSelect (sql, makeArray (SQLParam ("client",            client  ),
+                                         SQLParam ("dockind",        DocKind),
+                                         /* EVG 1/10/2012 Анализируются платежи по всем валютам
+                                         SQLParam ("curcode",        fiid),*/
+                                         SQLParam ("begdate",        dateBegin),
+                                         SQLParam ("enddate",        dateEnd  ),
+                                         SQLParam ("operDayEndTime", PC_getOperDayEndTime ) ), true);
+    if (sql.moveNext)
+        retVal = sql.value ("n", null, V_INTEGER);
+    end;
+    return retVal;
+end;
+
+
+
+
+//@desc  : Обновление привязки комиссий (вызывается из макроса usr_com_scroll.mac)
+//@return: true в случае успешного обновления
+macro PC_UpdateCommissionLink (m_feetype, m_number, m_code, m_payment_count)
+    var sql;
+    
+    // Обновление примечания 200 к виду объекта 650 ("Комиссия")
+    startQueryCapture ();
+    [MERGE INTO dnotetext_dbt nt
+     USING (SELECT 1
+              FROM DUAL) tmp
+     ON (    nt.t_objecttype = 650
+         AND nt.t_documentid = CONCAT (LPAD (:p_feeType1, 5, '0'), LPAD (:p_number1, 5, '0'))
+         AND nt.t_notekind = 200
+         AND nt.t_validtodate = TO_DATE ('31.12.9999', 'dd.mm.yyyy'))
+     WHEN MATCHED THEN
+        UPDATE
+           SET nt.t_text = UTL_RAW.cast_from_binary_integer (:p_payment_count1, 2),
+               nt.t_oper = rsbsessiondata.oper, nt.t_branch = rsbsessiondata.operdprt,
+               nt.t_date = TRUNC (SYSDATE),
+               nt.t_time =
+                  TO_DATE (CONCAT ('01.01.0001 ', TO_CHAR (SYSDATE, 'hh24:mi:ss')),
+                           'dd.mm.yyyy hh24:mi:ss'
+                          )
+     WHEN NOT MATCHED THEN
+        INSERT (nt.t_id, nt.t_objecttype, nt.t_documentid, nt.t_notekind, nt.t_oper, nt.t_date,
+                nt.t_time, nt.t_text, nt.t_validtodate, nt.t_branch, nt.t_numsession)
+        VALUES (0, 650, CONCAT (LPAD (:p_feeType2, 5, '0'), LPAD (:p_number2, 5, '0')), 200,
+                rsbsessiondata.oper, SYSDATE, SYSDATE,
+                UTL_RAW.cast_from_binary_integer (:p_payment_count2, 2),
+                TO_DATE ('31.12.9999', 'dd.mm.yyyy'), rsbsessiondata.operdprt, 0)];
+    
+    sql = endQueryCapture ();
+    // zip_z. Исправил Duplicate parameter name
+    sql = execSQL (sql, makeArray (SQLParam ("p_feeType1",       m_feeType      ),
+                                   SQLParam ("p_number1",        m_number       ),
+                                   SQLParam ("p_payment_count1", m_payment_count),
+                                   SQLParam ("p_feeType2",       m_feeType      ),
+                                   SQLParam ("p_number2",        m_number       ),
+                                   SQLParam ("p_payment_count2", m_payment_count)), false);
+                                    
+    var mergeSuccess = (sql != null); // true, если SQL выполнился
+
+   // Обновление названия значения категории 200 объекта 3 ("Субъект экономики") +
+   // обновление служебной информации в dobjattr_dbt.t_fullName
+   // (содержится в тегах <objattr:id>...</objattr:id>)
+   startQueryCapture ();
+
+   /* EVG 5/09/2012 Добавил выражение [[:alnum:]]{0,1} при анализе шаблона определения кода комиссии
+      для того, чтобы корректно обрабатывались комиссии по валютным пакетам (с символом 'v' в конце).
+   [UPDATE dobjattr_dbt attr
+      SET t_longAttr = :p_payment_count1,
+          t_intAttr = :p_payment_count2,
+          t_name = 'Пакет "' || TO_CHAR (:p_payment_count3) || ' платежей"',
+          t_fullName = 'Пакет "' || TO_CHAR (:p_payment_count4) || ' платежей"' || CHR (13) || CHR (10)
+                                 || '<objattr:id>' || TO_CHAR (:p_code1) || '</objattr:id>'
+    WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = CHR (1)
+      AND REGEXP_SUBSTR (REGEXP_SUBSTR (t_FullName, '<objattr:id>\d+.\d+.\d+</objattr:id>'), '\d+.\d+.\d+' ) = :p_code2];*/
+   [UPDATE dobjattr_dbt attr
+      SET t_longAttr = :p_payment_count1,
+          t_intAttr = :p_payment_count2,
+          t_name = 'Пакет "' || TO_CHAR (:p_payment_count3) || ' платежей"',
+          t_fullName = 'Пакет "' || TO_CHAR (:p_payment_count4) || ' платежей"' || CHR (13) || CHR (10)
+                                 || '<objattr:id>' || TO_CHAR (:p_code1) || '</objattr:id>'
+    WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = CHR (1)
+      AND REGEXP_SUBSTR (REGEXP_SUBSTR (t_FullName, '<objattr:id>\d+.\d+.\d+[[:alnum:]]{0,1}</objattr:id>'), '\d+.\d+.\d+[[:alnum:]]{0,1}' ) = :p_code2];
+    
+    sql = endQueryCapture ();
+    sql = execSQL (sql, makeArray (SQLParam ("", m_payment_count),
+                                   SQLParam ("", m_payment_count),
+                                   SQLParam ("", m_payment_count),
+                                   SQLParam ("", m_payment_count),
+                                   SQLParam ("", m_code         ),
+                                   SQLParam ("", m_code         )), false);
+    
+    var updateSuccess = (sql != null); // true, если SQL выполнился
+    return (mergeSuccess and updateSuccess);
+
+end;
+
+
+/* EVG 7/09/2012 Обёртка для вызова функции подсчёта количества платежей */
+macro PaymentsCount( sfcontr, beginDate, endDate, isCur )
+    var sql, cmd, rs;
+
+    var codeList = 1;
+    if( isCur )
+       codeList = 118;   // chr(118) = v
+    end;
+    
+    // Базу для расчета комиссии берем, исходя из даты простановки категории на клиенте.
+    sql = "select max(t_validfromdate) t_validfromdate " +
+          "  from dobjatcor_dbt cor, dobjattr_dbt attr " +
+          " where cor.t_objecttype  = 3 " +
+          "   and cor.t_groupid     = 200 " +
+          "   and cor.t_object      = lpad (to_char (?), 10, '0')" +
+          "   and attr.t_AttrID     = cor.t_attrId " +
+          "   and attr.t_objectType = cor.t_objectType " +
+          "   and attr.t_groupId    = cor.t_groupId " +
+          "   and attr.t_parentId   = 0 " +
+          "   and attr.t_codelist   = CHR(?) " ;
+    cmd = rsdCommand( sql );
+    cmd.AddParam( "", RSDBP_IN, sfcontr.partyid );
+    cmd.AddParam( "", RSDBP_IN, codeList );
+    rs = rsdRecordSet( cmd );
+    if( rs and rs.movenext() )
+        if ((rs.value ("t_validfromdate", null, V_DATE) > beginDate) and 
+            (rs.value ("t_validfromdate", null, V_DATE) < endDate))
+            beginDate = rs.value ("t_validfromdate", null, V_DATE);
+        end;
+    end;
+    
+    debugbreak;
+    var count = PC_countExternalPayments_Uni( sfcontr.partyid, sfcontr.fiid, beginDate, endDate );
+
+    return count;
+end;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

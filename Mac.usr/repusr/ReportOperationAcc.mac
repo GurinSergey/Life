@@ -1,0 +1,350 @@
+  /***************************************************************************************************************
+   Имя файла..:       ReportOperationAcc.mac
+   Назначение.:       Отчет по корр.счетах
+   Заявка.....:       R-581021
+   Дата.......:       15.05.2015
+   Автор......:       Ващенко Дмитрий                        
+****************************************************************************************************************/
+  import RSD, "ldmklbr.mac", "fg_Life_parm.mac", "KeyCodes.mac", globals, activeX, lib_sqltools, RCW, Rsexts;
+  var StatusBar = "F2 Выполнить ESC Выход"; 
+  var startDate;
+  var endDate;
+  FILE f_rep_out() txt;
+
+  private Class Report (beginDate, endDate, amount)
+    var beginDateReport = beginDate;
+    var endDateReport   = endDate  ;
+    var amountReport    = amount   ;
+
+    private var myWorkBook;
+    private var myWorkExcel;
+    private var myWorkSheet;
+    var numSheet = 1;
+
+    private var myRecord = null;
+
+    private var myFileName = "RepOperAcc" + Date();
+    private var cntRecord = 0;
+
+    /*Определение рабочей директории временных файлов*/
+    private macro GetWorkDirName() : string
+      var DirName:string = "", 
+          StrErr :string = "";
+
+      GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, DirName, StrErr );        
+      if( DirName )     
+        if( SubStr(DirName, 1, 1) == "." ) DirName = "$" + GetCurDir(TRUE) + replace (DirName, "..",""); end;     
+        if (existFile(DirName))  return DirName;  end;
+      end;
+
+      DirName = "$" + GetEnv("TEMP");
+
+      if( NOT DirName ) DirName = "$" + GetEnv("TMP"); end;
+      if (existFile(DirName)) return DirName; end;
+
+      msgbox("Ошибка поиска папки для временных файлов на терминале");
+
+      return "";
+    end;
+
+    /*Копирование файла на терминал*/
+    private macro myCopyFile (Name_file)
+      var Templs_Dir_Term = GetWorkDirName();
+
+      var TermFileName = toAnsi(Name_file);
+      var SPFileName;
+
+      if ( Templs_Dir_Term == "" )  return "";  end;
+      SPFileName = "..\\txtfile\\" + Name_file;
+
+      if (not existFile(SPFileName)) MsgBox(string("Транспортный временный файл не найден: |", SPFileName)); return ""; end;
+      if( not CopyFile(SPFileName, Templs_Dir_Term + "\\" + TermFileName) ) RunError("Ошибка при передаче файла на терминал\n" + Templs_Dir_Term + "\\" + TermFileName); end;
+
+      return subStr(Templs_Dir_Term + "\\" + TermFileName, 2);      
+    end;
+
+    /*Определение формата загружаемых данных*/
+    private macro SetTypeColumns();
+      var result_arr = TArray(true), i;
+ 
+      for(i, 1, 16)
+        var templs_arr = TArray(true);         
+        templs_arr(0) = i;
+        templs_arr(1) = 2;
+
+        result_arr(i - 1) = templs_arr;
+      end; 
+
+      return result_arr;
+    end;
+
+    /*Поиск "плохих" символов*/
+    private macro ClearSymble(str, split_char)
+      str = StrSubst(str, strfor(13), "" );
+      str = StrSubst(str, strfor(10), "" );
+      str = StrSubst(str, split_char, " ");
+      return string(str);   
+    end;
+
+    /*Формирвоание выборки данных*/
+    private macro FullRecord() 
+       initprogress(-1, "", "Ожидайте, формируется выборка");
+       startQueryCapture ();
+       [
+        SELECT DECODE (SUBSTR (dacc.t_account_receiver, 1, 5),
+          '30102', dacc.t_account_receiver,
+          '30109', dacc.t_account_receiver,
+          '30110', dacc.t_account_receiver,
+          '30114', dacc.t_account_receiver,
+          dacc.t_account_payer),
+               TO_CHAR(dacc.t_date_carry, 'dd.mm.yyyy'),
+               prop.t_number,
+               TO_CHAR(paym.t_valuedate, 'dd.mm.yyyy'),
+               paym.t_payeraccount,
+               paym.t_receiveraccount,
+               dacc.t_sum_natcur,
+               dacc.t_ground,
+               NVL (party1.t_name, prop.t_payername),
+               NVL (DECODE (party1.t_legalform, 2, (SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = party1.t_partyid),
+                                                   (SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = party1.t_partyid)),
+                    prop.t_payerinn),
+               NVL((SELECT t_name FROM dparty_dbt   WHERE t_partyid = paym.t_payerbankid), 
+                    prop.t_payerbankname),
+               NVL((SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 3 AND t_state = 0 AND t_objectid = paym.t_payerbankid), 
+                   (SELECT t_bankcode FROM dpmprop_dbt WHERE t_paymentid = paym.t_paymentid AND t_debetcredit = 0) ),
+               NVL (party2.t_name, prop.t_receivername),
+               NVL (DECODE (party2.t_legalform, 2, (SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = party2.t_partyid),
+                                                   (SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = party2.t_partyid)),
+                    prop.t_receiverinn),
+               NVL((SELECT t_name FROM dparty_dbt   WHERE t_partyid = paym.t_receiverbankid), 
+                    prop.t_payerbankname),
+               NVL((SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 3 AND t_state = 0 AND t_objectid = paym.t_receiverbankid), 
+                   (SELECT t_bankcode FROM dpmprop_dbt WHERE t_paymentid = paym.t_paymentid AND t_debetcredit = 1))
+        FROM dpmpaym_dbt paym,
+             dpmrmprop_dbt prop,
+             dpmdocs_dbt docs,
+             dacctrn_dbt dacc,
+             dparty_dbt party1,
+             dparty_dbt party2
+        WHERE paym.t_paymentid = prop.t_paymentid
+          AND paym.t_paymentid = docs.t_paymentid
+          AND docs.t_acctrnid = dacc.t_acctrnid
+          AND party1.t_partyid(+) = paym.t_payer
+          AND party2.t_partyid(+) = paym.t_receiver
+          AND dacc.t_sum_natcur >= :amount
+          AND (SUBSTR (dacc.t_account_receiver, 1, 5) IN ('30102', '30109', '30110', '30114')
+            OR SUBSTR (dacc.t_account_payer, 1, 5)    IN ('30102', '30109', '30110', '30114'))
+          AND dacc.t_date_carry BETWEEN :date_begin AND  :date_end
+        UNION
+        SELECT DECODE (SUBSTR (dacc.t_account_receiver, 1, 5),
+          '30102', dacc.t_account_receiver,
+          '30109', dacc.t_account_receiver,
+          '30110', dacc.t_account_receiver,
+          '30114', dacc.t_account_receiver,
+          dacc.t_account_payer),
+               TO_CHAR (dacc.t_date_carry, 'dd.mm.yyyy'),
+               dacc.t_numb_document,
+               TO_CHAR (dacc.t_date_carry, 'dd.mm.yyyy'),
+               dacc.t_account_payer,
+               dacc.t_account_receiver,
+               dacc.t_sum_natcur,
+               dacc.t_ground,
+               party1.t_name,
+               NVL (DECODE (party1.t_legalform, 2, (SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = party1.t_partyid),
+                                                   (SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = party1.t_partyid)),
+                    ' '),
+               ' ',
+               ' ',
+               party2.t_name,
+               NVL (DECODE (party2.t_legalform, 2, (SELECT TO_CHAR (t_born, 'dd.mm.yyyy') FROM dpersn_dbt WHERE t_personid = party2.t_partyid),
+                                                   (SELECT t_code FROM dobjcode_dbt WHERE t_codekind = 16 AND t_state = 0 AND ROWNUM = 1 AND t_objectid = party2.t_partyid)),
+                    ' '),
+               ' ',
+               ' '
+        FROM dacctrn_dbt dacc,
+             daccount_dbt acc1,
+             daccount_dbt acc2,
+             dparty_dbt party1,
+             dparty_dbt party2
+        WHERE acc1.t_account = dacc.t_account_payer
+          AND party1.t_partyid = acc1.t_client
+          AND acc2.t_account = dacc.t_account_receiver
+          AND party2.t_partyid = acc2.t_client
+          AND NOT EXISTS (SELECT * FROM dpmdocs_dbt  WHERE t_acctrnid = dacc.t_acctrnid)
+          AND dacc.t_sum_natcur >= :amount
+          AND (SUBSTR (dacc.t_account_receiver, 1, 5) IN ('30102', '30109', '30110', '30114')
+            OR SUBSTR (dacc.t_account_payer,    1, 5) IN ('30102', '30109', '30110', '30114'))
+          AND dacc.t_date_carry BETWEEN :date_begin AND :date_end
+       ];
+
+       var cmd = RsdCommand (endQueryCapture ());
+       cmd.addParam ("amount",     RSDBP_IN, amountReport   );
+       cmd.addParam ("date_begin", RSDBP_IN, beginDateReport);
+       cmd.addParam ("date_end",   RSDBP_IN, endDateReport  ); 
+        
+       myRecord = RsdRecordSet(cmd);
+       remprogress;
+
+     OnError(er)
+       msgBox(er.Message);
+     end;
+      
+    /*Формирование и открытие файла Excel*/
+    private macro OpenExcel()
+      private var objectXls, WorkExcel;
+
+      objectXls = CreateObject ("rsax", "TRsAxServer", string("RsAxServer", UserNumber()), IsStandAlone());
+      WorkExcel = objectXls.CreateComObject ("Excel.Application"); 
+
+      myWorkExcel = WorkExcel;
+
+      return true;
+
+    OnError(er)
+      msgbox(er.Message); 
+      return false;
+    end;
+
+    /*Заполнение заголовков столбцов, формирование сетки таблицы*/
+    private macro SetHeaderExcelTable()
+      var i; 
+      myWorkBook.Sheets(numSheet);
+      myWorkSheet = myWorkBook.ActiveSheet();
+
+      myWorkSheet.Cells(1, 1).Value  = "Корреспондентский счет";
+      myWorkSheet.Cells(1, 2).Value  = "Дата операции";
+      myWorkSheet.Cells(1, 3).Value  = "Номер документа";
+      myWorkSheet.Cells(1, 4).Value  = "Дата документа";
+      myWorkSheet.Cells(1, 5).Value  = "Л/счет плательщика";
+      myWorkSheet.Cells(1, 6).Value  = "Л/счет получателя";
+      myWorkSheet.Cells(1, 7).Value  = "Сумма в рублях или рублевом эквиваленте";
+      myWorkSheet.Cells(1, 8).Value  = "Основание";
+      myWorkSheet.Cells(1, 9).Value  = "Наименование плательщика (для ФЛ - ФИО, для ЮЛ - наименование ЮЛ)";
+      myWorkSheet.Cells(1, 10).Value = "Идентификатор плательщика (для ФЛ - год рождения, для ЮЛ, ИП - ИНН)";
+      myWorkSheet.Cells(1, 11).Value = "Наименование КО плательщика";
+      myWorkSheet.Cells(1, 12).Value = "БИК КО плательщика";
+      myWorkSheet.Cells(1, 13).Value = "Наименование получателя (для ФЛ - ФИО, для ЮЛ - наименование ЮЛ)";
+      myWorkSheet.Cells(1, 14).Value = "Идентификатор получателя (для ФЛ - год рождения, для ЮЛ, ИП - ИНН)";
+      myWorkSheet.Cells(1, 15).Value = "Наименование КО получателя";
+      myWorkSheet.Cells(1, 16).Value = "БИК КО получателя";
+     
+      for (i, 1, 16)
+        myWorkSheet.Cells(1, i).HorizontalAlignment = 3;
+        myWorkSheet.Cells(1, i).Font.Bold = true; 
+        myWorkSheet.Columns(i).EntireColumn.AutoFit;
+      end; 
+
+      myWorkSheet.Range("A1:P" + (cntRecord + 1)).Borders.Weight = 2;  
+      myWorkSheet.Range("A1:P1").Interior.Color = #B5B5B5;
+                                                                                                 	
+      return true;
+
+     OnError
+       return false;
+     end;     
+
+     /*Запись данных в временный файл*/
+     macro SetToFile()
+       FullRecord();
+       initprogress(-1, "", "Ожидайте, идет запись данных");
+       setoutput("..\\txtfile\\" + myFileName); 
+
+       var separator = ";";
+       println(separator);
+
+       while (myRecord.MoveNext())
+         var text = "", i;
+
+         for (i, 1, 16) text = text + ClearSymble(string(myRecord.value(i - 1)), ";") + separator; end;
+         println(text);
+
+         cntRecord = cntRecord + 1;
+         useprogress(cntRecord);
+       end;
+
+       setoutput(null, true);       
+       remprogress;
+     end;
+
+     /*Копирование данных в файл Excel*/
+     macro CopyValueToExcel()
+       initprogress(-1, "", "Подготовка файла Excel");
+       myFileName = myCopyFile(myFileName); 
+
+       if ( OpenExcel() and  myFileName != "")      
+          	
+         myWorkExcel.Workbooks.OpenText (myFileName, 866, 1, 1, 2, false, false, false, false, false, true, ";", SetTypeColumns(), 1, "."," ", true, false);
+         myWorkBook = myWorkExcel.Workbooks.Application;
+
+         SetHeaderExcelTable();
+         
+         MsgBox("Файл успешно записан");
+         myWorkExcel.Visible = true;
+       end;         
+       remprogress;
+     OnError(er)
+       msgBox(er.Message);
+     end;     
+  end;/*End class Report*/  
+
+  Class (TRecHandler) TParm(LbrName)    
+     InitTRecHandler ("statCB", (LbrName), true);    
+     Macro Handler (dlg, cmd, id, key)            
+       if (cmd == DLG_KEY)	
+         if (KEY == KEY_F2)
+           debugbreak;
+           var myReport = Report(dlg.("BeginDate"), dlg.("EndDate"), dlg.("Amount"));               
+               myReport.SetToFile();
+               myReport.CopyValueToExcel();                   
+  
+         elif (KEY == KEY_ESC) return CM_CANCEL; end;
+        end; 
+     End;
+     
+     Macro Run 
+        return RunDialog (this, R2M (this, "Handler"));  
+     End;
+  End; 
+
+  Macro MyPanel( lbr )    
+     var rc = lbr.AddPanel( "statCB", 40, 10, 30, 5, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+     rc.Title = "Настройка отчета";
+     rc.StatusLine = StatusBar;
+    
+     elem = rc.AddFrame(0, 0, 30, 6, 2);
+     elem = rc.AddLabel( 1, 1, "Начало периода:");
+     elem = rc.AddField( 19, 1,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "BeginDate", 10, 1);
+     elem = rc.AddLabel( 1, 2, "Конец  периода:");
+     elem = rc.AddField( 19, 2,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "EndDate", 10, 1); 
+     elem = rc.AddLabel( 1, 4, "Сумма, от:");
+     elem = rc.AddField( 14, 4,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DOUBLE, "Amount", 15, 1);        
+  end;
+
+  Macro MyLbr
+    var Fulloutputlbr, outputlbr = "statCBOperation.lbr", outlbr, lbr;
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, outlbr);
+    Fulloutputlbr = outlbr + "\\" + outputlbr;
+    lbr = TLbrFile( Fulloutputlbr, "C" );
+    MyPanel( lbr );
+
+    lbr.Save(); 
+    lbr = NULL;
+    return Fulloutputlbr;
+  end;
+
+  /********************Точка входа***********************/
+  private var LbrName, Parm;
+  LbrName = MyLbr();
+
+  Parm = TParm(LbrName);
+
+  Parm.rec.BeginDate  = Date() - 365;
+  Parm.rec.EndDate    = Date();
+  Parm.rec.Amount     = 300000.00; 
+
+  if( not Parm.Run() )
+     Parm = null;
+     DelFile(LbrName);
+     Exit (1);
+  end;
+end;

@@ -1,0 +1,186 @@
+/*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    RS-Bank 5.10
+
+    ПЗО
+
+    Оплата разовых комиссий
+                    Mikhailov S., 09.08.2001, Th
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*/
+// Changes:
+// 16.04.2013 joy R-179698-2 Не формируем Б/О, если нашлась СПИ с уже закрытым счётом
+// 17.06.2013 joy C-17776-6  Информирование в случае проведеняи чужих док-ов разовык комиссий 
+
+import sfpay, sfground, sfcomcat, lib_account;
+import lib_oper, fg_Life_parm, oprinter;
+private var fgBank = fg_life_subject({OurBank});
+
+private const SFDOC_DEF_ONCE = 52;
+/* EVG */
+import "sf_prbb.mac";
+
+//private const SFDOC_DEF_ONCE = 52;
+
+/*record sfcontrRec( "sfcontr.dbt") key 0*/;
+file sfcomissFile( "sfcomiss.dbt"  ) key 0;
+
+record sfsingdfRec( "sfdef.dbt" );
+
+private macro SfSingAccrue( SfSingPD, sfsingdfRec, sfcomiss, sicredit )  
+
+    var PayerAccount:string, ReceiverAccount:string;
+    var SumPayer = $0, SumNDS = $0;
+    var Ground = string( "За разовые услуги." );
+    var err = 0;
+    var carryDate = sfsingdfRec.DateFee;
+    var payFIID = sfsingdfRec.FIID_paySum;
+
+    PayerAccount = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, CALC_SFSI_KIND, PlusCalc_CatCode, carryDate, payFIID );
+    ReceiverAccount = sicredit.Account;
+
+    if( ConvSum( SumPayer, sfsingdfRec.sum, carryDate, sfsingdfRec.FIID_Sum, payFIID, sfcomiss.Ratetype ) == 0 )
+        err = CountComissAsIncome( carryDate, payFIID, PayerAccount, sicredit.FIID, ReceiverAccount, SumPayer, Ground );
+    else
+        err = 1;
+    end;
+  
+    if( (err == 0) AND (sfsingdfRec.sumNDS > 0) )
+        Ground = string("НДС за разовые услуги.");
+        PayerAccount = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, CALCNDS_SFSI_KIND, PlusCalcNDS_CatCode, carryDate, payFIID );
+        ReceiverAccount  = SfSingPD.GetDefComSfSiAccount( sfsingdfRec.ID, NDSACRUAL_SFSI_KIND, MinusNDSAccrual_CatCode, carryDate, payFIID );
+        if( ConvSum( SumNDS, sfsingdfRec.sumNDS, carryDate, sfsingdfRec.FIID_Sum, payFIID, sfcomiss.Ratetype ) == 0 )
+            err = CountComissAsIncome( carryDate, payFIID, PayerAccount, payFIID, ReceiverAccount, SumNDS, Ground );
+        else
+            err = 1;
+        end;
+    end;
+
+    if( err == 0 )
+        sfsingdfRec.IsIncluded = "X";
+        SfDefSetFlagIsInc( sfsingdfRec.FeeType, sfsingdfRec.ID, 0, 0 );
+    end;
+
+    return err;
+end;
+
+private macro SfSingPay( documentNum, SfSingPD, sfsingdfRec, sfcomissFile, sidebet, sicredit )
+
+    var stat = 0;
+
+    file sfcontr( "sfcontr.dbt") key 0;
+    var sfcontr_found = false;
+
+    if( sfsingdfRec.SfContrID > 0 )
+        sfcontr.ID = sfsingdfRec.SfContrID;
+        if( getEQ(sfcontr) )
+            sfcontr_found = true;
+        end;
+    end;
+
+    var payDate = sfsingdfRec.DateFee;
+    if( sfsingdfRec.CalcComissSumAlg == 3 ) /*SFCOMISS_CALCCOMISSSUMALG_BEFOREPAY*/
+      payDate = sfsingdfRec.DateFee - 1;
+    end;
+
+    var payMethod = SF_PAY_METHOD_PAYM;
+    var ground = "";
+    if( sfcontr_found )
+    ground = BuildGroundWithVO( sfsingdfRec, sfcomissFile, sfcontr, sidebet.rec.PartyID, sicredit.rec.PartyID, payDate );   
+        payMethod = sfcontr.payMethod;
+    else
+    ground = BuildGroundWithVO ( sfsingdfRec, sfcomissFile, null,  sidebet.rec.PartyID, sicredit.rec.PartyID, payDate  );   
+    end;
+
+    var bilfDocArray = TArray;
+
+
+    stat = SfFormDocs( documentNum, sidebet, sicredit, sfcomissFile,
+                        payDate, ground,
+                        sfsingdfRec.sum, sfsingdfRec.sumNDS, sfsingdfRec.FIID_Sum,
+                        SFDOC_DEF_ONCE, sfsingdfRec.ID, OBJTYPE_SFSINGDF, sfsingdfRec, payMethod,
+                        SfSingPD, sfsingdfRec.IsIncluded, false, sfsingdfRec.FacturaID, @bilfDocArray, null, null, null, null, null, null, sfcontr.PreAcptID);
+                       
+    if(stat == 0)                   
+        sfsingdfRec.Status = SFDEFCOM_STATUS_FOR_PAY;
+        if( not Opr_ChangeSfDefComStatus(sfsingdfRec.ID, sfsingdfRec.Status, 0, 0, sfsingdfRec.FeeType) )
+            MsgBox("Не удалось изменить статус УРК.");
+        end;
+        
+        if( (sfsingdfRec.FacturaID > 0) AND (bilfDocArray.Size > 0) )       
+            if(not CreateBilBookEntry(sfsingdfRec.FacturaID, payDate, bilfDocArray) )  
+                MsgBox("Не удалось связать оплату комиссии с СФ");
+            end;
+        end;
+    end;
+
+end;
+
+macro ExecuteStep( outBuff, primIn )
+
+    var stat = 0;
+    var DocumentNum = "";
+    setbuff( sfsingdfRec, primIn  );
+ 
+    sfcomissFile.FeeType = sfsingdfRec.FeeType;
+    sfcomissFile.Number  = sfsingdfRec.CommNumber;
+
+    if( not getEQ( sfcomissFile ) )
+        MsgBox("Не найдена комиссия");
+        return 1;
+    end;
+
+    /* 17.06.2013 joy  C-17776-6*/
+    if (not ( (fgBank.is_GO) or (fgBank.is_NBS)))
+        var docOper = RSL_Person (sfsingdfRec.oper);
+    
+        if (sfsingdfRec.oper != {oper})
+            if ( msgBoxEx ("Внимание! | Документ комиссии  введен операционистом №" + docOper.oper + ": " + docOper.name + " | Проводить?", MB_YES + MB_NO  ) == IND_NO);
+                msgBoxEx ("Разовая комиссия "+sfcomissFile.code+" по счету "+sfsingdfRec.accountpayer +"| помещена в Удержанные разовые комиссии/Открытые. | Вам необходимо откатить её в отложенные!");
+                return 1;
+            end;
+        end;
+    end;
+    /*end joy */
+
+    var SfAccrueRegVal = SfComAccrueGetRegValue();
+      
+    var sidebet = TRecHandler("sfsi.dbt");
+    var sicredit = TRecHandler("sfsi.dbt");
+    sidebet.Clear;
+    sicredit.Clear;
+    if(SfGetSI_Uni( OBJTYPE_SFSINGDF, sfsingdfRec, sidebet, sicredit ))  /*ObjectType = OBJTYPE_SFSINGDF = 664*/
+       MsgBox("Ошибка при взятии платежных инструкций");
+       return 1;
+    end;
+
+    if(sicredit.rec.Account == "") 
+       MsgBox("Не найдена подходящая СПИ для заполнения платежа");
+       return 1;
+    end;
+
+    /* 16.04.2013 joy R-179698-2 Не формируем Б/О, если нашлась СПИ с уже закрытым счётом */
+    var AccountDeb = RSL_Account (sidebet.rec.account, sidebet.rec.fiid);
+     
+    if (AccountDeb.rec.open_close == "З" )
+       MsgBox("Ошибка при взятии платежных инструкций. | Проверьте наличие СПИ на договоре обслуживания.");
+       return 1;
+    end;    
+   /*end joy*/
+
+    var SfSingPD = SfSingDfPrimDoc( SFDOC_DEF_ONCE, sfsingdfRec );
+
+    if( sfcomissFile.receiverID == {HeadBankID} ) /*if( SfIsOurFilial(sicredit.rec.PartyID) == true )*/
+       if( (SfAccrueRegVal == 0) OR ((SfAccrueRegVal == 2) AND (sfsingdfRec.sumNds > 0)) )
+           SfSingAccrue( SfSingPD, sfsingdfRec, sfcomissFile, sicredit.rec );
+       end;
+    end;
+  
+    if( sfcomissFile.InstantPayment == "X" )
+       SfSingPay( DocumentNum, SfSingPD, sfsingdfRec, sfcomissFile, sidebet, sicredit );
+    end;
+                      
+    return stat;
+end;  
+
+

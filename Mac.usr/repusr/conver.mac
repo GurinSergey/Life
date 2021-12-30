@@ -1,0 +1,454 @@
+/************************************************************************/
+/*          Автоматизированная банковская система RS-Bank v6.0          */
+/*                                                                      */
+/*               Copyright (c) R-Style Ukraine                          */
+/*                                                                      */
+/*  Имя файла        : conver.mac                                       */
+/*                                                                      */
+/*  Описание         : Макрос формирования отчета                       */
+/*                    "Журнал учета конверсионных операций"             */
+/*                                                                      */
+/*  Программист      : Новиков С. С.                                    */
+/*                                                                      */
+/*  Создан           : 21.08.2008                                       */
+/*                                                                      */
+/*  Модифицирован1   : 22.08.2008                                       */
+/*                                                                      */
+/*  Модифицирован2   : 26.08.2008                                       */
+/*                                                                      */
+/************************************************************************/
+
+
+
+import globals, oralib, bankinter, "KeyCodes.mac", repforms, Календарь, xlrep,PTInter ;
+
+record superior(ptoffice);
+record officet(ptoffice);
+
+var path = "",
+    pathfile = "",
+    filen = "RSU.lbr";
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+pathfile = FindPath(filen,path);
+	if (not pathfile)
+		msgbox("Не найдена LBR");
+		exit();
+	end;
+
+var dlg = TRecHandler("conver",pathfile,True);
+
+var
+    Date_report_begin ,
+    Date_report_end,
+    rselect = "";  
+
+var PartyID:integer;
+
+Private macro PrintHead(_Date_report_begin,_Date_report_end)
+[                                                  Журнал учета конверсионных операций
+   
+  за период с ########## по ##########
+
+
+  ______________________________________________________________________________________________________________________________
+ │ № сде│ Дата     │ Дата     │ Дата     │ Наименование     │Код         │ Тип     │ Сумма сделки │ Код   │ Сумма       │ Код   │
+ │ ки   │ поруче   │ сделки   │ валюти   │ клиента          │клиента     │ сделки  │ (на конверт) │ валюты│ зачисления  │ валюты│
+ │      │ ния      │          │ рования  │                  │            │         │              │       │             │       │
+ │______│__________│__________│__________│__________________│____________│_________│______________│_______│_____________│_______│
+ │      │          │          │          │                  │            │         │              │       │             │       │
+](_Date_report_begin, _Date_report_end );
+end;
+
+
+private macro PrintLine(_Doc_Num, _Date_por, _Date_doc, _Date_value, _Client_Name, _Client_RSB_Code,_Doc_type, 
+                       _Value_debet, _Currency_debet, _Value_credit, _Currency_credit);
+
+[│######│##########│##########│##########│##################│############│######## │############# │#######│#############│#######│
+ │      │          │          │          │                  │            │         │              │       │             │       │
+](_Doc_Num:w:c, trim(string(_Date_por)):c,trim(string(_Date_doc)):c,trim(string(_Date_value)):c,
+  _Client_Name:w, _Client_RSB_Code, _Doc_type:w, string(_Value_debet):c:w, _Currency_debet, string(_Value_credit):c:w,
+  _Currency_credit:w);
+
+end;
+
+
+Private macro PrintBottom()
+[│______│__________│__________│__________│__________________│____________│_________│______________│_______│_____________│_______│
+]
+end;
+
+
+/*Макрос формирования сообщения об отсутствии данных*/
+Macro nofound(_flagfound,__date_begin,__date_end):bool;
+  var nofound1:string = "";
+  if (_flagfound == false)
+   nofound1 = string(println("В отчетный период c"+__date_begin+" по"+__date_end+" отсутствуют проведенные" 
+                            +" мультивалютные документы!\n"
+                            +"(покупка, продажа, конверсия валюты и т.п.)"));
+   return CM_CANCEL;
+  end;   
+  return true;
+End;
+
+
+/*Макрос выборки из БД всех проведенных мультивалютных документов (покупка, продажа, конверсия валюты и т.п.) 
+у которых дата документа попадает в отчетный период включительно.*/
+Macro SQLquery(_date_begin, _date_end, _dlg_text, _dlg_excel)
+  
+  /*Переменные для выборки данных из таблиц БД (dps_bcord_dbt, dpmpaym_dbt, dpmrmprop_dbt,multycar_dbt )*/
+  var rs1:object = NULL;
+  var rs2:object = NULL;
+  var rs3:object = NULL;
+  var rs4:object = NULL;
+  var type:object = NULL; 
+  var select = "";
+
+  /*Переменные, которые принимают значения из БД*/
+  var Client_RSB_Code: string = "";
+  var Client_Name: string = "";
+  var Doc_Num: string = "";
+  var Date_por = date("01.01.0001");
+  var Date_doc = date("01.01.0001");
+  var Date_value = date("01.01.0001");
+  var Value_debet  = $0;
+  var Currency_debet:string = ""; 
+  var Value_credit = $0;
+  var Currency_credit:string = "";
+  var Doc_Type:string = "За счет собственных средств";
+  
+  /*Флаг найденных данных*/ 
+  var flagfound:bool = false;
+  
+  /*переменные для шаблона .xlt*/
+  var Templ:string = "";
+  var Rep:object = NULL ;
+  var RegParam:string = "";
+  
+  var n:integer = 0;
+  var i:integer = 0;
+
+
+  var val1 = true;
+    /*Шаблон для создания отчета в Excel*/  
+    Templ = "\\conver.xlt";   
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+    
+   
+    InitProgress(-1," ~CtrlBreak~ Прекратить","Печатаются данные  по конверсионным операциям ");
+  
+    
+    /*Выборка данных из таблицы БД multycar_dbt*/
+    /*номер документа, валюта по дебету, сумма в валюте дебетуемого счета, валюта по кредиту, 
+     сумма в валюте кредитуемого счета, дата проводки, дата валютирования, дата документа 
+     идентификатор рублевого платежа, идентификатор валютного платежа, статус МВП (проведенный)*/
+    select = "select t.t_numb_document, t.t_fiid_from, t.t_amount_from as sum_debet, t.t_fiid_to,"    
+           + " t.t_amount_to as sum_credit, t.t_date, t.t_date_value, t.t_date_document," 
+           + " t.t_paymentidr, t.t_paymentidc, t.t_forcemove from dmultycar_dbt t"             
+           + " where t.t_date_document >= '"+_date_begin+"' and t.t_date_document <= '"+_date_end+"'"
+           + " and t.t_forcemove = 0 ";
+  if (OperSelect != "")
+    select = select +
+             "   AND t.t_oper like '"+OperSelect+ "'\n";
+  end;
+    select = select +
+             " order by t.t_numb_document";
+    rs2 = ExecSQLSelect(select);
+    
+    val1 = rs2.movenext();
+   
+    if (not (val1))
+      /*вывод сообщения об отсутствии данных при выводе отчета в Excel*/
+      if (_dlg_excel == "X") 
+        nofound(flagfound, _date_begin, _date_end);
+      /*вывод сообщения об отсутствии данных при выводе отчета в текст*/
+      elif (_dlg_text == "X")
+        println;
+        nofound(flagfound, _date_begin, _date_end);
+      end;
+    else
+      if (_dlg_excel == "X")
+        Rep = CExcelRepMaker(RegParam+"\\cb"+Templ);
+      end;
+
+      while (val1)
+     
+        UseProgress(i = i + 1);
+        flagfound = true;
+       /* if ( (valtype(rs2.value("t_numb_document")) != 26) 
+              and (valtype(rs2.value("t_fiid_from")) != 26) 
+              and (valtype(rs2.value("sum_debet")) != 26) 
+              and (valtype(rs2.value("t_fiid_to")) != 26)
+              and (valtype(rs2.value("t_sum_credit")) != 26) 
+              and (valtype (date(rs2.value("t_date"))) != 26)
+              and (valtype (date(rs2.value("t_date_value"))) != 26) 
+              and (valtype(date(rs2.value("t_date_document")))) != 26)     
+       */  
+        
+        Doc_Num = rs2.value("t_numb_document");
+        if ( strlen(Doc_Num) == 0)
+           Doc_Num = "Не указан";
+        end;
+        Date_por = date(rs2.value("t_date_document"));
+        Date_doc = date(rs2.value("t_date"));
+        Date_value = date(rs2.value("t_date_value"));
+        Value_debet = rs2.value("sum_debet");
+        Currency_debet = GetIsoByID(rs2.value("t_fiid_from"), false);
+        Value_credit = rs2.value("sum_credit");
+        Currency_credit = GetIsoByID(rs2.value("t_fiid_to")); 
+      
+         
+       /*Выборка данных из таблицы БД dps_bcord_dbt (продажа, покупка, конверсия валюты)*/
+       /*за счет средств банка, вид поручения, id платежа */
+        if ((valtype(rs2.value("t_paymentidr")) != 26) and (valtype(rs2.value("t_paymentidc")) != 26))
+        
+          select = "select t.t_bankfunds, t.t_bcordkind, t.t_paymentid from dps_bcord_dbt t"
+                  +" where t.t_paymentid = '"+rs2.value("t_paymentidr")+"'"
+                  +" and t.t_paymentid = '"+rs2.value("t_paymentidc")+"'" ;
+          type = ExecSQLSelect(select);
+        
+          while (type.movenext())
+            if (type.value("t_bankfunds") == "X") 
+              if(type.value("t_bcordkind") == 1)
+                Doc_Type = "Покупка за счет средств банка" ;
+              elif (type.value("t_bcordkind") == 2)
+                Doc_Type = "Продажа за счет средств банка" ;
+              elif (type.value("t_bcordkind") == 3)
+                Doc_Type = "Конверсия за счет средств банка" ;
+              end;
+            else
+              if(type.value("t_bcordkind") == 1)
+                Doc_Type = "Покупка за счет собственных средств " ;
+              elif (type.value("t_bcordkind") == 2)
+                Doc_Type = "Продажа за счет собственных средств " ;
+              elif (type.value("t_bcordkind") == 3)
+                Doc_Type = "Конверсия за счет собственных средств средств " ;
+              end;
+            end;
+          end; 
+        
+           
+        
+       
+          /*Выборка данных из таблицы БД dpmpaym_dbt */
+          /*идентификатор платежа, код клиента*/
+          select = "select t.t_paymentid, t.t_payercode from dpmpaym_dbt t"
+                   +" where t.t_paymentid = ' "+rs2.value("t_paymentidr")+"'"
+                   +" and t.t_paymentid = '"+rs2.value("t_paymentidc")+"'";     
+          rs3 = ExecSQLSelect(select);
+          while (rs3.movenext())
+            if (valtype(rs3.value("t_payercode")) != 26) 
+              if (strlen(rs3.value("t_payercode")) != 0)
+                Client_RSB_Code = rs3.value("t_payercode");
+              else
+                Client_RSB_Code = "Неизвестно";
+              end;
+            else
+               Client_RSB_Code = "Неизвестно";
+            end;
+          end;
+
+          /*Выборка данных из таблицы БД dpmrmprop_dbt*/
+          /*идентификатор платежа, наименование клиента*/ 
+          select = "select t.t_paymentid, t.t_payername from dpmrmprop_dbt t" 
+                  +" where t.t_paymentid = ' "+rs2.value("t_paymentidr")+"'"
+                  +" and t.t_paymentid = '"+rs2.value("t_paymentidc")+"'";     
+          rs4 = ExecSQLSelect(select);
+          while (rs4.movenext())
+            if (valtype(rs4.value("t_payername")) != 26)
+              if (strlen(rs4.value("t_payername")) != 0)
+                Client_Name = rs4.value("t_payername");
+              else
+                Client_Name = "Неизвестно";
+              end;
+            else
+              Client_Name = "Неизвестно";
+            end;
+          end;
+        
+          
+          /* формирования данных --> текст */
+          if (_dlg_text == "X")
+            PrintLine(Doc_Num, Date_por, Date_doc, Date_value, Client_Name, Client_RSB_Code,Doc_Type, 
+                      string(Value_debet:a),Currency_debet, String(Value_credit:a), Currency_credit);
+          /* формирование данных --> Excel*/
+          elif (_dlg_excel == "X")
+            Rep.WriteReportRow(Doc_Num, date(Date_por), date(Date_doc), date(Date_value), Client_Name, 
+                               Client_RSB_Code, Doc_Type, String(Value_debet:a), 
+                               Currency_debet, String(Value_credit:a), Currency_credit);
+            
+          end;
+       
+        else
+          flagfound = false;
+        end;/*end main valtype */
+        n = n + 1;
+        val1= rs2.movenext();
+      
+      end; /*end main while*/ 
+    
+      /*рисование линии закрытия таблички (формат отчета --> текст) при наличии данных в ней*/
+      if (_dlg_text == "X")
+        PrintBottom();                                                                    
+      end
+    
+    end; /*end main if*/
+      
+    RemProgress();
+
+   
+   /*вывод отчета --> Excel*/
+   if ((_dlg_excel == "X") and (flagfound == true))
+  
+     Rep.TransferReportData("DATARANGE");
+     Rep.DefaultPaintRange("DATARANGE", n);//Rep.RowsWritten);
+
+     Rep.SetRangeValue("date_begin",_date_begin);
+     Rep.SetRangeValue("date_end",_date_end);
+
+     Rep.axExcel.Visible = true;
+     Rep.axExcel.WindowState = xlWindowMaximized;
+   
+     println("Данные отправлены в Excel!");
+   
+   end;
+   
+END;
+
+
+/*Главный макрос формирования отчета  отобранными данными из БД*/
+Macro PrintAll(dlg_text, dlg_excel);
+
+  var text:string = "";
+  var excel:string = "";
+
+    /*Формат отчета */  
+    /*текст*/
+    text = dlg_text;
+    /*Excel*/
+    excel = dlg_excel;
+
+    /*текстовый вид*/
+    if (dlg_text == "X") 
+      /*шапка таблички*/
+      PrintHead(Date_report_begin, Date_report_end);
+    end;
+    /*вызов макроса выборки из БД всех проведенных мультивалютных документов*/
+    SQLquery(Date_report_begin, Date_report_end, text, excel);
+  
+     OnError(Err)
+       MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module);
+ 
+END;
+
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key) 
+
+  var const_message = "~F2~ Продолжить F3~ Выбор даты из календаря  ~Space~ Выбор формата отчета  ~ESC~ Выход ";
+  var OrgDate:date = {curdate} + 1;
+  var NoChangeDate:bool = false;
+
+    /*Первоначальная инициализация полей*/
+    if(cmd == DLG_INIT)
+       Message(const_message);
+       PartyID = {OurBank};
+       dlg.rec.BeginDate ={curDate}-1;
+       dlg.rec.EndDate = {curDate};
+       dlg.rec.text = "X";
+       dlg.rec.oper   = "";
+       dlg.rec.opername = "все операционисты";
+       UpdateFields(dlg); 
+    end;
+    
+    if (cmd == DLG_REMFOCUS)
+      if (FldName(dlg,id)=="BeginDate")
+         if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+            MsgBox("Дата начала больше даты окончания отчетного периода");
+            return CM_CANCEL;
+         elif ( dlg.rec.BeginDate > {curdate} )
+            MsgBox("Дата начала больше даты текущего операционного дня"); 
+            return CM_CANCEL;
+         end;
+      elif (FldName(dlg,id)=="EndDate") 
+         if (dlg.rec.EndDate < dlg.rec.BeginDate )
+            MsgBox("Дата окончания меньше даты начала отчетного периода"); 
+            return CM_CANCEL;
+         elif ( dlg.rec.EndDate > {curdate} )
+            MsgBox("Дата окончания больше даты текущего операционного дня");
+            return CM_CANCEL;
+         end;
+      end;
+
+      UpdateFields(dlg); 
+    end; 
+
+    if (cmd == DLG_KEY)
+      /*Выход из диалогового окна формирования отчета*/
+      if (KEY == KEY_ESC)
+        return exit(1);//CM_CANCEL;
+      /*Выбор данных из списка*/
+      elif ( KEY == KEY_F3)
+      /*Выбор даты из календаря*/
+        if (FldName(dlg,id) == "BeginDate")
+          dlg.rec.BeginDate = GetDateByCalendar ({curDate}-1);
+        elif (FldName(dlg,id) == "EndDate")
+          dlg.rec.EndDate = GetDateByCalendar ({curDate}-1);
+        elif(FldName(dlg,id) == "oper")
+          rselect = "select t.t_oper, t.t_name " +   
+                    " from dperson_dbt t inner join ddp_dep_dbt v on v.t_name = '000' and t.t_codedepart = v.t_code;";
+
+            cmd = RSDCommand(rselect);
+            rsrec = RSDRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+            if (RunScroll(rsrec, 0, 0, "Опера", @EvProc, "Список операционистов", "~Enter~ выбор сотрудника ~Esc~ выход", true))
+              dlg.rec.oper = rsrec.value (0);
+              dlg.rec.OperName = rsrec.value (1);
+              UpdateFields(dlg);
+              OperSelect = rsrec.value (0);
+            end;
+        end;
+      /*Возможность выбора формата отчета текстовый вид, вывод в Excel*/
+      
+      /*Space key*/  
+      elif (KEY==KEY_SPACE)
+      /*Параметр текстовый вид*/
+        if (FldName(dlg,id)=="text")
+          if (dlg.rec.text == "")
+            dlg.rec.text = "X";
+            dlg.rec.excel = "";
+            UpdateFields(dlg); 
+          end;
+      /*Параметр вывод в Excel*/
+        elif(FldName(dlg,id)=="excel")
+          if (dlg.rec.excel == "")
+            dlg.rec.excel = "X";
+            dlg.rec.text = "";
+            UpdateFields(dlg); 
+          end;
+        end;
+      elif ( KEY == KEY_F2 )
+         Date_report_begin = dlg.rec.BeginDate;
+         Date_report_end = dlg.rec.EndDate;  
+         
+         if ((Date_report_begin <= {curDate}) and (Date_report_end <= {curDate}) 
+            and (Date_report_begin <= Date_report_end) and (Date_report_end >= Date_report_begin) )
+           Return CM_SAVE;
+         else
+            MsgBox("Не все поля корректны!"); 
+         end;
+      elif ( (KEY == KEY_ENTER) and (FldName(dlg,id) == "Excel") )
+          
+        SetFocus(dlg, 0);
+        Return CM_IGNORE;
+      
+      end;
+    
+    end;
+         
+END;
+
+if (RunDialog(dlg, "Event"))
+  PrintAll(dlg.rec.text, dlg.rec.excel);
+end;
+ 
+

@@ -1,0 +1,122 @@
+/*---------------------------------------------------------------------------\
+|                       Файл    arhdoc.mac                                   |
+|                     Для архивных документов                                |
+\---------------------------------------------------------------------------*/
+// ------------------------------------------------------------------------------------------------
+// @changes : 17.10.2012 LAO C-14564 Добавил возможность изменения опера по проводки+документы+шаги
+//            13.12.2012 LAO добавил вывод счета
+//            27.08.2013 TAM R-237239
+// ------------------------------------------------------------------------------------------------
+import rsd, makeMT103, BankInter, "payments.mac", globals; 
+import ShifrKind; 
+import "diver.mac";
+import "arh_oper.mac";
+import "lib_const.mac"; //TAM 27.08.2013 R-237239
+
+record  Документ( arhdoc );
+record  СтарыйДокумент( arhdoc );
+
+macro  Новый_документ( тип_документа )
+   msgbox("Запрещен ввод проводок вручную!|операции должны оформляться первичными документами");
+   return 1;
+end;
+
+macro    Проверить_документ( Режим, Тип_документа )
+   //А.Киселев 02.03.2011 проверка на связь проводки с СФ
+   var cmd, rs;    
+   cmd = RSDCommand(" SELECT E.T_FACTURAID, E.T_FACTURANUMBER FROM doprdocs_dbt A, doproper_dbt B, dbilreconcile_dbt C, dbilbookentry_dbt D, dbilfactura_dbt E " +
+                     " WHERE A.T_DOCUMENTID =  ? " +
+                     " AND B.T_ID_OPERATION = A.T_ID_OPERATION AND B.T_DOCKIND = 70 " +
+                     " AND C.T_DOCID = TO_NUMBER(B.T_DOCUMENTID) " +
+                     " AND D.T_BOOKENTRYID = C.T_BOOKENTRYID " +
+                     " AND E.T_FACTURAID = D.T_FACTURAID AND E.T_STATUS NOT IN (1,3) "
+                    ); //вариант добавить вместо E.T_PAYMENTNUMBER <> CHR(1) E.T_STATUS NOT IN (1,3)
+   cmd.addparam("DOCID",RSDBP_IN,"0000"+string(СтарыйДокумент.iapplicationkind)+string(СтарыйДокумент.applicationkey));
+   rs=RSDRecordset(cmd);
+
+   if (rs.movenext)
+      msgbox("Запрет удаления. Существует связанный счет-фактура:" + rs.value(1));
+      return 111;
+   end;
+   return 0;
+end;
+
+macro    ФункцияПользователя( тип_документа )
+   debugbreak;
+   array mn;
+   var cmd, rs;
+   var priority, pr;
+
+   mn(0)="Кредитовое авизо";
+   mn(1)="Корректировка шифра/вида";
+   if (ВходитВГруппу({oper}, ACS_GRP_CARRY_PRIORITY_DATE))  //185 - "Право исправлять очередность проводки"
+      mn(2) = "Корректировка очередности проводки";
+   end;
+   if (ВходитВГруппу ({oper}, ACS_GRP_CARRY_EDIT))
+      mn(3)="Простановка типа СПОД";
+      mn(4)="Исправить проводку покрытия";
+      mn(5)="Исправить проводку курсовой разницы";
+      mn(6)="Замена операциониста на проводке/документе";
+   end;
+   
+  
+   var m = menu(mn,null,"Выберите действие над платежом");
+   if (m == 0) // Кредитовое авизо
+      cmd = RSDCommand("select t_paymentid from dpmdocs_dbt where t_applicationkey = ?");
+      cmd.addparam("appkey",RSDBP_IN,Документ.applicationkey);
+      rs=RSDRecordset(cmd);
+      if (rs.movenext)
+         makeMT103(int(rs.value(0)));
+      else
+         msgbox("Отсутствует связь проводки с платежом");
+      end;
+   elif (m == 1) // Корректировка шифра\вида
+      updateSK(Документ.AutoKey, Документ.kind_oper, Документ.shifr_oper, true, (Документ.Code_Currency > 0) );
+   elif (m == 2) //Корректировка очередности проводки
+      priority = Документ.priority;
+      pr = getint(priority, "Очередность");
+      if(pr)//если параметр изменили, обновляем базу
+         rs = rsdcommand("begin update darhdoc_dbt set t_priority = "+priority+" where t_autokey = "+Документ.autokey+"; commit; end; ");
+         rs.execute;
+      end; 
+   elif (m == 3) // Простановка типа СПОД
+      //vihrov 01.02.2011 чтоб не затирались другие типы новым сподом, а добавлялись, но не приписывались к квадратику
+      cmd = RSDCommand("UPDATE   darhdoc_dbt   SET   t_typedocument   = CASE WHEN (t_typedocument = CHR (1)) THEN 'З' ELSE TRIM (t_typedocument || 'З') END WHERE   t_autokey =  "+Документ.autokey);
+      cmd.Execute;
+   elif (m == 4) // Исправить проводку покрытия
+      cmd = RSDCommand("update darhdoc_dbt set t_result_carry = 1 where t_autokey = " + Документ.autokey);
+      cmd.Execute;
+   elif (m == 5) //Исправить проводку курсовой разницы
+      cmd = RSDCommand("update darhdoc_dbt set t_result_carry = 18 where t_autokey = " + Документ.autokey);
+      cmd.Execute;
+   elif (m == 6) // Замена операциониста на проводке\документе
+      strartoperchange(Документ.autokey,Документ.date_carry,Документ.oper,Документ.numb_document,false,Документ.Account_Payer);
+   end;
+
+   return 0;
+end;
+
+macro    Проверить_Счет_В_Мемордере( поле ) /*0-счет плательщика, 1-счет получателя*/
+   var новое_значение_счета;
+   if(поле) 
+      новое_значение_счета = Документ.Account_Receiver;
+   else 
+      новое_значение_счета = Документ.Account_Payer;
+   end;
+   return новое_значение_счета;
+end;
+
+/*
+ *      Функция установки подсказки для списка проводок
+ *              
+ *         параметр ScrollKind принимает значения:
+ *         - CARRY_SCROLL          - список проводок
+ *         - CARRY_SCROLL_PAYER    - список дебитовых проводок по счету
+ *         - CARRY_SCROLL_RECEIVER - список кредитовых проводок по счету
+ *
+ *      Если функция возвращает пустую строку, то используется хинт по умолчанию
+ */
+private macro УстановитьПодсказку( ScrollKind )
+    /* EVG Хинт для оптимизации времени вывода списка проводок по счёту */
+    return "/*+FIRST_ROWS INDEX(t DARHDOC_DBT_IDX2) INDEX(t DARHDOC_DBT_IDX3)*/";
+end;

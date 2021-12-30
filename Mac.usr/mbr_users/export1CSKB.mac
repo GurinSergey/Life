@@ -1,0 +1,604 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : export1CSKB.mac v.1 клон export1CRosCap.mac                                         */
+/*  Created     : 21.04.2016                                                   */
+/*  Programmer  : Дунаев А.И.                                                  */
+/*  Description : Выгрузка документов в файл формата 1С для отправки по        */
+/*                системе банк-клиент банка СКБ.                               */
+/*                                                                             */
+/*  Изменен     : 21.08.2015 Алешин В.В. Корректировка выгрузки полей файла    */
+/*              : 24.08.2015 Алешин В.В. Чистка. Корректировка выгрузки        */
+/*              : 24.08.2015 Golovkin    Адаптация к массовой обработке        */
+/*                                       в скроллинге                          */
+/*              : 26.08.2015 Алешин В.В. Добавил вывод в отчет имени файла     */
+/*                                       Включено закрытие шага                */
+/*              : 07.09.2015 Чесноков Д.С. Исправлена ошибка отката статуса    */
+/*                                         документа при откате шага           */
+/*******************************************************************************/
+import bankinter, rsd, PaymInter, likePy, globals;
+import SbCrdInter,RsExts,"lib_fg.mac";
+
+var INN_Bank_="0"; var KPP_Bank_ = "0";
+SplitFullINN (GetPartyINN({OurBank}, 1), INN_Bank_, KPP_Bank_);
+
+var Loro_Account_Schem_:string;
+var Length_Payer_XML_:integer = 700;
+var str_messageFileName_:string;
+
+private macro getSKBAccLoro()
+  private var cmd = rsdCommand("SELECT T_CORACCOUNT FROM DCORSCHEM_DBT WHERE T_NUMBER = 42 AND T_FIID = 0");
+  private var rs = rsdRecordset(cmd);
+  if(rs.movenext)
+    return rs.value("T_CORACCOUNT");
+  else
+    return null;
+  end;  
+end;
+
+macro getSKBPropsRub(bankName, corrAcc, bic, city)
+    private var sql = " SELECT   (SELECT   party.t_name "
+                      "             FROM   dparty_dbt party "
+                      "            WHERE   party.t_partyid = CORSCHEM.T_CORRID) Name, "
+                      "          (SELECT   adr.t_district "
+                      "             FROM   dadress_dbt adr "
+                      "            WHERE   adr.t_partyid = CORSCHEM.T_CORRID AND adr.t_type = 1) City, "
+                      "          NVL ((SELECT   code.t_code "
+                      "                  FROM   dobjcode_dbt code "
+                      "                 WHERE       CODE.T_OBJECTID = CORSCHEM.T_CORRID "
+                      "                         AND T_CODEKIND = 3 "
+                      "                         AND T_OBJECTTYPE = 3 "
+                      "                         AND T_STATE = 0 "
+                      "                         AND ROWNUM = 1),0) bik, "
+                      "          (SELECT   T_CORACC  "
+                      "             FROM   dbankdprt_dbt bankProps  "
+                      "            WHERE   bankProps.t_partyid = CORSCHEM.T_CORRID) corrAccRCC, "
+                      "          corschem.T_ACCOUNT ACCOUNT, "
+                      "          corschem.T_CORACCOUNT CORACCOUNT "
+                      "   FROM   DCORSCHEM_DBT corschem "
+                      "  WHERE   T_NUMBER in (42,43) AND T_FIID = 0 AND T_FI_KIND = 1 ";
+
+    private var rs = rsdRecordSet(sql);
+    
+    if(rs.movenext)
+        setparm(0, rs.value("Name") );
+        setparm(1, rs.value("corrAccRCC") );
+        setparm(2, rs.value("bik") );
+        setparm(3, rs.value("City") );
+    else
+        setparm(0, "" );
+        setparm(1, "" );
+        setparm(2, "" );
+        setparm(2, "" );
+    end;
+end;
+
+macro GetRCCInfo(BankID, BIC, Name, City)
+   private var sql = " SELECT  B.T_BIC_RCC BIC_RCC, "
+                     "        B.T_PLACENAME, "
+                     "        S.T_NAME NAME_RCC, "
+                     "        A.T_ADRESS ADRESS_RCC, "
+                     "        A.T_DISTRICT CITY_RCC "
+                     " FROM   dbankdprt_dbt b, "
+                     "        dobjcode_dbt c, "
+                     "        dparty_dbt s, "
+                     "        dadress_dbt a "
+                     " WHERE B.T_PARTYID = " + BankID +
+                     "       AND C.T_OBJECTTYPE = 3 "
+                     "       AND C.T_CODEKIND = 3 "
+                     "       AND C.T_CODE = B.T_BIC_RCC "
+                     "       AND S.T_PARTYID = C.T_OBJECTID "
+                     "       AND A.T_PARTYID = C.T_OBJECTID "
+                     "       AND A.T_TYPE = 1 ";
+
+    private var rs = rsdRecordSet(sql);
+    
+    if(rs.movenext)
+        setparm(1, rs.value("BIC_RCC") );
+        setparm(2, rs.value("NAME_RCC") );
+        setparm(3, rs.value("CITY_RCC") );
+    else
+        setparm(1, "" );
+        setparm(2, "" );
+        setparm(2, "" );
+    end;
+end;
+
+
+private macro savePaymentToLog(paymentid,filename)
+//usr_export_1c_log
+  private var cmd = rsdCommand("insert into usr_export_1c_log values(:paymentid, :filename, sysdate)");
+              cmd.addparam( "", RSDBP_IN, paymentid );
+              cmd.addparam( "", RSDBP_IN, filename );
+              cmd.execute();
+end;
+
+private macro correctDate(_date)
+  private var yyyy,mm,dd;
+  DateSplit( _date, dd, mm, yyyy );
+  return string( dd:2:o,".",mm:2:o,".",yyyy:4:o );
+end;
+
+private macro correctTime(_time)
+  private var hour, min, sec;
+  TimeSplit ( _time, hour, min, sec );
+  return string( hour:2:o,":",min:2:o,":",sec:2:o );
+end;
+
+private macro getExportStepId( idOp )
+    private var cmd,rs;
+    cmd = rsdCommand( "SELECT MAX (T_ID_STEP) MAXSTEP  FROM doprstep_dbt WHERE T_ID_OPERATION = :idop AND T_ISEXECUTE = 'R' AND  T_BLOCKID = 10000145 AND T_NUMBER_STEP = 190" );
+    cmd.addparam( "", RSDBP_IN, idOp );
+
+    rs = rsdRecordset( cmd );
+
+    if( rs.movenext ) return int( rs.value( "MAXSTEP" ) ); end;
+    return 0;
+onerror
+    return 0;
+end;
+
+macro execOperationStep( idOp, Number_Step )
+    private var cmd = RsdCommand( " BEGIN ? := RSI_RsbOperation.executeStepTrn(?, ?, ?, ?, ?, ?, ? ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  Number_Step        );
+    cmd.addparam( "", RSDBP_IN,  strFor( 88 )       );
+    cmd.addparam( "", RSDBP_IN,  {curdate}          );
+    cmd.addparam( "", RSDBP_IN,  {oper}             );
+    cmd.addparam( "", RSDBP_IN,  strFor( 0 )        );
+    cmd.addparam( "", RSDBP_IN,  strFor( 0 )        );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro insOprStatus( docKind, idOp, Number_Step, statusKind, statusValue )
+    private var cmd = RsdCommand( " BEGIN RSI_RsbOperation.SetOprStatusValueOnStep(?, ?, ?, ?, ?, ?); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  docKind            );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  statusKind         );
+    cmd.addparam( "", RSDBP_IN,  statusValue        );
+    cmd.addparam( "", RSDBP_IN,  Number_Step        );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro setClosePaymStatus( paymentid, operationid, dockind, Number_Step)
+    private var cmd = RsdCommand( " BEGIN ? := pm_common.changepmpropstatus( :paymentid, null, pm_common.pm_finished, null ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+    cmd.addparam( "", RSDBP_IN,  paymentid );
+    cmd.execute;
+    
+    cmd = RsdCommand( " BEGIN ? := pm_common.changepaymstatus( :paymentid, :status, :operationId, :idStep, :oper ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+    cmd.addparam( "", RSDBP_IN,  paymentid );
+    cmd.addparam( "", RSDBP_IN,  32000 );
+    cmd.addparam( "", RSDBP_IN,  operationid );
+    cmd.addparam( "", RSDBP_IN,  Number_Step );
+    cmd.addparam( "", RSDBP_IN,  {oper} );
+    cmd.execute;
+
+    if(dockind == 201)
+      cmd = RsdCommand( " BEGIN ? := ps_payord.ChangePayOrderStatus( :paymentid, :status, :operationId, :idStep, :oper, 'X' ); END; " );
+      cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+      cmd.addparam( "", RSDBP_IN,  paymentid );
+      cmd.addparam( "", RSDBP_IN,  15 );
+      cmd.addparam( "", RSDBP_IN,  operationid );
+      cmd.addparam( "", RSDBP_IN,  Number_Step );
+      cmd.addparam( "", RSDBP_IN,  {oper} );
+      cmd.execute;
+    elif(dockind == 16)
+      cmd = RsdCommand( " BEGIN ? := bb_bankpaym.changebankpaymstatus( :paymentid, bb_bankpaym.memorder_status_close, 0, 0 ); END; " );
+      cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+      cmd.addparam( "", RSDBP_IN,  paymentid );
+      cmd.execute;
+    elif(dockind == 27)
+      cmd = RsdCommand( " BEGIN ? := bb_cpord.ChangeCPOrderStatus( :paymentid, bb_cpord.cp_st_closed, :operationId, :idStep, :oper, 'X' ); END; " );
+      cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+      cmd.addparam( "", RSDBP_IN,  paymentid );
+      cmd.addparam( "", RSDBP_IN,  operationid );
+      cmd.addparam( "", RSDBP_IN,  Number_Step );
+      cmd.addparam( "", RSDBP_IN,  {oper} );
+      cmd.execute;
+    elif(dockind == 202)
+      cmd = RsdCommand( " BEGIN ? := ps_cpord.ChangeCPOrderStatus( :paymentid, ps_cpord.CP_ST_CLOSED, :operationId, :idStep, :oper, 'X' ); END; " );
+      cmd.addParam( "", RSDBP_OUT, V_INTEGER );
+      cmd.addparam( "", RSDBP_IN,  paymentid );
+      cmd.addparam( "", RSDBP_IN,  operationid );
+      cmd.addparam( "", RSDBP_IN,  Number_Step );
+      cmd.addparam( "", RSDBP_IN,  {oper} );
+      cmd.execute;
+    end;  
+
+    return cmd.Param(0).value;
+end;
+
+/* 07.08.2015 Чесноков Д.С. Записываем в таблицу doprdocs_dbt данные для отката  */
+/*   Дистрибутивная функция pm_common.changepmpropstatus данные действия для     */
+/*   единичного документа выполнять отказывается                                 */
+macro statusZapili( paymentid, operationid, Number_Step)
+  
+  private var cmd = RsdCommand(
+  " DECLARE                                                                                 " +
+  "   paymentid     NUMBER := :paymentid;                                                   " +
+  "   operationid   NUMBER := :operationid;                                                 " +
+  "   number_step   NUMBER := :number_step;                                                 " +
+  " BEGIN                                                                                   " +
+  "   INSERT INTO doprdocs_dbt (t_dockind, t_documentid, t_id_operation, t_id_step, t_part, " +
+  "                             t_status, t_origin, t_servdockind, t_servdocid, t_autokey,  " +
+  "                             t_launchoper, t_fmtblobdata_xxxx)                           " +
+  "   SELECT DISTINCT                                                                       " +
+  "          pm_common.dldoc_paymentpropstat,                                               " +
+  "             LPAD (prop.t_paymentid, 10, '0')                                            " +
+  "          || LPAD (prop.t_propstatus, 5, '0')                                            " +
+  "          || LPAD (pm_common.pm_finished, 5, '0')                                        " +
+  "          || LPAD (operationid, 8, '0')                                                  " +
+  "          || LPAD (number_step, 4, '0'),                                                 " +
+  "          operationid, number_step,                                                      " +
+  "          1, 0, 0, 0, 0, 0, CHR (0), NULL                                                " +
+  "   FROM dpmprop_dbt prop                                                                 " +
+  "   WHERE prop.t_paymentid = paymentid;                                                   " +
+  " END;                                                                                    ");
+  
+  cmd.addparam( "", RSDBP_IN,  paymentid );
+  cmd.addparam( "", RSDBP_IN,  operationid );
+  cmd.addparam( "", RSDBP_IN,  Number_Step );
+  cmd.execute;
+end;
+
+macro closePayment(paymentid, dockind)
+  rsldefcon.BeginTrans;
+
+  file operation( oproper ) key 1;
+       operation.DOCUMENTID = string( int( paymentid ):34:o );
+       operation.DOCKIND    = docKind;
+  
+  if(getEQ(operation))
+    var step_id = getExportStepId(operation.ID_OPERATION);
+    execOperationStep(operation.ID_OPERATION, step_id);
+    insOprStatus(docKind, operation.ID_OPERATION, step_id, 291, 3);
+    //Chesnokov D.S. Статус отката мне запили
+    statusZapili(paymentid, operation.ID_OPERATION, step_id);
+    setClosePaymStatus(paymentid, operation.ID_OPERATION, docKind, step_id);
+  end;
+
+  rsldefcon.CommitTrans;
+onerror
+    if( RSLDefCon.IsinTrans )
+        RSLDefCon.RollbackTrans;
+    end;
+end;
+
+
+class message1CSKB()
+  var messageText = "";
+
+  macro checkFiled(_fieldName, _fieldValue)
+    if((    (_fieldName == "ПоказательОснования") 
+         or (_fieldName == "ПоказательПериода")  
+         or (_fieldName == "ПоказательНомера")
+         or (_fieldName == "ПоказательДаты")
+         or (_fieldName == "ПоказательТипа")
+         or (_fieldName == "ОКАТО")
+         )
+      and (strLen(_fieldValue) == 0))
+      _fieldValue = 0;
+    
+    elif( (valtype(_fieldValue) == V_STRING) and (strLen(_fieldValue) == 0))
+      //return "empty";
+      return null;
+
+    elif(valtype(_fieldValue) == V_DATE)
+      _fieldValue = correctDate(_fieldValue);  
+    end;
+
+    return _fieldValue;
+  end;
+
+  macro addField(_fieldName, _fieldValue)
+    _fieldValue = checkFiled(_fieldName, _fieldValue);
+
+    if(_fieldValue != null)
+      messageText = messageText + _fieldName + "=" + _fieldValue + "\n";
+    end;
+  end;
+
+  macro printMessage
+    messageText = messageText + "КонецДокумента";
+    println(ToANSI(messageText,true));
+  end;
+end;
+
+macro createMessage(paymentid, payer_id_)
+  var payment = rsbPayment(paymentid);
+  var messageText = "";
+  var currentLine = "";
+  var SKBMessage = message1CSKB();
+  var docType = "Платежное поручение";
+  var SKBBankName = ""; 
+  var SKBCorrAcc = "";
+  var SKBBik = "";
+  var SKBBankCity = "";
+  var BIC_RCC = "";
+  var NameRCC = "";
+  var CityRCC = "";
+  
+  getSKBPropsRub(SKBBankName, SKBCorrAcc, SKBBik, SKBBankCity);
+
+  SKBMessage.addField("РасчСчет",Loro_Account_Schem_);
+  SKBMessage.addField("Документ",docType);
+
+  SKBMessage.addField("СекцияДокумент",docType);
+  SKBMessage.addField("Номер",payment.Number);
+  SKBMessage.addField("Дата",payment.OutTransferDate);
+  SKBMessage.addField("Сумма",payment.PayerAmount);
+
+  /** 
+   * Плательщик 
+   */
+  SKBMessage.addField("ПлательщикСчет",Loro_Account_Schem_);
+  
+  var payerINN = split(payment.PayerINN,"/")[0];
+  if(strLen(payerINN)==0)
+    payerINN = 0;
+  end;
+  
+  var payerKPP = split(payment.PayerINN,"/")[1];
+  if(strLen(payerKPP)==0)
+    payerKPP = 0;
+  end;
+
+  var payer_Name_1 = trim(payment.PayerName) + " ИНН " + payerINN + " КПП " + payerKPP + " р/с " + payment.PayerAccount + " в " + trim(payment.PayerBankName);
+  var payer_str_inn_kpp_bank = "ИНН " + INN_Bank_ + "/" + KPP_Bank_;
+
+  SKBMessage.addField("Плательщик",payerINN + " " + trim(payment.PayerName));
+  SKBMessage.addField("ПлательщикИНН",payerINN);
+  //SKBMessage.addField("ПлательщикКПП",payerKPP);
+  SKBMessage.addField("Плательщик1",trim(payment.PayerName));
+  SKBMessage.addField("ПлательщикРасчСчет",Loro_Account_Schem_);
+  SKBMessage.addField("ПлательщикБанк1",SKBBankName);      
+  SKBMessage.addField("ПлательщикБанк2",SKBBankCity);
+  SKBMessage.addField("ПлательщикБИК",SKBBik);
+  SKBMessage.addField("ПлательщикКорсчет",SKBCorrAcc);
+
+  /** 
+   * Получатель 
+   */
+  SKBMessage.addField("ПолучательСчет",payment.ReceiverAccount);
+
+  var receiverINN = split(payment.ReceiverINN,"/")[0];
+  if(strLen(receiverINN)==0)
+    receiverINN = 0;
+  end;
+
+  var receiverKPP = split(payment.ReceiverINN,"/")[1];
+  if(strLen(receiverKPP)==0)
+    receiverKPP = 0;
+  end;
+
+  SKBMessage.addField("Получатель",payment.ReceiverName);
+  SKBMessage.addField("ПолучательИНН",receiverINN);
+  //SKBMessage.addField("ПолучательКПП",receiverKPP);
+  //SKBMessage.addField("Получатель","ИНН " + payment.ReceiverINN + " " + payment.ReceiverName);
+  SKBMessage.addField("Получатель1",payment.ReceiverName);
+  SKBMessage.addField("ПолучательРасчСчет",payment.ReceiverAccount);
+
+  GetRCCInfo(payment.ReceiverBankID, BIC_RCC, NameRCC, CityRCC);
+
+  SKBMessage.addField("ПолучательБанк1",NameRCC);
+  SKBMessage.addField("ПолучательБанк2",CityRCC);  
+  SKBMessage.addField("ПолучательБИК",BIC_RCC);
+  SKBMessage.addField("ПолучательКорсчет",payment.ReceiverCorrAccNostro);
+
+  //SKBMessage.addField("ВидПлатежа","ЭЛЕКТРОННО");
+  SKBMessage.addField("ВидОплаты",payment.ShifrOper);
+  SKBMessage.addField("СтатусСоставителя",payment.TaxAuthorState);
+  SKBMessage.addField("ПлательщикКПП",payerKPP);
+  SKBMessage.addField("ПолучательКПП",receiverKPP);
+  SKBMessage.addField("ПоказательКБК",payment.BttTICode);
+  SKBMessage.addField("ОКАТО",payment.OKATOCode);
+  SKBMessage.addField("ПоказательОснования",payment.TaxPmGround);
+  SKBMessage.addField("ПоказательПериода",payment.TaxPmPeriod);
+  SKBMessage.addField("ПоказательНомера",payment.TaxPmNumber);
+  SKBMessage.addField("ПоказательДаты",payment.TaxPmDate);
+  SKBMessage.addField("ПоказательТипа",payment.TaxPmType);
+  SKBMessage.addField("Очередность",payment.Priority);
+  /*
+  if (trim(string(payment.UIN)) == "")
+    SKBMessage.addField("Код","0");
+  else
+    SKBMessage.addField("Код",payment.UIN);
+  end;
+  SKBMessage.addField("НазначениеПлатежа",payment.Ground);
+  */
+  SKBMessage.printMessage();
+end;
+
+/**
+ * Подготовка к выгрузке платежей
+ */
+macro prepareToExport()
+  debugbreak;
+  /**
+   * Очищаем временную таблицу 
+   */ 
+  rsdCommand("truncate table usr_roscap_payments_tmp;").execute();
+  return 0;
+end;
+
+/**
+ * Добавляем платеж во временную таблицу
+ */
+macro addPaymentForExport(pmpaym)
+  private var sql = "INSERT INTO usr_roscap_payments_tmp VALUES(:paymentid,null)";
+  private var cmd = RsdCommand(sql);
+              cmd.addParam("", RSDBP_IN, pmpaym.paymentid);
+              cmd.execute();
+  return 0;
+end;
+
+macro getMinMaxDatesAndCount(sql, dateBegin, dateEnd)
+  sql = " SELECT   count(*) PAYM_COUNT, MAX (prop.t_TransferDate) DATE_END, MIN (prop.t_TransferDate) DATE_BEGIN" + sql;
+  private var rs = rsdRecordSet(sql);
+  if(rs.movenext)
+    setparm(1, int (rs.value("PAYM_COUNT")) );
+    setparm(2, date(rs.value("DATE_BEGIN")) );
+    setparm(3, date(rs.value("DATE_END"  )) );
+  else
+    setparm(1, 0 );
+    setparm(2, {CurDate} );
+    setparm(3, {CurDate} );    
+  end;
+end;
+
+/**
+ * Сохраняем результат для протокол
+ */
+macro saveResult(paymentid, resultText)
+  private var sql = " update usr_roscap_payments_tmp set t_result = :resultText where t_paymentid = :paymentid ";
+  private var cmd = RsdCommand(sql);
+              cmd.addParam("", RSDBP_IN, resultText);
+              cmd.addParam("", RSDBP_IN, paymentid);
+              cmd.execute();
+end;
+
+/**
+ * Показать протокол выгрузки
+ */
+macro getResultReport()
+    private var messageFileName = "SKBExportReport"; 
+
+    private var messageFileNameTXT = GetTXTFileName(messageFileName);
+
+    private var sql = " SELECT   RMPROP.T_NUMBER, "
+                      "          PMPAYM.T_PAYERACCOUNT, "
+                      "          PMPAYM.T_RECEIVERACCOUNT, "
+                      "          PMPAYM.T_AMOUNT, "
+                      "          RMPROP.T_GROUND, "
+                      "           prop.T_CORSCHEM, "
+                      "          nvl(ROSCAP.T_RESULT,'Не выгружен') T_RESULT "
+                      "   FROM   usr_roscap_payments_tmp roscap, "
+                      "          dpmpaym_dbt pmpaym, "
+                      "          dpmrmprop_dbt rmprop, "
+                      "          dpmprop_dbt prop   "
+                      "  WHERE   roscap.t_paymentid = pmpaym.t_paymentid "
+                      "          AND pmpaym.t_paymentid = rmprop.t_paymentid "
+                      "          AND pmpaym.t_paymentid = prop.t_paymentid "
+                      "          AND prop.T_DEBETCREDIT = 1 ";
+
+    private var rs = rsdRecordSet(sql);
+
+    SetOutput(messageFileNameTXT,false);
+    [#](String("Файл выгрузки: ", str_messageFileName_));
+    [ ┌───────────┬──────────────────────────────┬──────────────────────────────┬───────────────┬────────────────────────────────────────────────┬────────────┬───────────────────────────────────────────┐
+      │     №     │      Счет плательщика        │      Счет получателя         │     Сумма     │                  Основание                     │ Кор. схема │                  Результат                │
+      ├───────────┼──────────────────────────────┼──────────────────────────────┼───────────────┼────────────────────────────────────────────────┼────────────┼───────────────────────────────────────────┤
+    ];
+
+    while(rs.movenext)
+    [ │ ######### │ ############################ │ ############################ │ ############# │ ############################################## │ ########## │ ######################################### │]
+
+    (rs.value("T_NUMBER"):c, rs.value("T_PAYERACCOUNT"):c, rs.value("T_RECEIVERACCOUNT"):c, rs.value("T_AMOUNT"):l, rs.value("T_GROUND"):l:w, int(rs.value("T_CORSCHEM")):c, rs.value("T_RESULT"):l:w);
+    end;                                                                                                                                                                                           
+
+    [ └───────────┴──────────────────────────────┴──────────────────────────────┴───────────────┴────────────────────────────────────────────────┴────────────┴───────────────────────────────────────────┘];
+
+    SetOutput(null,false);
+    ViewFile(messageFileNameTXT);
+end;
+
+macro exportPayments
+debugbreak;
+    private var dateBegin = {CurDate}, dateEnd = {CurDate};
+    
+    /**
+     * Основной запрос
+     */
+    var mainQuery = "  FROM   dpmpaym_dbt paym, "
+                    "         dpmprop_dbt prop, "
+                    "         doprstep_dbt step, "
+                    "         doproper_dbt oper, "
+                    "         usr_roscap_payments_tmp roscap "
+                    " WHERE       paym.t_paymentid = prop.t_paymentid "
+                    "         AND paym.t_paymentid = roscap.t_paymentid "
+                    "         AND paym.t_dockind IN (16, 201, 320, 322) "
+                    "         AND prop.T_PROPSTATUS = 3000 "
+                    "         AND oper.T_DOCUMENTID = LPAD (paym.t_paymentid, 34, 0) "
+                    "         AND oper.T_ID_OPERATION = STEP.T_ID_OPERATION "
+                    "         AND oper.t_dockind = paym.t_dockind "
+                    "         AND step.T_ISEXECUTE = 'R' "
+                    "         AND step.T_BLOCKID = 10000145 "
+                    "         AND step.t_number_step = 190 "
+                    "         AND prop.T_DEBETCREDIT = 1 "
+                    "         AND prop.T_CORSCHEM IN (42, 43) ";
+
+    /**
+     * Получаем период и количество документов
+     */ 
+    var docCount;
+    getMinMaxDatesAndCount(mainQuery, docCount, dateBegin, dateEnd);
+
+    var cmd = rsdCommand(" SELECT prop.T_CORSCHEM, paym.* " + mainQuery);
+    var rs = rsdRecordset(cmd);
+
+    var messageFileName;
+    GenerateReference(1000777,messageFileName); 
+
+    var messageFileNameTXT = GetTXTFileName(messageFileName);
+
+    var strHead = ToANSI("1CClientBankExchange\n"                    +
+                         "ВерсияФормата=1.02\n"                      +
+                         "Кодировка=Windows\n"                       +
+                         "Отправитель=RS-BankV6\n"                   +
+                         "Получатель=ДБО BS-Client\n"  +
+                         "ДатаСоздания="  + correctDate(date)   + "\n"+
+                         "ВремяСоздания=" + correctTime(time)   + "\n"+
+                         "ДатаНачала=" + correctDate(dateBegin) + "\n"+
+                         "ДатаКонца="  + correctDate(dateEnd)   + "\n",true); 
+
+    If (docCount == 0)
+      println("ничего не выгрузилось");
+    Else
+      var dialogMode = SetDialogFlag(1);
+
+      SetOutput(messageFileNameTXT,false);
+      print(strHead);
+      Loro_Account_Schem_ = getSKBAccLoro();
+
+      InitProgress( docCount, "Выгрузка документов", "Выгрузка документов");
+
+      var i = 0;
+      while(rs.movenext)
+        createMessage(rs.value("t_paymentid"),rs.value("t_payer") );
+        closePayment(rs.value("t_paymentid"),rs.value("t_dockind"));
+        savePaymentToLog(rs.value("t_paymentid"),messageFileName);
+        saveResult(rs.value("t_paymentid"), "Платеж выгружен");
+        i = i + 1 ;
+        UseProgress (i);
+      end;
+      RemProgress;
+      
+      print(ToANSI("КонецФайла",true));
+      SetOutput(null,false);
+
+      str_messageFileName_ = string(messageFileName, ".txt");
+
+      getResultReport();
+      SetDialogFlag(dialogMode);
+
+      if(_bank.is_EXV)
+        rs = rsdRecordset("select t_exportdir from dwltpfrmt_dbt where t_tpid = 66");
+      end;
+
+      if(rs.movenext)
+        var exportDir = rs.value("t_exportdir");
+        if(not copyFile(messageFileNameTXT,exportDir + "\\" + str_messageFileName_))
+          println( "Не удалось скопировать файл в папку экспорта: ", string(exportDir,"\\",str_messageFileName_) );
+        end;  
+      end;
+
+    End;
+
+    return 0;
+end;

@@ -1,0 +1,675 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*                          Импорт  сообщений                               */
+/*                                                                          */
+/*  Имя файла: wlmnsimp.mac                                                 */
+/*  Создан:  01.12.04                                      Фомченкова Л.Н.  */
+/*  Изменено : 01.12.2011                                    Чесноков Д.С.  */
+/*  Заявка   : С-7026                                                       */
+/*  Изменения: Привел формирование TRN к единому виду для RPO, ROO          */
+/*             03.12.2012 Chesnokov D.S. I-00294408 добавил расширенную     */
+/*             информацию в случае отказа загрузки дублей                   */
+/*             15.11.2013 chesnokov D.S. I-00438817 привел формирование     */
+/*             учетных объектов к единому виду. Теперь при ошибке в файле   */
+/*             формируется сообщение вида ERR                               */
+/****************************************************************************/
+
+import "wlimport.mac", "wlgenmes.mac", "wlmnstls.mac", BankInter, "wllog.mac";
+import "likepy.mac", "fns_const.mac", "WL_CheckFNSMessageInter.mac","fns_lib.mac";
+
+ /* Общие глобализмы */
+var ВидСообщения = "";
+var КолБлоков = 0;
+var ИмяБлока = "";
+
+var Форма, ИмяФормы, ИмяФайла, Дата;
+
+var ErrFileName = TArray();//Ошибки имени файла
+var ErrRSL = TArray();//Ошибки обработки
+var ErrStruct = Tarray();
+
+var TpShemID, RespID, TRN, Релиз, Отправитель;
+
+var ВидРегОргана = 0;
+var ВидСправки = "";
+var FormName = "";
+var BIC_fldval = "";
+var DeptNum_fldval = "";
+var NumberOfLines = 0;
+
+const КолБлоковZNO = 2, 
+      КолБлоковErr = 2,
+      КолБлоковPOB = 2,
+      КолБлоковIPB = 1, 
+      БлокZNO = "Счет",
+      БлокPNO = "ПорПрВал",
+      БлокERR = "Ошибка",
+      БлокIPB = "ХарОш",
+      БлокPOB = "ХарОш",
+      БлокСчет = "Счет",
+      БлокСтрИзв = "СтрокаИзвещения";
+                  
+                  
+var ОшибкаФорматаИмениФайлаZNO = string("Неверный формат имени файла. Должно быть:\n",
+"'ZNOabbbbbbb_KKKKГГГГММДД_НННННН.txt', где:\n",
+"ZNO     - форма сообщения,\n", 
+"a       - номер зашифрованного файла,\n",
+"bbbbbbb - код банка (с 3 по 9 разряды) БИК,\n",
+"КККК    - код налогового органа, взаимодействующего с банком,\n",
+"ГГГГ    - год,\n", 
+"ММ      - месяц,\n", 
+"ДД      - число,\n"
+"НННННН  - номер файла с лидирующими нулями.");
+      
+var ОшибкаФорматаИмениФайла = string("Неверный формат имени файла. Должно быть:\n",
+"'ФФФИИИИГГГГММДДНННННН.txt', где:\n",
+"ФФФ    - форма сообщения,\n", 
+"ИИИИ   - код налогового органа - отправителя,\n",
+"КККК - код налогового органа, взаимодействующего с банком,\n",
+"ГГГГ   - год,\n", 
+"ММ     - месяц,\n", 
+"ДД     - число,\n"
+"НННННН - номер файла с лидирующими нулями.");
+
+class TError(_TextErr)
+
+  var TextErr = _TextErr;
+end;
+
+/* EVG 21/03/2014 Функция разбора даты, используемая при импорте сообщений ФНС по 365-П */
+private macro ToDate_zno( strYYYYMMDD )
+  return date( int(substr(strYYYYMMDD, 7, 2)), int(substr(strYYYYMMDD, 5, 2)), int(substr(strYYYYMMDD, 1, 4)) );
+end;
+
+
+macro ОбработатьПоле(Блок, Строка)
+  var ind = Index(Строка, ":"), кодПоля, поле;
+  if (FormName != ФормаKWT)
+    if(ind == 0)
+      ErrImport(string("Неверный формат поля: ", Строка));
+      return false;
+    end;
+    кодПоля = SubStr(Строка, 1, ind - 1);
+    поле = SubStr(Строка, ind + 1);
+  else
+    кодПоля = "_СтрокаИзвещения";
+    поле = Строка;    
+  end;
+  if(кодПоля == "ДатаПолСооб") 
+    кодПоля = "ДатаПлСооб";
+  elif(кодПоля == "НомСч")
+    Блок = БлокСчет;
+  elif(кодПоля == "БИК")
+    BIC_fldval = поле;
+  elif(кодПоля == "НомФ")
+    DeptNum_fldval = поле;
+  end;
+  if (поле != "")
+    ЗаписатьПолеЛогВБлок( Блок, кодПоля, поле);
+  end;
+  return true;
+end;
+
+private macro getPartyIDFromBICandDeptNum(BIC : string, DeptNum : string) : integer
+  // Найти субъект party, где:
+  // - код вида 3 равен значению поля "БИК" с учетом иерархии 
+  // - с заданным кодом вида 13
+  // - Если значение поля "НомФ" = "0", то:
+  //   В коде вида 13 нет символов после слеша 
+  //   Иначе
+  //   Символы после слеша в коде вида 13 равны значению поля "НомФ"
+  var qGetPartyByBIC : string =
+      "select pcBIC.t_PartyID, pc13.t_Code " +
+      "from (select pc.t_PartyID, pc.t_Code " +
+      "      from dpartcode_dbt pc " +
+      "      where pc.t_CodeKind = " + string(PTCK_BIC) +
+      "        and pc.t_Code = :BIC " +
+      "      union " +
+      "      select dp.t_PartyID, pc1.t_Code " +
+      "      from dpartcode_dbt pc1, " +
+      "           ddp_dep_dbt dp " +
+      "      where pc1.t_CodeKind(+) = " + string(PTCK_BIC) +
+      "        and pc1.t_Code(+) = :BIC1 " +
+      "        and pc1.t_PartyID(+) = dp.t_PartyID " +
+      "      start with dp.t_PartyID = pc1.t_PartyID " +
+      "      connect by dp.t_ParentCode = prior dp.t_Code " +
+      "     ) pcBIC, " +
+      "      dpartcode_dbt pc13 " +
+      "where pc13.t_PartyID = pcBIC.t_PartyID " +
+      "  and pc13.t_CodeKind = " + string(PTCK_BANKREGNUM) +
+      "  and ( :DepNum = '0' and " +
+      "        (instr(pc13.t_Code, '/') = 0 or instr(pc13.t_Code, '/') = length(pc13.t_Code)) " +
+      "      or " +
+      "        substr(pc13.t_Code, instr(pc13.t_Code, '/') + 1) = :DepNum1 " +
+      "      ) ";
+  var params : TArray = makeArray( SQLParam("BIC", BIC),
+                                   SQLParam("BIC1", BIC),
+                                   SQLParam("DepNum", DeptNum),
+                                   SQLParam("DepNum1", DeptNum) );
+  var rs : RsdRecordset = execSQLselect(qGetPartyByBIC, params, true);
+  
+  if ( (rs) and (rs.moveNext) )
+
+    // Найти филиал dp_dep, где dp_dep.partyID = party.partyID
+    var PartyIDinstr : string = string(rs.value("t_PartyID"));
+    while (rs.moveNext)
+      PartyIDinstr = PartyIDinstr + ", " + rs.value("t_PartyID");
+    end;
+    var qIsPartyIDInTS = "select t.t_PartyID "
+                         "  from ddp_dep_dbt t "
+                         " where t.t_PartyID in ( " + PartyIDinstr + " ) ";
+    var rs1 : RsdRecordset = execSQLselect(qIsPartyIDInTS);
+
+    if ( (rs1) and (rs1.moveNext) )
+      return rs1.value("t_PartyID");      
+    else
+      ErrImport(string("Получатель сообщения ", BIC, " не является филиалом нашего банка") );
+      return -1;
+    end;
+
+  else
+
+    ErrImport(string("По БИК ", BIC, " и номеру филиала ", DeptNum, 
+                     " не удалось определить получателя сообщения") );
+    return -1;
+
+  end;
+
+end;
+
+private macro getOutsideAbonentDateKWT()
+  ПерейтиВНачалоФайла();
+  var Длина = МаксимальнаяДлинаСтроки, Строка = "";
+  for (var i:integer, 1, NumberOfLines - 2, 1)
+    Строка = СчитатьСтроку( Длина );
+  end; // третья строка с конца файла 
+  Строка = subStr(Строка, 1, 10); // YYYY-MM-DD
+  Строка = strSubst(Строка, "-", ""); // YYYYMMDD
+
+  return ToDate_zno( Строка );
+end;
+
+/***************************************************************************/
+/*  Функция считывания сообщения МНС                                       */
+/*  Возвращает:                                                            */
+/*             0 - все ОК                                                  */
+/*             1 - сообщение не найдено                                    */
+/*             2 - найден конец файла                                      */
+/*            -1 - ошибка при обработке сообщения (ругается сама)          */
+/***************************************************************************/
+macro ОбработатьСообщение(ИмяФайла, TypeErr)
+
+  /* Вспомогательные переменные */
+  var result = 0, Строка;
+  var continue0 = 1, Длина, КоличествоБлоков = 0, Блок = "..", КоличествоФрагментов = 0;
+  NumberOfLines = 0;
+  var i = 0;
+  /* Последовательно читаем поля сообщения */
+  if (ValType(TypeErr) == V_Undef)
+    while( continue0 )
+       Длина = МаксимальнаяДлинаСтроки;
+       строка = СчитатьСтроку( Длина );
+       if( (Длина == КонецФайла) OR (Длина == 0) )
+          ErrImport("Неожиданный конец файла");
+         return -1;
+       end;
+       NumberOfLines = NumberOfLines + 1;
+       if((Строка == МНС_КонецФайла))
+          continue0 = 0;
+       end;
+       if(Строка == МНС_КонецФрагмента)
+         КоличествоФрагментов = КоличествоФрагментов + 1;
+       end;
+       if((Строка == МНС_КонецБлока) and (КоличествоФрагментов > 0)) // подсчитывать блоки начинаем после первого фрагмента (служебная часть)
+         КоличествоБлоков = КоличествоБлоков + 1;
+       end;
+       if((Строка != МНС_КонецБлока) and (Строка != МНС_КонецФайла) and (Строка != МНС_КонецФрагмента))
+         if(КоличествоБлоков == КолБлоков)
+           Блок = ИмяБлока;
+         end;
+         if( not ОбработатьПоле( Блок, Строка ) )
+           return -1;
+         end;
+       end;
+    end;
+
+    if ((FormName == ФормаZNO) or (FormName == ФормаRPO) or (FormName == ФормаROO))
+
+      var InsideAbonentID = getPartyIDFromBICandDeptNum(BIC_fldval, DeptNum_fldval);
+      if (InsideAbonentID > 0)
+        wlmes.InsideAbonentID = InsideAbonentID;
+        wlmes.InsideAbonentCodeKind = PTCK_BIC;
+        wlmes.InsideAbonentCode = BIC_fldval;
+        ОбновитьЗапись(wlmes);
+      else
+        return -1;
+      end;
+
+    elif (FormName == ФормаKWT)
+      wlmes.OutsideAbonentDate = getOutsideAbonentDateKWT();
+      ОбновитьЗапись(wlmes);
+    end;
+
+    if( ( result == 0 ) and ( ВидСправки != "" ) )
+      ЗаписатьПолеЛогВБлок( "..", "_ВидСправ", ВидСправки);
+    end;
+    if( ВидРегОргана )
+      ЗаписатьПолеЛогВБлок( "..", "_ВидРегОргана", string(ВидРегОргана));
+    end;
+  
+  else
+  
+    Строка = "ИмяВхФайла:" + ИмяФайла;
+    if( not ОбработатьПоле( Блок, Строка ) )
+      return -1;
+    end;
+  
+    Строка = "ТипОтв:" + TypeErr;
+    if( not ОбработатьПоле( Блок, Строка ) )
+      return -1;
+    end;
+
+    Строка = "ДатаПроверки:" + ToDateStr();
+    if( not ОбработатьПоле( Блок, Строка ) )
+      return -1;
+    end;
+
+    Строка = "ВремяПроверки:" + Time();
+    if( not ОбработатьПоле( Блок, Строка ) )
+      return -1;
+    end;
+
+    Блок = БлокERR;
+    while (i < ErrFileName.size)
+      Строка = "ОшСооб:" + ErrFileName(i);
+      if( not ОбработатьПоле( Блок, Строка ) )
+        return -1;
+      end;
+      i = i + 1;
+    end;
+  end;
+  return result;
+end;
+
+private macro GetOutSideAbonentTime()
+
+   ПерейтиВНачалоФайла(); // поле ИдФайл первое
+   var Длина = МаксимальнаяДлинаСтроки,
+       Строка = СчитатьСтроку( Длина );
+
+   var ind = Index(Строка, ":"), кодПоля, поле;
+   if(ind > 0)
+     кодПоля = SubStr(Строка, 1, ind - 1);
+     поле    = SubStr(Строка, ind + 1);
+     if( кодПоля == "ИдФайл" )                            
+       return time( int(SubStr( поле, 30, 2 )), int(SubStr( поле, 32, 2 )), int(SubStr( поле, 34, 2 )) );
+     end;
+   end;
+   return time(0,0,0);
+end;
+
+private macro ОпределитьИмяФормы( ИмяФайла )
+
+  var ИмяФормы = StrUpr( SubStr( ИмяФайла, 1, 3 ) );
+
+  if((ИмяФормы=="SBE") or (ИмяФормы=="SBF") or (ИмяФормы=="SBK") or (ИмяФормы=="KWT"))
+    ВидРегОргана = 7;//REG_ORGAN_KIND_FNS;
+  elif((ИмяФормы=="SBP") or (ИмяФормы=="SBN") )
+    ВидРегОргана = 11;//REG_ORGAN_KIND_PFR;
+  elif((ИмяФормы=="SBR") or (ИмяФормы=="SBT") )
+    ВидРегОргана = 52;//REG_ORGAN_KIND_FSS;
+  end;
+
+
+  if((ИмяФормы=="SBE") or (ИмяФормы=="SBP") or (ИмяФормы=="SBR"))
+    ИмяФормы = "SBF";
+  elif((ИмяФормы=="SBN") or (ИмяФормы=="SBT") )
+    ИмяФормы = "SBK";
+  elif( (ИмяФормы=="ZNS") or (ИмяФормы=="ZOS") or (ИмяФормы=="ZVS") )
+    ИмяФормы = "ZNS";
+    ВидСправки = SubStr( ИмяФайла, 2, 2 );
+  end;
+  return ИмяФормы;
+end;
+
+private macro GetBIC_RCC( PartyID )
+  f_wldprt.PartyID = PartyID;
+  if( not GetEQ(f_wldprt))
+    RunError( "|Не найдена запись в справочнике отделений банков с ID = " + PartyID );
+  end;
+  return f_wldprt.BIC_RCC;
+end;
+
+/*
+SBCXabbbbbbb_LLLLDDDDDDDD_RRRRFFFFGGNNNNNN_MMM.
+RXXabbbbbbb_ККККDDDDDDDD_NNNNNN,
+TRBabbbbbbb_KKKKDDDDDDDD_NNNNNN,
+ZNOabbbbbbb_KKKKDDDDDDDD_NNNNNN,
+KWTFCB_P*/
+macro РазобратьИмяФайла(ПолноеИмяФайла, Транспорт)
+
+  var НОБанка, error, ДатаОтправки, БанкПолучатель, continue0, Расширение, 
+  Получатель = "",  RespCode = "", RespCodeKind, НомерЗапроса, ТипФайла;
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  SplitFile( ПолноеИмяФайла, ИмяФайла, Расширение );
+  ИмяФормы = ОпределитьИмяФормы( ИмяФайла );
+  
+  if (ИмяФормы == ФормаZNO)
+    if(StrLen(ИмяФайла) != 31)
+       ErrImport( "Ошибка длинны имени файла. Длинна имени файла не соответствует длинне шаблона ZNOabbbbbbb_KKKKГГГГММДД_НННННН.txt" );
+       ErrFileName(ErrFileName.size) = TError("14;Ошибка длинны имени файла. Длинна имени файла не соответствует длинне шаблона ZNOabbbbbbb_KKKKГГГГММДД_НННННН.txt");
+    end;
+
+    if(IsDigitalNumber(ИмяФормы) == 0)
+       ErrImport( string("Ожидается буквенный код формата ZNO, пришел код: " + ИмяФормы));
+       ErrFileName(ErrFileName.size) = TError(string("14;Ожидается буквенный код формата ZNO, пришел код: " + ИмяФормы));
+       //return false;
+    end;
+
+    if (ИмяФормы == ФормаZNO)
+        ИмяБлока = БлокZNO;
+        КолБлоков = КолБлоковZNO;
+    end;
+
+    Форма = ОпределитьФорму( Транспорт, ИмяФормы, ВидСообщения );
+    if ( Форма == -1 )
+       ErrImport( string("Не найдена форма с кодом ", ИмяФормы) );
+       ErrRSL(ErrRSL.size) = string("Не найдена форма с кодом ", ИмяФормы);
+       //return false;
+    end;
+
+    ТипФайла = SubStr(ИмяФайла, 4, 1);
+    if(IsDigitalNumber(ТипФайла) == 1)
+       ErrImport( string("Ожидается числовое значение типа файла, пришло значение: " + ТипФайла));
+       ErrFileName(ErrFileName.size) = TError(string("14;Ожидается числовое значение типа файла, пришло значение: " + ТипФайла));
+       //return false;
+    end;
+
+    БанкПолучатель = SubStr(ИмяФайла, 5, 7);
+    if(IsDigitalNumber(БанкПолучатель) == 1)
+       ErrImport(string("Ожидается числовое значение БИК, пришло значение: " + БанкПолучатель));
+       ErrFileName(ErrFileName.size) = TError(string("14;Ожидается числовое значение БИК, пришло значение: " + БанкПолучатель));
+       //return false;
+    end;
+
+    Отправитель = SubStr(ИмяФайла, 13, 4);
+    if(IsDigitalNumber(Отправитель) == 1)
+       ErrImport(string("Ожидается числовое значение кода налогового органа, пришло значение: " + Отправитель));
+       ErrFileName(ErrFileName.size) = TError( string("14;Ожидается числовое значение кода налогового органа, пришло значение: " + Отправитель));
+       //return false;
+    end;
+    
+    RespID = ПолучитьКодСубъекта( Отправитель, PTCK_MNS, error );
+    if ( error )
+       ErrImport( string("Не найден субъект с кодом ", Отправитель) );
+       ErrRSL(ErrRSL.size) = string("Не найден субъект с кодом ", Отправитель);
+       RespID = 0;
+       // Получить налоговую по умолчанию
+       //return false;
+    end;
+
+    НомерЗапроса = Substr(ИмяФайла, 26, 6);
+    if(IsDigitalNumber(НомерЗапроса) == 1)
+       ErrImport( ОшибкаФорматаИмениФайлаZNO );
+       ErrFileName(ErrFileName.size) = TError( string("14;Номер запроса должен содержать только числовые символы"));
+       //return false;
+    end;
+
+    ДатаОтправки = SubStr(ИмяФайла, 17, ДлинаДаты);
+    if(IsDigitalNumber(ДатаОтправки) == 1)
+       ErrImport( ОшибкаФорматаИмениФайлаZNO );
+       ErrFileName(ErrFileName.size) = TError( string("14;Дата отправки файла должна содержать только числовые символы"));
+       //return false;
+    end;
+    
+    Дата = ToDate_zno( ДатаОтправки );
+   
+    TpShemID = ОпределитьТранспортнуюСхему(RespID, -1, -1, Транспорт, Форма, Релиз, NULL, NULL, wlsess.TpFrmtID);
+    if ( TpShemID == -1 )
+      ErrRSL(ErrRSL.size) = "Не удалось определить траспортную схему";
+      //return false;
+    end;
+    /*10.08.2012 Chesnokov D.S. Проверять наличие таких же файлов надо по TRN*/
+    TRN = StrSubSt( StrSubSt( ИмяФайла, "_", "" ), SubStr( {MFO_Bank}, 3, 7 ), "" );
+
+    /* Если уже было такое сообщение от корреспондента - не закачиваем */
+    select = "select mes.* from dwlmes_dbt mes "+
+             "where  mes.t_Direct='X' and "
+                    "mes.t_Department =:OperD and "+ 
+                    "mes.t_TRN =:NumberDoc and "+
+                    "mes.t_RlsFormID = :RlsFormID";  
+    params = makeArray( SQLParam("OperD",     {OperDprt}),
+                        SQLParam("NumberDoc", TRN),
+                        SQLParam("RlsFormID", Релиз) );
+
+    rs = execSQLselect( select, params, FALSE );
+
+    continue0 = rs.MoveNext();
+    while( continue0 )
+      if( rs.value("t_rlsformid") == Релиз )
+        std.out( 1, "Cообщение уже было принято - игнорируется.\n Параметры сообщения загруженного ранее:\n Номер сообщения: " + rs.value("t_mesid") +
+                "\n Операционный день: " + rs.value("t_bankdate", null, V_DATE) + "\n Номер/Референс: " + rs.value("t_TRN"));
+        return false;
+      end;
+      continue0 = rs.MoveNext();
+    end;
+    
+  else
+
+    if(ИмяФормы == "")
+       ErrImport( ОшибкаФорматаИмениФайла );
+       return false;
+    else
+      FormName = ИмяФормы;
+    end;
+
+    Форма = ОпределитьФорму( Транспорт, ИмяФормы, ВидСообщения );
+    if ( Форма == -1 )
+       ErrImport( string("Не найдена форма с кодом ", ИмяФормы) );
+       return false;
+    end;
+
+    if((ИмяФормы == ФормаRPO) or (ИмяФормы == ФормаROO) or (ИмяФормы == ФормаZNS) 
+       or (ИмяФормы == ФормаZNO) 
+      )
+        ИмяБлока = БлокСчет;
+        КолБлоков = 1;
+    elif(ИмяФормы == ФормаKWT)
+        ИмяБлока = БлокСтрИзв;
+        КолБлоков = 0;
+    elif(ИмяФормы == ФормаPNO)
+        ИмяБлока =   БлокPNO;
+        КолБлоков = 1;
+    else
+        ИмяБлока = БлокPOB;
+        КолБлоков = КолБлоковPOB;
+    end;
+    
+    if((ИмяФормы == ФормаRPO) or (ИмяФормы == ФормаROO) or (ИмяФормы == ФормаZNS)
+       or (ИмяФормы == ФормаTRB)  or (ИмяФормы == ФормаZNO) or (ИмяФормы == ФормаPNO)
+      )  
+      Получатель = SubStr(ИмяФайла, 5, 7);
+      if( Получатель == "" )
+        ErrImport( ОшибкаФорматаИмениФайла );
+        return false;
+      end;
+
+      if ( error )
+         ErrImport( string("Не найден БИК нашего банка") );
+         return false;
+      end;
+      if( SubStr({mfo_bank},3) != Получатель )
+       ErrImport(string("Сообщение не предназначено для банка ", {mfo_bank}));
+      end;
+
+    end;
+
+    if((ИмяФормы == ФормаRPO) or (ИмяФормы == ФормаROO) or (ИмяФормы == ФормаTRB) or (ИмяФормы == ФормаPNO))
+    
+      ДатаОтправки = SubStr(ИмяФайла, 17, ДлинаДаты);
+      Отправитель = SubStr(ИмяФайла, 13, 4);
+      
+      RespID = ПолучитьКодСубъекта( Отправитель, PTCK_MNS, error );
+      
+      RespCode = {MFO_RCC};
+      RespCodeKind = PTCK_BIC;
+      if ( error )
+         ErrImport( string("Не найден субъект с кодом ", Отправитель) );
+         return false;
+      end;
+
+      if (ИмяФормы == ФормаTRB)
+        TRN = SubStr(ИмяФайла, 1, 4) + StrSubst(SubStr(ИмяФайла,13),"_","");
+      elif (ИмяФормы == ФормаPNO)
+        //TRN = string(StrSubst(SubStr(ИмяФайла,1,7),"_",""),StrSubst(SubStr(ИмяФайла,16),"_","")); 
+        TRN = StrSubSt( StrSubSt( ИмяФайла, "_", "" ), SubStr( {MFO_Bank}, 3, 7 ), "" );
+      else
+        //TRN = StrSubst(SubStr(ИмяФайла,5),"_",""); 
+        TRN = StrSubSt( StrSubSt( ИмяФайла, "_", "" ), SubStr( {MFO_Bank}, 3, 7 ), "" );
+      end;
+    else
+      if (ИмяФормы != ФормаKWT)
+        НОБанка = SubStr(ИмяФайла, 8, 4);
+        if(НОБанка == "")
+          ErrImport( ОшибкаФорматаИмениФайла );
+          return false;
+        end;
+        ДатаОтправки = SubStr(ИмяФайла, 
+                              IfThenElse( ((ИмяФормы == ФормаZNS) or (ИмяФормы == ФормаZNO)), 17, 18 ), 
+                              ДлинаДаты);  
+      end;
+
+      RespCodeKind = IfThenElse( ((ИмяФормы == ФормаZNS) or 
+                                  (ИмяФормы == ФормаZNO) or
+                                  (ИмяФормы == ФормаKWT)), PTCK_BIC, PTCK_MNS );
+      RespCode = IfThenElse( ( (ИмяФормы == ФормаZNS) or 
+                               (ИмяФормы == ФормаZNO) or 
+                               (ИмяФормы == ФормаKWT) ), 
+                             GetBIC_RCC({OurBank}), SubStr(ИмяФайла, 14, 4) );
+      if(RespCode == "")
+         ErrImport( ОшибкаФорматаИмениФайла );
+         return false;
+      end;
+      RespID = ПолучитьКодСубъекта( RespCode, RespCodeKind, error );    
+
+      if ( error )
+         ErrImport( string("Не найден субъект с кодом ", RespCode) );
+         return false;
+      end;
+
+      if (ИмяФормы == ФормаKWT)
+        var P = subStr(ИмяФайла, 8);
+        // исключаем символы кода БИК (7 символов перед вторым подчеркиванием)
+        var ind = index(P, "_");
+        ind = index(P, "_", ind + 1); // позиция символа со вторым подчеркиванием
+        TRN = subStr(P, 1, ind - 8) + subStr(P, ind + 1);
+        // исключаем символы подчеркивания
+        TRN = strSubst(TRN, "_", "");
+      else
+        TRN = IfThenElse( ((ИмяФормы == ФормаZNS) or (ИмяФормы == ФормаZNO) or (ИмяФормы == ФормаPNO)), StrSubSt( StrSubSt( ИмяФайла, "_", "" ), SubStr( {MFO_Bank}, 3, 7 ), "" ), ИмяФайла );
+      end;
+    end;
+   
+    if (ИмяФормы != ФормаKWT)
+      if(ДатаОтправки == "")
+        ErrImport( ОшибкаФорматаИмениФайла );
+        return false;
+      end;
+
+      Дата = ToDate_zno( ДатаОтправки );
+    end;
+   
+    TpShemID = ОпределитьТранспортнуюСхему(RespID, -1, -1, Транспорт, Форма, Релиз, NULL, NULL, wlsess.TpFrmtID);
+    if ( TpShemID == -1 ) 
+       return false;      
+    end;
+
+    /* Если уже было такое сообщение от корреспондента - не закачиваем */
+    select = "select mes.* from dwlmes_dbt mes "+
+             "where  mes.t_Direct='X' and "
+                    "mes.t_Department =:OperD and "+ 
+                    "mes.t_TRN =:NumberDoc and "+
+                    "mes.t_RlsFormID = :RlsFormID";  
+    params = makeArray( SQLParam("OperD",     {OperDprt}),
+                        SQLParam("NumberDoc", TRN),
+                        SQLParam("RlsFormID", Релиз) );  
+
+    rs = execSQLselect( select, params, FALSE );
+
+    continue0 = rs.MoveNext();
+    while( continue0 )
+      if( rs.value("t_rlsformid") == Релиз )
+        std.out( 1, "Cообщение уже было принято - игнорируется.\n Параметры сообщения загруженного ранее:\n Номер сообщения: " + rs.value("t_mesid") +
+                "\n Операционный день: " + rs.value("t_bankdate", null, V_DATE) + "\n Номер/Референс: " + rs.value("t_TRN"));
+        return false;
+      end;
+      continue0 = rs.MoveNext();
+    end;
+
+  end;
+  return true;
+end;
+
+macro ImportMessage(TpID, FileName, addrSess)
+
+   var ДатаОтправки, Форма, stat, error;
+
+   SetBuff( wlsess, addrSess );
+   
+   Транспорт = TpID;
+   if(not(РазобратьИмяФайла(FileName, Транспорт)))
+       return FALSE;
+   end;
+
+   if(not(WL_CheckAll(FileName, ErrStruct)))
+     ИмяФормы = ФормаERR;
+     ErrFileName = TArray(ErrStruct);
+     Форма = ОпределитьФорму( Транспорт, ИмяФормы, ВидСообщения );
+     TpShemID = ОпределитьТранспортнуюСхему(RespID, -1, -1, Транспорт, Форма, Релиз, NULL, NULL, wlsess.TpFrmtID);
+   end;
+
+   /* Заполняем ответное сообщение */
+   ClearRecord( wlmes );
+   wlmes.TpSchemID              = TpShemID;
+   wlmes.RlsFormID              = Релиз;
+   wlmes.OutsideAbonentID       = RespID;
+   wlmes.AgentID                = wlmes.OutsideAbonentID;
+   wlmes.OutsideAbonentCodeKind = PTCK_MNS;
+   wlmes.AgentCodeKind          = wlmes.OutsideAbonentCodeKind;
+   wlmes.OutsideAbonentCode     = Отправитель;
+   wlmes.AgentCode              = wlmes.OutsideAbonentCode;
+   wlmes.Kind                   = ВидСообщения;
+   wlmes.TRN                    = TRN;
+   wlmes.OutsideAbonentDate     = Date();
+   wlmes.Importance             = 0;
+
+   if ( not СоздатьЗапись( wlmes ) )
+      ErrImport( string("Невозможно создать запись по форме ", ИмяФормы));
+      return false;
+   end;
+   AddRepElem(wlmes.Kind, ИмяФормы, "RUR", money(0) );
+   
+   ПерейтиВНачалоФайла();
+
+   if (ИмяФормы == ФормаERR)
+     stat = ОбработатьСообщение(ИмяФайла, 1);
+   else
+     stat = ОбработатьСообщение();
+   end;
+   
+   if( stat == -1 )
+       return FALSE;
+   end;
+
+   PrintImportReport();
+ 
+   return true;
+  OnError(er) /* Обработка ошибок времени выполнения */
+    std.msg(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+end;

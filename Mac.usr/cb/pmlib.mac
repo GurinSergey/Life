@@ -1,0 +1,330 @@
+/*
+ $Name:        pmlib.mac
+ $Module:      Ядро Banking
+ $Description: Общие функции и переменные для платежей
+*/
+
+/************************************************************************/
+/*         Автоматизированная банковская система RS-Bank                */
+/*                 Copyright (c) R-Style Software Lab 2008              */
+/*                                                                      */
+/*  Имя файла      : pmlib.mac                                          */
+/*                                                                      */
+/*  Описание       : Общие функции и переменные для платежей            */
+/*                                                                      */
+/*  Создан         : 14.04.08                                           */
+/*                                                                      */
+/************************************************************************/
+import oralib, likepy, BankInter, CTInter, FIInter, PTInter, globals, "bnk_common.mac", PaymInter, OprInter;
+
+/* Поиск типа сообщения по номеру счета */
+private macro Found_Type_Clir(Pm_paym, Rm_prop, Debet, Credit)
+
+  file PartCode ( partcode ) key 1; /*  Код контрагента (по коду)       */
+  file PartCode_Kind ( partcode ) key 0; /*  Код контрагента (по виду кода)  */
+
+  macro fndtype(Account,BankCode,CodeKind)
+    if( (CodeKind != 0) and (BankCode != "") )
+      if(CodeKind != PTCK_BIC)
+        /* Ищем свой БИК или вышестоящей организации */
+        PartCode.CodeKind = CodeKind;
+        PartCode.Code     = BankCode;
+        if( not GetEQ( PartCode ) )
+          BankCode = "";
+        else
+          PartCode_Kind.CodeKind = PTCK_BIC;
+          PartCode_Kind.PartyID  = PartCode.PartyID;
+          if( not GetEQ( PartCode_Kind ) ) BankCode = ""; end;
+        end;
+      end;
+      if (substr(BankCode,strlen(BankCode)-2)=="002") /* "002" - признак полевого учереждения ЦБ */
+        return("122")
+      end;
+    end;
+    
+    if (Rm_prop.Instancy and Rm_prop.NeedNotify)
+      return ("139");
+    elif (Rm_prop.Instancy)
+      return ("137");
+    elif (Rm_prop.Priority==1)
+      return("195");
+    elif (Rm_prop.Priority==2)
+      return("196");
+    elif (Rm_prop.Priority==3)
+      if   (substr(Account,1,5)=="40104")
+        return("199");
+      elif (substr(Account,1,5)=="40402")
+        return("200");
+      elif (substr(Account,1,5)=="40405")
+        return("201");
+      elif (substr(Account,1,5)=="40403")
+        return("202");
+      elif (substr(Account,1,5)=="40404")
+        return("202");
+      else
+        return("198");
+      end;
+    elif (Rm_prop.Priority==4)
+      return("141");
+    elif (Rm_prop.Priority==5)
+      return("197");
+    elif (Rm_prop.Priority==6)
+      return("193");
+    end;
+    return("193");
+  end;
+
+  if(Credit.BankCode != "")
+    return(fndtype(Pm_paym.ReceiverAccount,Credit.BankCode,Credit.CodeKind));
+  else
+    return(fndtype(Pm_paym.PayerAccount,Debet.BankCode,Debet.CodeKind));
+  end;
+end;
+
+private macro MsgCreateNotInstancy(paym, rm)
+
+  Array Text;
+  Array Buttons;
+                                                         /*в формате ДД.ММ.ГГ}*/
+  Text(0) = "Платеж № " + rm.Number + " от " + rm.Date + " на сумму " + paym.Amount +
+             " не может быть проведен как срочный."+
+             " Провести его как обычный платеж?";                                                       
+
+  Buttons(0) = " Да ";
+  Buttons(1) = " Отменить "; 
+
+  if(ConfWin(Text,Buttons) == 0)
+    return true;
+  end;
+  return false;
+end;
+/* Является ли платеж внешним по заданному свойству */
+private macro HavePaymProp( prop )
+  if( prop == NULL )
+    return false;
+  end;
+
+  if( (prop.BankCode != "") and (prop.CodeKind != 0) )
+    return true;
+  else
+    return false;
+  end;
+
+  return false;
+end;
+
+// Формирование строки с содержанием операции
+macro GetContentOperationString( Note_ContentOper: string,  // значение примечания платежа "Содержание операции"
+                                 pmpaym,                    // RECORD или TRecHandler
+                                 IsPrint:bool               // алгоритм вызывается для печатной формы
+                               ): string
+
+  RECORD pm(pmpaym);
+  Copy(pm, pmpaym);
+
+  var ContentOper: string = Note_ContentOper;
+
+  if( Note_ContentOper == "ЧИПО" )
+    if( pm.PartPaymShifrMain == "16" )
+      var DateStr = "";
+      if(IsPrint)
+        DateStr = DDpMMpYYYY(pm.PartPaymDateMain); // DD.MM.YYYY
+      else
+        DateStr = YYYY_MM_DD(pm.PartPaymDateMain); // YYYY-MM-DD
+      end;
+      ContentOper = ContentOper + " " + DateStr;
+    else
+      ContentOper = Note_ContentOper;
+    end;
+  end;
+
+  return ContentOper;
+end;
+
+//Проверка возможности проведения срочного платежа
+macro CheckInstancyPM(paym, rm, debet, credit, wlmes)
+  file Corschem(corschem) key 1;   
+  record AssigneeParty(party);
+  record Party(party);
+  var stat = true;
+  var GroupID, ObjectID;
+  var params:TArray;
+  var rs:RsdRecordset;
+  var select;
+  var PartyID;
+  var PayerBankID = IfThenElse(paym.PayerBankID, paym.PayerBankID, {OurBank});
+  var ReceiverBankID = IfThenElse(paym.ReceiverBankID, paym.ReceiverBankID, {OurBank});
+
+  //если входящий или внутренний, то не проверяем
+  if( ( (not HavePaymProp(credit)) and (not HavePaymProp(debet))) or (wlmes != NULL))
+    return true;
+  end;
+
+  if(rm.Instancy)
+  
+    if( paym.ReceiverMesBankID > 0 )
+      PartyID = paym.ReceiverMesBankID;
+    else
+      ClearRecord(Corschem);
+      if(HavePaymProp(credit))
+        Corschem.Number  = credit.Corschem;
+        Corschem.FIID    = credit.PayFIID;
+        Corschem.FI_Kind = 1;
+      else
+        Corschem.Number  = debet.Corschem;
+        Corschem.FIID    = debet.PayFIID;      
+        Corschem.FI_Kind = 1;
+      end; 
+      if ( GetEQ( Corschem ))
+        Party.PartyID = Corschem.CorrID;
+        if( GetLinkedObject( OBJROLE_PARTY_ASSIGNEE, OBJTYPE_PARTY, Party, OBJTYPE_PARTY, AssigneeParty ) == 0 )
+          PartyID = AssigneeParty.PartyID;
+        else
+          PartyID = Corschem.CorrID;
+        end;
+      end;
+
+    end;
+
+    select = "select 1 "+
+               "from dual "+
+              "where exists(select 1 "+
+                             "from dobjatcor_dbt oap, dobjatcor_dbt oaa, daccount_dbt acc "+ 
+                            "where oap.t_ObjectType = 3 and "+ //OBJTYPE_PARTY
+                                  "oap.t_Object = lpad(:PayerBankID, 10, '0') and "+
+                                  "oap.t_GroupID = :GroupIDP and "+
+                                  "oap.t_AttrID = 1 and "+
+                                  "oap.t_ValidToDate >= :curdateP and "+
+                                  "acc.t_Account = :PayerAccount and  "+
+                                  "acc.T_CHAPTER = 1 and "+
+                                  "acc.T_CODE_CURRENCY = :Code_Currency and "+
+                                  "((oaa.t_ObjectType = 4 and "+ //OBJTYPE_ACCOUNT
+                                    "oaa.t_Object = lpad(acc.T_CHAPTER, 2, '0') || lpad(acc.T_CODE_CURRENCY, 7, '0') || acc.t_Account and "+
+                                    "oaa.t_GroupID = 18 and "+
+                                    "oaa.t_AttrID = 1 and "+
+                                    "oaa.t_ValidToDate >= :curdateA) or (acc.T_CLIENT = :OurBank))) ";  
+    
+    if((paym.FIID == NATCUR) and  
+       (paym.PayFIID == NATCUR))
+    
+      GroupID = PARTY_ATTR_GROUP_INSTANCYPM;
+    else
+      GroupID = PARTY_ATTR_GROUP_CURINSTANCYPM;
+    end;
+    params = MakeArray( SQLParam("PayerBankID", PartyID),
+                        SQLParam("GroupIDP", GroupID),      
+                        SQLParam("curdateP", {curdate}));      
+    params[params.Size] = SQLParam("PayerAccount", paym.PayerAccount);
+    params[params.Size] = SQLParam("Code_Currency", paym.FIID); 
+    params[params.Size] = SQLParam("curdateA", {curdate});      
+    params[params.Size] = SQLParam("OurBank", {OurBank});
+
+    rs = execSQLselect( select, params, false );
+  
+    if(rs and not rs.moveNext() )
+        MsgBox(string("Платеж № " + rm.Number + " от " + rm.Date + " на сумму " + paym.Amount +
+             " не может быть проведен как срочный."+
+             " Признаки срочности и уведомления будут сняты"));
+
+        rm.Instancy = 0;
+        rm.NeedNotify = "";
+        rm.MessageType = Found_Type_Clir(paym, rm, debet, credit);
+        if(wlmes)
+          wlmes.Importance = 0;
+        end;
+    end;
+  end;
+  
+  return stat;
+end;
+
+// извлечь строку адреса из наименования плательщика (получателя) в платеже
+// текст между //... //
+macro GetAddressFromPaymSideName(Name)
+  var ind1 = index(Name, "//");
+  if(ind1)
+    var ind2 = index(Name, "//", ind1 + 2);
+    if(ind2 == 0)
+      ind2 = strlen(Name) + 1;
+    end;
+    return substr(Name, ind1 + 2, ind2 - ind1 - 2);
+  end;
+
+  return "";
+end;
+
+// Найти шаг, готовый к выполнению у платежа
+// Если заданы символы, то ищем только шаги с указанными символами
+macro FindPmReadyStepFromList(Payment : RsbPayment/*, StepSymbol : string*/) : string
+  var DocKind = 0;
+  if(Payment.PrimDocKind)
+    DocKind = Payment.PrimDocKind;
+  elif(Payment.DocKind == WL_WIPM)
+    DocKind = WL_INDOC;
+  else
+    DocKind = Payment.DocKind;
+  end;
+  var strSQL = "Select step.t_Symbol " +
+               "  from doprstep_dbt step, doproper_dbt oproper " +
+               " where step.t_ID_Operation = oproper.t_ID_Operation " +
+               "   and oproper.t_DocKind = :DocKind " +
+               "   and oproper.t_DocumentID = LPad( :PaymentID, 34, '0' ) " +
+               "   and step.t_IsExecute = 'R' ";
+
+  var params = makeArray( SQLParam("DocKind",   DocKind),
+                          SQLParam("PaymentID", Payment.PaymentID)
+                        );
+  var i : integer = 1, 
+      symb : string = "";
+  if( GetParm(i, symb) )
+    strSQL = strSQL + " and step.t_Symbol in ( :Symbol ";
+    params[ params.size ] = SQLParam("Symbol", symb);
+    i = i + 1;
+
+    while( GetParm(i, symb) )
+      strSQL = strSQL + "," + string("         :Symbol", i);
+      params[ params.size ] = SQLParam("Symbol"+i, symb);
+      i = i + 1;
+    end;
+    strSQL = strSQL + "                      )";
+  end;
+
+  var rs : RsdRecordset = execSQLselect(strSQL, params);
+  if(rs and rs.moveNext())
+    return rs.value("t_Symbol");
+  else
+    return "";
+  end;
+end;
+
+macro PM_DefaultMaxPriority() : integer
+  var MaxPriority : integer = 0, err : integer = 0, TypeVal : integer = V_UNDEF;
+
+  TypeVal = GetRegistryValue( "CB\\PAYMENTS\\MAXPRIORITY", V_INTEGER, MaxPriority, err );
+  if( ( TypeVal == V_UNDEF ) OR ( err != 0 ) )
+    MaxPriority = 5;
+  end;
+
+  return MaxPriority;
+end;
+
+macro CheckUIN(ReceiverAccount : string, UIN : string)
+  var stat : integer = 0;
+  var ErrMsg : string = "";
+
+  var params : TArray = makeArray
+    ( SQLParam("p_ReceiverAccount", ReceiverAccount),
+      SQLParam("p_UIN", UIN),
+      SQLParam("p_ErrMsg", V_STRING, RSDBP_OUT)
+    );
+
+  if( not stat )
+    stat = execStoredFunc( "PM_COMMON.CheckUIN", V_INTEGER, params );
+    ErrMsg = params.Value(2).value;
+
+    if( stat )
+      RunError(ErrMsg);
+    end;
+  end;
+
+end;

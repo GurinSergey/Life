@@ -1,0 +1,140 @@
+import oralib, rcw, likepy, globals, RsbFormsInter, KeyCodes, PaymInter;
+
+private var countAccounts = -1 ;
+private var repName = GetTXTFileName( "transferAccounts" );
+private var DEP = 1;
+private var Oper = 2328; //Операционист
+private var Scheme = "RSBANK_EVVOR";
+
+macro saveLogError( _account, _type, _errmsg )
+    var cmd =  rsdCommand( " BEGIN USR_TRANSFERINDEX2FROMBRANCH.saveLogError( :account, :type, :errmsg ); END; " );
+        cmd.addparam( "account", RSDBP_IN, _account );
+        cmd.addparam( "type",    RSDBP_IN, _type    );
+        cmd.addparam( "errmsg",  RSDBP_IN, _errmsg  );
+        cmd.execute;
+end;
+
+macro transferIndex2ForAccount( oldAcc, newAcc, newOper );
+    var stat = execSQL( "BEGIN USR_TRANSFERINDEX2FROMBRANCH.TRANSFERINDEX2FORACCOUNT( :oldAcc, :newAcc, :newOper ); END;", makeArray( sqlParam( "oldAcc",  oldAcc  ), 
+                                                                                                                                      sqlParam( "newAcc",  newAcc  ), 
+                                                                                                                                      sqlParam( "newOper", newOper ) ) );
+onerror(x)
+    saveLogError( newAcc, 6, x.message );
+end;
+
+macro transferIndex2
+    private var conformityAccTable = execSQLselect( " SELECT * FROM USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = "+DEP );
+    private var oldAcc;
+    private var newAcc;
+    private var newOper;
+    private var stat;
+    private var i = 0;
+
+    if (ExecMacroFile("loadConformityTable.mac","conformityTableEditor", 1))
+
+      var cmd =  rsdCommand( " BEGIN USR_TRANSFERINDEX2FROMBRANCH.init( :schema, :curdate, :opNum ); END; " );
+          cmd.addparam( "schema",  RSDBP_IN, Scheme ); // для теста RSUL_TEST RSBANK_EVU
+          cmd.addparam( "curdate", RSDBP_IN, {curdate}    );
+          cmd.addparam( "opNum",   RSDBP_IN, 24001        );
+          cmd.execute;
+      execSQL( " DELETE FROM USR_TRANSFERACCDATA_RESULT_TMP " );
+    
+      initProgress( countAccounts, "Перенос картотеки №2", "Перенос картотеки №2" );
+      while( conformityAccTable.movenext )
+          execSQL( " DELETE FROM USR_TRANSFERINDEX2_TMP " );
+
+          oldAcc  = conformityAccTable.value( "T_ACCOUNT_BRANCH" );
+          newAcc  = conformityAccTable.value( "T_ACCOUNT" );
+          newOper = Oper;//conformityAccTable.value( "t_newOper"    );
+
+          begAction(0);
+
+          /**
+           * Перенос документов картотеки из филиала в ЭВ-Саратов
+           * Вся логика в пакете USR_TRANSFERINDEX2FROMBRANCH
+           */
+          transferIndex2ForAccount( oldAcc, newAcc, newOper );
+
+          endAction;
+
+          /**
+           * Постановка документов в картотеку. К этому моменту у документов должен быть запланирован шаг "Помещение в картотеку №2"
+           */
+          var paymentsRSet = execSQLselect( " SELECT   PM.T_PAYMENTID PAYMENTID, PM.T_DOCKIND DOCKIND "
+                                            "   FROM   USR_TRANSFERINDEX2_TMP TMP, DPMPAYM_DBT PM "
+                                            "  WHERE   PM.T_PAYMENTID = TMP.T_PAYMENTID " );
+          var countRSet    = execSQLselect( " SELECT   COUNT(*) \"COUNT\""
+                                            "   FROM   USR_TRANSFERINDEX2_TMP TMP, DPMPAYM_DBT PM "
+                                            "  WHERE   PM.T_PAYMENTID = TMP.T_PAYMENTID " );
+          countRSet.movenext;
+
+          var paymentsCount = int( countRSet.value( "COUNT" ) ); 
+          var j = 0;
+
+          initProgress( paymentsCount, "Помещение документов в картотеку №2", "Счет " + newAcc );
+          while( paymentsRSet.movenext )
+              var i2PaymentId      = paymentsRSet.value( "PAYMENTID" );
+              var i2PaymentDocKind = paymentsRSet.value( "DOCKIND" );
+              var imode    = SetDialogFlag(0);
+              var execStat = PM_ExecuteOperation( i2PaymentId, i2PaymentDocKind );
+
+              SetDialogFlag( imode );
+
+              if( execStat != true ) saveLogError( newAcc, 6, i2PaymentId + " :: " + getErrMsg ); end;
+              j = j + 1;
+              useProgress(j);
+          end;
+          remProgress;
+
+          i = i + 1;
+          useProgress(i);
+      end;
+      remProgress;
+    end;
+end;
+
+macro printErrors
+    setOutput( repName, false );
+    var conformityAccTable = execSQLselect( " SELECT * FROM USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = "+DEP );
+    while( conformityAccTable.movenext )
+        var newAcc     = conformityAccTable.value( "T_ACCOUNT" );
+        var errorsRSet = execSQLselect( " SELECT * FROM USR_TRANSFERACCDATA_RESULT_TMP WHERE T_ACTIONTYPE IN ( 60, 6 )  AND T_NEWACCOUNT = :ACC", makeArray( sqlParam( "acc", newAcc ) ) ); 
+            [                                               Перенос картотеки №2. Ошибки 
+              ┌─────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
+              │          Счет               │                                    Результат                                                  │
+              ├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤ ];
+        while( errorsRSet.movenext )
+            [ │ ########################### │ ############################################################################################# │ ]( errorsRSet.value( "t_newAccount" ):c, errorsRSet.value( "t_errorTxt" ):w );
+        end;
+
+            [ └─────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘ ];
+    end;
+    var rsetPayments = execSQLselect( "  SELECT   nvl(PMPROP.T_NUMBER,       ' ') T_NUMBER,  "
+                                      "           PMPROP.T_DATE                   T_DATE, "
+                                      "           nvl(PAYM.T_PAYERACCOUNT,   ' ') T_PAYERACCOUNT,  "
+                                      "           nvl(PAYM.T_RECEIVERACCOUNT,' ') T_RECEIVERACCOUNT, "
+                                      "           nvl(PAYM.T_AMOUNT,          0 ) T_AMOUNT "
+                                      "    FROM   USR_TRANSFERINDEX2_TMP TRANSFER,  "
+                                      "           DPMRMPROP_DBT PMPROP,  "
+                                      "           DPMPAYM_DBT PAYM  "
+                                      "   WHERE   TRANSFER.T_PAYMENTID = PMPROP.T_PAYMENTID(+)  "
+                                      "           AND TRANSFER.T_PAYMENTID = PAYM.T_PAYMENTID(+)  "  );
+
+            [                                                     Перенос картотеки №2
+              ┌─────────┬──────────────────┬──────────────────────────┬─────────────────────────┬─────────────────────┐
+              │    №    │       Дата       │     Счет плательщика     │     Счет получателя     │    Сумма платежа    │
+              ├─────────┼──────────────────┼──────────────────────────┼─────────────────────────┼─────────────────────┤ ];
+
+        while( rsetPayments.movenext )
+            [ │ ####### │ ################ │ ######################## │ ####################### │ ################### │ ]
+            ( rsetPayments.value( "T_NUMBER" ):c, date( rsetPayments.value( "T_DATE" ) ):c, rsetPayments.value( "T_PAYERACCOUNT" ), rsetPayments.value( "T_RECEIVERACCOUNT" ), rsetPayments.value( "T_AMOUNT" ) );
+        end;
+            [ └─────────┴──────────────────┴──────────────────────────┴─────────────────────────┴─────────────────────┘ ];
+
+    setOutput( null, false );
+end;
+
+transferIndex2;
+printErrors;
+viewFile( repName );
+exit(1);

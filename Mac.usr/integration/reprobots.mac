@@ -1,0 +1,762 @@
+/***************************************************************************/
+/* Монитор обработчиков                                                    */
+/* 24.12.2012 Golovkin изменил интервал времени                            */
+/***************************************************************************/
+IMPORT RSD, BankInter, oralib, likepy, globals, KeyCodes;
+
+/* Подключаем форму */
+
+var Fulloutputl, outl, outputl="reprobots.lbr";
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+var mon_panel = TRecHandler("mon_obr", fulloutputl, TRUE);
+
+/* Robots - Список обработчиков              */
+/* Robot - Выбранный обработчик              */
+/* ErrCode - Ошибка чтения ветки реестра     */
+/* UpdateTime - Время обновления данных (мс) */
+
+VAR Robots, Robot, ErrCode, UpdateTime = 30000;
+
+/* Получаем список обработчиков */
+
+VAR rsRobots = RsdRecordset(" SELECT LISTAGG (robots.name, ',') WITHIN GROUP (ORDER BY robots.name) AS robots_list " // 11g
+                            "   FROM (SELECT fd.t_robot AS name FROM usr_fixdoc_dbt fd GROUP BY fd.t_robot) robots ");
+    BegAction(null,null,false);
+    if(rsRobots.movenext())
+       Robots = rsRobots.value("robots_list");
+    else
+       GetRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS", V_STRING, Robots, ErrCode);
+       if(ErrCode != 0) 
+          EndAction();
+          MsgBox("Постройте зиккурат");
+          [Not found registry value: "PRBB\МОНИТОР ОБРАБОТЧИКОВ\ROBOTS"; ErrorCode: #](ErrCode);	
+          exit(0); 
+       end;      
+    end;
+
+/* Очистка usr_robotslog_dbt от записей более чем месячной давности */
+// Интересное баго: 29 апреля SYSDATE - INTERVAL '2' MONTH высчитывается как 29 февраля :(
+/*
+VAR ClearRobotsLog = RsdCommand(" delete from usr_robotslog_dbt where t_starttime "
+                                " not between ADD_MONTHS(TRUNC(SYSDATE),-2) and SYSDATE "); // 24.12.2012 Golovkin
+    ClearRobotsLog.Execute();
+*/
+    EndAction(); 
+
+/* Получаем список номеров обработчиков */
+
+MACRO GetRobotsList()
+
+   VAR GetRobots = RsdRecordset(" SELECT LISTAGG (robots.name, ',') WITHIN GROUP (ORDER BY robots.name) AS robots_list " // 11g
+                                "   FROM (SELECT fd.t_robot AS name FROM usr_fixdoc_dbt fd GROUP BY fd.t_robot) robots ");
+   if(GetRobots.movenext())
+       return rsRobots.value("robots_list");
+   else
+       return "";
+   end;
+
+END;
+
+MACRO DiffDate(Date1, Date2)
+
+   VAR d1 = Date(Date1),
+       d2 = Date(Date2),
+       t1 = int(Time(Date1)),
+       t2 = int(Time(Date2)),
+       DDay = (d2 - d1)*8640000,
+       DTime = t2 - t1;
+   RETURN  DDay + DTime;
+
+END;
+
+/* Получаем статистику по обработчикам за последнии два часа */
+
+MACRO GetTwoHoursVolues(SID, start_time, TwoHoursDoc: @integer, AverTwoHoursTime: @integer)
+
+    TwoHoursDoc = 0;
+    AverTwoHoursTime = 0;
+
+    Var Count: integer = 0;
+    Var query: string = " select /*+ index(rl USR_ROBOTSLOG_DBT_IDX1) */ "
+                        "    rl.t_doctime "
+                        " from USR_ROBOTSLOG_DBT rl "
+                        "    where rl.t_sid = ? "
+                        "      and rl.t_starttime = ? "
+                        "      and rl.t_lasttime between SYSDATE  - INTERVAL '2' HOUR and SYSDATE ";	
+    VAR params: TArray  = makeArray (SQLParam("t_sid", SID),
+                                     SQLParam("shrtnameusr",Start_time));
+    VAR rs: RsdRecordSet = ExecSQLSelect(query, params);
+
+    while(rs.movenext())
+       TwoHoursDoc = TwoHoursDoc + 1;
+       Count = Count + rs.value("t_doctime");
+    end;
+
+    if(TwoHoursDoc != 0)	
+       AverTwoHoursTime = Count/TwoHoursDoc/100;
+    end;
+
+END;
+
+/* Находим отклонения среднего времени обработки сообщения от нормы */
+
+MACRO GetDeviationValues(nameRobot, normaTime: @integer, AverTime, AverDayTime, AverTwoHoursTime, devAverTime: @integer, devAverDayTime: @integer, devAverTwoHoursTime: @integer)
+
+    Var errCode;
+
+    GetRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\NORMA_TIME\\"+nameRobot, V_INTEGER, normaTime, errCode);
+
+    if ( errCode != 0 )
+       GetRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\NORMA_TIME_DEFAULT", V_INTEGER, normaTime, errCode);
+    end;
+
+    if ( errCode == 0 )
+       if (AverTime > normaTime)
+          devAverTime = AverTime - normaTime;
+       end;
+       if (AverDayTime > normaTime)
+          devAverDayTime = AverDayTime - normaTime;
+       end;
+       if (AverTwoHoursTime > normaTime)
+          devAverTwoHoursTime = AverTwoHoursTime - normaTime;
+       end;				
+    else	
+       NormaTime = 0;
+    end;	
+
+END;
+
+/* Печатает сообщение в отчете, если количество обработчиков не соответствует значению в настройке */
+
+MACRO PrintInfo(nameRobot,countRobots)
+
+    Var normaCount, errCode;
+
+    GetRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\NORMA_COUNT\\"+nameRobot, V_INTEGER, normaCount, errCode); // debugbreak;
+
+    if ( errCode != 0)
+       GetRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\NORMA_COUNT_DEFAULT", V_INTEGER, normaCount, errCode);	
+    end;
+
+    if ( errCode == 0 )
+       [ Нормальное количество обработчиков:## шт.](normaCount); 
+       if ( normaCount > countRobots ) 
+          [ Внимание! Количество активных обработчиков ниже нормы на ## шт.](normaCount - countRobots);
+       end;
+    end;
+
+END;
+
+/* Функции формирующие отчет по обработчикам */
+
+MACRO PrintRobot(schm,oper)
+    var flag = true;
+    var query_cnt: string = " SELECT count(*) cnt ";
+    var query_all: string = " SELECT * ";
+
+    VAR query_common: string = 
+                        " FROM v$session vs, dregistry_dbt rg, usr_fixdoc_dbt fd "
+                        "    WHERE vs.username = :usrname "
+                        "      AND rg.t_shortnameuser = :shrtnameusr "
+                        "      AND vs.SID = rg.t_connection_number(+) "
+                        "      AND vs.SID = fd.t_SID "
+                        "      AND vs.LOGON_TIME = fd.T_STARTTIME ";
+
+    VAR params: TArray = makeArray (SQLParam("usrname",string(schm)),
+                                    SQLParam("shrtnameusr",String(oper)));
+    VAR rs: RsdRecordSet = ExecSQLSelect(query_cnt + query_common, params);
+    rs.movenext();
+
+    VAR rsNameRobot = RsdRecordSet("SELECT T_NAME FROM DPERSON_DBT WHERE T_OPER =  "+oper);
+        rsNameRobot.moveNext();
+    VAR NameRobot = rsNameRobot.value(0),
+    ActiveRobots = 0;
+    if (rs.value("cnt") > 0)
+       [
+                Схема ###################
+                ################### - ########
+       ] (schm:c, NameRobot:l, oper:r);                                                                                          
+       [ ┌───┬───┬───────┬───────────┬───────┬────────────┬────────────┬──────────┬────────────┬───────┬───────────────┬───────────────┬─────┬───────────────┬──────────┬───────────┐
+         │ № │SID│Serial№│   Схема   │  PID  │   Cервер   │   Ошибки   │ Запущен  │Пользователь│ Время │Проведено док. │ Среднее время │Норма│Откл. от нормы │Последний │  Логфайл  │
+         │   │   │       │           │       │            │            │          │            │простоя├─────┬────┬────┼─────┬────┬────┤     ├─────┬────┬────┤          │           │
+         │   │   │       │           │       │            │            │          │     ОС     │ (сек.)│Всего│День│2 ч.│Всего│День│2 ч.│     │Всего│День│2 ч.│ документ │           │
+         ├───┼───┼───────┼───────────┼───────┼────────────┼────────────┼──────────┼────────────┼───────┼─────┼────┼────┼─────┼────┼────┼─────┼─────┼────┼────┼──────────┼───────────┤
+       ];                
+    else
+       flag = false;
+    end;                                                                                                
+
+    rs = ExecSQLSelect(query_all + query_common, params);
+    var i = 1;
+    while (rs.movenext())
+        Var AllDoc              = 0,
+            Daydoc              = 0,
+            TwoHoursDoc         = 0,
+            AverTime            = 0,
+            AverDayTime         = 0,
+            AverTwoHoursTime    = 0,
+            Last_Time           = DtTm(Date(0,0,0),Time(0,0,0)),
+            Cur_Time            = DtTm(Date,Time),
+            DevAverTime         = 0,
+            DevAverDayTime      = 0,
+            DevAverTwoHoursTime = 0,
+            NormaTime           = 0,
+            ErrorMessage        = "no_error";
+
+            AllDoc = rs.value("t_alldoc");
+
+            if(AllDoc > 0) 
+               AverTime = rs.value("t_alldocavertime")/AllDoc/100; 
+            end;
+
+            Last_Time = rs.value("t_lasttime");
+            GetTwoHoursVolues(rs.value("SID"), rs.value("LOGON_TIME"), @TwoHoursDoc, @AverTwoHoursTime);
+
+            if( int( Date(Cur_Time) ) > int( Date(Last_Time ) ) )
+               DayDoc = 0;
+               AverDayTime = 0;
+            else
+               DayDoc = rs.value("t_daydoc");
+               if(DayDoc > 0)  
+                  AverDayTime = rs.value("t_daydocavertime")/DayDoc/100;
+               end;
+            end;
+
+            GetDeviationValues(oper, @NormaTime, AverTime, AverDayTime, AverTwoHoursTime, @devAverTime, @devAverDayTime, @devAverTwoHoursTime); 
+            ErrorMessage = rs.value("t_errmsg");
+
+            if(rs.value("Seconds_in_wait") < NormaTime*50)
+               ActiveRobots = ActiveRobots + 1;			
+            end;
+
+            if(AllDoc == 0)
+               Last_Time = String( "00.00.0000 00.00.00" );
+            else
+               Last_Time = String( Date(rs.value("t_lasttime")), Time(rs.value("t_lasttime"))  );
+            end;
+
+
+    [ │###│###│#######│###########│#######│############│############│##########│############│#######│#####│####│####│#####│####│####│#####│#####│####│####│##########│###########│]
+           (i:c, String(int (rs.value("SID"))):w:c, int (rs.value("SERIAL#")):c, rs.value("SCHEMANAME"):c:w, rs.value("PROCESS"):c:w, rs.value("MACHINE"):c:w, ErrorMessage:c:w, date(rs.value("LOGON_TIME"))+" "+time(rs.value("LOGON_TIME")):c:w,rs.value("OSUSER"):c:w, int (rs.value("Seconds_in_wait") ):c, String( int(Alldoc) ):c, String( int(DayDoc) ):c, String( int(TwoHoursDoc) ):c, String( int(AverTime) ):c, String( int(AverDayTime) ):c, String( int(AverTwoHoursTime) ):c, NormaTime:c, devAverTime:c, devAverDayTime:c, devAverTwoHoursTime:c, Last_Time:c:w, rs.value("t_logfile"):c:w );
+            i = i + 1;
+    end;                                                                                                                                                                                                                                               
+    if (flag)
+       [ └───┴───┴───────┴───────────┴───────┴────────────┴────────────┴──────────┴────────────┴───────┴─────┴────┴────┴─────┴────┴────┴─────┴─────┴────┴────┴──────────┴───────────┘];
+       i = i-1;
+       [
+         Всего:## шт.
+         Количество активных обработчиков: ## шт.](i,ActiveRobots);
+		
+       PrintInfo(oper,ActiveRobots);
+    end;
+END;
+
+MACRO PrintReport(pn)
+
+    [ ########################](String(DtTm(Date,Time)));
+    if(pn.rec.oper == "Все")
+        var arrayRobots: TArray;
+            arrayRobots = Split(Robots,",");
+        var i = 0, n = arrayRobots.size;
+        while (i < n)
+            PrintRobot(pn.rec.schema,arrayRobots(i));
+            [
+            ];
+            i = i + 1;
+        end;
+    else
+        PrintRobot(pn.rec.schema,Robot);
+    end;
+
+END;
+
+/* Функции формирующие отчет для главной формы обработчика */
+
+MACRO PrintRobotEasy(oper)
+
+    VAR query = RsdCommand(" SELECT   * "
+                           "   FROM   v$session vs, usr_fixdoc_dbt fd, dperson_dbt oper "
+                           "  WHERE       vs.username = USER "
+                           "          AND vs.SID = fd.t_SID "
+                           "          AND vs.LOGON_TIME = fd.T_STARTTIME "
+                           "          AND oper.t_oper = fd.t_robot "
+                           "          AND INSTR(?,fd.t_robot) != 0 order by fd.t_robot ");
+
+        query.addparam("robot", RSDBP_IN, oper);
+
+    VAR rs = RsdRecordset(query);
+
+    VAR i = 1;
+
+    while (rs.movenext())
+
+       VAR AllDoc              = 0,
+           Daydoc              = 0,
+           TwoHoursDoc         = 0,
+           AverTime            = 0,
+           AverDayTime         = 0,
+           AverTwoHoursTime    = 0,
+           Last_Time           = DtTm(Date(0,0,0),Time(0,0,0)),
+           Cur_Time            = DtTm(Date,Time),
+           DevAverTime         = 0,
+           DevAverDayTime      = 0,
+           DevAverTwoHoursTime = 0,
+           NormaTime           = 0,
+           NameRobot           = "no_name",
+           ErrorMessage	       = "no_error";
+
+       NameRobot = rs.value("t_name");
+
+       AllDoc = rs.value("t_alldoc");
+
+       if(AllDoc > 0)  	
+           AverTime = rs.value("t_alldocavertime")/AllDoc/100;
+       end;
+
+       Last_Time = rs.value("t_lasttime");
+       GetTwoHoursVolues(rs.value("SID"), rs.value("LOGON_TIME"), @TwoHoursDoc, @AverTwoHoursTime);
+
+       if( int( Date(Cur_Time) ) > int( Date(Last_Time ) ) )
+           DayDoc = 0;
+           AverDayTime = 0;
+       else
+           DayDoc = rs.value("t_daydoc");
+           if(DayDoc > 0)
+               AverDayTime = rs.value("t_daydocavertime")/DayDoc/100;
+           end;
+       end;
+
+       GetDeviationValues(rs.value("t_robot"), @NormaTime, AverTime, AverDayTime, AverTwoHoursTime, @devAverTime, @devAverDayTime, @devAverTwoHoursTime); 
+
+       if(index(rs.value("t_errmsg"),"no_error") == 0)
+           ErrorMessage = "error"; //rs.value("t_errmsg");
+       end;
+
+        [│##│####│###################│####################│####################│#######│#####│####│####│#####│####│####│#####│#####│####│####│##################│]
+        (i:c,String(int (rs.value("SID"))):w:c, NameRobot:c, rs.value("MACHINE"):c:w, rs.value("OSUSER"):c:w, int (rs.value("Seconds_in_wait") ):c, String( int(Alldoc) ):c, String( int(DayDoc) ):c, String( int(TwoHoursDoc) ):c, String( int(AverTime) ):c, String( int(AverDayTime) ):c, String( int(AverTwoHoursTime) ):c, NormaTime:c, devAverTime:c, devAverDayTime:c, devAverTwoHoursTime:c, ErrorMessage:c );
+
+       i = i + 1;
+    end; 	                                                                                                                                                                                                                                              
+
+END;
+
+MACRO PrintReportEasy(pn)
+
+        [┌──┬────┬───────────────────┬────────────────────┬────────────────────┬───────┬───────────────┬───────────────┬─────┬───────────────┬──────────────────┐
+         │№ │SID │    Обработчик     │       Cервер       │    Пользователь    │ Время │Проведено док. │ Среднее время │Норма│Откл. от нормы │     Результат    │
+         │  │    │                   │                    │         ОС         │простоя├─────┬────┬────┼─────┬────┬────┤     ├─────┬────┬────┤ обработки послед.│
+         │  │    │                   │                    │                    │ (сек.)│Всего│День│2 ч.│Всего│День│2 ч.│     │Всего│День│2 ч.│     документа    │
+         ├──┼────┼───────────────────┼────────────────────┼────────────────────┼───────┼─────┼────┼────┼─────┼────┼────┼─────┼─────┼────┼────┼──────────────────┤
+        ];
+
+    if(pn.rec.oper == "Все")
+        PrintRobotEasy(Robots);
+    else
+        PrintRobotEasy(Robot);         
+    end;
+
+        [└──┴────┴───────────────────┴────────────────────┴────────────────────┴───────┴─────┴────┴────┴─────┴────┴────┴─────┴─────┴────┴────┴──────────────────┘];
+      
+END;
+
+/* Списки(скролинги)                             */
+/* ListSchemaName - Список схем(не используется) */
+/* ListOp - Список обработчиков                  */
+
+MACRO ListSchemaName(schema: @string)
+
+    Var cmd = RsdCommand(
+                     " SELECT SCHEMANAME "
+                     "   FROM v$session "
+                     "  group by SCHEMANAME "),
+        rs = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+
+    MACRO EvProc(rs, cmd, id, key)
+        if ((cmd == DLG_KEY) and (key == 13 ))
+           return CM_SELECT;
+        end;
+    END;
+
+    if(RunScroll(rs, null, null, null, "EvProc"))
+        Schema = rs.value(0);
+        return true;
+    else
+        return false;
+    end;
+
+    return false;
+
+END;
+
+MACRO ListOp(oper: @string)
+
+    Var cmd = RsdCommand(
+                         " SELECT T_OPER, T_NAME "
+                         "   FROM DPERSON_DBT "
+                         "  WHERE T_OPER IN ("+Robots+") "),
+        rs = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+    Var col = TArray();
+        col(0) = "T_OPER"; col(1) = "Номер"; col(2) = 7;  col(3) = 1; col(4) = 0; col(5) = 0;
+        col(6) = "T_NAME"; col(7) = "Имя"  ; col(8) = 10; col(9) = 1; col(10)= 0; col(11)= 0; 	
+
+    MACRO EvProc(rs, cmd, id, key)
+        if ((cmd == DLG_KEY) and (key == 13 ))
+           return CM_SELECT;
+        end;
+    END;
+
+    if(RunScroll(rs,2,col,null,"EvProc","Обработчики","~ESC~ Выход ~ENTER~ Выбор",false,null,null,30,null ))
+        Robot = rs.value(0);
+        oper = rs.value(1);
+        return true;
+    else
+        return false;
+    end;
+
+    return false;
+
+END;
+
+MACRO ListPanel(pn, CMD, ID, KEY)
+
+    VAR CurrentField = FldName(pn, ID),
+        schemaname;
+
+    record oper(person);
+
+    if (CurrentField == "oper")
+        if (ListOp(@oper.name))
+            pn.rec.oper = oper.name;
+        end;
+    elif (CurrentField == "schema")
+        if (ListSchemaName(@schemaname))      
+            pn.rec.schema =  schemaname;
+        end; 
+    end;	
+
+END;
+
+/* Отчеты по обработчикам                                        */
+/* ShowReportRunTime - Показывает отчет в главной форме монитора */
+/* ShowReport - Показывает отчет в окне редактора                */
+
+MACRO ShowReportRunTime(pn);
+
+    FILE f_rep_out() txt;
+
+    var f_rep_name = GetTXTFileName("reportrobotseasy");
+
+    SetOutput(f_rep_name,false);
+    PrintReportEasy(pn);
+    SetOutput(null,false);
+
+    if ((ExistFile(f_rep_name,0)) and (open(f_rep_out,f_rep_name))) ;
+        Pn.rec.rep = "";
+        while(Next(f_rep_out))
+            Var Str = f_rep_out.str;
+                Pn.rec.rep = Pn.rec.rep+Str+"\n";
+        end;	
+        close(f_rep_out);	
+    end;
+
+END;
+
+MACRO ShowReport(pn);
+
+    FILE f_rep_out() txt;
+    var f_rep_name = GetTXTFileName("reportrobots");
+
+    SetOutput(f_rep_name,false);
+    PrintReport(pn);
+    SetOutput(null,false);
+
+    if ((ExistFile(f_rep_name,0)) and (open(f_rep_out,f_rep_name))) ;
+        viewFile(f_rep_out);
+        close(f_rep_out);	
+    end;
+
+END;
+
+/* Инициализация панели */
+
+MACRO InitPanel(pn, CMD, ID, KEY);
+
+    VAR rs = RsdRecordSet(
+                          " SELECT username "
+                          "   FROM v$session vs, dregistry_dbt rg "
+                          "  WHERE trim(rg.t_shortnameuser) = '" + {oper} + "' "
+                          "    AND vs.SID = rg.t_connection_number(+) ");
+
+    if(rs.movenext())
+        pn.rec.schema = rs.value(0);
+    end;
+
+    pn.rec.oper = "Все";
+    pn.rec.spisok = Robots;
+    ShowReportRunTime(pn);
+    SetTimer(mon_panel,UpdateTime);
+    UpdateFields(pn);
+    return CM_IGNORE;
+
+END;
+
+/* Скролинги                                                                      */
+/* ShowErrorsForRobot - Показывает ошибки которые были при обработке сообщений    */
+/* ShowOperations - Показывает, обработанные сообщения                            */
+/* ShowRobots - Показывает обработчики по дате последнего обработанного документа */
+/* ShowUnknownRobots - Не известные науке обработчики                             */
+
+macro AddCol (ar, ind, fld, head, width, rdonly, DecPoint)
+
+   ar.value (ind * 6)     = fld;
+   ar.value (ind * 6 + 1) = head;
+   ar.value (ind * 6 + 2) = width;
+   if(rdonly)
+      ar.value (ind * 6 + 3 ) = 2;
+   else
+      ar.value (ind * 6 + 3 ) = 5;
+   end;
+   ar.value (ind * 6 + 4 ) = decPoint;
+   ar.value (ind * 6 + 5 ) = 0;
+
+end;
+
+MACRO ShowErrorsForRobot(SID,StartTime)
+
+    Var cmd = RsdCommand(" select "
+                         "    t_sid, "
+                         "    t_lasttime, "
+                         "    to_char(T_LASTTIME,'HH24:MI:SS') times, "
+                         "    t_doctime, "
+                         "    t_msgvalue, "
+                         "    t_error "
+                         " from usr_robotslog_dbt "
+                         "    where t_sid = ? "
+                         "      and t_starttime = ? "
+                         "      and t_error not like '%no_error%' "
+                         "      and t_error not like 'ready' "
+                         "    Order by t_lasttime, to_char(T_LASTTIME,'HH24:MI:SS') ");
+
+        cmd.addparam("t_sid", RSDBP_IN, SID);
+        cmd.addparam("t_starttime", RSDBP_IN, StartTime);
+
+    Var rs  = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+
+    Var col = TArray();
+
+        AddCol (col, 0, "t_sid", "SID", 5, true, 0);
+        AddCol (col, 1, "t_lasttime", "Дата", 10, true);
+        AddCol (col, 2, "times", "Время", 7, true);
+        AddCol (col, 3, "t_doctime", "Время проведения(знач./100=сек.)", 5, true, 0);
+        AddCol (col, 4, "t_msgvalue", "Сообщение", 20, false);
+        AddCol (col, 5, "t_error", "Ошибка", 25, false);
+
+    RunScroll( rs,6,col,null,"EvProc","Ошибки","~ESC~ Выход",false,null,null,150,null );
+
+END;
+
+MACRO ShowOperations(SID,StartTime)
+debugbreak;
+    Var cmd = RsdCommand(" select "
+                         "    t_sid, "
+                         "    t_lasttime, "
+                         "    to_char(T_LASTTIME,'HH24:MI:SS') times, "
+                         "    t_doctime, "
+                         "    t_msgvalue, "
+                         "    t_error "
+                         " from usr_robotslog_dbt "
+                         "    where t_sid = ? "
+                         "      and t_starttime = ? "
+                         "    Order by t_lasttime, to_char(T_LASTTIME,'HH24:MI:SS') ");
+
+        cmd.addparam("t_sid", RSDBP_IN, SID);
+        cmd.addparam("t_starttime", RSDBP_IN, StartTime);
+
+    Var rs  = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+
+    Var col = TArray();
+
+        AddCol (col, 0, "t_sid", "SID", 5, true, 0);
+        AddCol (col, 1, "t_lasttime", "Дата", 10, true);
+        AddCol (col, 2, "times", "Время", 7, true);
+        AddCol (col, 3, "t_doctime", "Время проведения(знач./100=сек.)", 5, true, 0);
+        AddCol (col, 4, "t_msgvalue", "Сообщение", 20, false);
+        AddCol (col, 5, "t_error", "Ответ", 25, false);
+
+    RunScroll( rs,6,col,null,"EvProc","Все операции","~ESC~ Выход",false,null,null,70,null );
+
+END;
+
+MACRO ShowRobots(pn)
+
+    var date_from = date, date_to = date;
+
+    getdate(date_from,"Дата начала периода");
+    getdate(date_to,"Дата конца периода");
+    date_to = date_to + 1;
+
+    Var cmd = RsdCommand(
+                         " SELECT "
+                         "    fd.T_SID, "
+                         "    fd.T_ROBOT, "
+                         "    fd.T_STARTTIME, "
+                         "    to_char(fd.T_STARTTIME,'HH24:MI:SS') starttimes, "
+                         "    fd.T_LASTTIME, "
+                         "    to_char(fd.T_LASTTIME,'HH24:MI:SS') times, "
+                         "    fd.T_ALLDOC, "
+                         "    fd.T_LOGFILE, "
+                         "    fd.T_ERRMSG, "
+                         "    NVL2(vs.SID,'X','') as active "
+                         " FROM USR_FIXDOC_DBT fd, v$session vs "
+                         "    WHERE "
+                         "          fd.T_LASTTIME between to_date('"+date_from+"','DD.MM.YYYY') AND to_date('"+date_to+"','DD.MM.YYYY') "
+                         "      AND fd.t_robot IN ("+pn.rec.spisok+") " 
+                         "      AND fd.t_SID = vs.SID(+) "
+                         "      AND fd.T_STARTTIME = vs.LOGON_TIME(+) "
+                         "    ORDER BY fd.t_robot, fd.t_lasttime, to_char(fd.T_LASTTIME,'HH24:MI:SS') "),
+
+        rs = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+
+    Var col = TArray();
+
+    AddCol (col, 0, "T_ROBOT", "Номер обработчика", 15, true);
+    AddCol (col, 1, "T_STARTTIME", "Дата запуска", 11, true);
+    AddCol (col, 2, "starttimes", "Время", 7, true);
+    AddCol (col, 3, "T_LASTTIME", "Дата последнего документа", 21, true);
+    AddCol (col, 4, "TIMES", "Время", 7, true);
+    AddCol (col, 5, "T_ALLDOC", "Обработано документов", 17, true, 0);
+    AddCol (col, 6, "T_LOGFILE", "Логфайл", 22, false);
+    AddCol (col, 7, "T_ERRMSG", "Последнее сообщение об ошибке", 10, false);
+    AddCol (col, 8, "active", "A", 2, true);
+
+    MACRO EvProc(rs, cmd, id, key)
+        if ((cmd == DLG_KEY) and (key == 319 )) /* F5 */
+           ShowOperations(rs.value(0),rs.value(2));
+        end;
+        if ((cmd == DLG_KEY) and (key == 320 )) /* F6 */
+           ShowErrorsForRobot(rs.value(0),rs.value(2));
+        end;
+    END;
+
+    RunScroll( rs,9,col,null,"EvProc","Обработчики","~ESC~ Выход ~F5~ Обработанные сообщения ~F6~ Ошибки ",false,null,null,150,null ) 
+
+END;
+
+MACRO ShowUnknownRobots(pn)
+
+    var date_from = date,date_to = date;
+
+    getdate(date_from,"Дата начала периода");
+    getdate(date_to,"Дата конца периода");
+    date_to = date_to + 1;
+
+    Var cmd = RsdCommand(
+                         " select "
+                         "    T_SID, "
+                         "    T_ROBOT, "
+                         "    T_STARTTIME, "
+                         "    to_char(T_STARTTIME,'HH24:MI:SS') starttimes, "
+                         "    T_LASTTIME, "
+                         "    to_char(T_LASTTIME,'HH24:MI:SS') times, "
+                         "    T_ALLDOC, "
+                         "    T_LOGFILE, "
+                         "    T_ERRMSG "
+                         " from USR_FIXDOC_DBT "
+                         "    where "
+                         "          T_LASTTIME between to_date('"+date_from+"','DD.MM.YYYY') and to_date('"+date_to+"','DD.MM.YYYY') "
+                         "      and t_robot not in ("+Robots+") " 
+                         "    Order by t_robot, t_lasttime, to_char(T_LASTTIME,'HH24:MI:SS') "),
+        rs = RsdRecordSet(cmd,RSDVAL_CLIENT,RSDVAL_STATIC);
+    Var col = TArray();
+
+    AddCol (col, 0, "T_ROBOT", "Номер обработчика", 15, true);
+    AddCol (col, 1, "T_STARTTIME", "Дата запуска", 11, true);
+    AddCol (col, 2, "starttimes", "Время", 7, true);
+    AddCol (col, 3, "T_LASTTIME", "Дата последнего документа", 21, true);
+    AddCol (col, 4, "TIMES", "Время", 7, true);
+    AddCol (col, 5, "T_ALLDOC", "Обработано документов", 17, true, 0);
+    AddCol (col, 6, "T_LOGFILE", "Логфайл", 22, false);
+    AddCol (col, 7, "T_ERRMSG", "Последнее сообщение об ошибке", 10, false);
+
+
+    MACRO EvProc(rs, cmd, id, key)
+        if ((cmd == DLG_KEY) and (key == 319 )) /* F5 */
+           ShowOperations(rs.value(0),rs.value(2));
+        end;
+        if ((cmd == DLG_KEY) and (key == 320 )) /* F6 */
+           ShowErrorsForRobot(rs.value(0),rs.value(2));
+        end;
+    END;
+
+    RunScroll( rs,8,col,null,"EvProc","Неизвестные обработчики","~ESC~ Выход",false,null,null,145,null ) 
+
+END;
+
+/* Обработчик панели */
+
+MACRO EventPanel(pn, CMD, ID, KEY)
+
+    if (CMD == DLG_INIT)
+        return InitPanel(pn, CMD, ID, KEY);
+    end;
+    if (CMD == DLG_KEY)
+        if(KEY == 317) /* F3 */
+            SetTimer(mon_panel,UpdateTime,false);
+            ListPanel(pn, CMD, ID, KEY);
+            ShowReportRunTime(pn);
+            SetTimer(mon_panel,UpdateTime);
+            UpdateFields(pn);
+            return CM_IGNORE;
+        elif((KEY == 13) and (ID == FldNumber(pn)-1)) /* ENTER */
+            SetFocus(pn,0);
+            return CM_IGNORE;
+        elif(KEY == 316) /* F2 */
+     debugbreak;
+            SetTimer(mon_panel,UpdateTime,false);
+            ShowReport(pn);
+            ShowReportRunTime(pn);
+            SetTimer(mon_panel,UpdateTime);
+            UpdateFields(pn);
+            return CM_IGNORE;
+        elif(KEY == 32)  /* Пробел */
+            if(pn.rec.oper != "Все")
+                pn.rec.oper = "Все";
+                ShowReportRunTime(pn);
+            end;
+            UpdateFields(pn);
+            return CM_IGNORE;
+        elif(KEY == 319)  /* F5 */
+            SetTimer(mon_panel,UpdateTime,false);
+            ShowRobots(pn);
+            SetTimer(mon_panel,UpdateTime);
+        elif(KEY == 320) /* F6 */
+            SetTimer(mon_panel,UpdateTime,false);
+            ShowUnknownRobots(pn);
+            SetTimer(mon_panel,UpdateTime);
+        elif(KEY == KEY_CTRL_F)
+            SetTimer(mon_panel,UpdateTime,false);
+            ExecMacroFile("SearchForOperation.mac","RunSearch");
+            SetTimer(mon_panel,UpdateTime);
+        elif(KEY == KEY_ALT_P)
+            SetTimer(mon_panel,UpdateTime,false);
+            ExecMacroFile("RobotsPing.mac","RunCheckRobot");
+            SetTimer(mon_panel,UpdateTime);
+        end;
+    end;
+    if(CMD == DLG_TIMER) /* Таймер */
+    //debugbreak;
+        ShowReportRunTime(pn);
+        UpdateFields(pn/*,FldIndex(pn,"rep")*/);
+        return CM_IGNORE;		
+    end;
+
+END;
+
+debugbreak;
+if (rundialog(mon_panel,"EventPanel"))
+    exit(1);
+else
+    exit(1);
+end;
+//-----------------------------------------------------------------------------------------

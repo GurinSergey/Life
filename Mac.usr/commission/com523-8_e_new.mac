@@ -1,0 +1,213 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   joy Банк ЭВ и ПРББ C-27734 и C-30183
+
+       Макрос нового алгоритма расчёта базовых сумм по комиссиям 
+       " Выдача наличных (с оформл. заявки):
+          - 5.2.3  (                 до 100 тыс. руб включительно);
+          - 5.2.4  (от 100 тыс. руб  до 300 тыс. руб. включительно);
+          - 5.2.5  (от 300 тыс. руб  до 600 тыс. руб. включительно);
+          - 5.2.6  (от 600 тыс. руб  до   1 млн. руб. включительно);
+          - 5.2.7  (от   1 млн. руб. до   3 млн. руб. включительно);
+          - 5.2.8  (от   3 млн. руб. до   5 млн. руб. включительно).
+        При снятии выше 5 млн. или при превышении общей суммы снятия 5 млн. руб. снимается комиссия 5.2.9
+
+       Тип комиссии - единовременная.
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ptinter, cb_sql, globals, oprinter;
+import exvComLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+  record sfbassum( "sfbassum.str" );
+
+/* Символ кассы, по которому берётся данная комиссия */
+CONST CommCashSymbol = "('53', '42', '46', '54', '58', '60', '61')";    // прочие
+
+CONST {EVChTarif 5.2.3 MIN} =       $0,
+      {EVChTarif 5.2.3 MAX} = $100000,
+
+      {EVChTarif 5.2.4 MIN} = $100000,
+      {EVChTarif 5.2.4 MAX} = $300000,
+      
+      {EVChTarif 5.2.5 MIN} = $300000,
+      {EVChTarif 5.2.5 MAX} = $600000,
+      
+      {EVChTarif 5.2.6 MIN} = $600000,
+      {EVChTarif 5.2.6 MAX} = $1000000,
+      
+      {EVChTarif 5.2.7 MIN} = $1000000,
+      {EVChTarif 5.2.7 MAX} = $3000000,
+      
+      {EVChTarif 5.2.8 MIN} = $3000000,
+      {EVChTarif 5.2.8 MAX} = $5000000;
+      
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+    var stat, SymbSum = $0, TotalCashSum = $0, SumOfBases = $0; // сумма по символам из чека, общая сумма с начала месяца, сумма уже посчитанных баз.
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var query, rs, sql, cmd, ComCode, Min, Max;
+
+    rs    = null;
+    sql   = null;
+    cmd   = null;
+    
+    //Получаем значения минимума и максимума для каждой комиссии
+
+   SQL = "SELECT subStr(com.t_code, 1, 5) cod";
+   SQL = SQL + "  FROM dsfcomiss_dbt com ";
+   SQL = SQL + " WHERE com.t_feetype     = " + sfCalcal.FeeType;
+   SQL = SQL + "   AND com.t_number      = " + sfCalcal.CommNumber;
+
+   rs = rsdRecordSet(SQL);
+   if (rs and rs.MoveNext())
+      ComCode = rs.Value("cod", null, V_STRING);
+   end;
+
+    if (ComCode == "5.2.3")
+        Min = {EVChTarif 5.2.3 MIN};
+        Max = {EVChTarif 5.2.3 MAX};
+    elif (ComCode == "5.2.4")
+        Min = {EVChTarif 5.2.4 MIN};
+        Max = {EVChTarif 5.2.4 MAX};
+    elif (ComCode == "5.2.5")
+        Min = {EVChTarif 5.2.5 MIN};
+        Max = {EVChTarif 5.2.5 MAX};
+    elif (ComCode == "5.2.6")
+        Min = {EVChTarif 5.2.6 MIN};
+        Max = {EVChTarif 5.2.6 MAX};
+    elif (ComCode == "5.2.7")
+        Min = {EVChTarif 5.2.7 MIN};
+        Max = {EVChTarif 5.2.7 MAX};
+    elif (ComCode == "5.2.8")
+        Min = {EVChTarif 5.2.8 MIN};
+        Max = {EVChTarif 5.2.8 MAX};
+    end;
+
+    if ( docKind == CASH_PS_OUTORDER )                                            // Комиссия по чекам
+        if ( ( valtype (GetGlobalParameter ("SymbSumGlob" + string (cashDoc.AutoKey))) == 0)           // Если глобальные переменные еще не определены, значит это первая комиссия по чеку 
+             and ( valtype (GetGlobalParameter ("TotalCashSumGlob"+ string (cashDoc.AutoKey))) == 0)  // такого типа, значит глобальные перемнные определяем
+             and ( valtype (GetGlobalParameter ("SumOfBasesGlob"+ string (cashDoc.AutoKey))) == 0) )
+
+            rs = GetComBank52RecordSet( cashDoc.IsCurrency, cashDoc.DocKind, cashDoc.AutoKey, CommCashSymbol );
+            while (rs and rs.moveNext())
+                SymbSum = SymbSum + rs.value(0, null, V_MONEY);
+            end;
+        
+        TotalCashSum = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, true, sfcontr );
+
+        /************************************************************/
+        /*Определяем глобальные параметры для их дальнейшей передачи. Имя переменной уникально для каждого чека, для подстраховки*/
+        SetGlobalParameter("SymbSumGlob" + string (cashDoc.AutoKey), SymbSum);
+        SetGlobalParameter("TotalCashSumGlob" + string (cashDoc.AutoKey), TotalCashSum);
+        SetGlobalParameter("SumOfBasesGlob" + string (cashDoc.AutoKey), SumOfBases);
+    
+        /************************************************************/
+        else 
+        /************************************************************/
+        /*Получаем глобальные параметры и не разрушаем*/
+        SymbSum      = GetGlobalParameter("SymbSumGlob"+ string (cashDoc.AutoKey), false);
+        TotalCashSum = GetGlobalParameter("TotalCashSumGlob"+ string (cashDoc.AutoKey), false);
+        SumOfBases   = GetGlobalParameter("SumOfBasesGlob"+ string (cashDoc.AutoKey), true); // Разрушаем, перезапишем ниже
+    
+        /************************************************************/
+        end;
+        
+        // Алгоритм отбора базы комиссии 
+        
+        If (TotalCashSum == 0) // Если это первый чек за месяц
+            If (SymbSum - SumOfBases > 0 ) // Если еще есть с чего списывать
+                If (  (SymbSum - SumOfBases) >= (Max-Min) )  // 
+                    CommSum = Max - Min;
+                else
+                    CommSum = SymbSum - SumOfBases;
+                end;
+            else 
+                CommSum = 0;
+            end;
+        Else // Если это не первый чек за месяц
+            If (TotalCashSum >= Max) // Не попадаем в базу комиссии, переходим к следующей
+                CommSum = 0;
+            elif ((TotalCashSum > Min) and (TotalCashSum < Max )) // Попали в первую комиссию, которая должна быть удержана с чека
+                If ((SymbSum  >= Max - TotalCashSum) ) // т.е. всё аналогично первому чеку, но вместо минимума используем накопленную за месяц сумму
+                    CommSum = Max -  TotalCashSum; 
+                else
+                    CommSum = SymbSum; // SumOfBases здесь не нужен, т.к. будет равен нулю (первая комиссия по чеку)
+                end;
+            else // т.е. TotalCashSum <= min, тогда всё аналогично тому, как для первого чека за месяц. 
+                If (SymbSum - SumOfBases > 0 )
+                    If (  (SymbSum - SumOfBases) >= (Max-Min) )  
+                        CommSum = Max - Min;
+                    else
+                        CommSum = SymbSum - SumOfBases;
+                    end;
+                else 
+                    CommSum = 0;
+                end;
+            end;
+        end;
+    end;
+        
+        
+        if (( CommSum < $0 ) or (CommSum > SymbSum) ) // На всякий случай
+            CommSum = $0;
+        end;
+        
+        SumOfBases = SumOfBases + CommSum;
+        SetGlobalParameter("SumOfBasesGlob" + string (cashDoc.AutoKey), SumOfBases); // перезаписываем глобальную переменную
+
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2  = SF_BASETYPE_SUM;
+    sfbassum.baseSum2   = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы: ", GetErrMsg );
+    end;
+
+ 
+    
+end;/*CalcCommissionSum*/
+
+        
+        
+        
+        
+        
+        
+      
+      
+      
+      
+      
+      
+      
+      

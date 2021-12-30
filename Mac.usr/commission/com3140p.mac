@@ -1,0 +1,320 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
+
+RR - Рахмедов Руслан 08.08.2012
+
+Комиссия 3.14.0 в рамках разработки конструктора тарифных планов ДКБ
+
+Тип комиссии: Периодическая
+
+Имя файла com13140p.mac
+
+RR 10.10.2012 Доработал запросы для улучшения быстродействия
+RR 13.12.2012 Расчет будет только за тот месяц который указан датой окончания периода
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, cb_sql;
+import CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+record sfbassum( "sfbassum.str" );
+
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sAddr /* EVG Какой-то ещё адрес */, sfcontrStruc /*Cтруктура sfcontr*/ )
+debugbreak;
+    record sfcontr( sfcontr );
+    var query, rs, cmd, rquery, rrs, rcmd, stat, ss, scmd, sqwyrt;
+    var CommSum   = 0;
+    var typepacket, numpacket, sumpacket, SummA = 0, sumpayment, sumafter16, sumbesp;
+    var countsimplepaym, countpaymafter16, countbesppaym;
+    debugbreak;
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+    else
+       Copy ( sfcontr, sfcontrStruc );
+    end;
+
+/* Получаем значение поля t_datepack и определяем из какой таблицы берем значения для дальнейшего расчета */ 
+query =  " SELECT   dcm.t_datepack datepack, dcm.t_typepacket typepacket, dcm.t_numpacket numpacket, dcm.t_sumpacket sumpacket, "
++"\n               (DCM.T_DEPOSITFLAG * DCM.T_DEPOSITSUM) "
++"\n             + (DCM.T_CREDITFLAG * DCM.T_CREDITSUM) "
++"\n             + (DCM.T_OVERFLAG * DCM.T_OVERSUM) "
++"\n             + (DCM.T_RATEFLAG * DCM.T_RATESUM) + DCM.T_SUMPACKET SUM, "//Сумму считаем сразу чтобы лишний раз не лезть в БД
++"\n                dcm.t_sumpayment sumpayment, dcm.t_sumafter16 sumafter16, dcm.t_sumbesp sumbesp"
++"\n         FROM   dconstrcom_dbt dcm "
++"\n        WHERE   dcm.t_object = ? " 
++"\n          AND   (dcm.t_state = 0 or dcm.t_dateclose < ?) ";
+    debugbreak;
+    cmd = rsdcommand(query);
+    cmd.AddParam("", RSDBP_IN,sfcontr.object);
+    cmd.AddParam("", RSDBP_IN,EndDate);
+    rs = rsdRecordSet( cmd );
+    
+    if (rs and rs.movenext())
+      sumpayment = rs.value("sumpayment");
+      sumafter16 = rs.value("sumafter16");
+      sumbesp    = rs.value("sumbesp");
+      if (rs.value("datepack") >  BeginDate)
+          typepacket = rs.value("typepacket");
+          numpacket  = rs.value("numpacket");
+          sumpacket  = rs.value("sumpacket");
+          SummA      = rs.value("sum");
+      else
+          rquery =  "SELECT   hist.t_typepacket typepacket, hist.t_numpacket numpacket, hist.t_sumpacket sumpacket, "
+          +"\n               (DCM.T_DEPOSITFLAG * DCM.T_DEPOSITSUM) "
+          +"\n             + (DCM.T_CREDITFLAG * DCM.T_CREDITSUM) "
+          +"\n             + (DCM.T_OVERFLAG * DCM.T_OVERSUM) "
+          +"\n             + (DCM.T_RATEFLAG * DCM.T_RATESUM) + DCM.T_SUMPACKET SUM "//Сумму считаем сразу чтобы лишний раз не лезть в БД
+          +"\n         FROM   dconstrcom_dbt dcm, dconstrhist_dbt hist "
+          +"\n        WHERE   dcm.t_object = ? "
+          +"\n          AND   HIST.T_ID = DCM.T_ID "
+          +"\n          AND '"+BeginDate+"' BETWEEN HIST.T_DATESTART AND HIST.T_DATEEND "; 
+              debugbreak;
+              rcmd = rsdcommand(rquery);
+              rcmd.AddParam("", RSDBP_IN,sfcontr.object);
+              rrs = rsdRecordSet( rcmd );
+              if (rrs and rrs.movenext())
+                  typepacket = rrs.value("typepacket");
+                  numpacket  = rrs.value("numpacket");
+                  sumpacket  = rrs.value("sumpacket");
+                  SummA      = rrs.value("sum");
+              else //Эти строчки не бред, именно так эта ситуация описана в ТЗ
+                  typepacket = rs.value("typepacket");
+                  numpacket  = rs.value("numpacket");
+                  sumpacket  = rs.value("sumpacket");
+                  SummA      = rs.value("sum");
+              end;
+       end;
+      
+    else 
+      CommSum = 0
+    end;
+    
+/* Основная логика */
+  IF (numpacket == 0)
+      CommSum = SummA;
+ELIF (typepacket == 1)
+
+   // EVG 18/12/2012 Добавил.
+   var DayEndTime = GetOperDayEndTime(); 
+
+      sqwyrt = "  WITH tmp "
++"\n       AS (SELECT   (SELECT   (SELECT   COUNT (paym.rowid) "
++"\n                                 FROM   dpmpaym_dbt paym, "
++"\n                                        dpmrmprop_dbt prop "
++"\n                                WHERE   paym.t_payeraccount = ? "
++"\n                                        AND SUBSTR (paym.t_receiveraccount,1,3) NOT between '401' and '404' "
++"\n                                        AND paym.t_paymstatus = 32000 "
++"\n                                        AND paym.t_payerbankid <> paym.t_receiverbankid "
++"\n                                        AND prop.t_paymentid = paym.t_paymentid "
++"\n                                        AND prop.t_shifroper <> '16' "
++"\n                                        AND INSTR ('ЭЦП', prop.T_PAYMENTKIND) > 0 "
++"\n                                        and PAYM.T_VALUEDATE BETWEEN (select trunc(to_date(?), 'MONTH') from dual) AND ?) "
++"\n                       FROM   DUAL) "
++"\n                       countsimplepaym, "
++"\n                    (SELECT   (SELECT   COUNT (paym.t_paymentid) "
++"\n                                 FROM   dpmpaym_dbt paym, "
++"\n                                        dpmrmprop_dbt prop "
++"\n                                WHERE   paym.t_payeraccount = ? "
++"\n                                        AND SUBSTR (paym.t_receiveraccount,1,3) NOT between '401' and '404' "
++"\n                                        AND paym.t_paymstatus = 32000 "
++"\n                                        AND paym.t_payerbankid <> paym.t_receiverbankid "
++"\n                                        AND prop.t_paymentid = paym.t_paymentid "
++"\n                                        AND prop.t_shifroper <> '16' "
++"\n                                        and PAYM.T_VALUEDATE BETWEEN (select trunc(to_date(?), 'MONTH') from dual) AND ? "
+
+// EVG 18/12/2012 Добавлена проверка на время в польз. поле 1 (для платежей ИК).
++"\n                                        AND (  EXISTS( SELECT 1 FROM dobjatcor_dbt oc                                               "
++"\n                                                               WHERE oc.t_objecttype = 501                                          "
++"\n                                                                 AND oc.t_groupid    = 10                                           "
++"\n                                                                 AND oc.t_object     = LPAD ( paym.t_paymentid,10,0))               "
++"\n                                               OR ( SELECT DECODE ( ord.t_userfield1,                                               "
++"\n                                                                    CHR (1),                                                        "
++"\n                                                                    TO_DATE( '01.01.0001 01.01.01', 'dd.mm.yyyy hh24.mi.ss' ),      "
++"\n                                                                    TO_DATE( ord.t_userfield1,      'dd.mm.yyyy hh24.mi.ss' )   )   "
++"\n                                                      FROM dpspayord_dbt ord                                                        "
++"\n                                                     WHERE ord.t_orderid = paym.t_paymentid )                                       "
++"\n                                                    > TO_DATE( to_char( paym.t_valuedate, 'dd.mm.yyyy' ) || ' ' || ?, 'dd.mm.yyyy hh24:mi:ss' )  )) "
+// EVG 18/12/2012 End
+
++"\n                       FROM   DUAL) "
++"\n                       countpaymafter16, "
++"\n                    (SELECT   (SELECT   COUNT (paym.t_paymentid) "
++"\n                                 FROM   dpmpaym_dbt paym, "
++"\n                                        dpmrmprop_dbt prop "
++"\n                                WHERE   paym.t_payeraccount = ? "
++"\n                                        AND SUBSTR (paym.t_receiveraccount,1,3) NOT between '401' and '404'"
++"\n                                        AND paym.t_paymstatus = 32000 "
++"\n                                        AND paym.t_payerbankid <> paym.t_receiverbankid "
++"\n                                        AND prop.t_paymentid = paym.t_paymentid "
++"\n                                        AND prop.t_shifroper <> '16' "
++"\n                                        AND INSTR ('С', prop.T_PAYMENTKIND) != 0 "
++"\n                                        and PAYM.T_VALUEDATE BETWEEN (select trunc(to_date(?), 'MONTH') from dual) AND ? ) "
++"\n                       FROM   DUAL) "
++"\n                       countbesppaym "
++"\n             FROM   DUAL) "
++"\n SELECT   countsimplepaym , countpaymafter16 , countbesppaym "
++"\n  FROM   tmp ";
+
+        
+        setoutput("d:\\11qqaa.txt", true);
+        println(sqwyrt);
+        setoutput(null, true);
+
+      scmd = rsdcommand(sqwyrt);
+      scmd.AddParam("", RSDBP_IN,sfcontr.object);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      scmd.AddParam("", RSDBP_IN,sfcontr.object);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+
+      // EVG 18/12/2012 Добавил.
+      scmd.AddParam("", RSDBP_IN, string(DayEndTime));
+
+      scmd.AddParam("", RSDBP_IN,sfcontr.object);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      ss = rsdRecordSet( scmd );
+      if (ss and ss.movenext())
+          countsimplepaym  = ss.value("countsimplepaym");
+          countpaymafter16 = ss.value("countpaymafter16");
+          countbesppaym    = ss.value("countbesppaym");
+      end;
+      
+      if ( (countsimplepaym - numpacket) > 0 )
+         CommSum = SummA + (countsimplepaym - numpacket) * sumpayment + (countpaymafter16 * sumafter16 ) + (countbesppaym * sumbesp );
+      else
+         CommSum = SummA + (countpaymafter16 * sumafter16 ) + (countbesppaym * sumbesp );
+      end;
+ELSE
+    sqwyrt =                     " SELECT   COUNT (paym.rowid) countsimplepaym "
++"\n                                     FROM   dpmpaym_dbt paym, "
++"\n                                            dpmrmprop_dbt prop "
++"\n                                    WHERE       paym.t_payeraccount = ? "
++"\n                                            AND SUBSTR (paym.t_receiveraccount, 1, 3) NOT between '401' and '404' "
++"\n                                            AND paym.t_paymstatus = 32000 "
++"\n                                            AND paym.t_payerbankid <> paym.t_receiverbankid "
++"\n                                            AND prop.t_paymentid = paym.t_paymentid "
++"\n                                            AND prop.t_shifroper <> '16' "
++"\n                                            and PAYM.T_VALUEDATE BETWEEN (select trunc(to_date(?), 'MONTH') from dual) AND ? ";
+      scmd = rsdcommand(sqwyrt);
+      scmd.AddParam("", RSDBP_IN,sfcontr.object);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      scmd.AddParam("", RSDBP_IN,EndDate);
+      ss = rsdRecordSet( scmd );
+      if (ss and ss.movenext())
+          if  ((ss.value("countsimplepaym") - numpacket) > 0)
+            CommSum = SummA + ( (ss.value("countsimplepaym") - numpacket) * sumpayment );
+          else
+            CommSum = SummA;
+          end;
+      end;
+      
+ END;
+ 
+      if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+
+
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

@@ -1,0 +1,301 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщения по SWIFT MT100                                       */
+/*                                                                          */
+/*  Имя файла: swgm103.mac                                                  */
+/*  Создан:  21.01.00                                        Алешин А.В.    */
+/****************************************************************************/
+/*SDA 29.11.2013 адаптация для 31-й сборки */
+
+
+import "swgenmes.mac";
+/* EVG */
+import "Commisslib.mac";
+
+record Party(party);
+const  Relise = "103";
+
+
+/* EVG 12.11.09 Реализовано по просьбе Фоменко.
+   Функция проверяет первый символ полученной строки.
+   Если символ содержится в массиве aBadSymbs, то перед ним подставляется
+   пробел. */
+macro CheckFirstSymbol( str:@string )
+   var aBadSymbs = TArray();
+       aBadSymbs(0) = ":";
+       aBadSymbs(1) = "-";
+
+   var i = 0,
+       isBad = false,
+       FirstSymbol = subStr(str, 1, 1);
+
+   while ((i < aBadSymbs.Size) and not isBad)
+      if (FirstSymbol == aBadSymbs(i))
+         isBad = true;
+      end;
+      i = i + 1;
+   end;
+
+   if (isBad)
+      str = " " + str;
+   end;
+end;
+
+
+
+macro GenMes( addrMes, addrPm ,addrOldMes )
+  var field_value, Tag, IsTransit, BaseAmount, CurrentCode, error, 
+      continue0, field33BPresent = 0;
+  var ОстатокПоля70;
+  var Recreate = false;
+  var RsPaym;
+
+  /* EVG */
+  var ComissAmount = $0;
+
+  
+  RECORD combuf( oprsfcom );    
+  Record oldwlMes (wlmes);
+  SetBuff( wlmes,  addrMes );
+  SetBuff( wlpmpaym, addrPm );
+  
+  if( ValType(AddrOldMes) == V_MEMADDR )
+     SetBuff( oldwlmes,  addrOldMes );
+     Recreate = true;
+  end;
+
+  PrintLog(2,"Генерация сообщения по МТ103");
+  RsPaym = RsbPayment( wlpmpaym.PaymentID );
+
+  IsTransit = (((RsPaym.PayerGroup == PAYMENTS_GROUP_EXTERNAL) AND (RsPaym.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL)) OR PM_PaymentIsChildTransit( RsPaym.PaymentID ));  
+  var InMesID = 0;
+/*
+  if(IsTransit)
+    InMesID = getInMesIDByPayment(RsPaym);
+  end;
+*/
+  var CommissCode = GetCommisCode (RsPaym.ComissCharges);
+
+  /* 20 - номер транзакции (документа) */
+  ЗаписатьПолеЛог( TransactionReferenceNumberField, wlmes.TRN );
+
+  /* 23B       */
+  ЗаписатьПолеЛог( BankOperationCodeField_B, BANKOPERCODE_CRED ) ;
+
+  /* 23Е   берем теперь из dwlpmrmprop_dbt.InstructionCode  */
+  StrChangeRusXSet( RsPaym.InstructionCode, field_value );
+  ЗаписатьПолеЛогВБлок( "23E", InstructionCodeField, string(field_value), NULL, Recreate, OldwlMes);
+  /* Восстанавливаем нулевой контекст блока */
+  if( not УстановитьКонтекстБлока() )
+    RunError("|Ошибка при установке нулевого контекста блока");
+  end;
+  
+  /* 32A - дата валютирования, код валюты, сумма */
+/*
+  field_value = GetSWIFTDate( RsPaym.OutTransferDate ) +
+                FillCurrencyOriginalOrderedAmountField( RsPaym );
+  WriteFieldEx  (ValueDateCurrencyCodeAmountField_A, field_value, Recreate, OldwlMes );
+*/
+
+  if ( RsPaym.ComissCharges == OUR )
+
+      field_value = GetSWIFTDate( RsPaym.OutTransferDate ) +
+                     ПолучитьКодВалютыЛог( RsPaym.ReceiverFIID ) +
+                     GetSWIFTAmount( RsPaym.ReceiverAmount );
+  /* EVG Для платежей с комиссией BEN или SHA поле 32 считается иначе */
+  else
+
+     ClearRecord(combuf); 
+     continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+     while( continue0 )          
+        /* EVG Только комиссии
+           1100 - 3.4.3v
+           1101 - 3.5.3v
+           , иначе здесь учитываются и комиссии других шагов - ВК.
+        (функция из CommissLib.mac) */
+        if (IsBeneficiaryCommission( combuf.CommNumber ))
+
+           if ( combuf.FIID_Sum==RsPaym.PayerFIID )
+              ComissAmount = ComissAmount + combuf.Sum + combuf.SumNDS;
+           else
+              /* Пересчитываем сумму */
+              ComissAmount = ComissAmount + GetSumConvert(combuf.Sum+combuf.SumNDS, combuf.FIID_Sum, RsPaym.ReceiverFIID);
+           end;
+
+        end;
+        continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+     end;
+     
+     field_value = //GetSWIFTDate( RsPaym.ValueDate ) +   //Seleznev
+                   GetSWIFTDate( RsPaym.OutTransferDate) +
+                   ПолучитьКодВалютыЛог( RsPaym.ReceiverFIID ) +
+                   GetSWIFTAmount( RsPaym.ReceiverAmount - ComissAmount );
+  end;
+  WriteFieldEx  (ValueDateCurrencyCodeAmountField_A, field_value, Recreate, OldwlMes );
+
+
+
+  /* 33B - Инструктируемая сумма, валюта */
+  /* EVG Поле 33 заполняется только для платежей с комиссией BEN или SHA */
+ if (RsPaym.ComissCharges != OUR) // != OUR
+
+    field_value = "";
+/*
+  if( InMesID > 0 )
+    if( not ПолучитьПоле(InMesID, CurrencyOriginalOrderedAmountField, field_value) )
+      InitError();
+    end;
+  elif( (RsPaym.OrderAmount != 0) and ((RsPaym.OrderAmount != RsPaym.FutureBaseAmount) or 
+                                       (RsPaym.OrderFIID != RsPaym.BaseFIID)) 
+        or (CommissCode == CHARGES_BEN)
+      )
+*/
+    field_value = ПолучитьКодВалютыЛог( RsPaym.OrderFIID ) + GetSWIFTAmount( RsPaym.OrderAmount );
+/*  end; */
+  if( field_value )
+    WriteFieldEx  (CurrencyOriginalOrderedAmountField, field_value, Recreate, OldwlMes );
+    field33BPresent = 1;
+   end;
+ end;
+  
+
+  /* EVG По просьбе Банка, при генерации формы МТ103 поля 33 и 36 не заполняются.
+/* 36  - Кросс-курс */
+  if( IsTransit and InMesID )
+    field_value = "";
+    // из входящего сообщения
+    if(not ПолучитьПоле( InMesID, ExchangeRateField, field_value ))
+      InitError();
+    end;
+
+    if( field_value )
+      WriteFieldEx(ExchangeRateField, field_value, Recreate, OldwlMes );
+    end;
+  end;
+*/
+
+  /* 50A - приказодатель */
+  field_value = FillOrderingCustomerField103( RsPaym, Tag );
+  if ( field_value=="" )
+      std.out( 2, "PaymentID: " + RsPaym.PaymentID );
+      RunError( "|Не найден плательщик" );
+  else
+    /* EVG Проверка 1-го символа */
+    CheckFirstSymbol(@field_value);
+    ЗаписатьПолеЛогВБлок( "50a", OrderingCustomerField + Tag, field_value,NULL,Recreate, OldwlMes );
+  end;
+
+  /* Восстанавливаем нулевой контекст блока */
+  if( not УстановитьКонтекстБлока() )
+    RunError("|Ошибка при установке нулевого контекста блока");
+  end;
+
+  /* 52a - банк приказодателя */
+  field_value = FillOrderingInstitutionField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( OrderingInstitutionField+Tag, "52a", field_value, Recreate, OldwlMes);
+
+  if( not УстановитьКонтекстБлока() )
+    RunError("|Ошибка при установке нулевого контекста блока");
+  end;
+  /* 53a - корреспондент отправителя */
+  /*SDA 18.112010 I-090893 формирование поля 53D */
+  Tag = SWIFT_Tag_A;
+  field_value = FillSenderCorrespondentField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( Sender_sCorrespondentField+Tag, "53a", field_value, Recreate, OldwlMes );
+
+  /* 54a - Корреспондент получателя */
+  Tag = SWIFT_Tag_A;
+  field_value = FillReceiverCorrespondentField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( Receiver_sCorrespondentField+Tag, "54a", field_value, Recreate, OldwlMes );
+
+  /* 55a - Третий рамбурсирующий посрдник */
+  Tag = SWIFT_Tag_A;
+  field_value = FillThirdReibursBankField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( ThirdReimbursementInstitutionField+Tag, "55a", field_value, Recreate, OldwlMes );    
+
+  /* 56a - банк посредник */
+  Tag = "";
+  field_value = FillIntermediaryField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( IntermediaryField+Tag, "56a", field_value, Recreate, OldwlMes );  
+
+  /* 57a - банк бенефициара */
+  Tag = "";
+  field_value = FillAccountWithInstitutionField(RsPaym, Tag );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  ЗаписатьПолеВБлокКонтекст0( AccountWithInstitutionField+Tag, "57a", field_value, Recreate, OldwlMes );      
+
+  /* 59 - бенефициар */
+/*SDA заполняем по опции A только в случае, если указан вид кода бенефициара и он не нулевой */ 
+/* I-084275  Возврат п/п в иностранной валюте */
+field_value = "";
+if (RsPaym.ReceiverCodeKind != 0)
+  field_value = FillBeneficiaryCustomerField_A( RsPaym );/*59A*/
+end;
+
+  if (field_value == "")
+    field_value = FillBeneficiaryCustomerField( RsPaym );/*59*/
+    if ( field_value=="" )
+      std.out( 2, "PaymentID: " + RsPaym.PaymentID );
+      RunError( "|Не найден получатель" );
+    end;
+    /* EVG Проверка 1-го символа */
+    CheckFirstSymbol(@field_value);
+    ЗаписатьПолеЛогВБлок( "59a", BeneficiaryCustomerField, field_value, NULL,Recreate, OldwlMes );
+  else
+    /* EVG Проверка 1-го символа */
+    CheckFirstSymbol(@field_value);
+    ЗаписатьПолеЛогВБлок( "59a", BeneficiaryCustomerField_A, field_value, NULL,Recreate, OldwlMes );
+  end;
+  /* Восстанавливаем нулевой контекст блока */
+  if( not УстановитьКонтекстБлока() )
+    RunError("|Ошибка при установке нулевого контекста блока");
+  end;
+
+  /* 70  - информация для бенефициара */
+  /*Tikh Передаем форму*/
+  field_value = FillDetailsOfPaymentField( RsPaym, ALLOWCODES70_MT103_STANDART, ОстатокПоля70, null, "103" );
+//  field_value = FillDetailsOfPaymentField( RsPaym, ALLOWCODES70_MT103_STANDART, ОстатокПоля70 );
+  /* EVG Проверка 1-го символа */
+  CheckFirstSymbol(@field_value);
+  WriteFieldEx  (DetailsOfPaymentField, field_value, Recreate, OldwlMes );
+
+  /*  71 */
+  field_value = CommissCode;
+    WriteFieldEx  (DetailsOfChargesField_A, field_value, Recreate, OldwlMes );
+
+  ЗаписатьКомиссииПлатежа( RsPaym, field_value, TRUE );
+
+  /* 72 - информация для банка-получателя */
+
+/* SDA 14/03/2012 не проходит проверку по стандарту и ничего не переносит в 72
+  if (not IsAllowCode(ALLOWCODES_MT103_STANDART, Field72CodesNZP))
+    ОстатокПоля70 = "";
+  end;
+*/
+  field_value = FillInformationOfPaymentField(RsPaym, ALLOWCODES_MT103_STANDART, ОстатокПоля70 , null, "103");
+  if( field_value != "" )
+    /* EVG Проверка 1-го символа */
+    CheckFirstSymbol(@field_value);
+    WriteFieldEx  (SenderToReceiverInformationField, field_value, Recreate, OldwlMes );
+  end;
+
+  return TRUE; /* Успешное завершение */
+
+  OnError(er) /* обработка ошибок */
+    ExeptionMessage(er);
+    return FALSE;
+end;
+

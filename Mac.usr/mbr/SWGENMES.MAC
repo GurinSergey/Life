@@ -1,0 +1,3052 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Константы и вспомогательные функции для генерации сообщений SWIFT        */
+/*                                                                          */
+/*  Имя файла: swgenmes.mac                                                 */
+/*  Создан:  21.01.00                                        Алешин А.В.    */
+/*  Changes:                                                                */
+/*  #1 TAM 26.08.2013 R-236205-2 - исправление ошибки в формировании 32A    */
+/****************************************************************************/
+
+import FIInter, OprInter, RMInter, "wlgenmes.mac", "wldoc.mac", "wlnote.mac", "wltools.mac", "pmtlscom", "adress.mac", rsd, oralib, likepy, "pm_common.mac";
+import "swsplit.mac";
+/* EVG */
+import "Commisslib.mac";
+/*SDA*/
+import "fg_Life_parm.mac";
+import cur_bank;
+
+const WLD_SUBKIND_PAYM_CLN       = 1,    /* клиентский перевод               */
+      WLD_SUBKIND_PAYM_BANK_ACC  = 2,    /* банковский перевод на свой счет  */
+      WLD_SUBKIND_PAYM_BANK_GEN  = 3,    /* общий банковский перевод         */
+      WLD_SUBKIND_PAYM_CHARGES   = 4;    /* согласование расходов            */
+
+/* Виды страниц выписки */
+const WLD_EXT_KIND_SINGLE = 1, /* Единственная */
+      WLD_EXT_KIND_FIRST  = 2, /* Первая       */
+      WLD_EXT_KIND_MID    = 3, /* Средняя      */
+      WLD_EXT_KIND_LAST   = 4; /* Последняя    */
+
+/* Виды корсхем */
+const WLD_COR_ERROR  = 0, /* Не найдена корсхема*/
+      WLD_COR_NOSTRO = 1, /* НОСТРО */
+      WLD_COR_LORO   = 2; /* ЛОРО       */
+      
+//TAM 24.06.2013 R-208011-2
+const RSB_EMPTY_STRING = strfor(1);
+
+var NotesPaymentSelve = TNotesPaymentSelve;
+/*SDA*/
+private macro ПолучитьСчетКорреспондентаПоСхемеРасчетов(Corschem, FIID);
+var sql, cmd, rs;
+
+    sql =
+    " select T_CORACCOUNT from dcorschem_dbt "
+    " where T_FIID = ? and t_number = ?";
+    cmd = RSDCommand( sql );
+    cmd.AddParam( "dp", RSDBP_IN, FIID );
+    cmd.AddParam( "nu", RSDBP_IN, Corschem );
+
+    rs = RSDRecordSet( cmd );
+
+    if( rs.MoveNext )
+        return (rs.value(0));
+    end;
+    return "";
+end;
+/* Возвращает корсчет, если на данного корреспондта настроено */
+/* более одной активной корсхемы в данной валюте */
+macro ПолучитьКорсчетКонтрагента(Corschem, FIID)
+  record CorrAccRec("account.dbt");
+  record LinkAccRec("account.dbt");
+  var CorrAcc="", LinkAcc = "", CorrID, Department;
+  var rs:object;
+  var select:string;
+  var params:TArray;
+  select = "select cors.t_CorrID, cors.t_Account, cors.t_Department "+
+                           "from dcorschem_dbt cors "+
+                           "where cors.t_Number=:Corschem and "+
+                           "cors.t_FIID=:FIID and "+
+                           "cors.t_FI_Kind=:FIKIND_CURRENCY";
+  params = makeArray( SQLParam("Corschem", Corschem),
+                      SQLParam("FIID", FIID),
+                      SQLParam("FIKIND_CURRENCY", FIKIND_CURRENCY));
+  rs = execSQLselect( select, params, FALSE );
+
+  if (not rs.moveNext())
+    return "";
+  end;
+  CorrID  = rs.value(0);
+  CorrAcc = rs.value(1);
+  Department = rs.value(2);
+
+  CorrAccRec.Account       = CorrAcc;
+  CorrAccRec.Code_Currency = FIID;
+  CorrAccRec.Chapter       = CHAPT1;
+
+ if( not GetLinkedObject( 47, OBJTYPE_ACCOUNT, UniID( CorrAccRec, OBJTYPE_ACCOUNT ), OBJTYPE_ACCOUNT, LinkAccRec) )
+    LinkAcc = LinkAccRec.account;
+  end;
+
+  select = "select count(*) "+
+           "from dcorschem_dbt cors "+
+           "where cors.t_FIID=:FIID "+
+           "and cors.t_FI_Kind=:FIKIND_CURRENCY "+
+           "and cors.t_CorrID=:CorrID "+
+           "and cors.t_Number<>:Corschem "+
+           "and cors.t_State=0 "+
+           "and cors.t_Department = :Department "+
+           "and cors.t_Account <> :Account";
+  params = makeArray( SQLParam("FIID", FIID),
+                      SQLParam("FIKIND_CURRENCY", FIKIND_CURRENCY),
+                      SQLParam("CorrID", CorrID),
+                      SQLParam("Corschem", Corschem),
+                      SQLParam("Department", Department),
+                      SQLParam("Account",LinkAcc));
+
+  rs = execSQLselect( select, params, FALSE );
+
+  if (not rs.moveNext()) 
+    return "";
+  end;
+  if (rs.value(0) < 1)
+    return "";
+  else
+    return CorrAcc;
+  end;
+end;
+
+macro GetNameBank_Tag_D(Tag, Name, BankID)
+
+  RECORD party(party);
+  if((Tag == SWIFT_Tag_D) and (Name == "") and (BankID > 0))
+    party.PartyID = BankID;
+    if(GetEQ(party))
+      return party.Name;
+    end;
+  end;
+
+  return Name;
+end;
+
+macro СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart, usingCode )
+  record RecordAdress ( adress );
+  var field_value = "", tempv, Name, BankCode, INN, error, account;
+
+  if( valtype(Tag) == V_UNDEF )
+    Tag = "";
+  end;
+
+  if ( Route.Sort>0 )
+     account = Route.InAccount;
+  elif ( Route.Sort<0 )
+     account = Route.OutAccount;
+  else
+     account = "";
+  end;
+
+  if ( Tag=="" )
+    if ( (Route.CodeValue!="") AND (Route.CodeKind==PTCK_SWIFT) )
+      Tag = SWIFT_Tag_A;
+    else
+      Tag = SWIFT_Tag_D;
+    end;
+  end;
+  
+  if( Tag == SWIFT_Tag_A )    
+    if ( (valtype(usingCode)!=V_UNDEF) AND (usingCode==true) AND (Route.PartyID) )
+       /* На данный момент используем только код ABA */
+       f_wlobjcode.ObjectID = Route.PartyID;
+       f_wlobjcode.ObjectType = OBJTYPE_PARTY;
+       f_wlobjcode.CodeKind = PTCK_ABA;
+       if ( GetEQ(f_wlobjcode) )
+          field_value = SYMB_SLASH + SYMB_SLASH + CODEWORLD_FEDWIRE + SYMB_ENDL;
+       end;
+    end;
+    if( account != "" )
+      field_value = field_value + SYMB_SLASH + account + SYMB_ENDL;
+    end;
+    field_value = field_value + Route.CodeValue;
+  elif ( Tag == SWIFT_Tag_B )
+    if ( (valtype(usingCode)!=V_UNDEF) AND (usingCode==true) AND (Route.PartyID) )
+       /* На данный момент используем только код ABA */
+       f_wlobjcode.ObjectID = Route.PartyID;
+       f_wlobjcode.ObjectType = OBJTYPE_PARTY;
+       f_wlobjcode.CodeKind = PTCK_ABA;
+       if ( GetEQ(f_wlobjcode) )
+          field_value = SYMB_SLASH + SYMB_SLASH + CODEWORLD_FEDWIRE + f_wlobjcode.Code + SYMB_ENDL;
+       end;
+    end;
+
+    
+    if( account != "")
+       if ( (valtype(DKFlag)!=V_UNDEF) AND (DKFlag!="") )
+         field_value = field_value + SYMB_SLASH + DKFlag;
+       end;
+    
+      field_value = field_value + SYMB_SLASH + account + SYMB_ENDL;
+    end;
+
+  elif( Tag == SWIFT_Tag_C )
+    if ( (valtype(usingCode)!=V_UNDEF) AND (usingCode==true) AND (Route.PartyID) )
+       /* На данный момент используем только код ABA */
+       f_wlobjcode.ObjectID = Route.PartyID;
+       f_wlobjcode.ObjectType = OBJTYPE_PARTY;
+       f_wlobjcode.CodeKind = PTCK_ABA;
+       if ( GetEQ(f_wlobjcode) )
+         field_value = SYMB_SLASH + SYMB_SLASH + CODEWORLD_FEDWIRE + f_wlobjcode.Code;
+       end;
+    end;
+
+    BankCode = ПолучитьКодСубъекта( Route.PartyID, PTCK_BIC, error );
+
+    if ( (not Error) AND (Route.PartyID) )
+       field_value = string( field_value, "//RU", BankCode );
+       if ( account != "" )
+         field_value = string( field_value, ".", account );
+       end;
+       field_value = field_value;
+    else
+      if( account != "")
+         field_value = field_value + SYMB_SLASH + account;
+      end;
+    end;
+    /*Наименование и адрес не используется см. документацию газ. банка, RUR4, RUR5 */
+  else 
+    if ( (valtype(usingCode)!=V_UNDEF) AND (usingCode==true) AND (Route.PartyID) )
+       /* На данный момент используем только код ABA */
+       f_wlobjcode.ObjectID = Route.PartyID;
+       f_wlobjcode.ObjectType = OBJTYPE_PARTY;
+       f_wlobjcode.CodeKind = PTCK_ABA;
+       if ( GetEQ(f_wlobjcode) )
+          field_value = SYMB_SLASH + SYMB_SLASH + CODEWORLD_FEDWIRE + f_wlobjcode.Code + SYMB_ENDL;
+       end;
+    end;
+
+    BankCode = ПолучитьКодСубъекта( Route.PartyID, PTCK_BIC, error );
+
+    if ( (not Error) AND (Route.PartyID) AND ((standart==ST_RUR4) OR (standart==ST_RUR5) OR (standart==ST_RUR6))  )
+       field_value = string( field_value, "//RU", BankCode );
+       if ( account != "" )
+         field_value = string( field_value, ".", account );
+       end;
+       field_value = field_value + SYMB_ENDL;
+    else
+      if( account != "")
+         field_value = field_value + SYMB_SLASH + account + SYMB_ENDL;
+      end;
+    end;
+
+    INN = GetPartyINN( Route.PartyID );
+    if( INN != "" )
+       field_value = String( field_value, "INN", INN, SYMB_ENDL );
+    end;
+
+    Name = GetNameBank_Tag_D(Tag, Route.Name, Route.PartyID);
+    if( Name != "" )
+      if( (Route.PartyID) AND НайтиЮридическийАдресСубъекта(Route.PartyID,RecordAdress) AND
+          (RecordAdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(RecordAdress.Place)))==0) )
+          Name = string( Name, SYMB_ENDL, trim(RecordAdress.Place) );
+      end;
+      StrChangeRusXSet( Name, tempv, standart );
+      StrMultyToFormat( tempv, tempv, 35, 5 );
+      field_value = field_value + tempv;
+    end;
+  end;
+
+  setparm( 1, Tag );
+
+  return field_value;
+end;
+
+macro ЗаписатьПолеВБлок( НазваниеПоля, НазваниеБлока, field_value , Recreate, oldMes )
+  if( Recreate == NULL )
+     Recreate = false;
+  end;
+
+  if( oldMes == NULL )
+    oldMes = NULL;
+  end;
+  if ( (valtype(field_value)!=V_UNDEF) AND ((valtype(field_value)!=V_STRING) OR (field_value!="")) )
+     if( not УстановитьКонтекстБлока( НазваниеБлока ) )
+       RunError("|Ошибка при установке контекста блока " + НазваниеБлока);
+     end;
+  end;
+  if( Recreate )
+     if( not GetBlockEdit(НазваниеПоля, OldMes.RlsFormID ) )
+        ПолучитьПоле(OldMes.MesID, НазваниеПоля, field_value );
+        if (field_value)
+            ЗаписатьПолеЛог( НазваниеПоля, field_value );
+        end;
+     end;
+  else 
+     ЗаписатьПолеЛог( НазваниеПоля, field_value );
+  end;
+end;
+
+macro ЗаписатьПолеВБлокКонтекст0( НазваниеПоля, НазваниеБлока, field_value )
+var   Recreate, oldMes;
+ GetParm(3, Recreate);
+ GetParm(4, oldMes  );
+ if( Recreate == NULL )
+    Recreate = false;
+ end;
+ if( oldMes == NULL )
+   oldMes = NULL;
+ end;
+ if ( (valtype(field_value)!=V_UNDEF) AND ((valtype(field_value)!=V_STRING) OR (field_value!="")) )
+    if( not УстановитьКонтекстБлока() )
+       RunError("|Ошибка при установке нулевого контекста блока");
+    end;
+
+    ЗаписатьПолеВБлок( НазваниеПоля, НазваниеБлока, field_value, NULL,  Recreate, OldMes );
+ end;
+end;
+
+/* Записать поле маршрута от текущего контекста с формированием лога (тип узла - B) */
+macro ЗаписатьПолеМаршрутаЛог( НазваниеПоля, НазваниеБлока, Route, Tag, DKFlag, standart, usingCode )
+  var field_value, Recreate, oldMes;       
+ GetParm(7, Recreate);
+ GetParm(8, oldMes  );
+ if( Recreate == NULL )
+     Recreate = false;
+ end;
+
+ if( oldMes == NULL )
+     oldMes = NULL;
+ end;
+
+  field_value = СформироватьЗаписьМаршрута(Route, Tag, DKFlag, standart, usingCode);
+
+  ЗаписатьПолеВБлок( НазваниеПоля + Tag, НазваниеБлока, field_value, NULL, Recreate, OldMes );
+end;
+
+/* Записать поле маршрута от нулевого контекста блока */
+macro ЗаписатьПолеМаршрутаКонтекст0Лог( НазваниеПоля, НазваниеБлока, Route, Tag, DKFlag, standart, usingCode )
+  var  Recreate, oldMes;       
+   GetParm(7, Recreate);
+   GetParm(8, oldMes  );
+   if( Recreate == NULL )
+       Recreate = false;
+   end;
+
+   if( oldMes == NULL )
+       oldMes = NULL;
+   end;
+
+  /* Устанавливаем нулевой контекст блока */
+  if( not УстановитьКонтекстБлока() )
+    RunError("|Ошибка при установке нулевого контекста блока");
+  end;
+  /* Запишем узел маршрута */
+  if( valtype(Tag) == V_UNDEF )
+    ЗаписатьПолеМаршрутаЛог( НазваниеПоля, НазваниеБлока, Route, "", DKFlag, Recreate, OldMes );
+  else
+    ЗаписатьПолеМаршрутаЛог( НазваниеПоля, НазваниеБлока, Route, Tag, DKFlag, standart, usingCode, Recreate, OldMes );
+  end;
+end;
+
+macro ДобавитьОстатокПоля70( field_value, ОстатокПоля70, standart )
+  var i = 0;
+  if ( ОстатокПоля70!="" )
+      ОстатокПоля70 = "ZP/" + substr(ОстатокПоля70,1,70);
+      if ( (valtype(standart)!=V_UNDEF) AND (standart==ST_RUR4) )
+         StrMultyToFormat( ОстатокПоля70, ОстатокПоля70, 33, 3, "CheckBreakRUR4" );
+      else
+         StrMultyToFormat( ОстатокПоля70, ОстатокПоля70, 33, 3 );
+      end;
+      ОстатокПоля70 = "/N" + ОстатокПоля70;
+
+      while( i<strlen(ОстатокПоля70) )
+         if( substr(ОстатокПоля70,i,1)=="\n" )
+             ОстатокПоля70 = substr( ОстатокПоля70, 1,i ) + "//" + substr( ОстатокПоля70, i+1 );
+             i = i+2;
+         end;
+         i = i+1;
+      end;
+      field_value = field_value + ОстатокПоля70;
+  end;
+  return field_value;
+end;
+
+macro FillNZP_byPaymentGround( field_value, PaymentGround, standart )
+  var i = 0;
+  if( PaymentGround != "" )
+    StrChangeRusXSet( PaymentGround, PaymentGround, standart );
+    PaymentGround = "ZP/" + PaymentGround;
+    if( (valtype(standart)!=V_UNDEF) and (standart==ST_RUR4) )
+      StrMultyToFormat( PaymentGround, PaymentGround, 33, 6, "CheckBreakRUR4" );
+    else
+      StrMultyToFormat( PaymentGround, PaymentGround, 33, 6 );
+    end;
+    PaymentGround = "/N" + PaymentGround;
+
+    while( i < strlen(PaymentGround) )
+      if( substr(PaymentGround,i,1) == "\n" )
+        PaymentGround = substr( PaymentGround, 1,i ) + "//" + substr( PaymentGround, i+1 );
+        i = i+2;
+      end;
+      i = i+1;
+    end;
+    field_value = field_value + PaymentGround;
+  end;
+  return field_value;
+end;
+
+macro ДобавитьБлокВПоле72( field_value, ИмяБлока, Содержимое, standart )
+  var i;
+
+  if ( Содержимое!="" )
+      i=0;
+      while( (ИмяБлока != "") and (i<(strlen(ИмяБлока)+2)) ) 
+         Содержимое = SYMB_BLANK + Содержимое;
+         i = i+1;
+      end;
+
+      if ( (valtype(standart)!=V_UNDEF) AND (standart==ST_RUR4) )
+         StrMultyToFormat( Содержимое, Содержимое, 33, 6, "CheckBreakRUR4" );
+      else
+         StrMultyToFormat( Содержимое, Содержимое, 33, 6 );
+      end;
+
+      if( ИмяБлока != "" )
+         Содержимое = SYMB_SLASH + ИмяБлока + SYMB_SLASH + substr( Содержимое, strlen(ИмяБлока)+3 );
+      end;
+
+      i = 0;
+      while( i<strlen(Содержимое) )
+         if( substr(Содержимое,i,1)==SYMB_ENDL )
+            Содержимое = substr( Содержимое, 1,i ) + SYMB_DSLASH + substr( Содержимое, i+1 );
+            i = i+2;
+         end;
+         i = i+1;
+      end;
+      if ( (field_value!="") AND (substr(field_value, strlen(field_value), 1)!=SYMB_ENDL) )
+        field_value = field_value + SYMB_ENDL;
+      end;
+      field_value = field_value + Содержимое;
+  end;
+  return field_value;
+end;
+
+/* Заполнить поле 26T*/
+macro FillTransactionTypeCodeField(RsPaym, Standart)  
+  var field_value="";
+
+  /* Используется только для RUR6 */
+  if (Standart != ST_RUR6)
+    return "";
+  end;
+
+  if ((RsPaym.PayerFIID==0) AND (RsPaym.PaymentID))
+    if (RsPaym.TaxAuthorState != "")
+      field_value = "S" + RsPaym.TaxAuthorState;
+    else
+      return "";
+    end;
+  else
+    return "";
+  end;
+  
+  return field_value;
+end;
+
+/* Заполнить поле 77B */ 
+macro FillRegulatoryReportingField(RsPaym, Standart)
+  var field_value="", str = "";
+
+  /* Используется только для RUR6 */
+  if (Standart != ST_RUR6)
+    return "";
+  end;
+
+  if (RsPaym.PayerFIID==0)
+    /* Строка 1 */
+    field_value = field_value + "/N10/";
+    if (RsPaym.TaxPmType != "")
+      StrChangeRusXSet(RsPaym.TaxPmType, str, Standart);
+      field_value = field_value + str;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + "/N4/";
+    if (RsPaym.BttTICode != "")
+      field_value = field_value + RsPaym.BttTICode;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + SYMB_ENDL;
+
+    /* Строка 2 */
+    field_value = field_value + "/N5/";
+    if (RsPaym.OKATOCode != "")
+      field_value = field_value + RsPaym.OKATOCode;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + "/N6/";
+    if (RsPaym.TaxPmGround != "")
+      StrChangeRusXSet(RsPaym.TaxPmGround, str, Standart);
+      field_value = field_value + str;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + "/N7/";
+    if (RsPaym.TaxPmPeriod != "")
+      StrChangeRusXSet(RsPaym.TaxPmPeriod, str, Standart);
+      field_value = field_value + str;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + SYMB_ENDL;
+    
+    /* Строка 3 */
+    field_value = field_value + "/N8/";
+    if (RsPaym.TaxPmNumber != "")
+      StrChangeRusXSet(RsPaym.TaxPmNumber, str, Standart);
+      field_value = field_value + str;
+    else
+      field_value = field_value + "0";
+    end;
+    field_value = field_value + "/N9/";
+    if (RsPaym.TaxPmDate != "")
+      StrChangeRusXSet(RsPaym.TaxPmDate, str, Standart);
+      field_value = field_value + str;
+    else
+      field_value = field_value + "0";
+    end;
+  else
+    return "";
+  end;
+  
+  return field_value;  
+end;
+
+private macro GetAccountClient( Account, FIID ) 
+  file file_acc ("account.dbt" ) key 0;
+  //file accC("account$.dbt") key 0;
+  file_acc.Chapter       = 1;
+  file_acc.Account       = Account;
+  file_acc.Code_Currency = FIID;
+  if( getEQ( file_acc ) )
+    return file_acc.Client;
+  end;
+  return -1;
+end;
+//Определение плательщика по платежу
+macro GetPaymPayer( RsPaym )
+  var Payer = -1
+  ;
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  if( RsPaym.Payer > 0 )
+    Payer = RsPaym.Payer;
+  else
+    if(RsPaym.PayerAccount != "")
+      select = "select cors.t_CorrID "+
+               "from dcorschem_dbt cors, dobjcode_dbt code "+
+               "where cors.t_Account=:Account "+
+               "and cors.t_FIID=:FIID "+
+               "and cors.t_State = 0 "+
+               "and cors.t_CorrID = code.t_ObjectID "+
+               "and code.t_CodeKind = :PTCK_SWIFT "+
+               "and code.t_ObjectType = :OBJTYPE_PARTY";
+      params = makeArray( SQLParam("Account", RsPaym.PayerAccount),
+                          SQLParam("FIID", RsPaym.PayerFIID),
+                          SQLParam("PTCK_SWIFT", PTCK_SWIFT),
+                          SQLParam("OBJTYPE_PARTY",OBJTYPE_PARTY));
+      rs = execSQLselect( select, params, FALSE );
+      if(rs.moveNext())
+        Payer = rs.value(0);
+      else
+        Payer = GetAccountClient(RsPaym.PayerAccount, RsPaym.PayerFIID);
+      end;     
+    end;
+  end;
+
+  return Payer;
+end;
+
+/* Заполнить поле приказодателя */
+/* Заполнение 50a Option A */
+/* Вернет "" если заполнить не удалось */
+macro FillOrderingCustomerField103_A( RsPaym, Standart )
+  var field_value = "", PayerID, PayerCode, error;
+
+  if (GetIdentProgram == 147) //Если ББ то плательщик ПРББ
+     PayerID = {OurBank};
+  else
+     PayerID = GetPaymPayer( RsPaym );
+  end;
+
+  if (PayerID > 0)
+      PayerCode = ПолучитьКодСубъекта(PayerID, PTCK_SWIFT, error);
+      if ((error != 0 ) OR (PayerCode == ""))                      
+         return ""; 
+      end;
+
+      if (RsPaym.PayerAccount != "")
+         field_value = "/" + RsPaym.PayerAccount + SYMB_ENDL;
+      end;
+
+      field_value = String(field_value, PayerCode);
+  end;      
+      
+  return field_value;
+end;
+
+macro FillOrderingCustomerField( RsPaym, Standart )
+  var field_value = "", PayerID, INN, KPP = "", field_Client, field_place;
+  record RecordAdress ( adress );
+
+  if ( valtype(Standart)==V_UNDEF )
+     Standart = ST_UNDEF;
+  end;
+
+  if ( Standart!=ST_UNDEF )
+     if ( RsPaym.PayerAccount!="" )
+        field_value = "/" + RsPaym.PayerAccount + SYMB_ENDL;
+     end;
+  end;
+
+
+  PayerID = GetPaymPayer( RsPaym );
+
+  if( ПолучитьСубъекта(PayerID, wlparty) != 0 )
+    /* Не найден плательщик */
+    if (Standart == ST_RUR6)
+      if ( RsPaym.PayerINN!="" )
+         field_value = String( field_value, "INN", RemoveKPP(RsPaym.PayerINN) );
+           KPP = RemoveINN(RsPaym.PayerINN);
+         if (KPP != "")
+           field_value = String(field_value, ".KPP", KPP);
+         end;
+       field_value = String(field_value, SYMB_ENDL);
+    end;
+    end;
+     
+    StrChangeRusXSet( RsPaym.PayerName, field_Client, Standart );
+
+    field_value = field_value + field_Client;    
+  else
+    if ((Standart == ST_RUR6) or _VUZ_BANK())
+      if ( RsPaym.PayerINN!="" )
+         INN = RemoveKPP(RsPaym.PayerINN);
+         KPP = RemoveINN(RsPaym.PayerINN);
+      else
+         INN = RemoveKPP( GetPartyINN( PayerID ) );
+         KPP = RemoveINN( GetPartyINN( PayerID ) );
+      end;
+      if( INN != "" )
+        field_value = String(field_value, "INN", INN);
+        if (KPP != "")
+          field_value = String(field_value, ".KPP", KPP);
+        end;
+        field_value = String(field_value, SYMB_ENDL);
+      end;
+    end;
+    
+    StrChangeRusXSet( RsPaym.PayerName, field_Client, Standart );
+
+    field_value = field_value + field_Client;
+
+    /* EVG 12.11.09 Вывод адреса для поля 103 убран по просьбе Фоменко. Адрес уже содержится
+       в заявлении на перевод.
+       Kozina а для ВУЗа надо выводить*/
+   if(_VUZ_BANK())
+    ClearRecord(RecordAdress);
+    НайтиЮридическийАдресСубъекта(wlparty.PartyID,RecordAdress);
+    if ( RecordAdress.Adress!="" )
+      StrChangeRusXSet( RecordAdress.Adress, field_place, Standart );
+      field_value = String( field_value, " ", field_place );
+    end;
+    if( RecordAdress.Place != "" )
+      StrChangeRusXSet( RecordAdress.Place, field_place, Standart );
+      field_value = String( field_value, SYMB_ENDL, field_place );
+    end;
+   end;
+  end;  
+
+  if ( Standart==ST_RUR4 )
+     StrMultyToFormat( field_value, field_value, 35, 5, "CheckBreakRUR4" );
+  elif(Standart == ST_UNDEF)
+    field_value = SwiftStrSplit( field_value, 35, 4 );
+    /*StrMultyToFormat( field_value, field_value, 35, 4 );*/
+  else
+    field_value = SwiftStrSplit( field_value, 35, 5 );
+    /*StrMultyToFormat( field_value, field_value, 35, 5 );*/
+  end;
+  return field_value;
+end;
+
+macro FillOrderingCustomerField103_K( RsPaym, Standart )
+  var field_value;
+
+  if ( valtype(Standart)==V_UNDEF )
+     Standart = ST_UNDEF;
+  end;
+
+  field_value = FillOrderingCustomerField( RsPaym, Standart );
+
+  if ( Standart==ST_UNDEF ) /* Иначе заполнит ф-ция FillOrderingCustomerField */
+     if ( RsPaym.PayerAccount!="" )
+        field_value = "/" + RsPaym.PayerAccount + SYMB_ENDL + field_value;
+     end;
+  end;
+
+  return field_value;
+end;
+
+//является ли физлицом
+/*macro IsPerson(PartyID)
+  record party(party);
+
+  if( PartyID > 0 )
+    if( ПолучитьСубъекта(PartyID, party) == 0 )
+      if( party.LegalForm == PTLEGF_PERSN )
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;*/
+
+macro GetCountryCode(PartyID)
+  file country("country.dbt") key 2;
+  record Adress(adress);
+  if( not НайтиЮридическийАдресСубъекта(PartyID,Adress))
+    НайтиАдресСубъекта(PartyID,PTADDR_REAL,Adress);
+  end;
+  if(Adress.Country != "")
+    country.CodeLat3 = Adress.Country;
+    if( GetEQ(country) )
+      if(country.CodeLat2 != "")
+        return country.CodeLat2;
+      end;
+    end;
+  end;
+  return "RU";
+end;
+
+macro FillOrderingCustomerField103_F( RsPaym, Standart )
+  FILE persnidc(persnidc) key 0;
+  FILE persn(persn) key 0;
+  FILE party(party) key 0;
+  record Adress(adress);
+  var field_value = "", INN = "", field_name, field_place;
+  var SubStr8 = "";
+  var PayerID = GetPaymPayer( RsPaym );
+  var IsPersn = IsPerson(PayerID);
+  var IBEICode = "", error;
+
+  if(PayerID == -1)
+    return "";
+  end;
+  if ( RsPaym.PayerINN!="" )
+     INN = RemoveKPP(RsPaym.PayerINN);
+  else
+     INN = RemoveKPP( GetPartyINN( PayerID ) );
+  end;
+
+  persnidc.PersonID = PayerID;
+  persnidc.PaperKind = 0;
+
+  persn.PersonID = PayerID;
+  GetEQ(persn);
+
+  IBEICode = ПолучитьКодСубъекта(PayerID, PTCK_IBEI, error);
+
+  if ( valtype(Standart)==V_UNDEF )
+     Standart = ST_UNDEF;
+  end;
+
+  if((RsPaym.PayerAccount != "") and (IsClientPayerAccount(RsPaym) or (not IsPersn)))
+    field_value = SYMB_SLASH + RsPaym.PayerAccount;
+  elif( GetEQ(persnidc) and IsPersn )
+    field_value = "CCPT/" + GetCountryCode(PayerID) + SYMB_SLASH + persnidc.PaperNumber ;
+  else
+    return "";
+  end;
+
+  if(strlen(field_value)>35)
+    SubStr8 = substr(field_value,36);
+    field_value = substr(field_value,1,35);
+  end;
+  field_value = field_value + SYMB_ENDL;
+
+
+  field_name = RsPaym.PayerName;
+  StrChangeRusXSet( field_name, field_name, Standart );
+  
+  if( strlen(field_name) > 33 )
+    while(strlen(field_name) > 33)
+     field_value = field_value + "1/" + substr(field_name,1,33) + SYMB_ENDL;
+     field_name = substr(field_name,34);
+    end;
+    field_value = field_value + "1/" + field_name + SYMB_ENDL;
+  else
+    field_value = field_value + "1/" + field_name + SYMB_ENDL;
+  end;
+
+
+  if( IsPersn and (persn.Born != date(0,0,0)) and (persn.BirsPlase != ""))
+     field_value = field_value + "4/" + GetSWIFTDate(persn.Born) +  SYMB_ENDL;
+     StrChangeRusXSet( persn.BirsPlase, field_place , Standart); 
+     field_place =  GetCountryCode(PayerID) + SYMB_SLASH + field_place;
+     if( strlen(field_place) > 33 )
+       while(strlen(field_place) > 33)
+        field_value = field_value + "5/" + substr(field_place,1,33) + SYMB_ENDL;
+        field_place = substr(field_place,34);
+       end;
+       field_value = field_value + "5/" + field_place + SYMB_ENDL;
+     else
+       field_value = field_value + "5/" + field_place + SYMB_ENDL;
+     end;
+  elif( НайтиЮридическийАдресСубъекта(PayerID,Adress) or     НайтиАдресСубъекта(PayerID,PTADDR_REAL,Adress))
+     field_place = string(Adress.Street," ",Adress.CodeStreet," ",Adress.House);
+     StrChangeRusXSet( field_place, field_place, Standart); 
+     if( strlen(field_place) > 33 )
+       while(strlen(field_place) > 33)
+        field_value = field_value + "2/" + substr(field_place,1,33) + SYMB_ENDL;
+        field_place = substr(field_place,34);
+       end;
+       field_value = field_value + "2/" + field_place + SYMB_ENDL;
+     else
+       field_value = field_value  + "2/" + field_place + SYMB_ENDL;
+     end;
+     field_place = "";
+     if( Adress.PostIndex != "" )
+       field_place = Adress.PostIndex + " ";
+     end;
+     if(Adress.Region != "" )
+       field_place = field_place + Adress.Region + " ";
+     end;
+     if(Adress.CodeRegion != "" )
+       field_place = field_place + Adress.CodeRegion + " ";
+     end;
+     if(Adress.Province != "" )
+       field_place = field_place + Adress.Province + " " ;
+     end;
+     if(Adress.CodeProvince  != "" )
+       field_place = field_place + Adress.CodeProvince + " ";
+     end;
+     if(Adress.District != "" )
+       field_place = field_place + Adress.District + " ";
+     end;
+     if(Adress.CodeDistrict != "" )
+       field_place = field_place + Adress.CodeDistrict + " ";
+     end;
+     if(Adress.Place != "" )
+       field_place = field_place + Adress.Place + " ";
+     end;
+     if(Adress.CodePlace != "" )
+       field_place = field_place + Adress.CodePlace + " ";
+     end;
+     field_place = Trim(field_place);
+     
+     StrChangeRusXSet( field_place, field_place, Standart); 
+     field_place = GetCountryCode(PayerID) + "/" + field_place;
+     if( strlen(field_place) > 33 )
+       while(strlen(field_place) > 33)
+        field_value = field_value + "3/" + substr(field_place,1,33) + SYMB_ENDL;
+        field_place = substr(field_place,34);
+       end;
+       field_value = field_value + "3/" + field_place + SYMB_ENDL;
+     else
+       field_value = field_value + "3/" + field_place + SYMB_ENDL;
+     end;
+  end;
+
+  if(SubStr8 != "")
+    field_value = field_value + "8/" + SubStr8;
+  end;
+  
+  StrMultyToFormat( field_value, field_value, 35, 5 );  
+    
+  return field_value;
+end;
+
+/* Проверяем является ли субъект нерезидентом. Если является - возвращаем true.
+   В случае ошибки - false. */
+macro PartyIsNotResident( PartyID )
+   var PartyObj:RsbParty = RsbParty( PartyID );
+   return PartyObj.IsNotResident;
+end;
+
+macro FillOrderingCustomerField103RUR_F( RsPaym, Standart )
+  FILE persnidc(persnidc) key 0;
+  FILE persn(persn) key 0;
+  FILE party(party) key 0;
+  record Adress(adress);
+  var field_value = "", INN = "", KPP = "", field_name, field_place;
+  var SubStr8 = "";
+  var PayerID = GetPaymPayer( RsPaym );
+  var IsPersn = IsPerson(PayerID);
+  var error, FillType;
+
+  const CASE_PAYER_UNDEF   = 1, // 1. Если субъект-плательщик не определен
+        CASE_PAYER_ISPERSN = 2, // 2. Если субъект-плательщик определен и является физическим лицом
+        CASE_ANOTHER       = 3; // 3. В других случаях
+
+  // определяем тип заполнения поля 50F
+  if( PayerID == -1 )
+    if( (RsPaym.PayerAccount != "") and IsClientPayerAccount(RsPaym) )
+      FillType = CASE_PAYER_UNDEF;
+    else
+      return "";
+    end;
+  elif( IsPersn )
+    FillType = CASE_PAYER_ISPERSN;
+  else
+    FillType = CASE_ANOTHER;
+  end;
+
+  // определяем ИНН и КПП
+  if( RsPaym.PayerINN != "" )
+    INN = RemoveKPP( RsPaym.PayerINN );
+    KPP = RemoveINN( RsPaym.PayerINN) ;
+  else
+    INN = RemoveKPP( GetPartyINN(PayerID) );
+    KPP = RemoveINN( GetPartyINN(PayerID) );
+  end;
+
+  persnidc.PersonID = PayerID;
+  persnidc.PaperKind = 0;
+
+  persn.PersonID = PayerID;
+  GetEQ(persn);
+
+  if( valtype(Standart)==V_UNDEF )
+     Standart = ST_UNDEF;
+  end;
+
+  if( FillType == CASE_PAYER_UNDEF ) // 5. Если субъект-плательщик не определен
+  
+    field_value = SYMB_SLASH + RsPaym.PayerAccount + SYMB_ENDL; // 5.1.2. Первая строка поля заполняется номером счета
+    // 5.1.3.  Если в платеже указан ИНН плательщика, то во второй строке записывается "1/INN" и добавляется код 
+    //         ИНН плательщика
+    if( INN != "" ) 
+      field_value = field_value + "1/INN" + INN;
+      // 5.1.3.1.  Если в платеже указан код КПП, то во вторую строку добавляется ".KPP" и добавляется код КПП плательщика
+      if( KPP != "" )
+        field_value = field_value + ".KPP" + KPP;
+      end;
+      field_value = field_value + SYMB_ENDL;
+    end;
+
+  elif(FillType == CASE_PAYER_ISPERSN) // 6. Если субъект-плательщик определен и является физическим лицом
+    
+    if( (RsPaym.PayerAccount != "") and IsClientPayerAccount(RsPaym) )
+      // 6.2. Если счет плательщика указан в платеже и принадлежит (по номеру) к клиентским счетам, 
+      //      то первая строка заполняется номером счета (вариант 1)
+      field_value = SYMB_SLASH + RsPaym.PayerAccount;
+    elif( GetEQ(persnidc) and IsPersn )
+      // 6.3. Иначе, если у субъекта-плательщика есть информация о паспорте РФ, 
+      //      то первая строка заполняется номером паспорта (по варианту 3)
+      field_value = "CCPT/" + GetCountryCode(PayerID) + SYMB_SLASH + persnidc.PaperNumber ;
+    end;
+
+    if(strlen(field_value)>35)
+      SubStr8 = substr(field_value,36);
+      field_value = substr(field_value,1,35);
+    end;
+    field_value = field_value + SYMB_ENDL;
+
+    // 6.4.  Если в платеже указан ИНН плательщика, то во второй строке записывается "1/INN" и добавляется код ИНН плательщика    
+    if( INN != "" ) 
+      field_value = field_value + "1/INN" + INN + SYMB_ENDL;
+    end;
+
+  else // 7. В других случаях
+
+    if( RsPaym.PayerAccount != "" )
+      // 7.2. Если счет плательщика указан в платеже, то первая строка заполняется номером счета (вариант 1)
+      field_value = SYMB_SLASH + RsPaym.PayerAccount + SYMB_ENDL;
+    end;
+
+    // 7.3. Если в платеже указан ИНН или КИО, то заполнить вторую строку подстрокой "1 Коды налогоплательщиков"
+    if( INN != "" ) 
+      if( strlen(INN) <= 5 )
+        field_value = field_value + "1/KIO" + INN;
+      else
+        field_value = field_value + "1/INN" + INN;
+      end;
+      if( KPP != "" )
+        field_value = field_value + ".KPP" + KPP;
+      end;
+      field_value = field_value + SYMB_ENDL;
+    end;
+
+  end;
+
+  if( IsPersn )
+     field_name = persn.Name1 + " " + persn.Name2 + " " + persn.Name3;
+     StrChangeRusXSet( field_name, field_name, Standart );
+  else
+     party.PartyID = PayerID;
+     GetEQ(party);
+     if(party.LatName != "")
+       field_name = party.LatName;
+     else
+       StrChangeRusXSet( party.Name, field_name, Standart );
+     end;
+  end;
+  while(strlen(field_name) > 33)
+   field_value = field_value + "1/" + substr(field_name,1,33) + SYMB_ENDL;
+   field_name = substr(field_name,34);
+  end;
+  field_value = field_value + "1/" + field_name + SYMB_ENDL;
+
+  if( ((FillType == CASE_PAYER_ISPERSN) and (INN == "")) or (FillType == CASE_ANOTHER) )
+    
+    if( IsPersn and (persn.Born != date(0,0,0)) and (persn.BirsPlase != ""))
+       field_value = field_value + "4/" + GetSWIFTDate(persn.Born) +  SYMB_ENDL;
+       StrChangeRusXSet( persn.BirsPlase, field_place , Standart); 
+       field_place =  GetCountryCode(PayerID) + SYMB_SLASH + field_place;
+       if( strlen(field_place) > 33 )
+         while(strlen(field_place) > 33)
+          field_value = field_value + "5/" + substr(field_place,1,33) + SYMB_ENDL;
+          field_place = substr(field_place,34);
+         end;
+         field_value = field_value + "5/" + field_place + SYMB_ENDL;
+       else
+         field_value = field_value + "5/" + field_place + SYMB_ENDL;
+       end;
+    elif( НайтиЮридическийАдресСубъекта(PayerID,Adress) or НайтиАдресСубъекта(PayerID,PTADDR_REAL,Adress) )
+       field_place = string(Adress.Street," ",Adress.CodeStreet," ",Adress.House);
+       StrChangeRusXSet( field_place, field_place, Standart); 
+       if( strlen(field_place) > 33 )
+         while(strlen(field_place) > 33)
+          field_value = field_value + "2/" + substr(field_place,1,33) + SYMB_ENDL;
+          field_place = substr(field_place,34);
+         end;
+         field_value = field_value + "2/" + field_place + SYMB_ENDL;
+       else
+         field_value = field_value  + "2/" + field_place + SYMB_ENDL;
+       end;
+       field_place = "";
+       if( Adress.PostIndex != "" )
+         field_place = Adress.PostIndex + " ";
+       end;
+
+       if(Adress.CodePlace != "" )
+         field_place = field_place + Adress.CodePlace + " ";
+       end;
+       if(Adress.Place != "" )
+         field_place = field_place + Adress.Place + " ";
+       end;
+
+       if(Adress.District != "" )
+         field_place = field_place + Adress.District + " ";
+       end;
+       if(Adress.CodeDistrict != "" )
+         field_place = field_place + Adress.CodeDistrict + " ";
+       end;
+
+       if(Adress.Province != "" )
+         field_place = field_place + Adress.Province + " " ;
+       end;
+       if(Adress.CodeProvince  != "" )
+         field_place = field_place + Adress.CodeProvince + " ";
+       end;
+
+       if(Adress.Region != "" )
+         field_place = field_place + Adress.Region + " ";
+       end;
+       if(Adress.CodeRegion != "" )
+         field_place = field_place + Adress.CodeRegion + " ";
+       end;
+
+       field_place = Trim(field_place);
+       
+       StrChangeRusXSet( field_place, field_place, Standart); 
+       field_place = GetCountryCode(PayerID) + "/" + field_place;
+       if( strlen(field_place) > 33 )
+         while(strlen(field_place) > 33)
+          field_value = field_value + "3/" + substr(field_place,1,33) + SYMB_ENDL;
+          field_place = substr(field_place,34);
+         end;
+         field_value = field_value + "3/" + field_place + SYMB_ENDL;
+       else
+         field_value = field_value + "3/" + field_place + SYMB_ENDL;
+       end;
+    end;
+
+  end;
+
+  if(SubStr8 != "")
+    field_value = field_value + "8/" + SubStr8;
+  end;
+  
+  StrMultyToFormat( field_value, field_value, 35, 5 );  
+    
+  return field_value;
+end;
+
+MACRO getInitialPaymentID( PurposePaymentID:integer, LinkKind:integer ):integer
+
+  var InitialPaymentID:integer = 0;
+  var select       :string  = "";
+  var params       :TArray  = TArray();
+  var rset         :object;
+
+  select = "select pmlink.t_InitialPayment " +
+           "from   dpmlink_dbt pmlink      " +
+           "where  pmlink.t_PurposePayment  = :PurposePaymID " +
+           "  and  pmlink.t_InitialPayment != pmlink.t_PurposePayment " +
+           "  and  pmlink.t_LinkKind        = :LinkKind ";
+
+  params = makeArray( SQLParam( "PurposePaymID" , PurposePaymentID  ),
+                      SQLParam( "LinkKind", LinkKind));
+
+  rset = execSQLselect( select, params, false );
+
+  if( rset AND rset.moveNext() )
+    InitialPaymentID = rset.Value( 0 );
+  end;
+  
+  return InitialPaymentID;
+END;
+
+macro FillOrderingCustomerField103(RsPaym, Tag, Standart)
+  var rs:object;
+  var select:string;
+  var params:TArray;
+  var InitPaymID = getInitialPaymentID(RsPaym.PaymentID,PMLINK_KIND_RETREDIR);
+  var PaymentID, PayerID;
+  var field_value = "";
+  
+  if( RsPaym.IsTransit or (InitPaymID != 0))
+    if(InitPaymID != 0)
+      PaymentID = InitPaymID
+    else
+      PaymentID = RsPaym.PaymentID;
+    end;
+
+    select = " select mesval.t_TpFieldID, mesval.t_Value"+
+             " from dwlmeslnk_dbt meslnk, dwlmes_dbt wlmes, dwlpm_dbt wlpm, dwltpshem_dbt wltpshem, dwlmesval_dbt mesval"+
+             " where wlmes.t_MesID = meslnk.t_MesID"+
+             " and meslnk.t_ObjID = wlpm.t_WlPmID"+
+             " and meslnk.t_ObjKind = :OBJTYPE_PAYMENT"+
+             " and wlpm.t_Direct = 'X'"+
+             " and wlpm.t_PaymentID = :PaymentID"+
+             " and wlpm.t_WlPmNum = 0"+
+             " and wltpshem.t_TpShemID = wlmes.t_TpSchemID"+
+             " and wltpshem.t_TpID = :TRANSP_SWIFT"+
+             " and mesval.t_MesID = wlmes.t_MesID"+
+             " and mesval.t_TpFieldID IN(108, 145, 611)"+
+             " and mesval.t_Index = (SELECT MIN(mesval1.t_Index)"+
+                                   " FROM dwlmesval_dbt mesval1"+
+                                   " WHERE mesval1.t_MesID = wlmes.t_MesID"+
+                                   " and mesval1.t_TpFieldID IN(108, 145, 611))";
+    params = makeArray( SQLParam("OBJTYPE_PAYMENT",OBJTYPE_PAYMENT),
+                        SQLParam("PaymentID", PaymentID),
+                        SQLParam("TRANSP_SWIFT",TRANSP_SWIFT));
+    rs = execSQLselect( select, params, FALSE );
+    if(rs.moveNext())
+      field_value = rs.value(1);
+      if(rs.value(0) == 108)
+        Tag = SWIFT_Tag_K;
+      elif(rs.value(0) == 145)
+        Tag = SWIFT_Tag_A;
+      elif(rs.value(0) == 611)
+        Tag = SWIFT_Tag_F;
+      end;
+      setparm( 1, Tag );  
+      return field_value;
+    end;    
+  end;
+
+  PayerID = GetPaymPayer( RsPaym );
+  debugbreak;
+  if( Standart == ST_RUR6 )
+    if( (PayerID == {OurBank}) or (RsPaym.Payer == -1) and (RsPaym.PayerAccount == "") )
+      Tag = SWIFT_Tag_K;
+      field_value = FillOrderingCustomerField103_K( RsPaym, Standart );
+    else
+      Tag = SWIFT_Tag_F;
+      field_value = FillOrderingCustomerField103RUR_F( RsPaym, Standart );      
+    end;
+  else     
+    if ( (GetIdentProgram == 147) and (PayerID > 0)  and ((substr(RsPaym.PayerAccount,1,3) != "423" )  and (substr(RsPaym.PayerAccount,1,3) != "426" ) and (substr(RsPaym.PayerAccount,1,3) != "603" ) and (substr(RsPaym.PayerAccount,1,5) != "40817" )))
+    //Teleshova A. 27.07.2011 Заявка № I-00075134: по счету 603 необходимо заполнение опции К
+    //VDN 13.05.2015 R-579983-2 по счету 40817 необходимо заполнение опции К
+    //Если ББ то плательщик ПРББ
+      Tag = SWIFT_Tag_A;
+      field_value = FillOrderingCustomerField103_A( RsPaym, Standart );
+    else    
+      Tag = SWIFT_Tag_K;
+      field_value = FillOrderingCustomerField103_K( RsPaym, Standart );
+      if( field_value == "")
+        if( (RsPaym.PayerAccount == "") or (PayerID == {OurBank})  or (RsPaym.Payer == -1) )
+          Tag = SWIFT_Tag_F;
+          field_value = FillOrderingCustomerField103_F( RsPaym, Standart );
+        else
+          Tag = SWIFT_Tag_A;
+          field_value = FillOrderingCustomerField103_A( RsPaym, Standart );      
+        end;
+      end; 
+    end;
+
+    /* EVG В Банке сообщение всегда генерится с опцией 50 K */
+    //Seleznev - не всегда, есть 103 формы с плательщиком ПРББ - заполняется 50A
+/*
+
+if ((GetIdentProgram == 147) and (PayerID > 0))//Если ББ то плательщик ПРББ
+//      if(IsPerson(PayerID))
+//      if (PayerID == 15424/*{selfid}*/)
+         Tag = SWIFT_Tag_A;
+         field_value = FillOrderingCustomerField103_A( RsPaym, Standart );
+      else
+         Tag = SWIFT_Tag_F;
+         field_value = FillOrderingCustomerField103_F( RsPaym, Standart );
+      end;
+//    else
+      Tag = SWIFT_Tag_A;
+      field_value = FillOrderingCustomerField103_A( RsPaym, Standart );
+      if( field_value == "")
+        if( (RsPaym.PayerAccount == "") or (PayerID == {OurBank})  or (RsPaym.Payer == -1) )
+          Tag = SWIFT_Tag_K;
+          field_value = FillOrderingCustomerField103_K( RsPaym, Standart );
+        else
+          Tag = SWIFT_Tag_F;
+          field_value = FillOrderingCustomerField103_F( RsPaym, Standart );      
+        end;
+      end; 
+    end;*/
+  end;
+
+  setparm( 1, Tag );  
+  return field_value;
+end;
+
+/* Заполнить поле бенефициара */
+/* Заполнение 59a Option A */
+/* Вернет "" если заполнить не удалось */
+macro FillBeneficiaryCustomerField_A( RsPaym, Standart )
+  var field_value, ReceiverID, ReceiverCode, error;
+
+  if (RsPaym.ReceiverCodeKind != PTCK_SWIFT)
+    if (RsPaym.ReceiverCode != "")
+      ReceiverID = ПолучитьКодСубъекта(RsPaym.ReceiverCode, RsPaym.ReceiverCodeKind, error);
+      if (error != 0)
+        ReceiverID = RsPaym.Receiver;                            
+      end;
+    else
+      ReceiverID = RsPaym.Receiver;                            
+    end;
+    ReceiverCode = ПолучитьКодСубъекта(ReceiverID, PTCK_SWIFT, error);
+    if ((error != 0 ) OR (ReceiverCode == ""))                      
+      return ""; /* у ReceiverID нет BIC ISO - возвращаем "" */
+    end;
+  else
+    if (RsPaym.ReceiverCode != "")
+      ReceiverCode = RsPaym.ReceiverCode; /* BIC ISO */
+    else
+      ReceiverID = RsPaym.Receiver;                            
+      ReceiverCode = ПолучитьКодСубъекта(ReceiverID, PTCK_SWIFT, error);
+      if ((error != 0 ) OR (ReceiverCode == ""))                      
+        return ""; /* у ReceiverID нет BIC ISO - возвращаем "" */
+      end;
+    end;
+  end;
+
+  if (trim(RsPaym.ReceiverAccount) != "")
+     field_value = "/" + trim(RsPaym.ReceiverAccount) + SYMB_ENDL;
+  end;
+
+  field_value = String(field_value, ReceiverCode);
+      
+  return field_value;
+end;
+
+macro FillBeneficiaryCustomerField( RsPaym, Standart )
+  var field_value, ReceiverID, BankCode, Error, field_Client, field_place, INN, KPP="";
+  record RecordAdress ( adress );
+
+  if ( valtype(Standart)==V_UNDEF )
+     Standart = ST_UNDEF;
+  end;
+
+  field_value = "";  
+  ReceiverID = RsPaym.Receiver;  
+
+  if ((Standart==ST_RUR5) OR (Standart==ST_RUR6))
+     BankCode = ПолучитьКодСубъекта( ReceiverID, PTCK_BIC, Error );
+
+     if ( (not Error) AND (ReceiverID) AND (Standart==ST_RUR5))
+        field_value = string( "//RU", BankCode );
+        if( trim(RsPaym.ReceiverAccount) != "" )
+          field_value = string( field_value, ".", trim(RsPaym.ReceiverAccount) );
+        end;
+        field_value = field_value + SYMB_ENDL;
+     else
+       if( trim(wlpmpaym.ReceiverAccount) != "" )
+          field_value = SYMB_SLASH + trim(RsPaym.ReceiverAccount) + SYMB_ENDL;
+       end;
+     end;
+  else
+     if( trim(RsPaym.ReceiverAccount) != "" )
+        field_value = SYMB_SLASH + trim(RsPaym.ReceiverAccount) + SYMB_ENDL;
+     end;
+  end;
+
+  /* EVG 13.11.09 Поля ИНН/КПП не нужны в валютных платежах. Как
+     и конец строки, который после них ставится. */
+  if ( RsPaym.BaseFIID == NATCUR )
+     if ( RsPaym.ReceiverINN!="" )
+        INN = RemoveKPP( RsPaym.ReceiverINN );
+        if (Standart == ST_RUR6)
+          KPP = RemoveINN(RsPaym.ReceiverINN);
+        end;
+     elif ( ReceiverID )
+        INN = RemoveKPP( GetPartyINN( ReceiverID ) );
+        if (Standart == ST_RUR6)
+          KPP = RemoveINN(GetPartyINN(ReceiverID));
+        end;
+     else
+        INN = "";
+        KPP = "";
+     end;
+
+     if( INN != "" )
+        field_value = String( field_value, "INN", INN );
+     end;
+     if (KPP != "")
+       field_value = String(field_value, ".KPP", KPP);
+     end;
+     field_value = String(field_value, SYMB_ENDL);
+  end;
+     
+  StrChangeRusXSet( RsPaym.ReceiverName, field_Client, Standart );
+
+  field_value = field_value + field_Client;
+
+  ClearRecord(RecordAdress);
+    НайтиЮридическийАдресСубъекта(wlparty.PartyID,RecordAdress);
+  if( ReceiverID AND НайтиЮридическийАдресСубъекта(ReceiverID,RecordAdress) )
+     if ( RecordAdress.Adress!="" )
+       StrChangeRusXSet( RecordAdress.Adress, field_place, Standart );
+       field_value = String( field_value, " ", field_place );
+     end;
+     if( RecordAdress.Place != "" )
+       StrChangeRusXSet( RecordAdress.Place, field_place, Standart );
+       field_value = String( field_value, SYMB_ENDL, field_place );
+     end;
+  end;  
+
+  if ( Standart==ST_RUR4 )
+     StrMultyToFormat( field_value, field_value, 35, 5, "CheckBreakRUR4" );
+  else
+    field_value = SwiftStrSplit( field_value, 35, 5 );
+    /*StrMultyToFormat( field_value, field_value, 35, 5 );*/
+  end;
+
+  return field_value;
+end;
+
+/* Проверяет на наличие такого кода среди разрешенных */
+macro IsAllowCode( AllowCodes, code )
+    var str = AllowCodes, curCode, i;
+    while( str!="" )
+        i = Index(str, SYMB_BLANK);
+        if ( i )
+           if ( i>1 )
+              curCode = substr( str, 1, i-1 );
+           else
+              curCode = "";
+           end;
+           str = substr( str, i+1 );
+        else
+           curCode = str;
+           str = "";
+        end;        
+        if ( code==curCode )
+           return true;
+        end;
+    end;
+
+    return false;
+end;
+
+macro ДобавитьБлокВПоле70( field_value, CurrentCode, field70, standart )
+    var len, i, ch, prevCh;
+
+    StrChangeRusXSet( field70, field70, standart );    
+
+    if ( field_value!="" )
+       field_value = field_value + SYMB_DSLASH;
+    end;
+
+    field_value = field_value + SYMB_SLASH + CurrentCode + SYMB_SLASH;
+
+    if ( CurrentCode==Field70CodesRFB )
+       field70 = substr( field70, 1, 16 );
+    end;
+
+    len = strlen( field70 );
+
+    i = 1;
+    prevCh = "";
+    while( i<=len )
+       ch = substr( field70, i, 1 );
+       if ( (ch!=SYMB_BLANK) AND (ch!=SYMB_ENDL) )
+          field_value = field_value + ch;
+       elif ( (prevCh!=SYMB_BLANK) AND (prevCh!=SYMB_ENDL) AND (prevCh!="") )
+          field_value = field_value + SYMB_DSLASH;
+       end;
+       prevCh = ch;
+       i = i + 1;
+    end;
+
+    return field_value;
+end;
+/*
+/* Заполнить поле 70 */
+macro FillDetailsOfPaymentField( RsPaym, AllowCodes, ОстатокПоля, Standart, form )
+  var field_value, rest:string, PaymentDetails, field70, i, ch;
+  var tmpfield70;
+
+  if( valtype(Standart)==V_UNDEF )
+    Standart = ST_UNDEF;
+  end;
+  
+  // Teleshova A. 27.07.2011 Заявка № I-00075134
+  // так как у платежа из ББ нет основания, а есть дополнительная информация, то поле 70 заполняем из неё ( для ЭВ)
+
+/*SDA 14/02/2012 2:01 Нет Саша, не так...  */
+  if ((RsPaym.dockind == 27) and (form == "103") and _VOLGA_BANK())
+      StrChangeRusXSet( RsPaym.AdditionalInfo, PaymentDetails, Standart );
+  else
+      StrChangeRusXSet( RsPaym.Ground, PaymentDetails, Standart );
+  end;
+  
+  i = 1;
+  while( i <= strlen(PaymentDetails) )
+    ch = SubStr( PaymentDetails, i, 1 );
+    if( ch == SYMB_ENDL )
+      PaymentDetails = SubStr( PaymentDetails, 1, i-1 ) + " " + SubStr( PaymentDetails, i+1 );
+    end;
+    i = i + 1;
+  end;
+
+  field_value = PaymentDetails;
+  if( Standart == ST_RUR4 )
+    rest = StrMultyToFormat( field_value, field_value, 35, 4, "CheckBreakRUR4" );
+  else
+    field_value = SwiftStrSplit( field_value, 35, 4, rest );
+    /*rest = StrMultyToFormat( field_value, field_value, 35, 4 );*/
+  end;
+
+  ОстатокПоля = rest;
+  setparm( 2, ОстатокПоля );
+
+  /* EVG Чей-то пользовательский код, как я понял */
+  if ((RsPaym.dockind == 27) and (form == "103") and (not (_VOLGA_BANK()))) 
+     field70 = RsPaym.AdditionalInfo;
+
+     if( SubStr( field70, 1, 1 ) == SYMB_SLASH )
+        // в случае если в поле уже содержится кодовое слово, то нужно исключить его из транслитерации
+        // и передавать в сообщение как есть (SCR 144401)
+        tmpfield70 = SubStr( field70, 2 );
+        field70 = SYMB_SLASH + SubStr( tmpfield70, 1, Index(tmpfield70, SYMB_SLASH) );
+        StrChangeRusXSet( SubStr(tmpfield70, Index(tmpfield70, SYMB_SLASH)+1), tmpfield70, standart );
+        field70 = field70 + tmpfield70;
+        field_value = ДобавитьБлокВПоле70( field_value, "", field70, standart );
+     else
+        StrChangeRusXSet( field70, field70, standart );
+        field_value = ДобавитьБлокВПоле72( field_value, Field72CodesACC, field70, standart );
+     end;
+  end;
+  
+  return field_value;
+end;
+*/
+/* Заполнить поле 70 */
+macro FillDetailsOfPaymentField( RsPaym, AllowCodes, ОстатокПоля, Standart, form )
+  var field_value, rest:string, PaymentDetails, field70, i, ch;
+  var tmpfield70;
+
+  if( valtype(Standart)==V_UNDEF )
+    Standart = ST_UNDEF;
+  end;
+  StrChangeRusXSet( RsPaym.Ground, PaymentDetails, Standart );
+
+  i = 1;
+  while( i <= strlen(PaymentDetails) )
+    ch = SubStr( PaymentDetails, i, 1 );
+    if( ch == SYMB_ENDL )
+      PaymentDetails = SubStr( PaymentDetails, 1, i-1 ) + " " + SubStr( PaymentDetails, i+1 );
+    end;
+    i = i + 1;
+  end;
+
+  field_value = PaymentDetails;
+  if( Standart == ST_RUR4 )
+    rest = StrMultyToFormat( field_value, field_value, 35, 4, "CheckBreakRUR4" );
+  else
+    field_value = SwiftStrSplit( field_value, 35, 4, true, @rest );
+    /*rest = StrMultyToFormat( field_value, field_value, 35, 4 );*/
+  end;
+
+  ОстатокПоля = rest;
+  setparm( 2, ОстатокПоля );
+
+/* EVG Чей-то пользовательский код, как я понял */
+/* SDA 14/02/2012 2:08 информация для 72-го поля вводится теперь (надеюсь пока) по CTRL+Z
+   Остаток поля 70 переносится в 72 штатно, по правилам SWIFT
+  if ((RsPaym.dockind == 27) and (form == "103"))
+     field70 = RsPaym.AdditionalInfo;
+
+     if( SubStr( field70, 1, 1 ) == SYMB_SLASH )
+        // в случае если в поле уже содержится кодовое слово, то нужно исключить его из транслитерации
+        // и передавать в сообщение как есть (SCR 144401)
+        tmpfield70 = SubStr( field70, 2 );
+        field70 = SYMB_SLASH + SubStr( tmpfield70, 1, Index(tmpfield70, SYMB_SLASH) );
+        StrChangeRusXSet( SubStr(tmpfield70, Index(tmpfield70, SYMB_SLASH)+1), tmpfield70, standart );
+        field70 = field70 + tmpfield70;
+        field_value = ДобавитьБлокВПоле70( field_value, "", field70, standart );
+     else
+        StrChangeRusXSet( field70, field70, standart );
+        field_value = ДобавитьБлокВПоле72( field_value, Field72CodesACC, field70, standart );
+     end;
+  end;
+*/
+  return field_value;
+end;
+
+
+
+macro ПолучитьИмяФормы( PaymentID, TpID, FormName )
+  var Direct;
+  FILE   wldfrm( wlmesfrm ) key 0;
+  FILE   wldrls( wlmesrls ) key 0;
+  RECORD wldmes( wlmes  );
+
+  if( not PaymentID )
+    return FALSE;
+  end;
+
+  var paym = RsbPayment( PaymentID );
+  
+  if( not paym.IsExternal )
+    return FALSE;
+  end;
+
+  if( paym.IsExternalIncoming )
+    Direct = 1;  /* Входящее */
+  else
+    Direct = 0;  /* Исходящее */
+  end;
+
+  if( not ПолучитьСообщение( PaymentID, OBJTYPE_PAYMENT, Direct, wldmes, NULL, WLD_SUBKIND_PAYM_CLN ) )
+    return FALSE;
+  end;
+
+  wldrls.RlsFormID = wldmes.RlsFormID;
+  if(not GetEQ(wldrls))
+    return FALSE;
+  end;
+
+  wldfrm.FormID = wldrls.FormID;
+  if(not GetEQ(wldfrm))
+    return FALSE;
+  end;
+
+  SetParm( 1, wldfrm.TpID );
+  SetParm( 2, wldfrm.Name );
+
+  return TRUE;
+end;
+
+// Запрлнить подполе "Transaction Type Identification Code" поля 61 "Statement Line"
+macro FillTypeOperField( PaymentID, FormName ) : string
+  var TypeOper : string = StatLine_TypeOperField_SWIFTTag;
+
+  // То, что PaymentID задан (проводка связана с платежом) и платеж внешний, 
+  // проверяется перед вызовом текущей функции в macro ПолучитьИмяФормы
+  if( ПолучитьУзелОсновнойИнструкцииПлатежа(PaymentID, RTDIR_OUT) or
+      ПолучитьУзелОсновнойИнструкцииПлатежа(PaymentID, RTDIR_IN)
+    )
+    TypeOper = TypeOper + CoverMessage;
+  else
+    TypeOper = TypeOper + FormName;
+  end;
+
+  return TypeOper;
+end;
+
+macro GetSWIFTDKFlagPaymProp( RsPaym )
+   var DKFlag;   
+  if( RsPaym.PayerIsSender == "X" )
+         DKFlag = "C" ;
+      else
+         DKFlag = "D" ;
+      end;
+   return DKFlag;
+end;
+
+macro GetSWIFTDKFlagPayment( RsPaym )
+   return GetSWIFTDKFlagPaymProp(RsPaym);
+end;
+
+/* Проверка, что банк-получатель - Тербанк СБ РФ */
+MACRO IsBankUSB(BankID)
+
+  if (IsBankType(BankID, PT_KIND_SAVINGS_BANK) == true)
+    return true;
+  end;
+  
+  return false;
+
+END;
+
+macro ПолучитьИмяБанка( PartyID )
+   var Name;
+   file party( party ) key 0;
+   record PartyAdress ( adress );
+
+   if ( PartyID )
+      party.PartyID = PartyID;
+   else 
+      party.PartyID = {OurBank};
+   end;
+
+   if ( getEQ(party) )
+      name = party.ShortName;
+      ClearRecord(PartyAdress);
+      НайтиЮридическийАдресСубъекта(party.PartyID,PartyAdress);
+      if (PartyAdress.Place)
+         name = name + SYMB_ENDL + PartyAdress.CodePlace + "." + PartyAdress.Place;
+      end;
+      return name; 
+   end;
+   return "";
+end;
+
+/* Заполняет поле 52 (для платежа) */
+macro FillOrderingInstitutionField(RsPaym, Tag, standart, form)
+   var field_value = "", Name, tempv, DKFlag, error, BIC_CB="", SideIdent="", SideIdent_Tmp="";
+   var INN = "", KPP = "", INNKPP = "";
+   var BankID = 0;
+
+   RECORD snd( pmroute );
+   record RecordAdress ( adress );
+
+   /*Если направление платежа в Сбербанк России заполняется только по опции D */
+   if ( (IsBankUSB(RsPaym.ReceiverBankID)) or ((standart == ST_RUR6) and (form == "202RUR6")) )
+       Tag = SWIFT_Tag_D;
+   else 
+       Tag = "";
+   end;
+
+   if( ПолучитьУзелОтправителяПлатежа(RsPaym.PaymentID, snd) AND 
+       ПолучитьСамыйДальнийУзелПлатежа(RsPaym.PaymentID, RTDIR_IN, Route) AND 
+       (snd.RouteID!=Route.RouteID) )
+       DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+       Route.InAccount = "";
+       field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );
+   else
+      // Для 202 rur6 заполняем всегда. Для других форм - если реальный отправитель отличается от нашего банка
+      if ( ExistsExternalInProp(RsPaym) or ((standart == ST_RUR6) and (form == "202RUR6")) or (RsPaym.PayerMesBankID != 0))
+         if(RsPaym.PayerMesBankID != 0)
+           BankID = RsPaym.PayerMesBankID;
+         else
+           BankID = RsPaym.PayerBankID;
+         end;
+         if ( Tag=="" )
+            tempv = ПолучитьКодСубъекта( BankID, PTCK_SWIFT, error);            
+            if ( error )
+               Tag = SWIFT_Tag_D;
+            else
+               Tag = SWIFT_Tag_A;
+            end;
+         end;      
+
+         if ( Tag==SWIFT_Tag_A )         
+            field_value = field_value + tempv;
+         else
+            if ((standart == ST_RUR6) or (standart == ST_RUR5)) /*52D идентично для RUR6 и RUR5, Шмаков. GVR*/
+              BIC_CB = ПолучитьКодСубъекта(BankID, PTCK_BIC, error);
+              SideIdent = "";
+              if (not error)
+                f_wldprt.PartyID = BankID;
+                if (GetEQ(f_wldprt))
+                  SideIdent = string(SideIdent, "//RU", BIC_CB, ".", f_wldprt.CorAcc, SYMB_ENDL);
+                end;
+              end;
+            end;
+
+            if (Standart == ST_RUR6)
+              INNKPP = GetPartyINN( BankID, 1 );
+              INN = RemoveKPP(INNKPP);
+              KPP = RemoveINN(INNKPP);
+
+              if(INN!="")
+                INN = "INN" + INN;
+               end;
+              if(KPP!="")
+                KPP = "." + "KPP" + KPP;
+               end;
+
+              INNKPP = INN + KPP + SYMB_ENDL;
+
+            end;
+
+            Name = ПолучитьИмяБанка(BankID);
+
+            if( Name != "" )      
+              StrChangeRusXSet( Name, tempv, standart );
+              if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+                 StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+              else
+                 StrMultyToFormat( tempv, tempv, 35, 5 );
+              end;
+              
+              field_value = field_value + SideIdent + INNKPP + tempv;
+            end;
+         end;
+
+      /* EVG 12.11.09 По просьбе Фоменко, поле 52D должно заполняться для всех форм 202. */
+      elif (form == "202")
+         if ( (RsPaym.BaseFiid > 0) and (subStr(RsPaym.PayerAccount, 1, 5) == "30109") )
+            Tag = SWIFT_Tag_D;
+            Name = "/" + RsPaym.PayerAccount + "\n" + RsPaym.PayerName;
+            StrChangeRusXSet( Name, tempv, standart );
+            StrMultyToFormat( tempv, tempv, 35, 5 );
+            field_value = field_value + tempv;
+         end;
+      end;
+
+   end;
+
+   if ( Tag=="" )
+      Tag = SWIFT_Tag_A;
+   end;
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 52 (для требования) */
+macro FillPayerBankField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error, BIC_CB="", SideIdent="", SideIdent_Tmp="";
+
+   RECORD snd( pmroute );
+   record RecordAdress ( adress );
+
+   /*Если направление платежа в Сбербанк России заполняется только по опции D */
+   if ( IsBankUSB(RsPaym.PayerBankID) )
+       Tag = SWIFT_Tag_D;
+   else 
+       Tag = "";
+   end;
+
+   if ( Tag=="" )
+      tempv = ПолучитьКодСубъекта( RsPaym.PayerBankID, PTCK_SWIFT, error);            
+      if ( error )
+        Tag = SWIFT_Tag_D;
+      else
+        Tag = SWIFT_Tag_A;
+      end;
+   end;      
+
+   if ( Tag==SWIFT_Tag_A )         
+      field_value = field_value + tempv;
+   else
+      if (standart == ST_RUR6)
+         BIC_CB = ПолучитьКодСубъекта(RsPaym.PayerBankID, PTCK_BIC, error);
+         SideIdent = "";
+         if (not error)
+            f_wldprt.PartyID = RsPaym.PayerBankID;
+            if (GetEQ(f_wldprt))
+               SideIdent = string(SideIdent, "//RU", BIC_CB, ".", f_wldprt.CorAcc, SYMB_ENDL);
+            end;
+         end;
+      end;
+      if ( RsPaym.PaymentID )
+         Name = RsPaym.PayerBankName;
+         if( НайтиЮридическийАдресСубъекта(RsPaym.PayerBankID,RecordAdress) AND
+           (RecordAdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(RecordAdress.Place)))==0) )
+           Name = string( Name, SYMB_ENDL, trim(RecordAdress.Place) );
+         end;
+      else
+         Name = ПолучитьИмяБанка(RsPaym.PayerBankID);
+      end;
+
+      if( Name != "" )      
+         StrChangeRusXSet( Name, tempv, standart );
+         if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+          StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+         else
+          StrMultyToFormat( tempv, tempv, 35, 5 );
+         end;
+         field_value = field_value + SideIdent + tempv;
+      end;
+   end;
+
+   if ( Tag=="" )
+      Tag = SWIFT_Tag_A;
+   end;
+   setparm( 1, Tag );
+
+   return field_value;
+
+end;
+
+/* Поле 21 из примечания платежа. DAI по C-20122*/
+macro FillRelatedReferenceField(RsPaym)
+   return ReadNoteForPayment ( RsPaym.PaymentID, 159 );
+end;
+
+/* Заполняет поле 53 (для платежа) */
+macro FillSenderCorrespondentField(RsPaym, Tag, standart, form)
+   var field_value = "", Name, tempv, DKFlag="", error, OurCorrAcc="";
+   var FIID, Corschem;
+   RECORD rcv(pmroute);
+
+/*SDA 18.112010 I-090893 формирование поля 53D */
+   var fgBank = fg_life_subject({OurBank});
+
+   if (valtype(Tag)==V_UNDEF)
+     Tag = SWIFT_Tag_A; /* По умолчанию считаем - A */
+   end;
+
+   if (ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND 
+       ПолучитьБлижайшийУзелПлатежа(RsPaym.PaymentID, RTDIR_OUT, Route) AND
+       (rcv.RouteID!=Route.RouteID) )
+     DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+     field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );
+   else
+     /* Узла маршрута нет, но это не означет, что мы ничем не заполним это поле */
+     Tag = SWIFT_Tag_B; /* В формах, зовущих эту функцию, опция В есть всегда*/
+     if (RsPaym.PaymentID)
+       if ( RsPaym.ReceiverIsSender!="X")
+         OurCorrAcc = RsPaym.ReceiverOurCorrAcc;
+         FIID       = RsPaym.ReceiverFIID;
+         Corschem   = RsPaym.OutCorschem;
+       else
+         OurCorrAcc = RsPaym.PayerOurCorrAcc;
+         FIID       = RsPaym.PayerFIID;
+         Corschem   = RsPaym.InCorschem;
+       end;
+       
+       /*Tikh Если заполнено примечание, то 53 поле для ББ 200 формы берем оттуда*/
+//       if ({oper} == 10000)
+       if (OurCorrAcc == "") /* Корсчет явно не задан */
+          if ((form == "200") and (RsPaym.dockind == 27))
+             Tag = SWIFT_Tag_B;
+             OurCorrAcc = ReadNoteForPayment ( RsPaym.PaymentID, 135 );
+          end;
+       end;
+//       end;
+
+       /*SDA 18.112010 I-090893 формирование поля 53D */
+       if (not fgBank.is_PRBB)
+         OurCorrAcc = ПолучитьСчетКорреспондентаПоСхемеРасчетов(RsPaym.OutCorschem,RsPaym.OutCorschemFIID);
+         DKFlag = "D";
+       end;
+
+       if (OurCorrAcc == "") /* Корсчет явно не задан */
+         OurCorrAcc = ПолучитьКорсчетКонтрагента(Corschem, FIID);
+       end;
+
+       if (OurCorrAcc != "")
+         /* Корсчет задан явно или для контрагента настроено более одной корсхемы */
+          if ((form == "200") and (RsPaym.dockind == 27))
+              DKFlag = "D";
+          end;
+       /*SDA 18.112010 I-090893 формирование поля 53D */
+       if (DKFlag == "")
+         DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+       end;
+
+         field_value = SYMB_SLASH + DKFlag;
+         field_value = field_value + SYMB_SLASH + OurCorrAcc + SYMB_ENDL;
+       end;            
+     end;
+   end;
+   
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 54 (для платежа) */
+macro FillReceiverCorrespondentField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error;
+   RECORD rcv(pmroute);
+   RECORD ocb(pmroute);
+
+   if ( valtype(Tag)==V_UNDEF )
+       Tag = SWIFT_Tag_A; /* По умолчанию считаем - A */
+   end;
+
+   if( ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND 
+       ПолучитьБлижайшийУзелПлатежа(RsPaym.PaymentID, RTDIR_OUT, ocb) AND
+       (rcv.RouteID!=ocb.RouteID) AND
+       ПерейтиНаБолееДальнийУзел(RTDIR_OUT, Route) AND
+       (rcv.RouteID!=Route.RouteID) )
+       DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+       field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );   
+   end;
+
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 55 (для платежа) */
+macro FillThirdReibursBankField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error;
+   RECORD rcv(pmroute);
+   RECORD ocb(pmroute);
+   RECORD irb(pmroute);
+
+   if ( valtype(Tag)==V_UNDEF )
+       Tag = SWIFT_Tag_A; /* По умолчанию считаем - A */
+   end;
+
+   if( ПолучитьБлижайшийУзелПлатежа( RsPaym.PaymentID, RTDIR_OUT, ocb ) AND
+       ПерейтиНаБолееДальнийУзел(RTDIR_OUT, irb) AND
+       ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND 
+       (rcv.RouteID!=ocb.RouteID) AND (rcv.RouteID!=irb.RouteID) AND
+       ПерейтиНаБолееБлизкийУзел(RTDIR_OUT, Route) AND (Route.RouteID!=irb.RouteID) )
+       DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+       field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );   
+   end;
+
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 56 (для платежа) */
+macro FillIntermediaryField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error, coresp, IsEq;
+   var CorrCodeKind, CorrCode, CorrName, CorrAcc;
+   RECORD rcv(pmroute);
+   RECORD acc(pmroute);
+
+   if ( RsPaym.ReceiverIsSender!="X") 
+      CorrCodeKind  = RsPaym.ReceiverBankCorrCodeKind;
+      CorrCode      = RsPaym.ReceiverBankCorrCode;  
+      CorrName      = RsPaym.ReceiverBankCorrName;
+      CorrAcc       = RsPaym.ReceiverBankCorrAcc;
+   else
+      CorrCodeKind  = RsPaym.PayerBankCorrCodeKind;
+      CorrCode      = RsPaym.PayerBankCorrCode;  
+      CorrName      = RsPaym.PayerBankCorrName;
+      CorrAcc       = RsPaym.PayerBankCorrAcc;
+   end;
+
+   if ( valtype(Tag)==V_UNDEF )
+       Tag = "";
+   end;
+
+
+   /* EVG Видимо, это особенность сбера.
+   /* При передаче в Сбербанк России это поле не используется */
+   if ( IsBankUSB(wlpmpaym.ReceiverBankID)==false )
+   */
+      if( ПолучитьСамыйДальнийУзелПлатежа(RsPaym.PaymentID, RTDIR_OUT, acc) AND
+          ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND
+          (rcv.RouteID!=acc.RouteID) AND
+          ПерейтиНаБолееДальнийУзел(RTDIR_OUT, Route) AND
+          (Route.RouteID!=acc.RouteID) )
+          DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);      
+          field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );
+      else
+         /* Узла маршрута нет, но это не означет, что мы ничем не заполним это поле */               
+         if( ПолучитьСамыйДальнийУзелПлатежа(RsPaym.PaymentID, RTDIR_OUT, acc) AND
+             ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND
+            (rcv.RouteID!=acc.RouteID) )
+           if ( (CorrCodeKind==PTCK_SWIFT) AND (CorrCode!="") AND ((Tag == "") OR (Tag == SWIFT_Tag_A)))
+             Tag = SWIFT_Tag_A;
+             if( CorrAcc != "" )
+               field_value = field_value + SYMB_SLASH + CorrAcc + SYMB_ENDL;
+             end;                 
+             field_value = field_value + CorrCode;
+           elif( ((trim(CorrName) != "") and (trim(CorrName) != RSB_EMPTY_STRING )) AND ((Tag == "") OR (Tag == SWIFT_Tag_D)) ) //TAM 24.06.2013 R-208011
+             Tag = SWIFT_Tag_D;
+             if( CorrAcc != "" )
+               field_value = field_value + SYMB_SLASH + CorrAcc + SYMB_ENDL;
+             end;
+             StrChangeRusXSet( CorrName, tempv, standart );
+             StrMultyToFormat( tempv, tempv, 35, 4 );
+             field_value = field_value + tempv;
+           end;
+         end;      
+      end;
+   // EVG end;
+
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 57 (для платежа) */
+macro FillAccountWithInstitutionField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error, coresp, IsEq, BankCode, INN, oldkey;
+   var corSchem, payFIID, BankCodeT;
+   RECORD prop( pmprop );
+   RECORD rcv(pmroute);
+   record RecordAdress ( adress );
+
+   if ( RsPaym.ReceiverIsSender!="X") 
+      corSchem      = RsPaym.OutCorschem;
+      payFIID       = RsPaym.ReceiverFIID;
+      BankCodeT     = RsPaym.ReceiverBankCodeKind;
+   else
+      corSchem      = RsPaym.InCorschem;
+      payFIID       = RsPaym.PayerFIID;
+      BankCodeT     = RsPaym.PayerBankCodeKind;
+   end;
+
+   if ( valtype(Tag)==V_UNDEF )
+       Tag = "";
+   end;
+
+   /*if ( IsBankUSB(RsPaym.ReceiverBankID)==true )
+     /* При передаче в Сбербанк России используется форма D */
+     Tag = SWIFT_Tag_D;
+   end;*/      
+
+   if( ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND
+       ПолучитьСамыйДальнийУзелПлатежа(RsPaym.PaymentID, RTDIR_OUT, Route) AND
+       (Route.RouteID!=rcv.RouteID) )
+       DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+       Route.OutAccount = Route.InAccount = RsPaym.ReceiverCorrAccNostro;
+       field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );
+   else
+      /* Если покрытия не будет */
+      if( not ПолучитьУзелОсновнойИнструкцииПлатежа(RsPaym.PaymentID, RTDIR_OUT) )
+         /* Проверим, не совпадает ли он с корреспондетом */         
+         oldkey = KeyNum( f_wlcors, 1 );
+         f_wlcors.Number  = corSchem;
+         f_wlcors.FI_Kind = 1; /* валюта */
+         f_wlcors.FIID    = payFIID;
+         if( getEQ(f_wlcors) AND (f_wlcors.CorrID!=RsPaym.ReceiverBankID) )
+            /* Узла маршрута нет, но это не означет, что мы ничем не заполним это поле */      
+            if ( Tag=="" )
+               if ( (prop.CodeKind==PTCK_SWIFT) AND (BankCodeT!="") )
+                  Tag = SWIFT_Tag_A;
+               else
+                  Tag = SWIFT_Tag_D;
+               end;
+            end;      
+
+            if ( Tag==SWIFT_Tag_A )                           
+               field_value = field_value + BankCodeT;
+            elif ( Tag==SWIFT_Tag_D )
+               BankCode = ПолучитьКодСубъекта( RsPaym.ReceiverBankID, PTCK_BIC, error );
+
+               if ( (not Error) AND (IsCreditPaym(RsPaym)) AND ((standart==ST_RUR4) OR (standart==ST_RUR5) OR (standart==ST_RUR6)) )
+                  field_value = string( "//RU", BankCode );                  
+                  if ( RsPaym.ReceiverCorrAccNostro!="" )
+                     field_value = field_value + SYMB_SLASH + RsPaym.ReceiverCorrAccNostro;
+                  end;
+                  field_value = field_value + SYMB_ENDL;
+               else
+                 if ( RsPaym.ReceiverCorrAccNostro!="" )
+                   field_value = field_value + SYMB_SLASH + RsPaym.ReceiverCorrAccNostro + SYMB_ENDL;
+                 end;
+               end;
+
+               INN = GetPartyINN( RsPaym.ReceiverBankID );
+               if( INN != "" )
+                  field_value = String( field_value, "INN", INN, SYMB_ENDL );
+               end;
+
+               
+               Name = GetNameBank_Tag_D(Tag, RsPaym.ReceiverBankName, RsPaym.ReceiverBankID);
+               if(Name != "")
+                 if( (IsCreditPaym(RsPaym)) AND НайтиЮридическийАдресСубъекта(RsPaym.ReceiverBankID,RecordAdress) AND
+                     (RecordAdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(RecordAdress.Place)))==0) )
+                    Name = string( Name, SYMB_ENDL, trim(RecordAdress.Place) );
+                 end;
+               end;
+
+               if( Name != "" )      
+                 StrChangeRusXSet( Name, tempv, standart );
+                 if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+                    StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+                 else
+                    StrMultyToFormat( tempv, tempv, 35, 5 );
+                 end;
+                 field_value = field_value + tempv;
+               end;
+            end;
+         end;
+         KeyNum( f_wlcors, oldKey );
+      end;
+   end;
+
+   if ( Tag=="" )
+      /* Если Tag так и не определился (field_value=""), то заполняем его силой, что бы потом крика не было */
+      Tag = SWIFT_Tag_A;
+   end; 
+
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+macro FillAccountWithInstitutionField_n91(RsPaym, Tag, standart)
+  var field_value = "", Name, error;
+  var NeedAcc, account = "", ID, INN, Code, tempv;
+  Tag = "";
+  
+  f_wlcors.Number  = RsPaym.OutCorschem;
+  f_wlcors.FI_Kind = 1; /* валюта */
+  f_wlcors.FIID    = RsPaym.ReceiverFIID;
+  
+  if( getEQ(f_wlcors) )
+    if(f_wlcors.CorrID == RsPaym.PayerBankID)
+      NeedAcc = false;
+      ID      = RsPaym.ReceiverBankID;
+    else
+      NeedAcc = true;
+      ID      = f_wlcors.CorrID;
+    end;
+    
+    Code = ПолучитьКодСубъекта( ID, PTCK_SWIFT, error );
+    account = f_wlcors.CorAccount;
+
+    if (not error)
+       if ( NeedAcc )
+          field_value = field_value + SYMB_SLASH + account + SYMB_ENDL;
+       end;
+       field_value = field_value + Code;
+       Tag = SWIFT_Tag_A;
+    else
+       
+       if ( NeedAcc )
+          field_value = field_value + SYMB_SLASH + account + SYMB_ENDL;
+       end;
+       Tag = SWIFT_Tag_D;
+       Code = ПолучитьКодСубъекта( ID, PTCK_BIC, error );
+
+       if ( (not error) AND ((standart==ST_RUR4) OR (standart==ST_RUR5) OR (standart==ST_RUR6)) )
+          field_value = string( "//RU", Code );                  
+          field_value = field_value + SYMB_ENDL;
+       end;
+
+       INN = GetPartyINN( ID );
+       if( INN != "" )
+         field_value = String( field_value, "INN", INN, SYMB_ENDL );
+       end;
+               
+       Name = ПолучитьИмяБанка(ID);
+               
+       if( ID AND НайтиЮридическийАдресСубъекта(ID,wladdress) AND
+           (wladdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(wladdress.Place)))==0) )
+         Name = string( Name, SYMB_ENDL, trim(wladdress.Place) );
+       end;
+
+       if( Name != "" )      
+         StrChangeRusXSet( Name, tempv, standart );
+         if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+            StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+         else
+            StrMultyToFormat( tempv, tempv, 35, 5 );
+         end;
+         field_value = field_value + tempv;
+       end;
+    end;
+  end;
+
+  setparm( 1, Tag );
+  return field_value;
+end;
+/* Проверка на платеж с порытием */
+macro CheckCoverPayment( RsPaym )
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  /* Проверяем, привязано ли к платежу более одного сообщения с абсолютно одинаковыми */
+  /* wlmes.OutsideAbonentID, wlmes.InsideAbonentID, wlmes.AgentID */
+  select = "select count(*) from dwlmeslnk_dbt wlmeslnk, dwlmes_dbt wlmes, dwlpm_dbt wlpm"+
+                            " where wlpm.t_PaymentID = :PaymentID"+
+                            " AND wlmeslnk.t_ObjKind = :OBJTYPE_PAYMENT"+
+                            " AND wlmeslnk.t_ObjID   = wlpm.t_WlPmID"+
+                            " AND wlmeslnk.t_Direct  = chr(0)"+
+                            " AND wlmeslnk.t_MesID   = wlmes.t_MesID"+
+                            " group by wlpm.t_PaymentID"+
+                            " having count(*) > 1";
+  params = makeArray( SQLParam("PaymentID",RsPaym.PaymentID),
+                      SQLParam("OBJTYPE_PAYMENT",OBJTYPE_PAYMENT ));
+  rs = execSQLselect( select, params, FALSE );
+  if( rs.MoveNext() )
+    return true;    
+  else
+    return false;
+  end;
+end;
+
+/* Заполняет поле 58 (для платежа) */
+macro FillBeneficiaryInstitutionField(RsPaym, Tag, standart)
+   var field_value = "", Name, tempv, DKFlag, error, coresp, IsEq, BankCode, INN;
+   var BenCodeKind, BenBankCode;   
+   record RecordAdress ( adress );
+
+   if ( RsPaym.ReceiverIsSender!="X") 
+      BenCodeKind  = RsPaym.ReceiverCodeKind;
+      BenBankCode  = RsPaym.ReceiverCode;
+   else
+      BenCodeKind  = RsPaym.PayerCodeKind;
+      BenBankCode  = RsPaym.PayerCode;
+   end;
+
+   if ( valtype(Tag)==V_UNDEF )
+       Tag = "";
+   end;
+
+   if ( not ( IsPmCoverMode() or CheckCoverPayment( RsPaym ) ) )      
+      /* Узла маршрута нет, но это не означет, что мы ничем не заполним это поле */      
+      if ( Tag=="" )
+         if ( (BenCodeKind==PTCK_SWIFT) And (BenBankCode!="") )  /*!!!*/
+            Tag = SWIFT_Tag_A;
+         else
+            Tag = SWIFT_Tag_D;
+         end;
+      end;      
+
+      if ( Tag==SWIFT_Tag_A )            
+         if ( trim(RsPaym.ReceiverAccount)!="" )
+            field_value = field_value + SYMB_SLASH + trim(RsPaym.ReceiverAccount) + SYMB_ENDL;
+         end;
+         field_value = field_value + BenBankCode;
+      elif ( Tag==SWIFT_Tag_D )            
+         BankCode = ПолучитьКодСубъекта( RsPaym.Receiver, PTCK_BIC, error );
+
+         if ( (not Error) AND (RsPaym.Receiver) AND ((standart==ST_RUR4) OR (standart==ST_RUR5) OR (standart==ST_RUR6)) )
+            field_value = string( "//RU", BankCode );
+            if ( trim(RsPaym.ReceiverAccount)!="" )
+              field_value = string( field_value, ".", trim(RsPaym.ReceiverAccount) );
+            end;
+            field_value = field_value + SYMB_ENDL;
+         else
+           if ( trim(wlpmpaym.ReceiverAccount)!="" )
+            field_value = field_value + SYMB_SLASH + trim(RsPaym.ReceiverAccount) + SYMB_ENDL;
+           end;
+         end;
+
+         INN = GetPartyINN( RsPaym.Receiver );
+         if( INN != "" )
+            if(RemoveINN(INN))
+               field_value = String( field_value, "INN", RemoveKPP(INN), 
+                                                 ".KPP", RemoveINN(INN), SYMB_ENDL );
+         else
+               field_value = String( field_value, "INN", RemoveKPP(INN), SYMB_ENDL );
+            end;
+         else
+            if(RemoveINN(RsPaym.ReceiverINN))
+               field_value = String( field_value, "INN", RemoveKPP(RsPaym.ReceiverINN), 
+                                                 ".KPP", RemoveINN(RsPaym.ReceiverINN), SYMB_ENDL );
+            elif( RsPaym.ReceiverINN != "" )
+               field_value = String( field_value, "INN", RemoveKPP(RsPaym.ReceiverINN), SYMB_ENDL );
+            end;
+         end;
+
+         Name = GetNameBank_Tag_D(Tag, RsPaym.ReceiverName, RsPaym.Receiver);
+         if( Name != "" )
+           if( (RsPaym.Receiver) AND НайтиЮридическийАдресСубъекта(RsPaym.Receiver,RecordAdress) AND
+               (RecordAdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(RecordAdress.Place)))==0) )
+               Name = string( Name, SYMB_ENDL, trim(RecordAdress.Place) );
+           end;
+           StrChangeRusXSet( Name, tempv, standart );
+           if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+              StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+           else
+              StrMultyToFormat( tempv, tempv, 35, 5 );
+           end;
+           field_value = field_value + tempv;
+         end;
+      end;
+   else
+      /* Заполнеие поля 58 для покрытия */
+      if( ПолучитьУзелПолучателяПлатежа( RsPaym.PaymentID, Route ) == TRUE )
+         DKFlag = GetSWIFTDKFlagPaymProp(RsPaym);
+         field_value = СформироватьЗаписьМаршрута( Route, Tag, DKFlag, standart );
+      else
+         /* Узла маршрута нет, но это не означет, что мы ничем не заполним это поле */      
+         if ( Tag=="" )
+            if ( (BenCodeKind==PTCK_SWIFT) And (BenBankCode!="") ) /*!!!*/
+               Tag = SWIFT_Tag_A;
+            else
+               Tag = SWIFT_Tag_D;
+            end;
+         end;      
+
+         if ( Tag==SWIFT_Tag_A )            
+            if ( RsPaym.ReceiverCorrAccNostro!="" )
+               field_value = field_value + SYMB_SLASH + RsPaym.ReceiverCorrAccNostro + SYMB_ENDL;
+            end;
+            field_value = field_value + BenBankCode;
+         elif ( Tag==SWIFT_Tag_D )
+            BankCode = ПолучитьКодСубъекта( RsPaym.ReceiverBankID, PTCK_BIC, error );
+
+            if ( (not Error) AND (IsCreditPaym(RsPaym)) AND ((standart==ST_RUR4) OR (standart==ST_RUR5)) )
+               field_value = string( "//RU", BankCode );
+               if ( RsPaym.ReceiverCorrAccNostro!="" )
+                 field_value = string( field_value, ".", RsPaym.ReceiverCorrAccNostro );
+               end;
+               field_value = field_value + SYMB_ENDL;
+            else
+              if ( RsPaym.ReceiverCorrAccNostro!="" )
+               field_value = field_value + SYMB_SLASH + RsPaym.ReceiverCorrAccNostro + SYMB_ENDL;
+              end;
+            end;
+
+            INN = GetPartyINN( RsPaym.ReceiverBankID );
+            if( INN != "" )
+               field_value = String( field_value, "INN", INN, SYMB_ENDL );
+            end;
+
+            Name = GetNameBank_Tag_D(Tag, RsPaym.ReceiverBankName, RsPaym.ReceiverBankID);
+            if( Name != "" )
+              if( (IsCreditPaym(RsPaym)) AND НайтиЮридическийАдресСубъекта(RsPaym.ReceiverBankID,RecordAdress) AND
+                  (RecordAdress.Place!="") AND (Index(strUpr(Name), strUpr(trim(RecordAdress.Place)))==0) )
+                  Name = string( Name, SYMB_ENDL, trim(RecordAdress.Place) );
+              end;
+              StrChangeRusXSet( Name, tempv, standart );
+              if ( (valtype(Standart)!=V_UNDEF) AND (Standart==ST_RUR4) )
+                 StrMultyToFormat( tempv, tempv, 35, 5, "CheckBreakRUR4" );
+              else
+                 StrMultyToFormat( tempv, tempv, 35, 5 );
+              end;
+              field_value = field_value + tempv;
+            end;
+         end;
+      end;
+   end;
+
+   setparm( 1, Tag );
+
+   return field_value;
+end;
+
+/* Заполняет поле 72 (для платежа) */
+/* Добавление в лексему ACC инфы из PaymentDetails(Ground) и PartyInfo */
+macro AddGroundAndPartyInfo(field72, Ground, PartyInfo)    
+
+  if ( (valtype(Ground)!=V_UNDEF) AND (PartyInfo != "") )
+    if (field72 != "")
+       field72 = field72 + SYMB_ENDL;
+    end;
+    field72 = field72 + PartyInfo;
+  end;
+
+  if ( (valtype(Ground)!=V_UNDEF) AND (Ground != "") )
+    if (field72 != "")
+       field72 = field72 + SYMB_ENDL;
+    end;
+    field72 = field72 + Ground;
+  end;
+
+  return field72;
+end;
+
+/* Заполнить поле 72 */
+macro FillInformationOfPaymentField(RsPaym, AllowCodes, ОстатокПоля70, standart, form )
+   var field_value = "", field72, tmpfield72, PartyInfo, 
+       PayerChargeOffDate,
+       PayerBankEnterDate,
+       PayerBankMarkDate, 
+       I2PlaceDate;
+
+   RECORD ord( pmroute );
+   RECORD rcv( pmroute );
+   RECORD ocb( pmroute );
+   RECORD irb( pmroute );
+                                                      
+   if( valtype(standart)==V_UNDEF )
+     standart = ST_UNDEF;
+   end;
+
+   /* Если в форме есть поле 70, то сюда попадает остаток из него.         */
+   /* Если в поля 70 нет, то сюда попадает инфа, предназначенная в поле 70 */
+   if ( IsAllowCode(AllowCodes, Field72CodesNZP) )
+      /* Используется только для RUR4, RUR5, RUR6 */
+      if ( (valtype(ОстатокПоля70)!=V_UNDEF) AND (ОстатокПоля70!="") )
+        field_value = ДобавитьОстатокПоля70( field_value, ОстатокПоля70, standart );
+        ОстатокПоля70 = "";
+      end;
+   end;
+
+   if( (IsAllowCode(AllowCodes, Field72CodesINS)==TRUE) AND
+       ПолучитьСамыйДальнийУзелПлатежа(RsPaym.PaymentID, RTDIR_IN, ord) AND 
+       ПолучитьУзелОтправителяПлатежа(RsPaym.PaymentID, Route) AND
+       (Route.RouteID!=ord.RouteID) )
+     field_value = String( field_value, SYMB_SLASH, Field72CodesINS, SYMB_SLASH, Route.CodeValue );
+   end;
+
+   if (IsAllowCode(AllowCodes, Field72CodesDAS)) /* только для MT103 RUR6 */
+     if (RsPaym.ReceiverFIID==0 )
+       PayerChargeOffDate = RsPaym.PayerChargeOffDate;
+       PayerBankEnterDate = RsPaym.PayerBankEnterDate;
+       PayerBankMarkDate = RsPaym.PayerBankMarkDate;
+       I2PlaceDate = RsPaym.I2PlaceDate;
+       if ((PayerChargeOffDate != Date(0, 0 ,0)) or 
+            (PayerBankEnterDate != Date(0, 0 ,0)) or
+            (PayerBankMarkDate != Date(0, 0 ,0)) or
+            (I2PlaceDate != Date(0, 0 ,0)) 
+           )
+         if (field_value != "")
+           field_value = string(field_value, SYMB_ENDL);
+         end;
+         field_value = String(field_value, SYMB_SLASH, Field72CodesDAS, SYMB_SLASH, 
+                                GetSWIFTDate(PayerChargeOffDate), ".",
+                                GetSWIFTDate(PayerBankEnterDate), ".",
+                                GetSWIFTDate(PayerBankMarkDate), ".",
+                                GetSWIFTDate(I2PlaceDate)
+                               );
+       end;
+     end;
+   end;
+
+   if ( IsAllowCode(AllowCodes, Field72CodesEARLY) ) /* только для срочных платежей */
+     if ( RsPaym.Instancy )
+       if (field_value != "")
+          field_value = string(field_value, SYMB_ENDL);
+       end;
+       field_value = String(field_value, SYMB_SLASH, Field72CodesEARLY, SYMB_SLASH);
+     end;
+   end;
+
+   if ( IsAllowCode(AllowCodes, Field72CodesRPP) )
+      /* Используется только для RUR4, RUR5, RUR6 */
+      if ( RsPaym.ReceiverFIID==0 )
+        if( field_value != "" )
+          field_value = String( field_value, SYMB_ENDL );
+        end;
+        field_value = String( field_value, SYMB_SLASH, Field72CodesRPP, SYMB_SLASH, substr(RsPaym.Number,1,5), ".", GetSWIFTDate(RsPaym.PayDate), "." );
+        if ( RsPaym.Priority<10 )
+          field_value = String( field_value, string(RsPaym.Priority), "." );
+        else
+          field_value = String( field_value, "9", "." )
+        end;     
+
+        if ( RsPaym.PaymentKind=="П" )
+           field_value = String( field_value, "POST" );
+        elif ( RsPaym.PaymentKind=="Т" )
+           field_value = String( field_value, "TELG" )
+        elif ( RsPaym.PaymentKind=="С" )
+           field_value = String( field_value, "BESP" )
+        else
+           field_value = String( field_value, "ELEK" )
+        end;
+      else
+        /* Валютный платеж */
+        if( field_value != "" )
+          field_value = String( field_value, SYMB_ENDL );
+        end;
+        field_value = String( field_value, SYMB_SLASH, Field72CodesRPP, SYMB_SLASH, substr(RsPaym.Number,1,5), ".", GetSWIFTDate(RsPaym.Date), ".6.ELEK" );
+      end;
+      if( (Strlen(RsPaym.ShifrOper) == 2))
+        field_value = String( field_value, ".", GetSWIFTDate(RsPaym.ValueDate), ".", RsPaym.ShifrOper ); 
+      else
+        field_value = String( field_value, ".", GetSWIFTDate(RsPaym.ValueDate) ); 
+      end;
+   end;
+
+   if ( IsAllowCode(AllowCodes, Field72CodesRPO) )
+      /* Используется только для RUR4, RUR5, RUR6 */
+      if ( RsPaym.PartPaymNumber )
+
+         field_value = String( field_value, SYMB_ENDL, SYMB_SLASH, 
+                                            Field72CodesRPO, 
+                                            SYMB_SLASH, 
+                                            substr(String(RsPaym.PartPaymNumber),1,3), ".",
+                                            substr(RsPaym.PartPaymShifrMain,1,2), ".",
+                                            substr(RsPaym.PartPaymNumMain,1,6), ".",
+                                            GetSWIFTDate(RsPaym.PartPaymDateMain), 
+                                            SYMB_ENDL, SYMB_SLASH, SYMB_SLASH,
+                                            substr(GetSWIFTAmount(RsPaym.PartPaymRestAmountMain),1,18)
+                                          );
+      end;
+   end;
+
+
+   if( IsAllowCode(AllowCodes, Field72CodesRCB) AND
+       ПолучитьБлижайшийУзелПлатежа( RsPaym.PaymentID, RTDIR_OUT, ocb ) AND
+       ПерейтиНаБолееДальнийУзел(RTDIR_OUT, irb) AND
+       ПолучитьУзелПолучателяПлатежа(RsPaym.PaymentID, rcv) AND 
+       (rcv.RouteID!=ocb.RouteID) AND (rcv.RouteID!=irb.RouteID) AND
+       ПерейтиНаБолееБлизкийУзел(RTDIR_OUT, Route) AND (Route.RouteID!=irb.RouteID) )
+      if( field_value != "" )
+       field_value = String( field_value, SYMB_ENDL );
+      end;
+      field_value = String( field_value, SYMB_SLASH, Field72CodesRCB, SYMB_SLASH, Route.CodeValue );
+   end;
+   
+   PartyInfo = RsPaym.PartyInfo;
+   if (PartyInfo != "") 
+     StrChangeRusXSet( PartyInfo, PartyInfo, standart );
+     if (IsAllowCode(AllowCodes, Field72CodesREC)==TRUE) 
+       field_value = ДобавитьБлокВПоле72( field_value, Field72CodesREC, PartyInfo, standart );
+       PartyInfo = "";
+     end;/*Если в поле формы нет лексемы REC, то PartyInfo добавим в ACC*/
+   end;
+
+   /* ACC в поле 72 формы разрешено,*/
+   /*и туда еще ничего не писали - ликвидируем этот недостаток :))*/
+   field72 = "";
+   if (IsAllowCode(AllowCodes, Field72CodesACC))
+     field72 = AddGroundAndPartyInfo(field72, ОстатокПоля70, PartyInfo);
+     if (field72 != "")
+        /* EVG 13/06/2012 Убрал вывод спецификатора /ACC/ по просьбе Ekaterina N Shmelkova.*/
+        if (index(field72,"/") == 1) //SDA - в случае ,если ведущий слеш уже содержится в поле 72
+           field_value = ДобавитьБлокВПоле72( field_value, "", field72, standart );
+        else
+           field_value = ДобавитьБлокВПоле72( field_value, Field72CodesACC, field72, standart );
+        end;
+     end;
+   end;
+
+   /* Добавляем информацию, введенную вручную пользователем в панели ввода платежки */
+
+//    if ((RsPaym.dockind == 27) and (form == "103") and ({oper} == 10000))
+//msgbox (field72 , " - ",  RsPaym.AdditionalInfo, "|- ", field_value);
+   if ((RsPaym.dockind == 27) and (form == "103"))
+   else
+      field72 = RsPaym.AdditionalInfo;
+
+      if( SubStr( field72, 1, 1 ) == SYMB_SLASH )
+         // в случае если в поле уже содержится кодовое слово, то нужно исключить его из транслитерации
+         // и передавать в сообщение как есть (SCR 144401)
+         tmpfield72 = SubStr( field72, 2 );
+         field72 = SYMB_SLASH + SubStr( tmpfield72, 1, Index(tmpfield72, SYMB_SLASH) );
+         StrChangeRusXSet( SubStr(tmpfield72, Index(tmpfield72, SYMB_SLASH)+1), tmpfield72, standart );
+         field72 = field72 + tmpfield72;
+         field_value = ДобавитьБлокВПоле72( field_value, "", field72, standart );
+      else
+         StrChangeRusXSet( field72, field72, standart );
+         field_value = ДобавитьБлокВПоле72( field_value, Field72CodesACC, field72, standart );
+      end;
+
+   end;
+   return field_value;
+end;
+
+/* Получает очередную комиссию платежа */
+macro GetPaymentCommission( RsPaym, belong, combuf )
+   var retVaiue = false, DocKind, DocID;
+   var rs:object;
+   var select:string;
+   var params:TArray;
+
+   if ( RsPaym.IsTransit == true )
+       /* Транзитный платеж */
+       DocKind = WL_INDOC;
+       DocID   = RsPaym.PaymentID;
+   else
+       DocKind = RsPaym.DocKind;
+       DocID   = RsPaym.DocumentID;
+   end;
+
+   select = "select op.t_ID_Operation from doproper_dbt op where "+
+                            "op.t_DocKind =:DocKind and "+
+                            "TO_NUMBER(op.t_DocumentID) = :DocID";
+   params = makeArray( SQLParam("DocKind", DocKind),
+                       SQLParam("DocID", DocID));
+   rs = execSQLselect( select, params, FALSE );
+
+   if ( rs.MoveNext() )
+      retVaiue = GetCommission( rs.value(0), ID_ALL_STEP, belong, combuf );
+   end;
+
+   return retVaiue;
+end;
+
+/* Получает оригинальную сумму платежа */
+macro GetOrigenSumPayment( RsPaym)
+   /* EVG В RsPaym.PayerAmount - поле 33. Поле 32 в RsPaym.FuturePayerAmount
+   var continue0, OrigenAmount = RsPaym.PayerAmount;*/
+   /*Kozina*/
+   var continue0, OrigenAmount = RsPaym.FutureReceiverAmount;
+   RECORD combuf( oprsfcom );
+
+   if ( RsPaym.IsTransit == true )
+       /* Транзитный платеж */
+       /*                    КОМИССИЯ НАШЕГО БАНКА                               */
+       ClearRecord(combuf); 
+       /* Перебираем комиссии нашего банка */
+       continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+       while( continue0 )          
+         if ( combuf.FIID_Sum==RsPaym.PayerFIID )
+            OrigenAmount = OrigenAmount + combuf.Sum + combuf.SumNDS;
+         else
+            /* Пересчитываем сумму */
+            /*Kozina поменяла RsPaym.PayerFIID на RsPaym.ReceiverFIID*/
+            OrigenAmount = OrigenAmount + GetSumConvert(combuf.Sum+combuf.SumNDS, combuf.FIID_Sum, RsPaym.ReceiverFIID);
+         end;
+         continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+       end;
+   else
+      /*                    КОМИССИЯ НАШЕГО БАНКА                               */
+debugbreak;
+debugbreak;
+debugbreak;
+debugbreak;
+      /* EVG Здесь ошибка: константа BEN = 1, а на самом деле должно быть 2. OUR нормально.
+      if ( RsPaym.ComissCharges == BEN )*/  /* За счет получателя */
+      if ( RsPaym.ComissCharges == 2 )  /* За счет получателя */
+         ClearRecord(combuf); 
+         continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+         while( continue0 )     
+            /* EVG Только комиссии
+               1100 - 3.4.3v
+               1101 - 3.5.3v
+               , иначе здесь учитываются и комиссии других шагов - ВК.
+            (функция из CommissLib.mac) */
+            if (IsBeneficiaryCommission( combuf.CommNumber ))
+               if ( combuf.FIID_Sum == RsPaym.PayerFIID )
+                  OrigenAmount = OrigenAmount + combuf.Sum + combuf.SumNDS;
+               else
+                  /* Пересчитываем сумму */
+                   /*Kozina поменяла RsPaym.PayerFIID на RsPaym.ReceiverFIID*/
+                  OrigenAmount = OrigenAmount + GetSumConvert(combuf.Sum+combuf.SumNDS, combuf.FIID_Sum, RsPaym.ReceiverFIID);
+               end;
+            end;
+            continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+         end;
+      end;
+
+      /*                   КОМИССИЯ КОРРЕСПОНДЕНТА          */
+      if ( RsPaym.ComissCharges == OUR )  /* За наш счет */
+         ClearRecord(combuf); 
+         /* Перебираем комиссии корреспондента */
+         continue0 = GetPaymentCommission( RsPaym, CORRESP, combuf );
+         while( continue0 )
+            if ( combuf.FIID_Sum == RsPaym.PayerFIID )
+               OrigenAmount = OrigenAmount - combuf.Sum - combuf.SumNDS;
+            else
+               /* Пересчитываем сумму */
+               OrigenAmount = OrigenAmount - GetSumConvert(combuf.Sum+combuf.SumNDS, combuf.FIID_Sum, RsPaym.PayerFIID);
+            end;
+            continue0 = GetPaymentCommission( RsPaym, CORRESP, combuf );
+         end;
+      end;
+   end;
+
+   return OrigenAmount;
+end;
+
+macro GetSumOwnCommis( RsPaym, 
+                       FIID,   /* заполняется здесь */
+                       Amount  /* сумма */
+                     )
+   RECORD combuf( oprsfcom );
+   var continue0;
+
+
+   Amount = $0;
+   FIID = RsPaym.ReceiverFIID;
+   ClearRecord(combuf); 
+   continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+   while( continue0 )
+
+      /* EVG Только комиссии
+         1100 - 3.4.3v
+         1101 - 3.5.3v
+         , иначе здесь учитываются и комиссии других шагов - ВК.
+      (функция из CommissLib.mac) */
+      if (IsBeneficiaryCommission( combuf.CommNumber ))
+
+         if ( FIID==combuf.FIID_Sum )
+            Amount = Amount + combuf.Sum + combuf.SumNDS;
+         else
+            Amount = Amount + GetSumConvert(combuf.Sum+combuf.SumNDS, combuf.FIID_Sum, FIID);
+         end;
+
+      end;
+      continue0 = GetPaymentCommission( RsPaym, OWN, combuf );
+   end;
+
+   setparm( 1, FIID );
+   setparm( 2, Amount );
+
+   return true;
+
+   OnError(er) /* обработка ошибок */
+      ExeptionMessage(er);
+      return FALSE;
+end;
+
+macro GetSumCorrespCommis( RsPaym, 
+                           FIID,   /* заполняется здесь */
+                           Amount  /* сумма */
+                         )
+   RECORD combuf( oprsfcom );
+   var continue0, OwnSum, ;
+   RECORD sleeve( pmsleeve );
+
+   if ( RsPaym.IsTransit )
+      /* Транзитный платеж */
+      if ( ПолучитьРасходыРеспондента(RsPaym.PaymentID, sleeve, {OurBank}) )
+          if ( not GetSumOwnCommis(RsPaym, FIID, Amount) )
+              return false;
+          end;
+
+          if ( FIID==sleeve.FIID )
+             Amount = sleeve.Amount - Amount;
+          else
+             Amount = sleeve.Amount - GetSumConvert( Amount, FIID, sleeve.FIID );
+             FIID = sleeve.FIID;
+          end;
+
+          if ( Amount<$0 )
+             Amount = $0;
+          end;
+      else
+          Amount = $0;
+          FIID = 0;
+      end;
+   else
+      Amount = $0;
+      FIID = RsPaym.ReceiverFIID;
+      ClearRecord(combuf); 
+      continue0 = GetPaymentCommission( RsPaym, CORRESP, combuf );
+      while( continue0 )
+         if ( FIID==combuf.FIID_Sum )
+            Amount = Amount + combuf.Sum + combuf.SumNDS;
+         else
+            Amount = Amount + GetSumConvert(combuf.Sum + combuf.SumNDS, combuf.FIID_Sum, FIID);
+         end;
+         continue0 = GetPaymentCommission( RsPaym, CORRESP, combuf );
+      end;
+   end;
+
+   setparm( 1, FIID );
+   setparm( 2, Amount );
+
+   return true;
+
+   OnError(er) /* обработка ошибок */
+      ExeptionMessage(er);
+      return FALSE;
+end;
+
+/* Записывает комисси платежа в сообщение */
+macro ЗаписатьКомиссииПлатежа( RsPaym, TypeCharges, UseC19 )
+    var continue0, ComAmount, ComFIID, comflag;
+    RECORD sleeve( pmsleeve );
+
+    if( valtype(UseC19) != V_BOOL )
+      UseC19 = false;  /* Использовать ли Network Validated Rules MT103 С19 */
+    end;
+
+  if ( RsPaym.IsTransit )
+       /* Для транзитного записываем цепочку комиссий */
+       comflag = false;
+       ClearRecord( sleeve );
+     continue0 = ПолучитьРасходыРеспондента(RsPaym.PaymentID, sleeve);
+       while( continue0 AND (sleeve.PartyID!={OurBank}) )
+
+          comflag = true;
+
+          if( not УстановитьКонтекстБлока( "71F" ) )
+              RunError("|Ошибка при установке контекста блока '71F'");
+          end;
+
+          ЗаписатьПолеЛог( SendersChargesField, ПолучитьКодВалютыЛог( sleeve.FIID )
+                                                + GetSWIFTAmount( sleeve.Amount ) ) ;
+
+          /* Восстанавливаем контекст блока */
+          if( not УстановитьКонтекстБлока("..") )
+             RunError("|Ошибка при восстановлении контекста блока");
+          end;
+
+        continue0 = ПолучитьРасходыРеспондента(RsPaym.PaymentID, sleeve);
+       end;
+
+       if ( comflag OR (TypeCharges!=CHARGES_OUR) )
+          /* Запысываем сумму нашей комиссий */
+        if ( not GetSumOwnCommis(RsPaym, ComFIID, ComAmount) )
+            RunError("|Ошибка вычисления комиссии");
+          end;
+          if ( ComAmount )
+            if( not УстановитьКонтекстБлока( "71F" ) )
+                RunError("|Ошибка при установке контекста блока '71F'");
+            end;
+            ЗаписатьПолеЛог( SendersChargesField, ПолучитьКодВалютыЛог( ComFIID )
+                                                  + GetSWIFTAmount( ComAmount ) ) ;
+            /* Восстанавливаем контекст блока */
+            if( not УстановитьКонтекстБлока("..") )
+               RunError("|Ошибка при восстановлении контекста блока");
+            end;
+          end;
+       end;
+
+       if ( TypeCharges==CHARGES_OUR )
+        if ( not GetSumCorrespCommis(RsPaym, ComFIID, ComAmount) )
+            RunError("|Ошибка вычисления комиссии");
+          end;
+
+          if ( ComAmount )
+            /* C19 The currency code in the fields 71G and 32A must be the same */
+          if( (UseC19 == FALSE) OR ((UseC19 == TRUE) AND (RsPaym.ReceiverFIID == ComFIID)) )
+              ЗаписатьПолеЛог( ReceiversChargesField, ПолучитьКодВалютыЛог( ComFIID ) + GetSWIFTAmount( ComAmount ) ) ;
+            else
+              RunError("|Код валюты в полях 32A и 71G должен быть одинаковым");
+            end;
+          end;
+       end;
+    else
+       if ( TypeCharges==CHARGES_OUR )
+        if ( not GetSumCorrespCommis(RsPaym, ComFIID, ComAmount) )
+             RunError("|Ошибка вычисления комиссии");
+          end;
+          if ( ComAmount )
+            /* C19 The currency code in the fields 71G and 32A must be the same */
+          if( (UseC19 == FALSE) OR ( (UseC19 == TRUE) AND (RsPaym.ReceiverFIID == ComFIID)) )
+              ЗаписатьПолеЛог( ReceiversChargesField, ПолучитьКодВалютыЛог( ComFIID ) + GetSWIFTAmount( ComAmount ) ) ;
+            else
+              RunError("|Код валюты в полях 32A и 71G должен быть одинаковым");
+            end;
+          end;
+       elif ( TypeCharges==CHARGES_BEN )
+        if ( not GetSumOwnCommis(RsPaym, ComFIID, ComAmount) )
+              RunError("|Ошибка вычисления комиссии");
+          end;
+          if ( ComAmount )
+             if( not УстановитьКонтекстБлока( "71F" ) )
+                RunError("|Ошибка при установке контекста блока '71F'");
+             end;
+             ЗаписатьПолеЛог( SendersChargesField, ПолучитьКодВалютыЛог( ComFIID )
+                                                              + GetSWIFTAmount( ComAmount ) ) ;
+             /* Восстанавливаем контекст блока */
+             if( not УстановитьКонтекстБлока("..") )
+                RunError("|Ошибка при восстановлении контекста блока");
+             end;
+          end;
+       end;
+    end;
+end;
+
+//---------------------------------------------------------------------
+// Получение входящего сообщения платежа
+//---------------------------------------------------------------------
+MACRO GetMessageByPayment( PaymentID:integer ):integer
+
+  RECORD wldmes( wlmes  );
+  if( not ПолучитьСообщение( PaymentID, OBJTYPE_PAYMENT, 1, wldmes, NULL ) )
+    return 0;
+  end;
+
+  return wldmes.MesID;
+END;
+
+//---------------------------------------------------------------------
+// Записать Поле 71F
+//---------------------------------------------------------------------
+MACRO ЗаписатьПоле71F( RsPaym:RsbPayment, IsTransit, TypeCharges, fld33B, fld32A )
+
+  MACRO СчитатьПоля71F( PaymentID:integer ):TArray
+    var query:string = "select val.T_VALUE " +
+                        " from dwlmesval_dbt val, " +
+                             " dwltpfld_dbt  fld  " +
+                       " where val.t_MesID = :MesID " +
+                        " and fld.t_TpFieldID = val.t_TpFieldID " +
+                        " and fld.t_Name = :FieldName " + 
+                        " order by val.t_index";
+
+    var params:TArray = makeArray( SQLParam( "MesID"    , GetMessageByPayment( PaymentID ) ), 
+                                   SQLParam( "FieldName", SendersChargesField ) );
+
+    var rs:RsdRecordset = execSQLselect( query, params, true );
+    var flst:TArray = TArray();
+    while( rs.MoveNext() )
+      flst.value( flst.size ) = rs.value(0);
+    end;
+    return flst;
+  END;
+  
+  var flst:TArray=TArray();
+  var i:integer=0;
+  var СуммаИт:Money=0., Сумма71F:Money=0., Сумма32A:Money=0., Сумма33B:Money=0.;
+  var Валюта32A, Валюта33B;
+  
+  if( (TypeCharges == CHARGES_BEN) OR (TypeCharges == CHARGES_SHA) )
+  
+    // документ порожден транзитным платежом или сам транзитный
+    if( IsTransit )
+      // в исходящее сообщение копируются все существующие поля 71F из входящего сообщения в том же порядке
+      flst = СчитатьПоля71F( RsPaym.PaymentID );
+      i = 0;
+      while( i < flst.Size )
+        // переносим поле
+        if( not УстановитьКонтекстБлока( "71F" ) )
+          RunError( "|Ошибка при установке контекста блока '71F'" );
+        end;
+        ЗаписатьПолеЛог( SendersChargesField, flst.value(i) );
+        if( not УстановитьКонтекстБлока( ".." ) )
+          RunError( "|Ошибка при восстановлении контекста блока" );
+        end;
+        
+        //посчитаем сумму
+        Сумма71F = Сумма71F + Money( substr( strsubst( flst.value(i), ",", "." ), 4 ) );
+        
+        i = i + 1;
+      end;
+    end;
+
+    // получим данные поля 32A
+    ПолучитьФинИнПоISO( substr( fld32A, 7, 3 ), wlfininstr );
+    Валюта32A = wlfininstr.FIID;
+    Сумма32A = Money( substr( strsubst( fld32A, ",", "." ), 10 ) );
+
+    // получим данные поля 33B
+    ПолучитьФинИнПоISO( substr( fld33B, 1, 3 ), wlfininstr );
+    Валюта33B = wlfininstr.FIID;
+    Сумма33B = Money( substr( strsubst( fld33B, ",", "." ), 4 ) );
+
+    if( Валюта33B == Валюта32A )
+      СуммаИт = Сумма33B - Сумма32A;
+    else
+      СуммаИт = GetSumConvert( Сумма33B, Валюта33B, Валюта32A ) - Сумма32A;
+      //СуммаИт = ConvertSum( Сумма33B, RsPaym.FactRate.Rate, RsPaym.FactRate.Scale, RsPaym.FactRate.Point, RsPaym.FactRate.IsInverse ) - Сумма32A;
+    end;
+
+    // вычитаются все имеющиеся суммы в полях 71F
+    СуммаИт = СуммаИт - Сумма71F;
+     
+    // результат, больший или равный 0, записывается в новое поле 71F
+    if( СуммаИт >= 0.0 )
+      if( not УстановитьКонтекстБлока( "71F" ) )
+        RunError( "|Ошибка при установке контекста блока '71F'" );
+      end;
+      ЗаписатьПолеЛог( SendersChargesField, ПолучитьКодВалютыЛог( Валюта32A ) + GetSWIFTAmount( СуммаИт ) );
+      if( not УстановитьКонтекстБлока( ".." ) )
+        RunError( "|Ошибка при восстановлении контекста блока" );
+      end;
+    end;
+
+  elif( TypeCharges == CHARGES_OUR )
+    // Поле отсутствует в сообщении
+  end; 
+
+END;
+
+macro DefineSWIFTRateByPmPaym( RsPaym )
+    var Rate, i = 0;
+    
+    if ( RsPaym.FactRate.Rate == 0.0 ) 
+       return "";
+    end;
+
+    Rate = RsPaym.FactRate.Rate/RsPaym.FactRate.Scale;
+    while( i<RsPaym.FactRate.Point )
+       Rate = Rate/10;
+       i = i+1;
+    end;
+       
+    if ( RsPaym.FactRate.IsInverse=="X" )
+        return GetSWIFTRate(Trim( string((Rate):16:7) ));
+    else
+        return GetSWIFTRate( Trim( string( (1.0/Rate):16:7 ) ) );
+    end;
+end;
+
+macro НайтиКорсхемуНеЕдинственнуюУКонтрагента( Account, FIID, Corschem )
+   var rs:object;
+   var select:string;
+   var params:TArray;
+
+   select = "select cors.t_number, cors.t_FIID, cors.t_FI_Kind, cors.t_CorrID, cors.t_TpID, cors.t_Name, cors.t_account from dcorschem_dbt cors where "+
+                              "cors.t_Account =:Account and "+
+                              "cors.t_FIID =:FIID and "+
+                              "Exists(select * from dcorschem_dbt corsIn where corsIn.t_CorrID=cors.t_CorrID and (corsIn.t_Number!=cors.t_Number or corsIn.t_FIID!=cors.t_FIID))";
+   params = makeArray( SQLParam("Account", Account),
+                       SQLParam("FIID", FIID));
+   rs = execSQLselect( select, params, FALSE );
+
+   if ( not rs.moveNext() ) 
+        return false;
+   end;
+
+   ClearRecord(Corschem);
+   Corschem.number = rs.value(0);
+   Corschem.FIID = rs.value(1);
+   Corschem.FI_Kind = rs.value(2);
+   Corschem.CorrID = rs.value(3);
+   Corschem.TpID = rs.value(4);
+   Corschem.Name = rs.value(5);
+   if ( Corschem.Name=="" )
+      Corschem.Name = "";
+   end;
+   Corschem.Account = rs.value(6);
+   if ( Corschem.Account=="" )
+      Corschem.Account = "";
+   end;
+   return true;
+end;
+
+// Возвращет вид корсхемы (0 - корсхема не найдена)
+macro ПолучитьКорСхему (Number, FIID)
+   var rs:object;
+   var select:string;
+   var params:TArray;
+
+   select = "select t_isnostro from dcorschem_dbt cors where "+
+                              "cors.t_Number = :NumberCor and "+
+                              "cors.t_FIID =:FIID and cors.t_FI_Kind = 1";
+   params = makeArray( SQLParam("NumberCor",Number),
+                       SQLParam("FIID", FIID));
+   rs = execSQLselect( select, params, FALSE );
+
+   if ( not rs.moveNext() ) 
+        return WLD_COR_ERROR;
+   end;
+   if (rs.value(0)=="X") return WLD_COR_NOSTRO;
+   end;
+   return WLD_COR_LORO;
+end;
+
+/*********************************************************************/
+/*            Вернуть ID платежа по сообщению                        */
+/*     функция используется в макросах контроля сообщений            */
+/*********************************************************************/
+macro GetPaymentID (MesID)
+  var select:string;
+  var rs:object;
+  var params:TArray;
+
+  select = "    select wlpm.T_PAYmentid  " +
+           "    from dwlmes_dbt mes, dwlmeslnk_dbt meslnk, dwlpm_dbt wlpm "+
+           "    where mes.T_MESID = meslnk.T_MESID and "+
+           "    meslnk.T_OBJID = wlpm.T_WLPMID  " +
+           "    and mes.T_MESID = :MesID " ;
+
+  params = makeArray(SQLParam("MesID", MesID)); 
+  rs = execSQLselect( select, params, FALSE );
+  if ( rs.MoveNext() )
+     return rs.value(0);
+  else 
+     return 0;
+  end;
+end;
+
+
+/*Заполнение поля 32*/
+macro FillCurrencyOriginalOrderedAmountField( RsPaym )
+  var field_value = "";
+  debugbreak;
+  if(RsPaym.IsCredit)
+    field_value = ПолучитьКодВалютыЛог( RsPaym.FutureReceiverFIID ) + //TAM 26.08.2013 R-236205-2
+                  GetSWIFTAmount( RsPaym.FutureReceiverAmount );
+  else
+    field_value = ПолучитьКодВалютыЛог( RsPaym.FuturePayerFIID ) +    //TAM 26.08.2013 R-236205-2
+                  GetSWIFTAmount( RsPaym.FuturePayerAmount );
+  end;
+  
+  return field_value;
+
+end;

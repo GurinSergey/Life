@@ -1,0 +1,234 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank v6.0                     */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*  Отложенная обработка запросов на справку об остатках                    */
+/*                                                                          */
+/*  Имя файла:  BOS_deff.mac                                                */
+/*  Создан   :  13.04.2012                                   Чесноков Д.С.  */
+/*  Заявка   :  С-10108                                                     */
+/*  Изменен  :  20.07.2012 Chesnokov D.S. заявка I-00224557 убрал очистку   */
+/*              статусов счетов в dwlacclnk_dbt                             */
+/*              29.01.2012 Chesnokov D.S. заявка I-00318581 обработка       */
+/*              нажатия ESC в панели выбора Должностного лица               */
+/****************************************************************************/
+
+import BankInter, RSD, Календарь, "globals.mac", "KeyCodes.mac";
+import "wlreq.mac", "fns_lib.mac";
+
+var RecordSet, col = TArray;
+var Path, PathFile = "", NameFile = "365P.lbr", dlg;
+var CmdText, Command, reqids;
+var flag = false, state = 0;
+var stat, pd = PersData(), mes_usr, i, cnt;
+var Ошибки:errors;
+
+private var rset, exclude_reqs;
+file wlr_BOS(wlreq);
+
+macro ReadSettings()
+
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR" ,V_STRING, Path);
+  PathFile = FindPath(NameFile, Path);
+  if (not pathfile)
+    msgbox("Не найдена LBR ", NameFile);
+    exit();
+  end;
+  
+  if (PathFile != "")
+    dlg = TRecHandler("dateimp", PathFile, True);
+  end;
+  
+end;
+
+MACRO PanelEvent (dlg, cmd, id, key)     
+   
+  if(cmd == DLG_INIT)
+    message("~F2~ продолжить,  ~ESC~ выход");
+    dlg.rec.BeginDate = GetDateAfterWorkDays({curdate}, - 1);
+    dlg.rec.EndDate   = {curdate} - 1;
+  end;
+   
+  if ((KEY == KEY_F2) or (KEY == KEY_ENTER))
+    if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+      MsgBox("Дата начала больше даты окончания отчетного периода");
+      return CM_IGNORE;
+    end;
+    if (dlg.rec.EndDate == {curdate})
+      if (GetTrue(False, "Формирование BOS осуществляется на утро следующего опер. дня. | Определить дату как текущий опер. день"))
+        dlg.rec.EndDate = {curdate};
+      else
+        dlg.rec.EndDate = {curdate} - 1;
+      end;
+    end;
+    return CM_save;
+  end; 
+
+  if (cmd == DLG_REMFOCUS)
+    if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+      MsgBox("Дата начала больше даты окончания отчетного периода");
+      return CM_CANCEL;
+    end;
+  end;
+  UpdateFields(dlg); 
+  
+END;
+
+macro EvProcScroll (RecordSet, Command, id, key )
+
+   if (Command == DLG_INIT)
+      if (not AddMultiAction (RecordSet, 316)) 
+        msgbox ("!!!");
+      end;
+      reqids = "";
+   end;
+
+   if ((Command == DLG_MSEL) and (key == 316)) // F2
+      reqids = reqids + RecordSet.value("T_reqid")+", ";
+      return CM_MSEL_CONT_CLEAR;
+   end;
+
+   if (Command == DLG_MSELEND)
+     flag = true;
+     return CM_cancel;
+   end;
+   
+   if ((Command == DLG_KEY) and Flag)
+       reqids = substr(reqids, 1, strlen(reqids)-2);
+       state = 1;
+       return CM_SELECT;
+   elif ((Command == DLG_KEY) and (key == 316)) 
+       state = 2;
+       reqids = RecordSet.value("T_reqid");
+       return CM_SELECT;
+   elif ((Command == DLG_KEY) and (key == 27))
+       reqids = "0";
+       Exit(1);
+       return CM_cancel;
+   elif ((Command == DLG_KEY) and ((key == 322) or (key == 323)))
+       return cm_ignore
+   end;
+
+ end;
+
+//Добавляем колонки в скроллинг
+macro AddCol (ar,ind, fld, head, width, rdonly)
+  ar.value (ind * 6)     = fld;
+  ar.value (ind * 6 + 1) = head;
+  ar.value (ind * 6 + 2) = width;
+  ar.value (ind * 6 + 3 ) = 2;   // fldType
+  ar.value (ind * 6 + 4 ) = -1;  // decPoint
+  ar.value (ind * 6 + 5 ) = 0;   // reserv
+end;
+
+  
+/*Start*/
+ReadSettings();
+  
+  if ( RunDialog(dlg, "PanelEvent"))
+  
+    AddCol (col, 0, "t_formname", "Форма", 5, true);
+    AddCol (col, 1, "T_TRN", "Ном. док", 10, true);
+    AddCol (col, 2, "t_pmdatevalue", "Дата док",10, true);
+    AddCol (col, 3, "T_RELATEDREF", "ИД файл", 25, true);
+    AddCol (col, 4, "t_bankdate",  "Дата", 10, true);
+    AddCol (col, 5, "t_userid",  "Операционист", 5, true);
+    AddCol (col, 6, "t_queries",  "Сообщение", 50, true);
+    AddCol (col, 7, "t_originatorcode",  "Отправитель", 10, true);
+    AddCol (col, 8, "t_originatorname",  "Наименование отправителя", 50, true);
+    AddCol (col, 9, "t_reqid",  "ID объекта", 10, true);
+
+    CmdText = " SELECT wlmesfrm.t_name t_formname, " +
+              "        t.t_trn, t.t_pmdatevalue, " +
+              "        t.t_relatedref, t.t_bankdate, " +
+              "        t.t_userid, t.t_queries, " +
+              "        t.t_originatorcode, t.t_originatorname, " +
+              "        t.t_reqid " +
+              "   FROM dwlreq_dbt t, dwlmes_dbt wlmes, " +
+              "        dwlmesfrm_dbt wlmesfrm, " +
+              "        dwlmeslnk_dbt wlmeslnk, " +
+              "        dwlmesrls_dbt wlmesrls " +
+              "  WHERE wlmeslnk.t_objid(+) = t.t_reqid " +
+              "    AND wlmeslnk.t_objkind(+) = 505 " +
+              "    AND wlmeslnk.t_direct(+) = 'X' " +
+              "    AND wlmes.t_mesid(+) = wlmeslnk.t_mesid " +
+              "    AND wlmeslnk.t_mesid = " +
+              "        (SELECT NVL (MIN (sublnk.t_mesid), 0) " +
+              "           FROM dwlmeslnk_dbt sublnk " +
+              "          WHERE sublnk.t_objid = t.t_reqid " +
+              "            AND sublnk.t_objkind = 505) " +
+              "    AND wlmes.t_department = 1 " +
+              "    AND wlmesrls.t_rlsformid(+) = wlmes.t_rlsformid " +
+              "    AND wlmesfrm.t_formid(+) = wlmesrls.t_formid " +
+              "    AND t.t_state = 65 AND t.t_kind = 5 " +
+              "    AND t.t_direct = 'X' " +
+              "    AND t.t_BankDate BETWEEN TO_DATE ('"+dlg.rec.BeginDate+"', 'dd.mm.yyyy') " +
+              "                         AND TO_DATE ('"+dlg.rec.EndDate+"', 'dd.mm.yyyy') ";
+            
+    CmdText = CmdText + "  order by  t.t_BankDate, t.t_reqid ";
+    Command = RSDCommand(CmdText);
+    Command.Execute();
+    
+    RecordSet = RSDRecordSet(Command, RSDVAL_CLIENT, RSDVAL_STATIC);
+    
+    if (runScroll(RecordSet, 10, col, null, @EvProcScroll, string("Необработанные запросы "), "~F2~   Выбор", false))
+    
+      stat = PutPersData(pd.SurName, null, null, pd.Officer, pd.Phone );
+      //29.01.2012 Chesnokov D.S. заявка I-00318581
+      if((pd.SurName=="") and (pd.Officer=="") and (pd.Phone==""))
+        msgbox("Вы не выбрали Должностное лицо банка!!! || Перезайдите в RS-Bank и больше ни когда не нажимайте ESC в панели выбора Должностного лица.|| Файл сформирован не будет. ");
+        exit(1);
+      end;
+      if (state == 1)
+
+        Ошибки.init();
+        
+        exclude_reqs = "";
+        str = "select count(*) cnt from dwlreq_dbt where t_reqid in ("+reqids+") ";
+        rset = trsbdataset(str);
+        if(rset and rset.movenext)
+           cnt = int(rset.cnt);  
+        else
+           cnt = 0; 
+        end;
+        str = "select * from dwlreq_dbt where t_reqid in ("+reqids+") ";
+        rset = trsbdataset(str);
+        i = 0;
+        initprogress(cnt,"","Обработка входящих запросов");
+        while( rset and rset.movenext) 
+          i = i + 1;
+          useprogress(i);
+          wlr_BOS.reqid = rset.t_reqid;
+          if(not geteq(wlr_BOS))
+             msgbox("Ошибка");
+          end;
+          //Clear_wlacclnk(rset.t_reqid); 20.07.2012 Chesnokov D.S. заявка I-00224557
+          ОбработатьЗапрос_mas(wlr_BOS, @mes_usr, pd, 2);
+          if(mes_usr.DoNotProcess == 1)
+             Ошибки.Add(rset.t_reqid, ОтрезатьПутьОтИмениФайла(mes_usr.filename), mes_usr.errormes);
+             exclude_reqs = exclude_reqs + rset.t_reqid +", "; //Gurin I-00208193-1
+           end;
+        end;
+        remprogress();
+        if(Ошибки.errs.size > 0)
+           Ошибки.print;
+           exclude_reqs = substr(exclude_reqs, 1, strlen(exclude_reqs)-2);
+        end;
+        
+        if(cnt_RPO > 0)
+           print_body_RPO(null,null, reqids, exclude_reqs);
+        end; 
+        
+      elif (state == 2)
+
+        wlr_BOS.reqid = reqids;
+        if(not geteq(wlr_BOS))
+           msgbox("Ошибка");
+        end;
+        ОбработатьЗапрос(wlr_BOS, mes_usr, pd, 2); //флаг режима, откуда вызывается
+        if (cnt_RPO > 0)
+          print_body_RPO(null,null, wlr_BOS.reqid);
+        end;
+      end;
+    end;
+  end;

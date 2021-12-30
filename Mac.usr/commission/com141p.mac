@@ -1,0 +1,94 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: com141p.mac
+// @author  : 2012-06-21 zip_z. C-10045
+// @desc    : Макрос расчета базовой суммы ежедневной комиссиb 1.4.1 за транзакции по таможенным картам
+// @changes : none
+//RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+//joy 14.11.2014 I-00532241 в 2031 обязательно надо проверять, что t_state в проводках = 1
+// -------------------------------------------------------------------------------------------------
+import sfinter, lib_SqlTools;
+
+macro calcServiceSum (sfcontr_addr, beginDate, endDate, sAddr, sfcontrStruc)
+    private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+    private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+    record sfcontr (sfcontr);
+    record sfbassum ("sfbassum.str");
+    
+    var CommSum = $0; 
+    
+    if (valType (sfcontr_addr) != V_UNDEF)
+        setBuff (sfcontr, sfcontr_addr);
+    else
+        copy (sfcontr, sfcontrStruc);
+    end;
+
+    /* К расчету базовой суммы ежедневной  комиссии за  транзакции принимаются внешние платежи по дебету счета СКС. 
+     * Для расчета комиссии по транзакциям отбираются платежи, 
+     * удовлетворяющие следующим условиям:
+     *      1. операция по безакцептному списанию средств со счета СКС 
+     *        в пользу получателя в другом банке (БИК банка плательщика не равен  БИКу банка получателя);
+     *      2. платеж может быть проведен через СНР (счет незавершенных расчетов), 
+     *        либо непосредственно через корр. счет. (Кт  30213*, 30232*); 
+     *      3. платежи по требованиям ИФНС, ПП Клиента на перечисление средств на свой расчетный счет, 
+     *        списание комиссий (Кт 70601*, 47423*, 405 - 407, 40802*, 40101*) - исключить из расчета транзакций. 
+     *        На это требование мы забиваем, т.к. см. пункт два: счет получателя ТОЛЬКО 30213*, 30232*.
+     *        Лишнее исключается само собой. 
+     */
+    
+    startQueryCapture ();
+ [SELECT NVL (SUM (pm.t_amount), 0) m_sum
+  FROM dacctrn_dbt ad,
+       dpmdocs_dbt pd,
+       dpmpaym_dbt pm,
+       dpmrmprop_dbt rm,
+       daccount_dbt ac
+ WHERE ad.t_account_payer = :acc
+   AND ad.t_date_carry BETWEEN :begdate AND :enddate
+   AND ad.t_chapter = 1
+   AND ad.t_state = 1
+   AND ad.T_ACCTRNID = PD.T_ACCTRNID
+   AND pm.t_payeraccount = ac.t_account
+   AND ac.t_chapter = 1
+   AND ac.t_code_currency = 0
+   AND pm.t_paymentid = pd.t_paymentid
+   AND pm.t_paymstatus = 32000
+   -- AND pm.t_dockind = 201
+   -- ((внешний платеж) или (внутренний и перечисление на СНР - прямое или косвенное))
+   AND (   pm.t_payerbankid != pm.t_receiverbankid
+        OR (    pm.t_payerbankid = pm.t_receiverbankid
+            AND (   REGEXP_INSTR (pm.t_receiveraccount, '^(30213|30232)') = 1
+                 OR REGEXP_INSTR (pm.t_futurereceiveraccount,
+                                  '^(30213|30232)') = 1
+                )
+           )
+       )
+   AND pm.t_paymentid = rm.t_paymentid
+   AND rm.t_taxauthorstate = CHR (1) ];
+   
+    var sql = endQueryCapture ();
+    sql = execSqlSelect (sql, makeArray (SqlParam ("acc",     sfcontr.Object),
+                                         SqlParam ("begdate", beginDate     ),
+                                         SqlParam ("enddate", endDate       )));
+    if (sql.moveNext ())
+        commSum = sql.value ("m_sum");
+    end;
+
+    if ( valType (sfcontrStruc) != V_UNDEF )
+        return (commSum > 0);
+    end;
+    
+    debugbreak ();
+    
+    sfbassum.baseType      = SF_BASETYPE_SUM;
+    sfbassum.baseSum       = CommSum;
+    sfbassum.FIID_baseSum  = 0;
+    
+    sfbassum.baseType2     = SF_BASETYPE_SUM;
+    sfbassum.baseSum2      = CommSum;
+    sfbassum.FIID_baseSum2 = 0;
+
+    if( insertSumList(sfbassum) )
+        msgBox("Ошибка при вставке базовой суммы");
+    end;
+end;

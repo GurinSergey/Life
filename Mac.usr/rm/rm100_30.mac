@@ -1,0 +1,454 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29030 - "Обработка невыясненной суммы"
+// Шаг       : 30    - "Проводка платежа в невыясненные"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+// KS 06.12.2013 Перенос пользовательских доработок в 31ю сборку
+// Jushmanov 2014-02-25 C-19151 Лоrrирование масcово выполненных шагов
+//-----------------------------------------------------------------------------
+import InsCarryDoc, PaymInter, PTInter, OprInter, BankInter, wlinstpm, pm_tools;
+import "rmtools.mac", "cbsttls.mac", "rmtplstr.mac";
+import WldInter; //SDA - импорт перенесен из rmtools.mac
+import "FrontRoute.mac", "FrontCommon.mac"; // KS 30.09.2011
+import oralib; //Jushmanov 2014-02-25 C-19151
+
+const ПутьКНастройкеПроводитьТекущимДнем = "АРМ ПОЗИЦИОНЕРА\\ПЕРЕМЕННЫЕ\\CARRYINUNKNOWNCURRENTDAY";
+
+var PaymentObj:RsbPayment;
+
+
+macro ЗаполнитьСортировку( InData, Sum )
+    var str, day, month, year;
+
+    DateSplit(InData, day, month, year );
+
+    str = String( year:4:o, month:2:o, day:2:o, Sum:18:o );
+
+    /* Точку удаляем */
+    str = substr( str, 1, Index(str, ".")-1 ) + substr( str, Index(str, ".")+1 );
+
+    return str;
+end;
+
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first, KindDoc, ID_Operation, ID_Step )
+    var FlagTrans = 0, DKFlag = "", stat, TransferDate, err, IsCarryCurDay, ForceMove = 0, Sort, regval, TpID, TpShemID = 0, RlsFormID = 0, Narrative = "", PartyID;
+    var paymtr:RsbPaymTransaction = PaymentObj.MakeTransaction();
+    var FAccount = "", FFIID = 0; 
+    var rs: RsdRecordset, query: string, params: TArray;
+
+    File   cors(corschem);
+    RECORD wlreq( wlreq  );   
+    RECORD wlinfo( wlinfo  );   
+
+    var errorMsg:string = "";
+
+    private var ruleid = ReadFrontRule(PaymentObj.PaymentID); // KS 30.09.2011
+    private var SoaGo = IsSoaGo(ruleid); // KS 30.09.2011
+    private var cmdarh,rsarh;    // KS 30.09.2011
+    var cmd;
+
+    if(GetOprStatus(3202) == 1) // KS 23.04.2011 Для отмены повторной постановки на невыясненные 3202 = "Помещено в невыясненные", 1-Да
+        return 0;
+    end;
+
+    if (SoaGo) // KS 30.09.2011
+
+        cmdarh = RSDCommand("SELECT arh.* "+
+                            "  FROM dpmdocs_dbt doc, dacctrn_dbt arh "+
+                            " WHERE doc.t_paymentid = ? "+
+                            "   AND arh.t_acctrnid = doc.t_acctrnid "+
+                            "   AND arh.t_account_receiver = '"+InPaymentAccUnclosed( PaymentObj ).FindAndOpenAccount()+"' ");
+
+        cmdarh.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+        rsarh = RSDRecordset(cmdarh);
+
+        if (rsarh.movenext) // KS 27.09.2010 I-053538: Подразумеваю, что может быть или 47416 или транзитный. Два одновременно быть не могут
+
+            if( PaymentObj.DeleteTransaction(rsarh.value("t_acctrnid")) )
+                // KS 25.03.2011 Округление!!!! Проводка не откатывается
+                cmd = RSDCommand("update dpmpaym_dbt t set t_futurepayeramount=round(t_futurepayeramount,2),t_futurereceiveramount=round(t_futurereceiveramount,2) where t.t_paymentid = ?");
+                cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+                cmd.Execute();
+
+                PaymentObj = RsbPayment(PaymentObj);
+
+                if( PaymentObj.DeleteTransaction(rsarh.value("appkind"),rsarh.value("appkey")) )
+                    msgbox("Исходная проводка не удалена");
+                    return 1;
+                end;
+            end;
+
+        end;
+
+    end;
+
+    //Lavrenov: для сконвертированных документов ни чего не делаем
+    if ( PaymentObj.origin < 10000 )
+
+        // Актуализировать проводки платежа
+        if( not CarryPlanDocuments(PaymentObj.PaymentID) ) 
+            MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+            return 1;
+        end;
+
+        GetRegistryValue( ПутьКНастройкеПроводитьТекущимДнем, V_BOOL, IsCarryCurDay, err );
+        if( err != 0 )
+            /* По умолчанию считаем, что флаг "Проводить в невыясненные текущим днем" установлен */
+           // IsCarryCurDay = TRUE;
+              IsCarryCurDay = FALSE;
+        end;
+
+        if ( PaymentObj.IsCredit() )
+            DKFlag = FL_KREDIT;
+        else
+            DKFlag = FL_DEBET;
+        end;
+
+        FlagTrans = PaymentObj.IsTransit();
+        /* Проверяем ДПП и предлагаем его сменить в случае неверного значения */
+        if ( PaymentObj.CorrectInDpp(false) )
+            msgbox("Неверное значение ДПП");
+            return 1;
+        end; 
+        /* До исправлений функций ДПП */
+        TransferDate = PaymentObj.InTransferDate;
+
+        if ( TransferDate>{curdate} )
+            msgBox("Этот платеж можно проводить только " + string(TransferDate));
+            return 1;
+        end;
+
+        if( DKFlag == "" ) /* документ не внешний */
+            msgbox("Документ не является внешним");
+            return 1;
+        end;
+
+        if ( FlagTrans )
+            if ( DKFlag == FL_KREDIT )
+            else
+                if ( (PaymentObj.OutTransferDate!={curdate}) OR 
+                     (PaymentObj.InTransferDate!={curdate}) )
+                    msgBox("Транзитное требование необходимо проводить текущим днем");
+                    return 1;
+                end;
+                if ( НайтиКорсхему(PaymentObj.InCorschem, PaymentObj.BaseFIID, cors) )
+                    msgBox("Не найдена входящая корсхема");
+                    return 1;
+                else
+                    if (cors.IsNostro=="")
+                        msgBox("Транзитные требования от лоро-корреспондентов не обрабатываются");
+                        return 1; 
+                    end;
+                end;
+            end;
+        end;
+
+     /* Заполняем поля документа */
+
+        paymtr.Chapter = 1;
+        paymtr.Number_Pack = PaymentObj.NumberPack;
+
+        paymtr.ResultCarry = AVIZOCARRY;
+
+        paymtr.Kind_Oper  = " 6";
+
+        //Lavrenov: как в 2029
+        paymtr.Shifr_Oper = "09";
+
+        /* Реальные счета и коды банков */
+        if( DKFlag == FL_KREDIT )
+            paymtr.AccountPayer      = PaymentObj.FuturePayerAccount;
+            paymtr.AccountReceiver   = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.BaseFIID);
+
+            paymtr.FIIDPayer    = PaymentObj.FuturePayerFIID;
+            paymtr.SumPayer     = PaymentObj.FuturePayerAmount;
+            paymtr.FIIDReceiver = PaymentObj.BaseFIID;
+            paymtr.SumReceiver  = PaymentObj.BaseAmount;
+        else
+            paymtr.AccountPayer      = Unkn_GetAccountActive( PaymentObj.Department, PaymentObj.BaseFIID);
+            paymtr.AccountReceiver   = PaymentObj.FutureReceiverAccount;
+
+            paymtr.FIIDPayer    = PaymentObj.BaseFIID;
+            paymtr.SumPayer     = PaymentObj.BaseAmount;
+            paymtr.FIIDReceiver = PaymentObj.FutureReceiverFIID;
+            paymtr.SumReceiver  = PaymentObj.FutureReceiverAmount;
+        end;
+
+        if ( IsCarryCurDay )
+            paymtr.Date_Carry   = {curdate};
+        else
+            /*SDA - постановка на невыясненные производится по входящей ДПП,
+                    читайте нормативные документы */
+            paymtr.Date_Carry    = PaymentObj.InTransferDate; /* PaymentObj.ValueDate;*/
+        end;
+
+        paymtr.Department    = PaymentObj.Department;
+        paymtr.Ground        = PaymentObj.Ground;
+        paymtr.Numb_Document = PaymentObj.Number;     
+        paymtr.ClaimID       = GetClaimID( PaymentObj, paymtr.AccountPayer, paymtr.Chapter, paymtr.FIIDPayer ); 
+        paymtr.Status_After  = ACCTRN_STATUS_DOCUMENT;
+        /*SDA */
+        paymtr.Oper          = PaymentObj.Oper;
+
+        if(DKFlag == FL_KREDIT)
+            FAccount = PaymentObj.FuturePayerAccount;
+            FFIID    = PaymentObj.FuturePayerFIID;
+        else
+            FAccount = PaymentObj.FutureReceiverAccount;
+            FFIID    = PaymentObj.FutureReceiverFIID;
+        end;
+
+        if( not paymtr.Carry() )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+
+        if(PaymentObj.FreeReserve( FAccount, 1, FFIID))
+            MsgBox("Ошибка освобождения резерва по счету " + FAccount);
+            return 1;
+        end;
+
+    end; //Lavrenov: для сконвертированных документов ничего не делаем
+  
+    //Для срочного платежа формируем сообщение
+    if( (GetOprStatus(OPR_PAYM_DIRECT) != OPR_PM_ST_DIR_OUT) and (PaymentObj.Instancy > 0) and (PaymentObj.NeedNotify == "X")
+    and (not ФормированиеУведомленияПоСрочномуПлатежу(PaymentObj.PaymentID, TYPETEMPLINFO_UNKNOWNSUM)))
+        return 1;
+    end;
+
+    //Lavrenov: для сконвертированных документов ничего не делаем
+    if ( PaymentObj.origin < 10000 )
+
+        /*Для ответного создаем запрос или инф.сообщение*/
+        DebugBreak;
+        GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\ПЕРЕМЕННЫЕ\\CREATEMESSUNKNOWPAY", V_BOOL, regval, err );  
+        if((PaymentObj.PrimDocKind == WL_INDOC) and (regval == true) )
+
+            if ( PaymentObj.IsCredit() )
+                PartyID = PaymentObj.PayerBankID;
+            else
+                PartyID = PaymentObj.ReceiverBankID;
+            end;
+   
+            query = " SELECT m.t_Trn, m.t_OutsideAbonentDate, r.t_FormID"+
+                      " FROM dwlmes_dbt m, dwlpm_dbt p, dwlmesrls_dbt r, dwlmeslnk_dbt l "+
+                     " WHERE p.t_wlpmid = :wlpmid"+
+                       " AND l.t_mesid = m.t_mesid"+
+                       " AND l.t_objid = p.t_wlpmid"+
+                       " AND l.t_objkind = :payment"+
+                       " AND r.t_rlsformid = m.t_rlsformid";
+
+            params = makeArray( SQLParam( "wlpmid",  PaymentObj.InWlpmID ),
+                                SQLParam( "payment", OBJTYPE_PAYMENT ) ); 
+
+            rs = execSQLselect( query, params, false );
+
+            ClearRecord(wlreq);
+
+            if( rs.MoveNext())
+                wlreq.RelatedRef    = rs.value(0);
+                wlreq.InitDateMes   = rs.value(1);
+                wlreq.InitFormIDMes = rs.value(2);
+            end;
+
+            wlreq.Kind         = WLD_MES_KIND_REQUEST;
+            wlreq.OriginatorID = {OurBank};
+            wlreq.RecipientID  = PartyID;
+            wlreq.Corschem     = PaymentObj.InCorschem;
+            wlreq.FIID         = PaymentObj.InCorschemFIID;
+            wlreq.PmDateValue  = PaymentObj.ValueDate;
+            wlreq.Sum          = PaymentObj.BaseAmount;
+
+            Narrative = СформироватьСтрокуПоШаблону( PaymentObj, OPR_PAYM_ST_INDEX_UNKNOWN );     
+
+            TpID = PaymentObj.InTransport;
+            if( PaymentObj.InTransport == 9 )
+                TpID = 0;
+            end;
+
+            if( not WldDefineRlsForm( OBJTYPE_REQ, PartyID, WLD_MES_KIND_REQUEST, TpID, TpShemID, RlsFormID )
+            or (not RlsFormID)
+            or (not TpShemID) )
+                if( not WldDefineRlsForm( OBJTYPE_INFO, PartyID, WLD_MES_KIND_INFO, TpID, TpShemID, RlsFormID )
+                or (not RlsFormID)
+                or (not TpShemID) )
+                    err = CreateQuery( wlreq,                    
+                                       Narrative,
+                                       "",
+                                       RlsFormID,
+                                       TpShemID,
+                                       true,                     
+                                       ID_Operation,
+                                       ID_Step,
+                                       TpID);
+                else
+                    wlinfo.OriginatorID = {OurBank};
+                    wlinfo.RecipientID  = PartyID;
+                    wlinfo.RelatedRef   = wlreq.RelatedRef;
+                    err = CreateInfo ( wlinfo,
+                                       Narrative,
+                                       RlsformID,
+                                       TpShemID,
+                                       true, 
+                                       ID_Operation,      
+                                       ID_Step);            
+                end;
+            else
+                err = CreateQuery( wlreq,
+                                   Narrative,
+                                   "",
+                                   RlsFormID,
+                                   TpShemID,
+                                   true,                     
+                                   ID_Operation,
+                                   ID_Step);      
+            end;
+
+            if(err)
+                MsgBox("Не удалось сформировать запрос на уточнение реквизитов получателя");
+                return 1;
+            end;
+        end;
+    end; //Lavrenov: для сконвертированных документов ничего не делаем
+
+    if(GetOprStatus(OPR_PAYM_INDEX) != OPR_PAYM_ST_INDEX_UNKNOWN)
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_UNKNOWN) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+
+    if(GetOprStatus(OPR_PAYM_MANUAL) != OPR_PAYM_ST_MANUAL_NOTNEED)
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+
+    //Gurin S. 06.01.2014 Адаптация 31 патч
+    if(GetOprStatus(3202) != 1)
+        if( УстановитьСтатусыПлатежа( 3202, 1 ) ) // KS 23.04.2011 Для отмены повторной постановки на невыясненные 3202 = "Помещено в невыясненные", 1-Да
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+
+    /* Платеж делаем невыясненным - если он внешний входящий */
+    if( PaymentObj.IsExternal and PaymentObj.IsExternalIncoming )
+        PaymentObj.PropStatus = PM_PROP_UNKNOWN;
+    end;
+    /* Заполним сортировку - дата помещения + сумма */
+    if ( IsCarryCurDay )
+        Sort = ЗаполнитьСортировку( {curdate}, PaymentObj.ReceiverAmount );
+    else
+        Sort = ЗаполнитьСортировку( PaymentObj.InTransferDate/*PaymentObj.ValueDate*/, PaymentObj.ReceiverAmount );
+    end;
+
+    //Lavrenov: для сконвертированных документов ни чего не делаем
+    if ( PaymentObj.origin < 10000 )
+
+        err = PaymentObj.PlaceToUnknown(Sort);
+
+        if(err == 7251)   
+            DisplayError();
+            return 1;  
+        elif(err == 7312) // KS 11.10.2011 Обработка 7312
+            cmd = RSDCommand("delete from drminprop_dbt where t_paymentid = ?");
+            cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+            cmd.Execute();
+            err = PaymentObj.PlaceToUnknown(Sort);
+        end;
+
+        if(err)   
+            MsgBox("Ошибка при помещении платежа в невыясненные");
+            return 1;
+        end;
+
+    end;
+
+    return 0;
+end;
+
+// KS 26.12.2011 Поправим t_poutdate I-00125999
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+    var cmd;
+
+    //Jushmanov 2014-02-25 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn==0))
+        //SDA 17/02/2012 - фикс ошибки при которой документ, поставленный на невыясненные, не появлялся 
+        //                 в скроллинге картотеки невыясненных
+        cmd = RsdCommand (" MERGE INTO drminprop_dbt t "+
+                           "\n   USING (SELECT 1 FROM DUAL) "+
+                           "\n   ON (t.t_paymentid = :paymentid1) "+
+                           "\n   WHEN NOT MATCHED THEN "+
+                           "\n      INSERT (t.T_PAYMENTID, "+
+                           "\n              t.T_CLOSED, "+
+                           "\n              t.T_PLACEDATE, "+
+                           "\n              t.T_ACCOUNT, "+
+                           "\n              t.T_FIID, "+
+                           "\n              t.T_SORT, "+
+                           "\n              t.T_POUTDATE, "+
+                           "\n              t.T_SUM, "+
+                           "\n              t.T_OUTDATE, "+
+                           "\n              t.T_RMINPROPID) "+
+                           "\n      VALUES (:paymentid2, "+
+                           "\n              CHR(0), "+
+                           "\n              :InTransferDate, "+
+                           "\n              :FuturePayerAccount, "+
+                           "\n              :FutureReceiverFIID, "+
+                           "\n              :sort, "+
+                           "\n              to_date('01.01.0001','dd.mm.yyyy'), "+
+                           "\n              :ReceiverAmount, "+
+                           "\n              to_date('01.01.0001','dd.mm.yyyy'), "+
+                           "\n              0) ");
+        cmd.addParam("paymentid1", RSDBP_IN, PaymentObj.PaymentID);
+        cmd.addParam("paymentid2", RSDBP_IN, PaymentObj.PaymentID); 
+        cmd.addParam("InTransferDate", RSDBP_IN, PaymentObj.InTransferDate);
+        cmd.addParam("FuturePayerAccount", RSDBP_IN, PaymentObj.FuturePayerAccount);
+        cmd.addParam("FutureReceiverFIID", RSDBP_IN, PaymentObj.FutureReceiverFIID);
+        var _sort = ЗаполнитьСортировку( PaymentObj.InTransferDate, PaymentObj.ReceiverAmount );
+        cmd.addParam("sort", RSDBP_IN, _sort);
+        cmd.addParam("ReceiverAmount", RSDBP_IN, PaymentObj.ReceiverAmount);
+        cmd.Execute();
+
+        // KS 26.12.2011 Поправим t_poutdate I-00125999
+        cmd = RSDCommand("update drminprop_dbt \n" +
+                         "   set t_poutdate = \n" +
+                         "       RSI_RSBCALENDAR.GetDateAfterWorkDay \n" + // Прибавляю нужное количество дней
+                         "        (t_placedate, \n" +
+                         "         (select UTL_RAW.cast_to_binary_integer (UTL_RAW.SUBSTR (n.t_text, 1, 4), 3) \n" + // Конверт
+                         "            from dnotetext_dbt n \n" +  // Читаю соответствующее примечание
+                         "           where n.t_documentid = lpad(t_fiid,10,'0') \n" + // Код ФИ
+                         "             and n.t_objecttype = 2 \n" +                   // ФИ
+                         "             and n.t_notekind = 1)) \n" +                   // Тип примечания
+                         " where t_paymentid = ?");
+        cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+        cmd.Execute();
+    elif (( message == OP_BACKOUT_STEP ) and (errTrn==0)) //Gurin S. 08.12.2015 R-631045-2
+        cmd = RSDCommand("update drminprop_dbt set t_outdate = to_date('01.01.0001','dd.mm.yyyy') where t_paymentid = :pmid");
+        cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+        cmd.Execute();
+    end;
+end;

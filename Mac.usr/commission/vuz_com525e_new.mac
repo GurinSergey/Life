@@ -1,0 +1,197 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ПОЛНОСТЬЮ СКОПИРОВАНО С ПРББ
+   RR Макрос пользовательского алгоритма расчёта базовых сумм по комиссии 5.2.5
+       "Выдача наличных с оформлением заявки в течение предыдущего опер. дня:
+          - прочее (при общей сумме снятия наличных на прочие цели от 1 млн.руб 
+          за текущий календарный месяц, если общая сумма снятия наличных на 
+          прочие цели не превышает 5 млн.рублей в месяц) ".
+   Chesnokov D. После введения комиссии 5.2.10, проверяем на то что не установлена
+        категория "Вид тарифа комиссии 5.2.10 за выдачу разового кредита,      
+        предоставленного банком".
+       Тип комиссии - единовременная.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+/*Changes:
+27-05-2012 Жаворонкова (joy) С-10885 Добавлена разбивка базы комиссии на граничном чеке 
+28.11.2013 Жаворонкова Н. (joy) C-23416 Добавила парметры true, sfcontr в Cash_CalcSymbSum_Period, чтобы искать чеки по всем счетам клиента
+//21.01.2014 C-25244 VV 
+*/
+
+import sfinter, ptinter, cb_sql;/*InsertSumList*/
+import CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+  record sfbassum( "sfbassum.str" );
+  record paym(pmpaym);
+
+/* Символ кассы, по которому берётся данная комиссия */
+CONST CommCashSymbol = "('42', '46', '47', '53', '54', '58', '59', '60', '61')";    // прочие и т.п.
+/* Номер категории, которая определяет тариф для платежей (Тариф 5.2.10) */
+const Tarif5210Number = "5.2.10";
+const Tarif529Number  = "5.2.9";
+/* ID Категории "Вид тарифа комиссии 5.2.10 за выдачу разового кредита, предоставленного банком" */
+const GroupID = 26;
+
+/*
+    Расчет для единовременных комиссий
+*/
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    var stat:integer; 
+    var query, rs;
+    var CommSum   = $0,
+        SymbSum   = $0,
+        mm, yy,
+        MonthBegDate,
+        PaymValueDate,
+        TotalCashSum,
+        Num,
+        retVal,
+        error;
+
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+    /* Получим значение категории "Вид тарифа комиссии 5.2.10 за выдачу разового кредита, предоставленного банком" */
+    Num = "";
+
+    ClearRecord(paym);
+    paym.PaymentID = cashDoc.AutoKey;                    // V.6.20: PaymentID = Autokey
+
+    GetMainObjAttr (retVal, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), GroupID, null, null, Num);
+
+    // Комиссия по чекам
+    if (( docKind == CASH_PS_OUTORDER ) and (Num != Tarif5210Number) and (Num != Tarif529Number))
+
+       rs = GetComBank52RecordSet( cashDoc.IsCurrency, cashDoc.DocKind, cashDoc.AutoKey, CommCashSymbol );
+       while (rs and rs.moveNext())
+          SymbSum = SymbSum + rs.value(0, null, V_MONEY);
+       end;
+
+       if (Cash_IsProperCommission (sfcontr, sfcalcal, SymbSum) )
+          TotalCashSum = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, true, sfcontr );
+         /* 17-05-2012 Жаворонкова (joy) С-10885 Добавлена разбивка базы комиссии на граничном чеке*/
+          if ( TotalCashSum + SymbSum <= $3000000 ) /*Если сумма с начала месяца, вкл. текущий чек, не превышает лимита, то база = сумме текущего чека*/
+             CommSum = SymbSum;
+          else 
+             CommSum = ($3000000 - TotalCashSum); /* Комиссию берем с той части суммы текущего чека, которая осталась до лимита в 3 млн.*/
+          end;
+       end;
+
+    end;
+    
+    //VV C-25244   
+    var  quer="SELECT   CAT.T_OBJECT "+
+            "FROM   dobjatcor_dbt cat "+
+            "WHERE   CAT.T_GROUPID = 1023 "+
+            " AND CAT.T_OBJECTTYPE = 501 "+
+            " and CAT.T_OBJECT=" +cashDoc.AutoKey ;
+    var  qrs=TRsbDataSet(quer);
+
+     if(qrs.movenext)
+     debugbreak;
+       CommSum=$0;
+     end;  
+//VV C-25244 
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2  = SF_BASETYPE_SUM;
+    sfbassum.baseSum2   = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы: ", GetErrMsg );
+    end;
+
+end;/*CalcCommissionSum*/
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

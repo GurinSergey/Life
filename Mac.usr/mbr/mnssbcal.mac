@@ -1,0 +1,1752 @@
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : Межбанковские расчеты
+//
+// Описание     : Функции для сообщений SBC0, SBC1, SBC2
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 13.05.2014
+// Изменения    :
+//                TAM 14.10.2014 R-459502-2
+//
+//-----------------------------------------------------------------------------
+
+import oralib, likepy, CTInter, PTInter, "bnk_common.mac", "xmlmestools.mac", 
+       "adress.mac", "bnk_ptlib.mac", "wlmnstls.mac", PSInter, FIInter;
+//TAM 311-П
+import "lib_fg.mac"; 
+
+private macro GetPartyAttr_PartyType(PartyID : integer) : integer
+
+  macro HasPartyAttr(sPartyID : string, AttrID : integer) : bool
+    var AttrFound : bool = false;
+    if( CheckObjAttrPresence(AttrFound, OBJTYPE_PARTY, sPartyID, PARTY_ATTR_GROUP_PTTYPE, AttrID)
+        and AttrFound )
+      return true;
+    end;
+
+    return false;
+  end;
+
+  // Для категории "Тип субъекта" может быть задано несколько значений
+  // Сначала проверяем основное значение, затем неосновные
+  var AttrID : integer = GetPartyMainAttr_PartyType(PartyID);
+
+  // Если основная категория не задана, значит, ни одной не задано. Дальше нет смысла
+  if(AttrID == 0)
+    return AttrID;
+  end;
+
+  // Ищем те значения, по которым можно заполнить поля (КодЛица)
+  if( not InList( AttrID, PARTY_ATTR_PTTYPE_NOTARIUS, 
+                          PARTY_ATTR_PTTYPE_ADVOCAT,
+                          PARTY_ATTR_PTTYPE_MANAGPARTNER )
+    )
+    var RecParty : TRecHandler = TRecHandler("party.dbt");
+    RecParty.rec.PartyID = PartyID;
+    var sPartyID : string = UniID(RecParty, OBJTYPE_PARTY);
+
+    if( HasPartyAttr(sPartyID, PARTY_ATTR_PTTYPE_NOTARIUS) )
+      AttrID = PARTY_ATTR_PTTYPE_NOTARIUS;
+    elif( HasPartyAttr(sPartyID, PARTY_ATTR_PTTYPE_ADVOCAT) )
+      AttrID = PARTY_ATTR_PTTYPE_ADVOCAT;
+    elif( HasPartyAttr(sPartyID, PARTY_ATTR_PTTYPE_MANAGPARTNER) )
+      AttrID = PARTY_ATTR_PTTYPE_MANAGPARTNER;
+
+    // не влияет на КодЛица, но влияет на выбор блока НЕТИНН
+    elif( HasPartyAttr(sPartyID, PARTY_ATTR_PTTYPE_KFH) )
+      AttrID = PARTY_ATTR_PTTYPE_KFH;
+    end;
+  end;
+
+  return AttrID;
+end;
+
+private macro GetPartyData
+( PartyID : integer, 
+  LegalForm : @integer, 
+  IsIndividEmployer : @bool, 
+  AttrPartyType : @integer, 
+  NotResident : @string
+) : bool
+
+  var q : string = "select t_LegalForm, t_NotResident "
+                   "  from dparty_dbt "
+                   " where t_PartyID = :PartyID ";
+  var params : TArray = makeArray( SQLParam("PartyID", PartyID) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+  if(rs and rs.moveNext())
+    LegalForm = rs.value("t_LegalForm");
+
+    if(LegalForm == PTLEGF_PERSN)
+      IsIndividEmployer = IsIndividualEmployer(PartyID);
+    else
+      IsIndividEmployer = false;
+    end;
+    
+    AttrPartyType = GetPartyAttr_PartyType(PartyID);  
+
+    NotResident = rs.value("t_NotResident");
+
+    return true;
+  end;
+
+  return false;
+end;
+
+// Формирование поля "КодЛица"
+macro GetEntityCodeFld
+( LegalForm : integer,
+  NotResident : string,
+  IsIndividEmployer : bool,
+  AttrPartyType : integer
+
+) : string
+
+  if( (LegalForm == PTLEGF_INST) and (NotResident != "X") )
+    return "1"; // российская организация
+  elif( (LegalForm == PTLEGF_PERSN) and IsIndividEmployer and
+        not InList(AttrPartyType, PARTY_ATTR_PTTYPE_NOTARIUS, 
+                                  PARTY_ATTR_PTTYPE_ADVOCAT,
+                                  PARTY_ATTR_PTTYPE_MANAGPARTNER)
+      )
+    return "2"; // индивидуальный предприниматель
+  elif( (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_NOTARIUS) )
+    return "3"; // нотариус, занимающийся частной практикой
+  elif( (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_ADVOCAT) )
+    return "4"; // адвокат, учредивший адвокатский кабинет
+  elif( (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_MANAGPARTNER) )
+    return "5"; // управляющий товарищ инвестиционного товарищества
+  elif( (LegalForm == PTLEGF_INST) and (NotResident == "X") )
+    return "6"; // иностранная организация
+  elif( (LegalForm == PTLEGF_PERSN) and not IsIndividEmployer and not AttrPartyType )
+    return "7"; // физическое лицо, не являющееся индивидуальным предпринимателем
+  end;
+
+  // ничего не смогли вернуть
+  RunError("Не удалось определить код лица");
+end;
+
+private macro GetAccKindName(AccKind : string) : string
+  if(AccKind == "01")
+    return "Расчетный";
+  elif(AccKind == "02")
+    return "Текущий";
+  elif(AccKind == "03")
+    return "Специальный";
+  elif(AccKind == "04")
+    return "Счет по вкладу";
+  elif(AccKind == "05")
+    return "Депозитный";
+  elif(AccKind == "06")
+    return "Бюджетный";
+  elif(AccKind == "07")
+    return "Корреспондентский";
+  elif(AccKind == "08")
+    return "Корреспондент. субсчет";
+  elif(AccKind == "09")
+    return "Доверит. управления";
+  elif(AccKind == "10")
+    return "Накопительный";
+  elif(AccKind == "11")
+    return "Внебюджетный";
+  elif(AccKind == "99")
+    return "Иной";
+  elif(AccKind == "00")
+    return "Неустановленный";
+  end;
+
+  RunError("Ошибка программирования: некорректное значение параметра AccKind");
+end;
+
+private macro GetAccKindByTypeAccount(Type_Account : string/*, AccKinds*/) : string
+  var AccKind : string = "", 
+      i : integer = 0;
+
+  while( GetParm(i, AccKind) )
+    if( (AccKind == "01") and (StrBrk(Type_Account, "ЧX") > 0) 
+        or
+        (AccKind == "02") and (StrBrk(Type_Account, "W") > 0)
+        or
+        (AccKind == "03") and (StrBrk(Type_Account, "ЯQ") > 0)
+        or
+        (AccKind == "04") and (StrBrk(Type_Account, "J") > 0)
+        or
+        (AccKind == "05") and (StrBrk(Type_Account, "JG") > 0)
+        or
+        (AccKind == "06") and (StrBrk(Type_Account, "Б") > 0)
+        or
+        (AccKind == "07") and (StrBrk(Type_Account, "К") > 0)
+        or
+        (AccKind == "08") and (StrBrk(Type_Account, "Р") > 0)
+        or
+        (AccKind == "09") and (StrBrk(Type_Account, "E") > 0)
+        or
+        (AccKind == "10") and (StrBrk(Type_Account, "L") > 0)
+      )
+      return AccKind;
+    end;
+
+    i = i + 1;
+  end;
+
+  // Если нет ни одного совпадения, вернуть вид счета "99"
+  return "99";
+end;
+
+// Формирование поля  "ВидСч"
+macro GetAccKindFld(AccClient : integer, Type_Account : string) : string
+  var AccKind : string = "";
+
+  // Если для счета на задано ни одного системного типа, вернуть значение "00"
+  if(not Type_Account)
+    AccKind = "00";
+  else
+    var IsPersn : bool = IsPerson(AccClient);
+    var IsEmployer : bool = false, PartyType : integer = 0;
+    if(IsPersn)
+      IsEmployer = IsIndividualEmployer(AccClient);
+      PartyType = GetPartyMainAttr_PartyType(AccClient);
+    end;
+
+    if(not IsPersn) // Если владелец счета юр. лицо
+      AccKind = GetAccKindByTypeAccount(Type_Account, "01", "07", "08", "03", "06", "11", "09", "05", "10");
+    elif(IsPersn and IsEmployer or PartyType)
+      AccKind = GetAccKindByTypeAccount(Type_Account, "01", "02", "03", "04", "09");
+    elif(IsPersn and not IsEmployer and not PartyType)
+      AccKind = GetAccKindByTypeAccount(Type_Account, "02", "04");
+    else
+      AccKind = "99";
+    end;
+  end;
+
+  return GetAccKindName(AccKind);
+end;
+
+class TAddrRF
+  var Индекс : string = "",
+      КодРегион : string = "",
+      Район : string = "",
+      Город : string = "",
+      НаселПункт : string = "",
+      Улица : string = "",
+      Дом : string = "",
+      Корпус : string = "",
+      Кварт : string = "";
+end;
+
+// Адрес в Российской Федерации (АдрРФТип) - получение данных
+// true - удалось заполнить поля, false - не удалось
+macro GetDataAddrRF(PartyID : integer, Addr : TAddrRF, ErrMsg : @string) : bool
+
+  macro GetAddrItemWithCode(AddrItem : string, AddrItemCode : string) : string
+    var field_value : string = AddrItem;
+
+    if(field_value)
+      if(AddrItemCode)
+        field_value = field_value + " " + AddrItemCode;
+      end;
+
+      // Формат полей НаселПункт, Улица - A50
+      field_value = substr(field_value, 1, 50);
+    end;
+
+    return field_value;
+  end;
+
+
+  record adress(adress);
+
+  // Проверим, есть ли у нас данные для заполнения обязательных полей
+  if( not НайтиЮридическийАдресСубъекта(PartyID, adress) )
+    ErrMsg = "Не найден юридический адрес субъекта " + PartyID;
+    return FALSE;
+  end;
+
+  // Индекс
+  if(adress.PostIndex)
+    Addr.Индекс = SubStr(adress.PostIndex, 1, 6);
+  else
+    ErrMsg = "Не указан почтовый индекс в юридическом адресе субъекта " + PartyID;
+    return FALSE;
+  end;
+
+  // КодРегион
+  if(adress.RegionNum)
+    Addr.КодРегион = SubStr(adress.RegionNum, 1, 2);
+  elif(adress.Country != "RUS")
+    Addr.КодРегион = "99";
+  else
+    ErrMsg = "Не указан код региона в юридическом адресе субъекта " + PartyID;
+    return FALSE;
+  end;
+
+  // Район
+  if( adress.Province and not InList(adress.RegionNum, "77", "78") )
+    Addr.Район = adress.Province;
+  end;
+
+  // Город
+  if(adress.District)
+    Addr.Город = adress.District;
+  elif(not adress.Place)
+    if(adress.RegionNum == "77")
+      Addr.Город = "Москва";
+    elif(adress.RegionNum == "78")
+      Addr.Город = "Санкт-Петербург";
+    end;
+  end;
+
+  Addr.НаселПункт = GetAddrItemWithCode(adress.Place, adress.CodePlace);
+  Addr.Улица = GetAddrItemWithCode(adress.Street, adress.CodeStreet);
+  Addr.Дом = adress.House;
+  Addr.Корпус = adress.NumCorps;
+  Addr.Кварт = adress.Flat;
+
+  return TRUE;
+end;
+
+// Адрес в Российской Федерации (АдрРФТип) - запись в сообщение
+// Передаваемые данные должны быть уже проеверены!
+macro WriteAddrRF(Addr : TAddrRF, BlockName : string)
+
+  macro ЗаписатьПолеЛогЗагл(field_name, field_value)
+    field_value = StrUpr(field_value);
+    ЗаписатьПолеЛог(field_name, field_value);
+  end;
+
+  macro WriteAddrItemOptional(field_name : string, AddrItem : string)
+    if(AddrItem)
+      ЗаписатьПолеЛогЗагл(field_name, AddrItem);
+    end;
+  end;
+
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛогЗагл("Индекс", Addr.Индекс);
+  ЗаписатьПолеЛогЗагл("КодРегион", Addr.КодРегион);
+  WriteAddrItemOptional("Район", Addr.Район);
+  WriteAddrItemOptional("Город", Addr.Город);
+  WriteAddrItemOptional("НаселПункт", Addr.НаселПункт);
+  WriteAddrItemOptional("Улица", Addr.Улица);
+  WriteAddrItemOptional("Дом", Addr.Дом);
+  WriteAddrItemOptional("Корпус", Addr.Корпус);
+  WriteAddrItemOptional("Кварт", Addr.Кварт);
+
+  FinishBlockLogXML(BlockName);
+
+  return true;
+end;
+
+// Фамилия, имя, отчество физического лица (ФИОТип) - получение данных
+// true - удалось заполнить поля, false - не удалось
+macro GetDataFIO
+( PartyID : integer, 
+  NameF : @string, 
+  NameI : @string, 
+  NameO : @string, 
+  ErrMsg : @string
+
+) : bool
+
+  if( not GetPersonNames(PartyID, @NameF, @NameI, @NameO) )
+    ErrMsg = "Не найдены данные физ.лица  ИД = " + PartyID;
+    return FALSE;
+  end;
+
+  // обязательные поля в ФИОТип
+  if(not NameF)
+    ErrMsg = "Не задана фамилия физ.лица  ИД = " + PartyID;
+    return FALSE;
+  end;
+
+  if(not NameI)
+    ErrMsg = "Не задано имя физ.лица  ИД = " + PartyID;
+    return FALSE;
+  end;
+
+  return TRUE;
+end;
+
+// Фамилия, имя, отчество физического лица (ФИОТип) - запись в сообщение
+// Передаваемые данные должны быть уже проеверены!
+macro WriteFIO
+( BlockName : string, 
+  F : string, 
+  I : string, 
+  O : string
+)
+  // запись полей
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("Фамилия", F);
+  ЗаписатьПолеЛог("Имя", I);
+  if(O)
+    ЗаписатьПолеЛог("Отчество", O);
+  end;
+
+  FinishBlockLogXML(BlockName);
+
+  return TRUE;
+end;
+
+private macro IsGoodINN_Org(INN : string) : bool
+  return IsNDigits(INN, 10, true);
+end;
+
+private macro IsGoodINN_IndEmpl(INN : string) : bool
+  return IsNDigits(INN, 12, true);
+end;
+
+private macro IsGoodKIO(KIO : string) : bool
+  return IsNDigits(KIO, 5, false);
+end;
+
+private macro IsGoodKPP(KPP : string) : bool
+  return IsNDigits(KPP, 9, true);
+end;
+
+private macro IsGoodOGRN_Org(OGRN : string) : bool
+  return IsNDigits(OGRN, 13, false);
+end;
+
+private macro IsGoodOGRN_IndEmpl(OGRN : string) : bool
+  return IsNDigits(OGRN, 15, false);
+end;
+
+private macro IsGoodBIC(BIC : string) : bool
+  if( substr(BIC, 1, 2) != "04" )
+    return FALSE;
+  end;
+
+  if( not IsNDigits( substr(BIC, 3), 7, false ) )
+    return FALSE;
+  end;
+
+  return TRUE;
+end;
+
+// true - удалось заполнить поля, false - не удалось
+private macro WriteTaxPayerRusOrg
+( BlockName : string, 
+  AccMsgKind : integer,
+  INN : string, 
+  KPP : string, 
+  OGRN : string, 
+  OrgName : string,
+  ErrMsg : @string
+
+) : bool
+
+  // Check
+  if(not INN)
+    ErrMsg = "Не задан ИНН для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+  if(not IsGoodINN_Org(INN))
+    ErrMsg = "Неверное значение ИНН: " + INN;
+    return FALSE;
+  end;
+
+  if(KPP)
+    if(not IsGoodKPP(KPP))
+      ErrMsg = "Неверное значение КПП: " + KPP;
+      return FALSE;
+    end;
+  elif(AccMsgKind == ACCMSG_KIND_OPEN)
+    // Обязательно заполняется в сообщении об открытии счета
+    ErrMsg = "Не задан КПП для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+
+  if(OGRN)
+    if(not IsGoodOGRN_Org(OGRN))
+      ErrMsg = "Неверное значение ОГРН: " + OGRN;
+      return FALSE;
+    end;
+  end;
+
+  // write
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("ИННРО", INN);
+  
+  if(KPP)
+    ЗаписатьПолеЛог("КПП", KPP);
+  end;
+
+  if(OGRN)
+    ЗаписатьПолеЛог("ОГРН", OGRN);
+  //TAM 14.10.2014 R-459502-2
+  else
+    if (not getTrue(true, "У клиента \"" + OrgName + "\" отсутствует ОГРН.|" +
+                          "Формировать сообщение без него?") )
+        return false;
+    end;
+  end;
+
+  ЗаписатьПолеЛог("НаимОрг", OrgName);
+
+  FinishBlockLogXML(BlockName);
+
+  return TRUE;
+end;
+
+// Российская организация (НПРОТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteRusOrg
+( PartyID : integer, 
+  BlockName : string, 
+  AccMsgKind : integer,
+  ErrMsg : @string
+
+) : bool
+
+  var INN : string = "", KPP : string = "", OGRN : string = "", OrgName : string;
+
+  // get INN, KPP, OGRN, OrgName
+  OrgName = GetPartyName(PartyID);
+  if(not OrgName)
+    ErrMsg = "Не задано наименование для субъекта " + PartyID;
+    return FALSE;
+  end;
+
+  var FullINN : string = ПолучитьКодСубъекта(PartyID, PTCK_INN);
+  if(not FullINN)
+    ErrMsg = "Не задан ИНН для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+  INN = RemoveKPP(FullINN);
+  KPP = RemoveINN(FullINN);
+
+  OGRN = ПолучитьКодСубъекта(PartyID, PTCK_OGRN);
+
+  // check and write fields
+  return WriteTaxPayerRusOrg( BlockName, AccMsgKind, INN, KPP, OGRN, OrgName, @ErrMsg );
+end;
+
+// Реквизиты юридического лица до изменения (ИзмНПЮЛТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteRusOrgBeforeChng
+( PartyID : integer, 
+  BlockName : string, 
+  ДатаИзмНП : date,
+  ErrMsg : @string
+
+) : bool
+
+  var INN : string = "", KPP : string = "", OGRN : string = "", OrgName : string;
+  var dt : date = ДатаИзмНП - 1;
+
+  // get INN, KPP, OGRN, OrgName
+  record party(party);
+  var stat : integer = GetPartyOnDate(PartyID, dt, party);
+  if(stat)
+    ErrMsg = "Ошибка при получении наименования для субъекта " + PartyID;
+    return FALSE;
+  else
+    OrgName = party.Name;
+
+    if(not OrgName)
+      ErrMsg = "Не задано наименование для субъекта " + PartyID;
+      return FALSE;
+    end;
+  end;
+  
+  var FullINN : string = "";
+  record buffOBJCODE(objcode);
+  stat = FindObjCodeForDate(OBJTYPE_PARTY, PTCK_INN, PartyID, dt, buffOBJCODE);
+  if(not stat)
+    FullINN = buffOBJCODE.Code;
+  end;
+  if(not FullINN)
+    ErrMsg = "Не задан ИНН для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+  INN = RemoveKPP(FullINN);
+  KPP = RemoveINN(FullINN);
+
+  stat = FindObjCodeForDate(OBJTYPE_PARTY, PTCK_OGRN, PartyID, dt, buffOBJCODE);
+  if(not stat)
+    OGRN = buffOBJCODE.Code;
+  end;
+
+  // check and write fields
+  return WriteTaxPayerRusOrg( BlockName, ACCMSG_KIND_CHNG, INN, KPP, OGRN, OrgName, @ErrMsg );
+end;
+
+// true - удалось заполнить поля, false - не удалось
+private macro WriteTaxPayerIndEmployer
+( 
+  PartyID : integer,
+  BlockName : string, 
+  AccMsgKind : integer,
+  INN : string, 
+  OGRN : string, 
+  SurName : string,
+  Name : string,
+  ParentName : string,
+  ErrMsg : @string
+
+) : bool
+
+  // Check
+  var FullName : string = SurName + " " + Name + " " + ParentName;
+
+  if(not INN)
+    ErrMsg = "Не задан ИНН для субъекта " + FullName;
+    return FALSE;
+  end;
+  if(not IsGoodINN_IndEmpl(INN))
+    ErrMsg = "Неверное значение ИНН: " + INN;
+    return FALSE;
+  end;
+
+  if(OGRN)
+    if(not IsGoodOGRN_IndEmpl(OGRN))
+      ErrMsg = "Неверное значение ОГРН: " + OGRN;
+      return FALSE;
+    end;
+  end;
+
+  // write
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("ИННИП", INN);
+  
+  if(OGRN)
+    ЗаписатьПолеЛог("ОГРНИП", OGRN);
+  //TAM 14.10.2014 R-459502-2
+  else
+    if (not getTrue(true, "У клиента \"" + FullName + "\" отсутствует ОГРН.|" +
+                          "Формировать сообщение без него?") )
+        return false;
+    end;
+  end;
+
+  WriteFIO("ФИОИП", SurName, Name, ParentName);
+
+  FinishBlockLogXML(BlockName);
+
+  return TRUE;
+end;
+
+// Индивидуальный предприниматель, нотариус, адвокат (НПИПТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteIndEmployer
+( PartyID : integer, 
+  BlockName : string, 
+  AccMsgKind : integer,
+  ErrMsg : @string
+
+) : bool
+
+  var INN : string = "", OGRN : string = "", 
+      SurName : string = "", Name : string = "", ParentName : string = "";
+
+  // get INN, OGRN, SurName, Name, ParentName
+  if( not GetDataFIO(PartyID, @SurName, @Name, @ParentName, @ErrMsg) )
+    return FALSE;
+  end;
+
+  var FullINN : string = ПолучитьКодСубъекта(PartyID, PTCK_INN);
+  INN = RemoveKPP(FullINN);
+
+  OGRN = ПолучитьКодСубъекта(PartyID, PTCK_OGRN);
+
+  // check and write fields
+  return WriteTaxPayerIndEmployer( PartyID, BlockName, AccMsgKind, INN, OGRN, SurName, Name, ParentName, @ErrMsg );
+end;
+
+// Индивидуальный предприниматель, нотариус, адвокат до изменения реквизитов (ИзмНПИПТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteIndEmployerBeforeChng
+( PartyID : integer, 
+  BlockName : string, 
+  ДатаИзмНП : date,
+  ErrMsg : @string
+
+) : bool
+
+  var INN : string = "", OGRN : string = "", 
+      SurName : string = "", Name : string = "", ParentName : string = "";
+  var dt : date = ДатаИзмНП - 1;
+
+  // get INN, OGRN, SurName, Name, ParentName
+  record persn(persn);
+  var stat : integer = GetPartyOnDate(PartyID, dt, null, null, null, persn);
+  if(not stat)
+    SurName = persn.Name1;
+    Name = persn.Name2;
+    ParentName = persn.Name3;
+  else
+    ErrMsg = "Ошибка при получении данных для субъекта " + PartyID;
+    return FALSE;
+  end;
+  
+  record buffOBJCODE(objcode);
+  stat = FindObjCodeForDate(OBJTYPE_PARTY, PTCK_INN, PartyID, dt, buffOBJCODE);
+  if(not stat)
+    var FullINN : string = buffOBJCODE.Code;
+    INN = RemoveKPP(FullINN);
+  end;
+
+  stat = FindObjCodeForDate(OBJTYPE_PARTY, PTCK_OGRN, PartyID, dt, buffOBJCODE);
+  if(not stat)
+    OGRN = buffOBJCODE.Code;
+  end;
+
+  // check and write fields
+  return WriteTaxPayerIndEmployer( PartyID, BlockName, ACCMSG_KIND_CHNG, INN, OGRN, SurName, Name, ParentName, @ErrMsg );
+end;
+
+// Иностранная организация (НПИОТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteForeignOrg
+( PartyID : integer, 
+  BlockName : string, 
+  ErrMsg : @string
+
+) : bool
+
+  var INN : string = "", KPP : string = "", OGRN : string = "", OrgName : string;
+
+  // get INN, KPP, OGRN, OrgName
+  OrgName = GetPartyName(PartyID);
+  if(not OrgName)
+    ErrMsg = "Не задано наименование для субъекта " + PartyID;
+    return FALSE;
+  end;
+
+  var FullINN : string = ПолучитьКодСубъекта(PartyID, PTCK_INN);
+  if(not FullINN)
+    ErrMsg = "Не задан ИНН для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+  INN = RemoveKPP(FullINN);
+  KPP = RemoveINN(FullINN);
+
+  OGRN = ПолучитьКодСубъекта(PartyID, PTCK_OGRN);
+
+  // check
+  if(OGRN)
+    if(not IsGoodOGRN_Org(OGRN))
+      ErrMsg = "Неверное значение ОГРН: " + OGRN;
+      return FALSE;
+    end;
+  end;
+
+  if(KPP)
+    if(not IsGoodKPP(KPP))
+      ErrMsg = "Неверное значение КПП: " + KPP;
+      return FALSE;
+    end;
+  end;
+
+  if(not INN)
+    ErrMsg = "Не задан ИНН или КИО для субъекта \"" + OrgName + "\"";
+    return FALSE;
+  end;
+  if( strlen(INN) == 5 )
+    if(not IsGoodKIO(INN))
+      ErrMsg = "Неверное значение КИО: " + KPP;
+      return FALSE;
+    end;
+  else
+    if(not IsGoodINN_Org(INN))
+      ErrMsg = "Неверное значение ИНН: " + INN;
+      return FALSE;
+    end;
+  end;
+
+  // write fields
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("НаимОрг", OrgName);
+  
+  if(OGRN)
+    ЗаписатьПолеЛог("ОГРН", OGRN);
+  //TAM 14.10.2014 R-459502-2
+  else
+    if (not getTrue(true, "У клиента \"" + OrgName + "\" отсутствует ОГРН.|" +
+                          "Формировать сообщение без него?") )
+      return false;
+    end;
+  end;
+  
+  if(KPP)
+    ЗаписатьПолеЛог("КПП", KPP);
+  end;
+  if( strlen(INN) == 5 )
+    WriteFieldLogXML("КИО", INN, true);
+  else
+    WriteFieldLogXML("ИННИО", INN, true);
+  end;
+
+  FinishBlockLogXML(BlockName);
+
+  return TRUE;
+end;
+
+// Лицо без ИНН (НетИННТип)
+// true - удалось заполнить поля, false - не удалось
+macro WritePartyNoINN
+( PartyID : integer, 
+  BlockName : string, 
+  ErrMsg : @string
+
+) : bool
+
+  var IsLegalFormPersn : bool = IsPerson(PartyID), 
+      OGRN : string = ПолучитьКодСубъекта(PartyID, PTCK_OGRN), 
+      OrgName : string = "", 
+      SurName : string = "", Name : string = "", ParentName : string = "";
+
+  if(IsLegalFormPersn)
+    if( not GetDataFIO(PartyID, @SurName, @Name, @ParentName, @ErrMsg) )
+      return FALSE;
+    end;
+  else
+    OrgName = GetPartyName(PartyID);
+    if(not OrgName)
+      ErrMsg = "Не задано наименование для субъекта " + PartyID;
+      return FALSE;
+    end;
+  end;
+
+  // write
+  StartBlockLogXML(BlockName);
+
+  if(OGRN)
+    ЗаписатьПолеЛог("ОГРН", OGRN);
+  //TAM 14.10.2014 R-459502-2
+  else
+    if (not getTrue(true, "У клиента \"" + OrgName + "\" отсутствует ОГРН.|" +
+                          "Формировать сообщение без него?") )
+      return false;
+    end;
+  end;
+
+  if(IsLegalFormPersn)
+    WriteFIO("ФИОИП", SurName, Name, ParentName);
+  else
+    ЗаписатьПолеЛог("НаимОрг", OrgName);
+  end;
+
+  FinishBlockLogXML(BlockName);
+
+  return TRUE;
+end;
+
+private macro WriteTaxRegistration(TaxPayer : integer, FieldName : string)
+
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    ЗаписатьПолеДляАннул( FieldName, GetOldfnsMessageID() );
+  else
+    var Серия : string = "", Номер : string = "", RegDocKind : integer = 0, 
+        ДатаРегистрации : date = date(), RegDocKindName : string = "";
+
+    if(FieldName == "СвидНУ")
+      RegDocKind = СвидетельствоОПостановкеНаУчет;
+      RegDocKindName = "Свидетельство о постановке на учет";
+    else // "СвидГР"
+      RegDocKind = СвидетельствоГосРегистрации;
+      RegDocKindName = "Свидетельство о госрегистрации";
+    end;
+
+    var ИДГНИКлиента = ПолучитьИДГНИ(TaxPayer, Серия, Номер, ДатаРегистрации, RegDocKind);
+
+    if( (Серия != "") and (Номер != "") )
+      if( (strlen(Серия) != 2) or not StrIsNumber(Серия) )
+        RsbThrow("В документе регистрации \"" + RegDocKindName + "\" неверное значение серии");
+      end;
+
+      var NumLen : integer = strlen(Номер);
+      if( (NumLen < 7) or (NumLen > 9) or not StrIsNumber(Номер) )
+        RsbThrow("В документе регистрации \"" + RegDocKindName + "\" неверное значение номера");
+      end;
+
+      ЗаписатьПолеЛог( FieldName, string(Серия, ",", Номер) );
+    //TAM 14.10.2014 R-459502-2
+    else
+      if (not getTrue(true, "У клиента отсутствует \"" + RegDocKindName + "\".|" +
+                            "Формировать сообщение без него?") )
+          //Gurin S. 14.11.2014 R-494196-2
+          RsbThrow("У клиента отсутствует \"" + RegDocKindName );
+          return false;
+      end;
+    end;
+  end;
+
+end;
+
+private macro ЗаполнятьСвидГР(NotResident : string, AttrPartyType : integer) : bool
+  if( (NotResident == "X") or
+      (AttrPartyType == PARTY_ATTR_PTTYPE_NOTARIUS) or
+      (AttrPartyType == PARTY_ATTR_PTTYPE_ADVOCAT)
+    )
+    return FALSE; // не заполняется
+  end;
+
+  return TRUE;
+end;
+
+private macro IsNotINN
+( ClientID : integer,
+  LegalForm : integer,
+  NotResident : string,
+  IsIndividEmployer : bool,
+  AttrPartyType : integer,
+  AccOpenDate : date
+
+) : bool
+
+  var FullINN : string = ПолучитьКодСубъекта(ClientID, PTCK_INN);
+  if(FullINN)
+    var INN : string = RemoveKPP(FullINN);
+
+    if(INN)
+      return FALSE;
+    end;
+  end;
+
+  if( (NotResident != "X") and 
+      (LegalForm == PTLEGF_INST) and 
+      (AccOpenDate < date(22, 9, 1994))
+    )
+    return TRUE;
+  end;
+
+  if( (NotResident != "X") and 
+
+      ( (LegalForm == PTLEGF_INST) or
+        (LegalForm == PTLEGF_PERSN) and IsIndividEmployer or
+        (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_NOTARIUS) or
+        (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_KFH)
+      ) and
+
+      (AccOpenDate < date(22, 9, 1996))
+    )
+    return TRUE;
+  end;
+
+  if( (LegalForm == PTLEGF_PERSN) and (AttrPartyType == PARTY_ATTR_PTTYPE_ADVOCAT) and
+      (AccOpenDate < date(1, 1, 2004))
+    )
+    return TRUE;
+  end;
+
+  return FALSE;
+end;
+
+// Выбрать блок, который будем заполнять в элементе СвНП
+private macro GetTaxPayerChoice
+( EntityCode : string, 
+  AccMsgKind : integer,
+  ClientID : integer, 
+  LegalForm : integer, 
+  NotResident : string, 
+  IsIndividEmployer : bool, 
+  AttrPartyType : integer, 
+  AccOpenDate : date
+
+) : string
+
+  var Code : integer = int(EntityCode);
+
+  if(Code == 1)
+    return "НПРО";
+
+  elif((Code >= 2) and (Code <= 5))
+
+    if( (AccMsgKind == ACCMSG_KIND_CLOSE) and 
+        IsNotINN(ClientID, LegalForm, NotResident, IsIndividEmployer, AttrPartyType, AccOpenDate)
+      )
+      return "НетИНН";
+    else
+      return "НПИП";
+    end;
+
+  elif(Code == 6)
+    return "НПИО";
+  end;
+
+  RunError("Ошибка программирования: неверное значение параметра EntityCode");
+end;
+
+// Сведения о налогоплательщике (СвНП)
+macro WriteTaxPayerInfo( ClientID : integer, AccMsgKind : integer, 
+                         AccOpenDate : date, EntityCode : @string )
+
+  var BlockName : string = "СвНП", ErrMsg : string = "";
+
+  var LegalForm : integer = PTLEGF_ALL,
+      IsIndividEmployer : bool = false,
+      NotResident : string = "",
+      AttrPartyType : integer = 0; // значение категории "Тип субъекта"
+
+  if( not GetPartyData(ClientID, @LegalForm, @IsIndividEmployer, @AttrPartyType, @NotResident) )
+    RunError("Не найден субъект " + ClientID);
+  end;
+
+  EntityCode = GetEntityCodeFld(LegalForm, NotResident, IsIndividEmployer, AttrPartyType);
+
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("КодЛица", EntityCode);
+
+  if( (AccMsgKind == ACCMSG_KIND_OPEN) or (AccMsgKind == ACCMSG_KIND_CLOSE) )
+    WriteTaxRegistration(ClientID, "СвидНУ");
+
+    if( ЗаполнятьСвидГР(NotResident, AttrPartyType) )
+      WriteTaxRegistration(ClientID, "СвидГР");
+    end;
+  end;
+
+  var Choice : string = GetTaxPayerChoice( EntityCode, AccMsgKind,
+                                           ClientID, LegalForm, NotResident, 
+                                           IsIndividEmployer, AttrPartyType, AccOpenDate
+                                         );
+  if(Choice == "НПРО")
+    if( not WriteRusOrg(ClientID, "НПРО", AccMsgKind, @ErrMsg) )
+      RunError(ErrMsg);
+    end;
+  elif(Choice == "НПИП")
+    if( not WriteIndEmployer(ClientID, "НПИП", AccMsgKind, @ErrMsg) )
+      RunError(ErrMsg);
+    end;
+  elif(Choice == "НПИО")
+    if( not WriteForeignOrg(ClientID, "НПИО", @ErrMsg) )
+      RunError(ErrMsg);
+    end;
+  elif(Choice == "НЕТИНН")
+    if( not WritePartyNoINN(ClientID, "НЕТИНН", @ErrMsg) )
+      RunError(ErrMsg);
+    end;
+  else
+    RunError("Ошибка программирования: функция GetTaxPayerChoice вернула неверное значение");
+  end;
+
+  FinishBlockLogXML(BlockName);
+end;
+
+private macro ПолучитьПризнТер(PartyID : integer) : string
+  var q : string = "select 1 "
+                   "  from dadress_dbt "
+                   " where t_PartyID = :PartyID "
+                   "   and t_Type = :PTADDR_LEGAL "
+                   "   and t_Country <> 'RUS' ";
+
+  var params : TArray = makeArray( SQLParam("PartyID", PartyID),
+                                   SQLParam("PTADDR_LEGAL", PTADDR_LEGAL) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+  if( rs and rs.moveNext() )
+    return "1";
+  end;
+
+  return "";
+end;
+
+private macro ПолучитьРегНомИНомФ
+( PartyID : integer, 
+  ПризнТер : string, 
+  РегНом : @string, 
+  НомФ : @string
+
+) : bool
+  debugbreak;
+  var Error : integer = 0;
+  var Code : string = ПолучитьКодСубъекта( PartyID, PTCK_BANKREGNUM, Error);
+
+  if(not Error and Code)
+    // до знака "/"
+    РегНом = GetSymbolsBeforeSlash(Code);
+    // без лидирующих нулей
+    РегНом = strLtrim(РегНом, "0");
+
+    if( (ПризнТер == "1") or НашБанкГоловной(PartyID) )
+      //TAM 24.09.2014
+      if ( _bank.is_EXV_Stavropol )
+        НомФ = "7";
+      elif (_bank.is_EXV_Voronezh)
+        НомФ = "6";
+      elif (_bank.is_EXV_Volgograd)
+        НомФ = "1";
+      else
+        НомФ = "0";
+      end;
+    else
+      // после знака "/"
+      НомФ = GetSymbolsAfterSlash(Code);
+      // без лидирующих нулей
+      НомФ = strLtrim(НомФ, "0");
+    end;
+
+    if(РегНом and НомФ)
+      return TRUE;
+    end;
+  end;
+
+  return FALSE;
+end;
+
+private macro GetINNKPP_CreditOrg
+( PartyID : integer, 
+  ИННКО : @string, 
+  КППКО : @string, 
+  ErrMsg : @string
+
+) : bool
+  var Error : integer = 0;
+  var Code : string = ПолучитьКодСубъекта( PartyID, PTCK_INN, Error);
+
+  if(not Error and Code)
+    ИННКО = RemoveKPP(Code);
+    if( not IsGoodINN_Org(ИННКО) )
+      ErrMsg = "Неверное значение ИНН: " + ИННКО;
+      return FALSE;
+    end;
+
+    КППКО = RemoveINN(Code);
+    if( not IsGoodKPP(КППКО) )
+      ErrMsg = "Неверное значение КПП: " + КППКО;
+      return FALSE;
+    end;
+  else
+    ErrMsg = "Не задан ИНН банка";
+    return FALSE;
+  end;
+
+  return TRUE;
+end;
+
+// Сведения о банке (филиале банка) (СвБанкТип)
+// true - удалось заполнить поля, false - не удалось
+macro WriteBankInfo
+( PartyID : integer, 
+  BlockName : string, 
+  ErrMsg : @string, 
+  CorrectMesObj : TCorrectMesFNS
+
+) : bool
+
+  ErrMsg = "";
+  var Error : integer = 0;
+
+  // -----------------------------------------------------------------------------------
+  // Get field values
+  // -----------------------------------------------------------------------------------
+
+  var РегНом : string = "", НомФ : string = "", БИК : string = "", НаимКО : string = "",
+      ИННКО : string = "", КППКО : string = "", ОГРНКО : string = "", ПризнТер : string = "",
+      Addr : TAddrRF = TAddrRF();
+
+  // ПризнТер
+  ПризнТер = ПолучитьПризнТер(PartyID);
+
+  // РегНом, НомФ
+  if(not ПолучитьРегНомИНомФ(PartyID, ПризнТер, @РегНом, @НомФ))
+    ErrMsg = "Не задан регистрационный номер банка и/или порядковый номер филиала";
+    return FALSE;
+  end;
+
+  var HeadID : integer = 0;
+  if(ПризнТер == "1")
+    HeadID = GetTSHeadPartyID(PartyID);
+    if(not HeadID)
+      ErrMsg = "Не найден головной филиал банка";
+      return FALSE;
+    end;
+  end;
+
+  var FillBankID : integer = IfThenElse(ПризнТер == "1", HeadID, PartyID);
+
+  // БИК
+  Error = 0;
+  БИК = ПолучитьКодСубъекта( FillBankID, PTCK_BIC, Error, 1);
+  if(not БИК)
+    ErrMsg = "Не задан БИК банка";
+    return FALSE;
+  elif(not IsGoodBIC(БИК))
+    ErrMsg = "Неверный БИК банка: " + БИК;
+    return FALSE;
+  end;
+
+  // НаимКО
+  НаимКО = GetPartyShortName(PartyID);
+  if(ПризнТер == "1")
+    // party.shortName для головного банка и в скобках party.name самого субъекта
+    НаимКО = GetPartyShortName(HeadID) + " (" + НаимКО + ")";
+  end;
+  if(not НаимКО)
+    ErrMsg = "Не задано краткое наименование банка";
+    return FALSE;
+  end;
+
+  // ИННКО, КППКО
+  if(not GetINNKPP_CreditOrg(FillBankID, @ИННКО, @КППКО, @ErrMsg))
+    return FALSE;
+  end;
+
+  // ОГРНКО
+  Error = 0;
+  ОГРНКО = ПолучитьКодСубъекта( FillBankID, PTCK_OGRN, Error);
+  if(not ОГРНКО)
+    ErrMsg = "Не задан ОГРН банка";
+    return FALSE;
+  elif(not IsGoodOGRN_Org(ОГРНКО))
+    ErrMsg = "Неверный ОГРН банка: " + ОГРНКО;
+    return FALSE;
+  end;
+
+  // АдрМНКО
+  if( not GetDataAddrRF(FillBankID, Addr, @ErrMsg) )
+    return FALSE;
+  end;
+
+  // -----------------------------------------------------------------------------------
+  // Write fields
+  // -----------------------------------------------------------------------------------
+  StartBlockLogXML(BlockName);
+
+  ЗаписатьПолеЛог("РегНом", РегНом);
+  ЗаписатьПолеЛог("НомФ", НомФ);
+  ЗаписатьПолеЛог("БИК", БИК);
+  ЗаписатьПолеЛог("НаимКО", НаимКО);
+  ЗаписатьПолеЛог("ИННКО", ИННКО);
+  ЗаписатьПолеЛог("КППКО", КППКО);
+  ЗаписатьПолеЛог("ОГРНКО", ОГРНКО);
+  if(ПризнТер == "1")
+    ЗаписатьПолеЛог("ПризнТер", ПризнТер);
+  end;
+  WriteAddrRF(Addr, "АдрМНКО");
+
+  FinishBlockLogXML(BlockName);
+
+  CorrectMesObj.РегНом = РегНом;
+  CorrectMesObj.НомФ = НомФ;
+  CorrectMesObj.ИННКО = ИННКО;
+
+  return TRUE;
+end;
+
+macro ПолучитьПолеДляАннул(FieldName : string) : string
+  // Если выполняется генерация сообщения из процедуры аннулирования,
+  // то некоторые поля не генерируются, а берутся из одноименного поля старого сообщения
+  return GetFldValue( GetOldfnsMessageID(), FieldName );
+end;
+
+// общие данные для генерации сообщений по формам SBC
+CLASS TCommonDataGenSBC(p_AccDprt : integer, p_AccMsgKind : integer, p_vers : integer)
+  var ИдФайл : string = "",
+      ТипИнф : string = "",
+      ВерсПрог : string = "",
+      ТелОтпр : string = "",
+      ДолжнОтпр : string = "",
+      ФамОтпр : string = "",
+      КолДок : string = "",
+      ВерсФорм : string = "",
+      ИдДок : string = "",
+      КНД : string = "",
+      КодНОБ : string = "",
+      ДолжнПрБ : string = "",
+      ДатаСооб : string = "",
+      ТелБанка : string = "",
+      _ВидРегОргана : string = "",
+      _СпОбм : string = "";
+
+  // идентификатор субьекта - отправителя сообщения (соответствует связанному субъекту 
+  // филиала счета заявления )
+  var MesSender : integer = 0;
+
+  // значение для полей, которые будут заполняться на экспорте, а не при генерации
+  private const FILL_AT_EXPORT : string = " ";
+
+  // ИдДок
+  private macro GetIDDoc(vers : integer) : string
+
+    macro SeparateParts(Str : string, PartsLengths : TArray) : string
+      var Result : string = "";
+
+      for(var PartLen : integer, PartsLengths)
+        if(Result)
+          Result = Result + "-";
+        end;
+
+        Result = Result + substr(Str, 1, PartLen);
+        Str = substr(Str, PartLen + 1);
+      end;
+
+      return Result;
+    end;
+
+    var IDDoc : string = "";
+    if( vers < 510 )
+      IDDoc = FILL_AT_EXPORT;
+    else
+      IDDoc = execStoredFunc( "sys_guid", V_STRING );
+      IDDoc = SeparateParts(IDDoc, makeArray(8, 4, 4, 4, 12));
+    end;
+
+    return IDDoc;
+  end;
+
+  // Код налогового органа банка
+  private macro GetCodeNOB(BankID : integer) : string
+    var КодНОБ : string = "";
+
+    if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+      КодНОБ = ПолучитьПолеДляАннул( "КодНОБ" );
+    else
+      КодНОБ = GetCodeNOBWithChecks(BankID);
+    end;
+
+    return КодНОБ;
+  end;
+
+  macro Fill(AccDprt : integer, AccMsgKind : integer, vers : integer)
+    // связанный субъект филиала счета заявления
+    MesSender = GetDprtPartyID(AccDprt);
+    if(MesSender <= 0)
+      RunError("Не найден связанный субъект филиала счета заявления");
+    end;
+
+    ИдФайл = FILL_AT_EXPORT;
+
+    // ТипИнф
+    if(AccMsgKind == ACCMSG_KIND_CHNG)
+      ТипИнф = "СООБЩИЗМЕН";
+    else
+      ТипИнф = "СООБЩБАНКА";
+    end;
+
+    ВерсПрог = "RS-Bank V.6";
+    ТелОтпр = FILL_AT_EXPORT;
+    ДолжнОтпр = FILL_AT_EXPORT;
+    ФамОтпр = FILL_AT_EXPORT;
+    КолДок = "1";
+
+    // ВерсФорм
+    if( vers == 501 )
+      ВерсФорм = "5.01";
+    elif( vers == 502 )
+      ВерсФорм = "5.02";
+    elif( vers == 510 )
+      ВерсФорм = "5.10";
+    else
+      // поле обязательное, поэтому ошибка, если не смогли заполнить
+      RunError("Ошибка программирования: неверное значение параметра vers");
+    end;
+
+    ИдДок = GetIDDoc(vers);
+
+    // КНД
+    if(AccMsgKind == ACCMSG_KIND_CHNG)
+      КНД = "1114304";
+    else
+      КНД = "1114301";
+    end;
+
+    КодНОБ = GetCodeNOB(MesSender);
+
+    // ДолжнПрБ
+    if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+      ДолжнПрБ = ПолучитьПолеДляАннул( "ДолжнПрБ" );
+    else
+      GetRegValForOPENAC("ИМНС_ДОЛЖ", V_STRING, ДолжнПрБ);
+    end;
+
+    // ТелБанка
+    if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+      ТелБанка = ПолучитьПолеДляАннул( "ТелБанка" );
+    else
+
+      ТелБанка = ПолучитьТелефон(MesSender);
+
+      if(not ТелБанка)
+        if(vers < 510)
+          ТелБанка = " "; // предписанное поле
+        else
+          RunError("Не задан телефон в адресе банка"); // обязательное поле
+        end;
+      end;
+
+    end;
+
+    ДатаСооб = FILL_AT_EXPORT;
+
+    // _ВидРегОргана
+    var RegOrgKind : integer = GetKindRegOrgan();
+    if( RegOrgKind )
+      _ВидРегОргана = string(RegOrgKind);
+    else
+      _ВидРегОргана = "";
+    end;
+
+    _СпОбм = GetllValueElement( 2300, "Электронно" );
+
+    return TRUE;
+  end;
+
+  // constructor
+  Fill(p_AccDprt, p_AccMsgKind, p_vers);
+END;
+
+macro ПолучитьСчетСВалютой(buff, Открытие, Счет, Валюта )
+  record AccIn(account);
+  record AccOut(account);
+  FILE reqlinka(reqlinka) key 0;
+
+  Var ТипСчета; 
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  ТипСчета = GetAccountType();
+  if(ТипСчета == -1)
+    SetParm(2, buff.Account);
+    SetParm(3, buff.Code_Currency);
+    return;
+  end;
+  if(not Открытие)/*закрыт*/
+     AccIn.Chapter = 1;
+     AccIn.Account = buff.Account;
+     AccIn.Code_Currency = buff.Code_Currency;
+     select = "select t_AttrID from dobjlink_dbt where t_ObjectType = :OBJTYPE_ACCOUNT"+
+                    " and t_ObjectID = :OBID"
+                    " and t_GroupID = :TypeScore and t_AttrType = :OBJTYPE_ACCOUNT"; 
+
+     params = makeArray( SQLParam("OBJTYPE_ACCOUNT", OBJTYPE_ACCOUNT),
+                         SQLParam("OBID",UniID( AccIn, OBJTYPE_ACCOUNT )),
+                         SQLParam("TypeScore",ТипСчета ));
+     rs = execSQLselect( select, params, FALSE );
+     if( rs.MoveNext())
+        RestoreFromUniID(rs.Value(0), AccOut, OBJTYPE_ACCOUNT);
+        SetParm(2, AccOut.Account);
+        SetParm(3, AccOut.Code_Currency);
+     else
+        RunError("Не найден связанный счет");
+     end;
+  else
+     ClearRecord(reqlinka);
+     reqlinka.DocKind   = PS_REQOPENA;
+     reqlinka.RequestID = buff.RequestID;
+     reqlinka.GroupID   = ТипСчета;
+     reqlinka.Action    = 0;
+     if(not getEQ(reqlinka))
+        RunError("Не найден связанный счет");
+     else
+        SetParm(2, reqlinka.Account);
+        SetParm(3, reqlinka.Code_Currency);
+        if( ТипСчета == 6 )
+          buff.Type_Account = "Y";
+        end;
+     end;
+  end;
+end;
+
+macro WriteFieldWithCheckAnnul(FieldName : string, FieldValue : string)
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    ЗаписатьПолеДляАннул(FieldName, GetOldfnsMessageID());
+  else
+    ЗаписатьПолеЛог(FieldName, FieldValue);
+  end;
+end;
+
+// атрибуты элемента "Файл"
+macro WriteFileAttrs(CommonSBC : TCommonDataGenSBC)
+  ЗаписатьПолеЛог("ИдФайл", CommonSBC.ИдФайл);
+  ЗаписатьПолеЛог("ТипИнф", CommonSBC.ТипИнф);
+  ЗаписатьПолеЛог("ВерсПрог", CommonSBC.ВерсПрог);
+  ЗаписатьПолеЛог("ТелОтпр", CommonSBC.ТелОтпр);
+  ЗаписатьПолеЛог("ДолжнОтпр", CommonSBC.ДолжнОтпр);
+  ЗаписатьПолеЛог("ФамОтпр", CommonSBC.ФамОтпр);
+  ЗаписатьПолеЛог("КолДок", CommonSBC.КолДок);
+  ЗаписатьПолеЛог("ВерсФорм", CommonSBC.ВерсФорм);
+end;
+
+// НомСооб, ТипСооб
+private macro ЗаписатьНомСообИТипСооб
+( PartyID : integer, 
+  Account : string, 
+  Account_New : string, 
+  FIID : integer, 
+  ClientID : integer, 
+  OldMesID : integer,
+  CorrectMesObj : TCorrectMesFNS,
+  ChangeBankProps : bool
+  
+)
+  var Серия : string = "", Номер : string = "";
+
+  if( not GetMessageNumber510( PartyID, Account, Account_New, 1, FIID, ClientID, 
+                               Серия, Номер, OldMesID, ChangeBankProps )
+    )
+    var ErrText : string = GetErrMsg();
+    if( not ErrText )
+      ErrText = "Ошибка при генерации номера сообщения";
+    end;
+    RunError( ErrText );
+  end; 
+
+  ЗаписатьПолеЛог("НомСооб", Серия);
+  CorrectMesObj.НомСооб = Серия;
+
+  ЗаписатьПолеЛог("ТипСооб", Номер);
+end;
+
+// ФамПрБ
+private macro ЗаписатьФамПрБ
+
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    ЗаписатьПолеДляАннул("ФамПрБ", GetOldfnsMessageID());
+    return;
+  end;
+
+  var ФамПрБ : string = "";
+
+  var RegVal : string = "";
+  var Error : integer = GetRegValForOPENAC("ИМНС_ФИО", V_STRING, RegVal);
+  if(Error or not RegVal)
+    RsbThrow("Не заданы ФИО сотрудника, подписывающего сообщения в ФНС");
+  end;
+  var arrFIO : TArray = StrCut(RegVal, ",. ");
+
+  // Фамилия
+  ФамПрБ = arrFIO[0];
+
+  // Имя (первая буква)
+  if(arrFIO.size > 1)
+    ФамПрБ = ФамПрБ + " " + substr( arrFIO[1], 1, 1 );
+  end;
+
+  // Отчество (первая буква)
+  if(arrFIO.size > 2)
+    ФамПрБ = ФамПрБ + " " + substr( arrFIO[2], 1, 1 );
+  end;
+
+  ЗаписатьПолеЛог( "ФамПрБ", ФамПрБ );
+end;
+
+// атрибуты элемента "Документ"
+macro WriteDocumentAttrs
+( CommonSBC : TCommonDataGenSBC, 
+  Счет : string, 
+  НовыйСчет : string, 
+  Валюта : integer,
+  ClientID : integer,
+  OldMesID : integer,
+  CorrectMesObj : TCorrectMesFNS
+)
+  ЗаписатьПолеЛог("ИдДок", CommonSBC.ИдДок);
+  ЗаписатьПолеЛог("КНД", CommonSBC.КНД);
+
+  ЗаписатьПолеЛог("КодНОБ", CommonSBC.КодНОБ);
+  CorrectMesObj.КодНОБ = CommonSBC.КодНОБ;
+
+  ЗаписатьНомСообИТипСооб( CommonSBC.MesSender, Счет, НовыйСчет, Валюта, ClientID, 
+                           OldMesID, CorrectMesObj );
+  ЗаписатьПолеЛог("ДолжнПрБ", CommonSBC.ДолжнПрБ);
+  ЗаписатьФамПрБ();
+  ЗаписатьПолеЛог("ТелБанка", CommonSBC.ТелБанка);
+  ЗаписатьПолеЛог("ДатаСооб", CommonSBC.ДатаСооб);
+end;
+
+// ДатаОткрСч
+macro GetAccOpenDateFldVal(Счет : string, Валюта : integer, AccOpenDate : date) : string
+  var OpenDateStr : string = "";
+
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    OpenDateStr = ПолучитьПолеДляАннул( "ДатаОткрСч" );
+  else
+    var OpenDate : date = date(0,0,0);
+
+    var Note : string = ReadNoteForAccount(Счет, Валюта, 42); //42 = ACC_NOTE_KIND_DATE_CHANGE_TO_SETTLEMENT
+    if(Note != "") 
+      OpenDate = date(StrSubst(Note, " ", "0"));
+    else
+      if( AccOpenDate != date(0,0,0) )
+        OpenDate = AccOpenDate;
+      else
+        OpenDate = {curdate};
+      end;
+    end;
+
+    OpenDateStr = ДатаДДpММpГГГГ(OpenDate);
+  end;
+
+  return OpenDateStr;
+end;
+
+// ВалСч
+private macro GetAccCurFldVal(Валюта : integer) : string
+  var КодВалСчета : string = "";
+
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    КодВалСчета = ПолучитьПолеДляАннул( "ВалСч" );
+  else
+    if( Валюта == NATCUR )
+      КодВалСчета = "0";
+    else
+      КодВалСчета = "1";
+    end;
+  end;
+
+  return КодВалСчета;
+end;
+
+// атрибуты элемента СвСчет
+macro WriteAccInfoAttrs(Счет : string, Валюта : integer, GenAcc)
+  WriteFieldWithCheckAnnul( "НомСч", Счет );
+  ЗаписатьПолеЛог( "ДатаОткрСч", GetAccOpenDateFldVal(Счет, Валюта, GenAcc.Open_Date) );
+  ЗаписатьПолеЛог( "ВидСч", GetAccKindFld(GenAcc.Client, GenAcc.Type_Account) );
+  ЗаписатьПолеЛог( "ВалСч", GetAccCurFldVal(Валюта) );
+end;
+
+// ДатаЗаклДог
+macro ЗаписатьПоле_ДатаЗаклДог( DateOpen : date, UnionContrID : integer, 
+                                Счет : string, Валюта : integer )
+
+  var ContractDate : date = DateOpen;
+
+  record SfCntr(sfcontr);
+
+  if( UnionContrID != 0 )
+    var select = "select t_DateConc from dsfunioncontr_dbt sfcontr" +                           //если у договора обслуживания счета есть связанный сводный договор,
+                 " where sfcontr.t_unioncontrid = :UNIONCONTRID";                               //то заполняем ДатаРастДог датой заключения сводного договора
+
+    var params = makeArray( SQLParam("UNIONCONTRID", UnionContrID) );
+    var rs = execSQLselect( select, params );
+
+    if( rs and rs.MoveNext() )
+      ContractDate = date(rs.Value(0));
+    end;
+  elif( ПолучитьДоговорОбслуживания(Валюта, Счет, SfCntr) == 0 )
+    ContractDate = SfCntr.DateConc;
+  end;
+
+  ЗаписатьПолеЛог( "ДатаЗаклДог", ДатаДДpММpГГГГ( ContractDate ) );
+end;
+
+macro ЗаписатьПоле_ДатаЗакрСч(AccCloseDate : date)
+  var CloseDate : date = AccCloseDate;
+
+  if( CloseDate == date(0,0,0) )
+    CloseDate = {curdate};
+  end;
+
+  ЗаписатьПолеЛог( "ДатаЗакрСч", ДатаДДpММpГГГГ(CloseDate) );
+end;
+
+macro GetSfUnionContrCloseDate
+(
+  UnionContrID : integer, 
+  SfUnionContrCloseDate : @date
+
+) : bool
+
+  if(UnionContrID != 0)                                                     
+                                                                                   
+    var select : string = 
+             "select t_DateClose from dsfunioncontr_dbt sfcontr"+ 
+             " where sfcontr.t_unioncontrid = :UNIONCONTRID";
+
+    var params : TArray = makeArray( SQLParam("UNIONCONTRID", UnionContrID) );
+    var rs : RsdRecordset = execSQLselect( select, params );
+  
+    if( rs and rs.MoveNext() )
+      SfUnionContrCloseDate = date( rs.value("t_DateClose") );
+      return TRUE;
+    end;
+
+  end;
+
+  return FALSE;
+end;
+
+private macro AllContractsAreClosed(UnionContrID : integer) : bool
+  var select = "select t_DateClose "+
+               "  from dsfcontr_dbt sfcontr"+ 
+               " where sfcontr.t_unioncontrid = :UNIONCONTRID"+
+               "   and sfcontr.t_DateClose = :ZeroDate ";
+    
+  var params = makeArray( SQLParam("UNIONCONTRID", UnionContrID),
+                          SQLParam("ZeroDate", date(0, 0, 0)) );
+  if( existsSQLselect(select, params) )
+    return FALSE;
+  end;
+
+  return TRUE;
+end;
+
+private macro GetContractCloseDate
+( reqclosa, 
+  SfCntrBuf, 
+  IsSfUnionContr : bool, // необязательный
+  SfUnionContrCloseDate : date // необязательный
+
+) : date
+  
+  // Если у счета нет договора об-служивания, то заполняется 
+  // датой заявления на закрытие счета (заявление от).
+  if(SfCntrBuf == null)
+    return reqclosa.Date;
+  end;
+
+  record SfCntr(sfcontr);
+  Copy(SfCntr, SfCntrBuf);
+
+  if(SfCntr.DateClose == date(0, 0, 0))
+    return date(0, 0, 0); // договор не закрыт
+  end;
+
+  // Проверяем сводный договор
+  if( (IsSfUnionContr == null) or (SfUnionContrCloseDate == null) )
+    IsSfUnionContr = GetSfUnionContrCloseDate( SfCntr.UnionContrID, 
+                                              @SfUnionContrCloseDate );
+  end;
+
+  if( // Договор обслуживания счета не связан со сводным договором
+      not IsSfUnionContr or
+
+      // Договор обслуживания счета связан со сводным договором и 
+      // этот сводный договор закрыт
+      (SfUnionContrCloseDate != date(0, 0, 0)) or
+
+      // Договор обслуживания связан с незакрытым сводным договором и  
+      // все индивидуальные договоры по этому счету закрыты
+      AllContractsAreClosed(SfCntr.UnionContrID)
+    )
+
+    // Заполняется датой закрытия договора обслуживания
+    return SfCntr.DateClose;
+  end;
+
+  return date(0, 0, 0);
+end;
+
+macro ЗаписатьПоле_ДатаРастДог( reqclosa, SfCntrBuf, vers : integer, 
+                               IsSfUnionContr : bool, SfUnionContrCloseDate : date // могут быть не переданы
+                             )
+
+  var FieldValue : string = "";
+  var DateClose : date = GetContractCloseDate(reqclosa, SfCntrBuf, IsSfUnionContr, SfUnionContrCloseDate);
+
+  if( DateClose != date(0, 0, 0) )
+    FieldValue = ДатаДДpММpГГГГ(DateClose);
+  else
+    if(vers < 510)
+      FieldValue = " "; // предписанное поле
+    end;
+  end;
+
+  if(FieldValue)
+    ЗаписатьПолеЛог( "ДатаРастДог", FieldValue );
+  end;
+
+end;

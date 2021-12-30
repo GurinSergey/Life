@@ -1,0 +1,394 @@
+import payminter,ptinter,oprinter;
+import "globals.mac","lib_registry.mac";
+
+private var fssp_numberPack = RSL_GetRegistryValue( "PRBB/FSSP/PACK" );
+
+const BLOCK_ID_RECALL_I2 = 10000127;
+const BLOCK_ID_PAY_I2    = 10000140;
+
+private macro getMaxStep( idOp )
+    private var cmd,rs;
+    cmd = rsdCommand( " SELECT   MAX (T_ID_STEP) MAXSTEP "
+                      "   FROM   doprstep_dbt "
+                      "  WHERE   T_ID_OPERATION = :idop AND T_ISEXECUTE != chr(0) " );
+
+    cmd.addparam( "", RSDBP_IN, idOp );
+
+    rs = rsdRecordset( cmd );
+    if( rs.movenext )
+        return int( rs.value( "MAXSTEP" ) );
+    else
+        return 0;
+    end;
+
+onerror
+    return 0;
+
+end;
+
+macro insertBranch( idOp, idBlock, idStep, kindBranch )
+    if( kindBranch == NULL ) kindBranch = OPRBR_REMOVE; end;
+    if( idStep     == NULL ) idStep     = 10;           end;
+
+    private var cmd = RsdCommand( " BEGIN ? := RSI_RsbOperation.InsertBranchTrn(?, ?, ?, ?, ?, ?, ?, ?, ?); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( idOp ) );
+    cmd.addparam( "", RSDBP_IN,  kindBranch         );
+    cmd.addparam( "", RSDBP_IN,  idBlock            );
+    cmd.addparam( "", RSDBP_IN,  idStep             );
+    cmd.addparam( "", RSDBP_IN,  {curdate}          );
+    cmd.addparam( "", RSDBP_IN,  0                  );
+    cmd.addparam( "", RSDBP_IN,  0                  );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+macro execOperationStep( idOp )
+    private var cmd = RsdCommand( " BEGIN ? := RSI_RsbOperation.executeStepTrn(?, ?, ?, ?, ?, ?, ? ); END; " );
+    cmd.addParam( "", RSDBP_OUT, V_INTEGER          );
+    cmd.addparam( "", RSDBP_IN,  idOp               );
+    cmd.addparam( "", RSDBP_IN,  getMaxStep( idOp ) );
+    cmd.addparam( "", RSDBP_IN,  strFor( 88 )       );
+    cmd.addparam( "", RSDBP_IN,  {curdate}          );
+    cmd.addparam( "", RSDBP_IN,  {oper}             );
+    cmd.addparam( "", RSDBP_IN,  strFor( 0 )        );
+    cmd.addparam( "", RSDBP_IN,  strFor( 88 )       );
+    cmd.execute;
+    return cmd.Param(0).value;
+end;
+
+private macro saveError( stat, errorText )
+    initError;
+    memoryError( stat, errorText );
+end;
+
+private macro setParentOperation( opr, parentOpr )
+    private var cmd = RsdCommand( " UPDATE   doproper_dbt "
+                                  "    SET   T_PARENT_ID_OPERATION = :parentOprId, T_PARENT_ID_STEP = 0 "
+                                  "  WHERE   T_ID_OPERATION = :oprId " );
+    cmd.addparam( "", RSDBP_IN, parentOpr );
+    cmd.addparam( "", RSDBP_IN, opr       );
+    cmd.execute;
+end;
+
+macro getOperationId( pid )
+    private var cmd,rs;
+
+    cmd = RsdCommand( " SELECT   T_ID_OPERATION "
+                      "   FROM   doproper_dbt "
+                      "  WHERE   T_DOCUMENTID = LPAD (:paymentid, 34, '0') " );
+    cmd.addparam( "paymentid", RSDBP_IN, pid );
+
+    rs = RsdRecordset( cmd );
+    if( rs.movenext )
+        return int( rs.value( "T_ID_OPERATION" ) );
+    else
+        return 0;
+    end;
+
+onerror
+    return 0;
+end;
+
+private macro getInsI2CarryAutokey( pid )
+    private var cmd,rs;
+
+    cmd = RsdCommand( " SELECT   arhdoc.T_AUTOKEY "
+                      "   FROM   dpmdocs_dbt pmdoc, darhdoc_dbt arhdoc "
+                      "  WHERE       pmdoc.T_PAYMENTID = :paymentid "
+                      "          AND ARHDOC.T_APPLICATIONKEY = PMDOC.T_APPLICATIONKEY "
+                      "          AND ARHDOC.T_IAPPLICATIONKIND = PMDOC.T_APPLICATIONKIND "
+                      "          AND ARHDOC.T_RESULT_CARRY = 50 " );
+    cmd.addparam( "paymentid", RSDBP_IN, pid );
+
+    rs = RsdRecordset( cmd );
+    if( rs.movenext )
+        return int( rs.value( "T_AUTOKEY" ) );
+    else
+        return 0;
+    end;
+
+onerror
+    return 0;
+end;
+
+private macro getPartPartlyPayment( pid )
+    private var cmd,rs;
+
+    cmd = RsdCommand( " SELECT   MAX (PM.T_PARTPAYMNUMBER) NUMPART "
+                      "   FROM   DPMLINK_DBT LNK, DPMPAYM_DBT PM "
+                      "  WHERE   LNK.T_INITIALPAYMENT = :paymentid "
+                      "          AND LNK.T_PURPOSEPAYMENT = PM.T_PAYMENTID " );
+    cmd.addparam( "paymentid", RSDBP_IN, pid );
+
+    rs = RsdRecordset( cmd );
+    if( rs.movenext )
+        return int( rs.value( "NUMPART" ) ) + 1;
+    else
+        return 1;
+    end;
+
+onerror
+    return 1;
+end;
+
+macro paymentInI2( _paymentId )
+    private var cmd, rs;
+    cmd = RsdCommand( " SELECT 1 FROM DPMPAYM_DBT WHERE T_PAYMENTID = :paymentid AND T_PAYMSTATUS = 2000 " );
+    cmd.addparam( "paymentid", RSDBP_IN, _paymentId );
+
+    rs = RsdRecordset( cmd );
+
+    if( rs.movenext ) return true; end;
+
+    return false;
+end;
+
+private macro linkPayments( id1, id2, amount );
+    private var cmd;
+    cmd = RsdCommand( "insert into dpmlink_dbt values (0,2,?,?,0,?,chr(45),0,0,0,0,?)" );
+    cmd.addParam( "", RSDBP_IN , id1 );
+    cmd.addParam( "", RSDBP_IN , id2 );
+    cmd.addParam( "", RSDBP_IN , amount );
+    cmd.addParam( "", RSDBP_IN , null );
+    cmd.execute;
+end;
+
+private macro updateFutureAmount( id,
+                                  newFuturepayeramount,
+                                  newFuturereceiveramount,
+                                  newFuturebaseamount
+                                )
+    private var cmd;
+    cmd = RsdCommand( " UPDATE   dpmpaym_dbt "
+                      "    SET   t_futurepayeramount    = :amount1, "
+                      "          t_futurereceiveramount = :amount2, "
+                      "          t_futurebaseamount     = :amount2 "
+                      "  WHERE   t_paymentid = :id " );
+
+    cmd.addParam( "", RSDBP_IN , newFuturepayeramount    );
+    cmd.addParam( "", RSDBP_IN , newFuturereceiveramount );
+    cmd.addParam( "", RSDBP_IN , newFuturebaseamount     );
+    cmd.addParam( "", RSDBP_IN , id );
+    cmd.execute;
+end;
+
+macro getFuturePayerAmount( id )
+    private var cmd,rs;
+
+    cmd = RsdCommand( " SELECT t_futurepayeramount FROM dpmpaym_dbt WHERE  t_paymentid = :id " );
+    cmd.addParam( "", RSDBP_IN, id );
+
+    rs = RsdRecordset( cmd );
+    if( rs.movenext ) return money( rs.value( "t_futurepayeramount" ) );
+    else              return $0;
+    end;
+onerror
+    return $0;
+end;
+
+macro getPartlyPayment( pId, partlyPId, partlyAmount )
+    private var cmd,rs;
+
+    cmd = RsdCommand( " SELECT   PM.T_PAYMENTID PAYMENTID,                 "
+                      "          PM.T_AMOUNT    AMOUNT                     "
+                      "   FROM   DPMLINK_DBT LNK, DPMPAYM_DBT PM           "
+                      "  WHERE       LNK.T_INITIALPAYMENT = :paymentid     "
+                      "          AND LNK.T_PURPOSEPAYMENT = PM.T_PAYMENTID "
+                      "          AND PM.T_PARTPAYMNUMBER = 1               " );
+    cmd.addParam( "", RSDBP_IN , pId );
+
+    rs = RsdRecordset( cmd );
+    if( rs.movenext )
+        setParm( 1, int  ( rs.value( "PAYMENTID" ) ) );
+        setParm( 2, money( rs.value( "AMOUNT"    ) ) );
+    end;
+end;
+
+macro execOperation( paymObj:object )
+    private var imode,  
+                execStat = true, 
+                stat     = 0;
+
+    private var paymentId = paymObj.payment.paymentid, 
+                docKind   = paymObj.payment.docKind;
+
+    imode = setDialogFlag( 0 );
+    execStat = PM_ExecuteOperation( paymentid, docKind );
+    setDialogFlag( imode );
+
+    if( not execStat ) return false; end;
+
+    // если после обработки документ попал в Картотеку 2
+    if( paymentInI2( paymentid ) ) 
+
+        imode = setDialogFlag( 0 );
+        execStat = PM_ExecuteOperation( paymentid, docKind );
+        setDialogFlag( imode );
+
+        if( not execStat ) return false; end;
+    end;
+
+    return true;
+onerror( x )
+    saveError( x.code, x.message );
+    return false;
+end;
+
+class( RsbPSPayOrder ) FSSP_Order( paymentId )
+    initRsbPSPayOrder( paymentId );
+
+    var payerAcc     = "", // счет плательщика
+        receiverBIC  = "", // банк получателя
+        receiverAcc  = "", // счет получателя
+        receiverName = "", // наименование получателя
+        receiverINN  = "", // ИНН получателя
+        group        = PAYMENTS_GROUP_EXTERNAL,
+        amount       = $0,
+        IDDate       = {curdate},
+        number       = "",
+        ground       = "",
+        FIID         = 0,
+        priority     = 6,
+        partlyPaymentId = 0,
+        partlyAmount    = $0;
+
+    macro init   
+        // инкассовое поручение
+        docKind             = PSPOKIND_REQUEST;
+        // номер пачки из настройки
+        payment.numberPack  = fssp_numberPack;
+        // вид платежа "электронно"
+        payment.paymentKind = "Э";
+        // шифр операции 06
+        payment.shifrOper   = "06";
+        // дата значения - текущий опер. день
+        payment.valueDate   = {curdate};
+        // плановый платеж
+        payment.isPlanPaym  = "X";
+    end;
+
+    macro insert
+        var stat = 0;
+
+        if( receiverBIC == {MFO_BANK} ) group = PAYMENTS_GROUP_INTERNAL; end;
+
+        payment.PayDate    = 
+        payment.Date       = IDDate  ;
+        payment.BaseAmount = amount  ;
+        payment.Number     = number  ;  
+        payment.Ground     = ground  ;
+        payment.priority   = priority;
+        payment.baseFIID   = FIID    ;
+        payment.docKind = PS_PAYORDER;
+
+        // реквизиты плательщика
+        stat = payment.SetPayerPI( PAYMENTS_GROUP_INTERNAL, {OurBank}, PTCK_BIC, {MFO_BANK}, {NAME_BANK}, {CORAC_BANK}, 0, 1, payerAcc );
+        if( stat != 0 ) return stat; end;
+
+        //реквизиты получателя
+        stat = payment.SetReceiverPI( group, 0, PTCK_BIC, receiverBIC, "", "", 0, 1, receiverAcc, null, receiverName, receiverINN );
+        if( stat != 0 ) return stat; end;
+
+        return update;
+    end;
+
+    macro execute
+        return execOperation( this );
+    end;
+
+    init();
+end;
+
+class( RsbRequestOrder ) FSSP_RequestOrder( paymentId )
+    initRsbRequestOrder( paymentId );
+
+    var payerAcc     = "", // счет плательщика
+        receiverBIC  = "", // банк получателя
+        receiverAcc  = "", // счет получателя
+        receiverName = "", // наименование получателя
+        receiverINN  = "", // ИНН получателя
+        group        = PAYMENTS_GROUP_EXTERNAL,
+        amount       = $0,
+        amountRUR    = $0,
+        IDDate       = {curdate},
+        number       = "",
+        ground       = "",
+        FIID         = 0,
+        priority     = 6,
+        partlyPaymentId = 0,
+        partlyAmount    = $0;
+
+    macro init   
+        // номер пачки из настройки
+        payment.numberPack  = fssp_numberPack;
+        // вид платежа "электронно"
+        payment.paymentKind = "Э";
+        // шифр операции 06
+        payment.shifrOper   = "06";
+        // дата значения - текущий опер. день
+        payment.valueDate   = {curdate};
+        // плановый платеж
+        payment.isPlanPaym  = "X";
+    end;
+
+    macro orderid
+        return paymentid;
+    end;
+
+    macro insert
+        var stat = 0;
+
+        if( receiverBIC == {MFO_BANK} ) group = PAYMENTS_GROUP_INTERNAL; end;
+
+        payment.PayDate    = 
+        payment.Date       = IDDate  ;
+        payment.receiverAmount = amountRUR;
+        payment.payerAmount= 
+        payment.BaseAmount = amount  ;
+        payment.Number     = number  ;  
+        payment.Ground     = ground  ;
+        payment.priority   = priority;
+        payment.baseFIID   = FIID    ;
+        payment.docKind    = 203     ;
+
+        PSBCNumber = number;
+        PSBCDate   = IDDate;
+
+        // реквизиты плательщика
+        stat = payment.SetPayerPI( PAYMENTS_GROUP_INTERNAL, {OurBank}, PTCK_BIC, {MFO_BANK}, {NAME_BANK}, {CORAC_BANK}, FIID, 1, payerAcc );
+        if( stat != 0 ) return stat; end;
+
+        //реквизиты получателя
+        stat = payment.SetReceiverPI( group, 0, PTCK_BIC, receiverBIC, "", "", 0, 1, receiverAcc, null, receiverName, receiverINN );
+        if( stat != 0 ) return stat; end;
+
+        return update;
+    end;
+
+    macro execute
+        return execOperation( this ); 
+    end;
+
+    init();
+end;
+
+/*var fssp_payment = FSSP_RequestOrder;
+    fssp_payment.payerAcc     = "40702840600000004763";
+    fssp_payment.receiverAcc  = "40702810700000010505";
+    fssp_payment.receiverBIC  = "044583505"; 
+    fssp_payment.receiverName = "Vasya Pupkin";
+    fssp_payment.receiverINN  = "7707107560/770701002";
+    fssp_payment.amount       = $200;
+    fssp_payment.amountRUR    = $6000;
+    fssp_payment.number       = "55555";
+    fssp_payment.iddate       = date(16,04,2013);
+    fssp_payment.ground       = "штраф гибдд";
+    fssp_payment.origin       = 3500;
+    fssp_payment.fiid         = 41;
+
+    fssp_payment.insert;
+
+exit(0);*/

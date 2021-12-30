@@ -1,0 +1,540 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*                          Экспорт сообщений                               */
+/*                                                                          */
+/*  Имя файла: swiftout.mac                                                 */
+/*  Создан:  29.02.00                                         Бабин А.П.    */
+/*  Изменен: TAM 05.12.2013 C-22504                                         */
+/****************************************************************************/
+
+import "wlexport.mac", "swtools.mac", oralib, likepy;
+
+const TURBO_SWIFT_HEADER72 = true,
+      TURBO_SWIFT_DECIMAL  = true;
+
+var ВидТерминала;
+
+var out = TArray;
+
+macro InitOut()
+    out.size = 1;
+    out( 0 ) = "";
+end;
+
+macro НоваяСтрока( buf:string )
+    if ( buf!="" )
+       /* Пустые строки не вставляем */
+       out( out.size-1 ) = out( out.size-1 ) + string(buf);
+       out( out.size ) = "";
+    end;
+    return true;
+end;
+
+macro СохранитьСтроку( buf:string )
+    while( Index( buf, "\n" ) )
+       НоваяСтрока( substr(buf, 1, Index( buf, "\n" )-1) );
+       buf = substr( buf, Index( buf, "\n" )+1 );
+    end;
+    НоваяСтрока( buf );
+    return true;
+end;
+
+macro СохранитьБлок( buf:string )
+    while( Index( buf, "\n" ) )
+       НоваяСтрока( substr(buf, 1, Index( buf, "\n" )-1) );
+       buf = substr( buf, Index( buf, "\n" )+1 );
+    end;
+    out( out.size-1 ) = out( out.size-1 ) + string(buf);
+    return true;
+end;
+
+macro ВычислитьРазмерИнформации()
+    var count = 0, size = 0;
+
+    while( count<out.size )
+        size = size + strlen( out(count) );
+        if ( count<(out.size-1) )
+           size = size + 2;  /* Переход на другую строку */
+        end;
+        count = count + 1;
+    end;
+
+    return size;
+end;
+
+macro СохранитьИнформациюВФайле()
+    var count = 0, continue0 = true;
+
+    while( continue0 AND (count<out.size) )
+        if ( count<(out.size-1) )
+           if ( not ЗаписатьСтроку(out(count)) )
+              ErrExport("Ошибка записи строки: " + out(count));
+              continue0 = false;
+           end;
+        else
+           if ( not ЗаписатьБлок(out(count)) )
+              ErrExport("Ошибка записи блока: " + out(count));
+              continue0 = false;
+           end;
+        end;
+        count = count + 1;
+    end;
+
+    InitOut();
+
+    return continue0;
+end;
+
+macro WldFindPaym( MesID )
+   var rs:object;
+   var select:string;
+   var params:TArray;
+   select = "select wlpm.t_PaymentID from dwlmeslnk_dbt lnk, dwlpm_dbt wlpm where "+
+                      "lnk.t_MesID =:MesID and "+ 
+                      "lnk.t_ObjKind = :OBJTYPE_PAYMENT and wlpm.t_WlPmID = lnk.t_ObjID";
+   params = makeArray( SQLParam("MesID", MesID),
+                       SQLParam("OBJTYPE_PAYMENT", OBJTYPE_PAYMENT));
+   rs = execSQLselect( select, params, FALSE );
+                                 
+   if ( not rs.MoveNext() )
+      return false
+   else
+      if( FindPayment( rs.Value(0), 0, 0, 0, 0, true, wlpmpaym, wlpmpropdeb, wlpmpropcred, wlpmrmprop ) != 0 )
+         return false;
+      end;
+   end;
+   return true;
+end;
+
+/* Определить код валюты */
+macro ПолучитьКодВалюты( FIID )
+  f_wlfininstr.FIID = FIID;
+  if( not getEQ( f_wlfininstr ) )
+    ErrExport( "Код финансового инструмента "+FIID+" не найден в справочнике" );
+  end;
+  return f_wlfininstr.Ccy;
+end;
+
+/******************************************************************/
+/*            Заголовок сообщения по TURBO SWIFT                  */
+/******************************************************************/
+macro ЗаписатьAAIHeader()
+    var AAIHeader, headerSize;
+
+    macro СформироватьСтрокуРазмера(headSize, InfoSize, useDecimal )
+        const Table = "0123456789ABCDEF";
+        var numSize = headSize + InfoSize - 4, strSize, dig;
+
+        if ( useDecimal==false )
+            strSize = "";
+            while( numSize )
+               dig = (numSize - (int(numSize/16))*16);
+               strSize = substr(Table, dig+1, 1) + strSize;
+               numSize = int(numSize/16);
+            end;
+        else
+            strSize = string( numSize );
+        end;
+        while( strlen(strSize)<4 ) strSize = string( "0", strSize ); end;
+        if ( strlen(strSize)>4 )
+           strSize = "****";
+        end;
+        return strSize;
+    end;
+
+    if ( TURBO_SWIFT_HEADER72==true )
+       headerSize = 72;
+    else
+       headerSize = 210; 
+    end;
+
+     /* Размер AAI Message */
+    AAIHeader = СформироватьСтрокуРазмера(headerSize, ВычислитьРазмерИнформации(), TURBO_SWIFT_DECIMAL );
+    if ( AAIHeader=="****" )
+       ErrExport( "Превышение размера сообщения. Используйте 16-ричную систему счисления" );
+       return FALSE;
+    end;
+    AAIHeader = AAIHeader + "SWI";
+    /* Optional User Key */
+    AAIHeader = AAIHeader + "                    ";
+    /* DUP Flag */
+    AAIHeader = AAIHeader + "0"; 
+    /* Department Name (по умолчанию "KORR    ") */
+    AAIHeader = AAIHeader + "KORR    ";
+    /* Queue Name (по умолчанию "_VER1   ")      */
+    AAIHeader = AAIHeader + "_VER1   ";
+
+    if ( (TURBO_SWIFT_HEADER72==false) AND WldFindPaym(wlmes.MesID) )
+       while( strlen(AAIHeader)<72 ) AAIHeader = string( AAIHeader, " " ); end;
+
+       AAIHeader = AAIHeader + substr( GetSWIFTDate(wlpmpaym.ValueDate), 1, 6 );
+       AAIHeader = AAIHeader + substr( ПолучитьКодВалюты( wlpmpaym.PayFIID ), 1, 3 );
+       AAIHeader = AAIHeader + substr( GetSWIFTAmount( wlpmpaym.amount ), 1, 21 );
+
+       while( strlen(AAIHeader)<102 ) AAIHeader = string( AAIHeader, " " ); end;
+    end;
+
+    while( strlen(AAIHeader)<headerSize ) AAIHeader = string( AAIHeader, " " ); end;
+
+    if( not ЗаписатьБлок( AAIHeader ) )
+       ErrExport( "Ошибка при записи начала сообщения" );
+       return FALSE;
+    end;
+
+    return true;
+end;
+
+/***************************************************************************/
+/* Сформировать блок 1 заголовка Basic Header Block                        */
+/***************************************************************************/
+macro ЗаписатьBasicHeaderBlock()
+  var BankCode, Destination, BranchCode, НомерТерминала, НомерСессии, ISN;
+  var error;
+
+  BankCode = ПолучитьКодСубъекта( {OurBank}, PTCK_SWIFT, error );
+  if( error ) ErrExport( "Не найден SWIFT-код Отправителя сообщения! " ); return FALSE; end;
+
+  Destination = SubStr(BankCode,1,Len_BIC_Destination);
+  if(StrLen(Destination) != Len_BIC_Destination) ErrExport( "Неправильно указан Отправитель сообщения (BIC)!" ); return FALSE; end;
+  BranchCode = SubStr(BankCode,Len_BIC_Destination+1,Len_BIC_BranchCode);
+  if( (BranchCode!="")AND(StrLen(BranchCode) != Len_BIC_BranchCode) ) ErrExport( "Неправильно указан Отправитель сообщения (код отделения)!" ); return FALSE; end;
+  if(BranchCode=="") BranchCode=MkStr(CodeFor(СимволBICПоУмолчанию),Len_BIC_BranchCode); end;
+  /* !!! Код приложения всегда FIN, ApplicationID=01 */
+
+  if( ВидТерминала == TPFRMT_PCC )
+     НомерТерминала = "A";
+     НомерСессии = ".SS.";
+     ISN =  ".SEQ..";
+  else
+     НомерТерминала = НомерТерминалаПоУмолчанию;
+     НомерСессии = НомерСессииПоУмолчанию;
+     ISN = ISNПоУмолчанию;
+  end;
+
+  if( not СохранитьБлок(
+      КодНачалаБлока+НомерБлокаBasicHeader+КодРазделительНомера+
+      КодПриложенияFIN+НомерПриложенияFIN+Destination+НомерТерминала+
+      BranchCode+НомерСессии+ISN+КодКонцаБлока) )
+     ErrExport( "Ошибка при записи блока Basic Header" ); return FALSE; end;
+  return TRUE;
+end;
+
+/***************************************************************************/
+/* Сформировать блок 2 заголовка Application Header Block                  */
+/***************************************************************************/
+macro ЗаписатьApplicationHeaderBlockMIR()
+  var BankCode, Destination, BranchCode, Delivery, Priority, НомерФормы, Категория;
+  var error;
+
+  if ( (wlmes.OutsideAbonentCodeKind==PTCK_SWIFT) AND (wlmes.OutsideAbonentCode!="") )
+     BankCode = wlmes.OutsideAbonentCode;
+     error = 0;
+  else
+     BankCode = ПолучитьОткрытыйКодСубъекта( wlmes.OutsideAbonentID, PTCK_SWIFT, error );
+  end;
+  if( error ) ErrExport( "Не найден SWIFT-код Получателя сообщения!" ); return FALSE; end;
+  Destination = SubStr(BankCode,1,Len_BIC_Destination);
+  if(StrLen(Destination) != Len_BIC_Destination) ErrExport( "Неправильно указан Получатель сообщения (BIC)!" ); return FALSE; end;
+  BranchCode = SubStr(BankCode,Len_BIC_Destination+1,Len_BIC_BranchCode);
+  if((BranchCode!="")AND(StrLen(BranchCode) != Len_BIC_BranchCode)) ErrExport( "Неправильно указан Получатель сообщения (код отделения)!" ); return FALSE; end;
+  if(BranchCode=="") BranchCode=MkStr(CodeFor(СимволBICПоУмолчанию),Len_BIC_BranchCode); end;
+
+  if( wlmes.Importance == 0 ) 
+     Priority = КодПриоритетНормальный;
+  else
+     Priority = КодПриоритетСрочный;
+  end;
+
+  Delivery = wlmes.DeliveryNotification;
+  if(Delivery==0)
+    Delivery = "";
+  else
+    Delivery = string(Delivery);
+  end;
+
+  if( not DefineFormExport( wlmes.RlsFormID ) )
+    return FALSE;
+  end;
+
+  НомерФормы = ФормаЭкспорт.Name;
+  //TAM 05.12.2013 C-22504
+  if( not СохранитьБлок(
+                КодНачалаБлока       + НомерБлокаApplicationHeader + КодРазделительНомера   + КодВходящего   +
+                НомерФормы           + "0000"                      + "000000"               + Destination    + 
+                СимволBICПоУмолчанию + BranchCode                  + НомерСессииПоУмолчанию + ISNПоУмолчанию +
+                "000000"             + "0000"                      + Priority               + Delivery       + КодКонцаБлока))
+     ErrExport( "Ошибка при записи блока Application Header" );
+     return FALSE;
+  end;
+   /*if( not СохранитьБлок(
+    КодНачалаБлока+НомерБлокаApplicationHeader+КодРазделительНомера+КодИсходящего+НомерФормы
+    +Destination+СимволBICПоУмолчанию+BranchCode+Priority+Delivery+КодКонцаБлока)
+    )
+     ErrExport( "Ошибка при записи блока Application Header" );
+     return FALSE;
+  end;*/
+  return TRUE;
+end;
+
+/***************************************************************************/
+/* Сформировать блок 3 заголовка User Header Block                         */
+/***************************************************************************/
+macro ЗаписатьUserHeaderBlock()
+  var BlockStandart = "";
+
+  if( substr(РелизЭкспорт.Name, strlen(РелизЭкспорт.Name)+1-strlen(ЗначениеRUR5), strlen(ЗначениеRUR5))==ЗначениеRUR5 )
+    BlockStandart = КодНачалаБлока+НомерПоляStandart+
+                    КодРазделительНомера+ЗначениеRUR5+КодКонцаБлока;
+  end;
+
+  if( substr(РелизЭкспорт.Name, strlen(РелизЭкспорт.Name)+1-strlen(ЗначениеRUR6), strlen(ЗначениеRUR6))==ЗначениеRUR6 )
+    BlockStandart = КодНачалаБлока+НомерПоляStandart+
+                    КодРазделительНомера+ЗначениеRUR6+КодКонцаБлока;
+  end;
+
+  if( РелизЭкспорт.Name == НазваниеФормы103Plus )
+    BlockStandart = BlockStandart + КодНачалаБлока+НомерПоляSTP+
+                    КодРазделительНомера+ЗначениеSTP+КодКонцаБлока;
+  end;
+
+  if( not СохранитьБлок(
+    КодНачалаБлока+НомерБлокаUserHeader+КодРазделительНомера+КодНачалаБлока
+    +НомерПоляMUR+КодРазделительНомера+ЗначениеMURПоУмолчанию+КодКонцаБлока+BlockStandart+КодКонцаБлока)
+    )
+     ErrExport( "Ошибка при записи блока User Header" );
+     return FALSE;
+  end;
+  return TRUE;
+end;
+
+macro СохранитьПоляСообщения()
+   var field, buff, str;
+   while( СчитатьПоле( field, buff ) )   
+      if ( field==CopyMandatoryFields )
+          str = string(buff);
+      else
+          str = string(":",field, ":", buff);
+      end;
+      if( not СохранитьСтроку( str ) )
+          ErrExport("Ошибка записи поля сообщения" + string(field));
+          return false;
+      end;
+   end;
+   return true;
+end;
+
+/***************************************************************************/
+/* Сформировать блок 4 - текст сообщения                                   */
+/***************************************************************************/
+macro ЗаписатьTextBlock()
+  if( not СохранитьСтроку(
+      КодНачалаБлока+НомерБлокаText+КодРазделительНомера)
+    )
+      ErrExport( "Ошибка при записи текстового блока" );
+      return FALSE;
+  end;
+  if( not СохранитьПоляСообщения() )
+     return FALSE;
+  end;
+  if( not СохранитьБлок( КодКонцаТекстовогоБлока+КодКонцаБлока ) )
+     ErrExport( "Ошибка при записи текстового блока" );
+     return FALSE;
+  end;
+  return TRUE;
+end;
+
+/***************************************************************************/
+/*  Функция формирования сообщения SWIFT                                   */
+/*  Возвращает:                                                            */
+/*             TRUE или FALSE                                              */
+/***************************************************************************/
+macro ЗаписатьСообщение()
+
+  InitOut();
+
+  if( ВидТерминала == TPFRMT_PCC )
+     if( not СохранитьБлок( КодНачалаСообщения ) )
+        ErrExport( "Ошибка при записи кода начала сообщения" );
+        return FALSE;
+     end;
+     if( not ЗаписатьBasicHeaderBlock()          ) return false; end;
+     if( not ЗаписатьApplicationHeaderBlockMIR() ) return false; end;
+     if( not ЗаписатьUserHeaderBlock()           ) return false; end;
+     if( not ЗаписатьTextBlock()                 ) return false; end;
+     if( not СохранитьБлок( КодКонцаСообщения ) )
+       ErrExport( "Ошибка при записи кода конца сообщения" );
+       return FALSE;
+    end;
+  else
+     if( not ЗаписатьBasicHeaderBlock()          ) return false; end;
+     if( not ЗаписатьApplicationHeaderBlockMIR() ) return false; end;
+     if( not ЗаписатьUserHeaderBlock()           ) return false; end;
+     if( not ЗаписатьTextBlock()                 ) return false; end;
+  end;
+
+  if ( ВидТерминала == TPFRMT_TURBOSWIFT )
+     if ( not ЗаписатьAAIHeader()         ) return false; end;
+     if ( not СохранитьИнформациюВФайле() ) return false; end;
+  else
+     if ( not СохранитьИнформациюВФайле() ) return false; end;
+  end;
+
+  return TRUE;
+end;
+
+/***************************************************************************/
+/* Функция формирования разделителей сообщений SWIFT в файле               */
+/***************************************************************************/
+macro ЗаписатьРазделительСообщений()
+ var count;
+
+ if( ВидТерминала == TPFRMT_PCC )
+    /* Дополним сообщение пробелами до размера, кратного 512 байт */
+    count = int(ТекущийРазмерФайла() / 512);
+    if( not ЗаписатьБлок( MkStr( " ", (count+1) * 512 - ТекущийРазмерФайла() ) ) )
+       ErrExport( "Ошибка при дополнении файла пробелами" );
+       return FALSE;
+    end;
+ elif ( ВидТерминала == TPFRMT_RJE )
+    /*if( not ЗаписатьСтроку( КодРазделительСообщений ) )*/
+    if( not ЗаписатьБлок( КодРазделительСообщений ) )
+       ErrExport( "Ошибка при записи разделителя сообщений" );
+       return FALSE;
+    end;
+ end;
+
+ return TRUE;
+end;
+
+/***************************************************************************/
+/* Функция формирования заголовка файла сообщения SWIFT                    */
+/***************************************************************************/
+macro ЗаписатьЗаголовок()
+
+ if ( ВидТерминала == TPFRMT_TURBOSWIFT )
+    if( not ЗаписатьБлок( FormatCode ) )
+       ErrExport( "Ошибка при записи кода формата" );
+       return FALSE;
+    end;
+ end;
+
+ return TRUE;
+
+end;
+
+/***************************************************************************/
+/* Функция формирования кода конца файла сообщения                         */
+/***************************************************************************/
+macro ЗаписатьКонцовку()
+ var count;
+
+ if( ВидТерминала == TPFRMT_PCC )
+    /* Дополним файл пробелами до размера, кратного 512 байт */
+    count = int(ТекущийРазмерФайла() / 512);
+    if( not ЗаписатьБлок( MkStr( " ", (count+1) * 512 - ТекущийРазмерФайла() ) ) )
+       ErrExport( "Ошибка при дополнении файла пробелами" );
+       return FALSE;
+    end;
+ end;
+
+ return TRUE;
+end;
+
+/* Макрос экспорта  */
+macro SWIFTOutProc( ExportFileName, addrSess )
+  DebugBreak;
+  var continue0 = 1, Документов = 0, err;
+
+  SetBuff( wlsess, addrSess );
+
+  /* Определяем, есть ли сообщения, подлежащие выгрузке */
+  if( not СчитатьЗапись( wlmes, err ) )
+    if( not err )
+      ErrExport("Не найдено ни одного сообщения для отправки");
+    else
+      ErrExport("Ошибка чтения сообщения");
+    end;
+    return false;
+  end;
+
+  if( ((ОпределитьФорматТранспорта( wlsess.TpID, ВидТерминала )) == 0) OR (ВидТерминала == "" ) )
+    ErrExport( string("Не найден формат по умолчанию для траснпорта № ", wlsess.TpID) );
+    return false;
+  end;
+
+  if( not ЗаписатьЗаголовок() ) return FALSE; end;
+  
+  /* Последовательно считываем сообщения и формируем файл экспорта */
+  while( continue0 )
+    if( not ЗаписатьСообщение() )
+      return false;
+    end;
+    if( СчитатьЗапись( wlmes, err, false ) )
+       ЗаписатьРазделительСообщений();
+    else
+      if ( not err )
+         continue0 = 0;
+      else
+         ErrExport("Ошибка чтения сообщения");
+         return false;
+      end;
+    end;
+
+    Документов = Документов + 1;
+    message( "Идет выгрузка документов. Отправлено: ", Документов );
+  end;
+
+  if( not ЗаписатьКонцовку() )
+    return false;
+  end;
+
+  return true;
+end;
+
+macro SwNDCOutProc(ExportFileName, addrSess)
+  var continue0 = 1, Документов = 0, err;
+DebugBreak;
+  SetBuff( wlsess, addrSess );
+
+  /* Определяем, есть ли сообщения, подлежащие выгрузке */
+  if( not СчитатьЗапись( wlmes, err ) )
+    if( not err )
+      ErrExport("Не найдено ни одного сообщения для отправки");
+    else
+      ErrExport("Ошибка чтения сообщения");
+    end;
+    return false;
+  end;
+
+  ВидТерминала = TPFRMT_RJE;
+
+  if( not ЗаписатьЗаголовок() ) return FALSE; end;
+  
+  /* Последовательно считываем сообщения и формируем файл экспорта */
+  while( continue0 )
+    if( not ЗаписатьСообщение() )
+      return false;
+    end;
+    if( СчитатьЗапись( wlmes, err, false ) )
+       ЗаписатьРазделительСообщений();
+    else
+      if ( not err )
+         continue0 = 0;
+      else
+         ErrExport("Ошибка чтения сообщения");
+         return false;
+      end;
+    end;
+
+    Документов = Документов + 1;
+    message( "Идет выгрузка документов. Отправлено: ", Документов );
+  end;
+
+  if( not ЗаписатьКонцовку() )
+    return false;
+  end;
+
+  return true;
+end;

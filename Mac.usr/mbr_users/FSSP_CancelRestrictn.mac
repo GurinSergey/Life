@@ -1,0 +1,863 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: FSSP_Restrictn.mac 
+// @desc    : Обработка постановлений к исполнению     
+// -------------------------------------------------------------------------------------------------                                               
+debugbreak;
+
+Import  Rsexts;
+Import FSSP_LIB, FNS_LIB, lib_account, pschkrst, acs_func, lib_const, lib_types, fssp_xml_lib, lib_fg, FSSP_AnswerQuery;
+
+private class TList()
+   private  var Container = TArray();
+   var size = 0;
+   
+   macro add()
+      var i :integer = 0, parm :variant;
+      while( getParm(i = i + 1, parm) ) Container[Container.size] = parm; end;
+      size = Container.size;
+   end;
+
+   macro get(i) :variant  return Container[i];  end;
+end;
+
+private class TStateList()
+   var a = TArray();
+
+   macro add(value)  a[a.size] = value; end;
+
+   macro inList()
+      var i = 0, k = 0, parm;
+      while(i< a.size)
+         while( getParm(k = k + 1, parm) ) 
+            if(parm == a[i]) return true; end;
+         end;
+         k = 0;
+         i = i + 1;
+      end;
+      return false;
+   end;
+
+end;
+
+
+class TFSSP_CANCEL_RESTRICTN(_mes_id, _mes_kind) 
+
+PRIVATE  CONST 
+    SINGLE_ACTION_MODE          = 1,
+    MULTI_ACTION_MODE           = 2,    
+
+    MT_IP_ACT_ENDARREST_ARM_3   = 5,
+    MT_IP_ACT_ENDARREST_ARM_1_2 = 6;
+
+                                     
+    VAR
+    id              = int( _mes_id   ),
+    mes_id          = int( _mes_id   ),       
+    mes_kind        = int( _mes_kind ),           
+    Error           = 0,
+    Errors          = TArray(),
+    DataBlock       = TArray(),
+    Params          = TFSSP_SETTINGS(),                
+    ReportTxtFile   = getTxtFileName ("report_file_tmp"),
+    ClientArrID     = TArray(),
+    ClientID        = -1,         
+    InternalKey     = NULL,
+    IPInternalKey   = NULL,
+    OutInternalKey  = NULL,
+    ExternalKey     = NULL,
+    Docdate         = NULL,    
+   
+    DocNum          = NULL,
+    Amount          = NULL,
+    AppOrder        = NULL,
+    DocCode         = NULL,
+    IPNum           = NULL,
+    IPDate          = NULL,
+    Reason          = NULL,
+    Article         = NULL,      
+    DebtorName      = NULL,        
+    DebtorINN       = NULL,
+    DebtorKPP       = NULL,
+    RestrDocId      = NULL,  
+    RestrDocNumber  = NULL,
+    RestrDocDate    = NULL,
+    RecpName        = NULL,
+    RecpCnt         = NULL,  
+    RecpINN         = NULL, 
+    RecpKPP         = NULL,
+    RecpBIK         = NULL;    
+
+    /*глобальные переменные для отправки ответа*/
+    var
+    ArrestRecoveryAmountDataBlock = TList(),     
+    RestrictedAmount              = $0,
+    RestrictedAmountRub           = $0,  
+    RestrictionAnswerType         = 0,
+
+    all_clients_found             = TArray(),       
+    report                        : XMLElement,
+    arrestRecoveryAmountData      : XMLElement,
+    restrictedData                : XMLElement,
+    nonrestrictedData             : XMLElement;
+   
+    
+
+    private class TRestrictnAccounts(_account :string, _summ :money, _InternalKey:string)
+       var account     = _account;
+       var summ        = _summ;
+       var InternalKey = _InternalKey;
+    end;        
+
+    private class TArestRecoveryBlock(_acc, _acc_state, _claimid, _clientid)
+       var acc        = _acc      ;
+       var acc_state  = _acc_state;                         
+    end;    
+
+    private class TClaimInfo(_account, _claimId, _summ, _chgmsgId)
+       var account  = _account,
+           claimId  = _claimId,
+           summ     = _summ,
+           chgmsgId = _chgmsgId;
+    end;
+
+   
+   private macro set_datablock()
+       var sql = " SELECT   *                                                                        "  
+                 " FROM   XMLTABLE ('//Data' PASSING (SELECT   xmltype (mes.T_MES_DATA) AS xml_data  "
+                 "    FROM     USR_FSSP_MES mes                                                      "
+                 "     WHERE    T_ID = :mes_id)                                                      "
+                 " COLUMNS                                                                           "
+                 " InternalKey VARCHAR2 (500) PATH '//InternalKey',                              "
+                 " Acc VARCHAR2 ( 25) PATH '//Acc',                                              "
+                 " Sum VARCHAR2 ( 50) PATH '//Summa')                                            ";
+
+       sql = execSQLSelect(sql, makeArray(SQLParam("", mes_id)));
+       while(sql and sql.moveNext())
+          var summ = sql.value("Sum");
+          if(valtype(summ) == 26 )  summ = amount; end;
+          DataBlock[DataBlock.size] = TRestrictnAccounts(string(sql.value("Acc")), money(summ), sql.value("InternalKey"));
+          
+          if(string(sql.value("Acc")) == ""  ) runerror; end;
+       end;
+    onError
+       DataBlock.size = 0;
+    end;
+      
+    private macro set_field(mes_field, class_field, mes_type)              
+       if(mes_field != NullVal) 
+            if (valtype(mes_type) == v_date  ) class_field = toRSLdate(mes_field);
+          elif (valtype(mes_type) == v_money ) class_field = money(mes_field);
+          elif (valtype(mes_type) == v_string) class_field = ReplaceSpecialChars(mes_field);
+          else                                 class_field = mes_field;  
+          end;
+          setParm(2, class_field);  
+       else   
+          setParm(2, null);  
+       end; 
+    end;
+
+    macro getOwnerInternalKey(acc)
+       var i = 0;
+       while(i < DataBlock.size)
+          if(DataBlock[i].account == acc ) return DataBlock[i].internalkey; end;
+          i = i + 1;
+       end;
+       return "";
+    end;
+
+    macro check_mandatory_field()
+       if(inList(null, DebtorName, DebtorINN, RestrDocId, RestrDocNumber, RestrDocDate)) return true; end;
+       if((mes_kind == MT_IP_ACT_ENDARREST_ARM_1_2) and (DataBlock.size == 0)) return true; end;
+       return false;
+    end;    
+
+    macro checkCancelRestricnt(amount)
+       var sql = RsdRecordset("select 1 from USR_FSSP_RESTRICTN r, usr_fssp_mes m where "
+                              " M.T_ID = R.MESID  and M.T_MES_TYPE =                    "  + mes_kind +
+                              "                   and R.AMOUNT     =                    "  + amount   +
+                              "                   and R.DOCNUM     =                    '" + RestrDocNumber + "'");
+       return sql.movenext();
+    end;
+
+    macro ExistsRestrictn(clientid :@integer)
+       var sql  = " select CLIENT from USR_FSSP_RESTRICTN r            "
+                  " WHERE R.INTERNALKEY = '" + RestrDocId     + "'"
+                  " AND R.DOCNUM        = '" + RestrDocNumber + "'"
+                  " AND R.DOCDATE       = '" + toRSLdate(RestrDocDate) + "'";
+       sql = RsdRecordset(sql);
+       if(sql.movenext)
+          clientid = sql.value(0, null, v_integer);
+          return true;
+       end;
+       return false;
+    end;
+
+    macro ExistsRestrictnAcc(clientid :@integer, account, summ)
+       var sql  = " select CLIENT from USR_FSSP_RESTRICTN r            "+
+                  " WHERE R.INTERNALKEY = '" + RestrDocId              +"'"+
+                  " AND R.DOCNUM        = '" + RestrDocNumber          +"'"+
+                  " AND R.DOCDATE       = '" + toRSLdate(RestrDocDate) +"'"+
+                  " AND r.ACCOUNT =  '" + account                      +"'"+
+                  " AND R.CANCELRESTR != chr(88) ";
+
+       if(summ) sql = sql + " AND r.AMOUNT  = " + summ ; end;                  
+                 
+
+       sql = RsdRecordset(sql);
+       if(sql.movenext)
+          clientid = sql.value(0, null, v_integer);
+          return true;
+       end;
+       return false;
+    end;
+
+
+        
+    macro FSSP_CANCEL_RESTRICTN()                
+       var sql = " SELECT XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/InternalKey/text()')   .getStringVal() InternalKey,    "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/InternalKey/text()').getStringVal()IPInternalKey,   "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/DocDate/text()')       .getStringVal() DocDate,        "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/DocNum/text()')        .getStringVal() DocNum,         "+                  
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/Amount/text()')        .getStringVal() Amount,         "+                                         
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/IPNum/text()')      .getStringVal() IPNum,          "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/IPDate/text()')     .getStringVal() IPDate,         "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('//Data')                    .getStringVal() Data,           "+                  
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorName/text()') .getStringVal() DebtorName,     "+                  
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorINN/text()')  .getStringVal() DebtorINN,      "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorKPP/text()')  .getStringVal() DebtorKPP,      "+                    
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/RestrDocId/text()')    .getStringVal() RestrDocId,     "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/RestrDocNumber/text()').getStringVal() RestrDocNumber, "+
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/RestrDocDate/text()')  .getStringVal() RestrDocDate,   "+ 
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ( '/*/*/OspProperty/RecpName/text()').getStringVal() RecpName,"+ 
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ( '/*/*/OspProperty/RecpCnt/text()' ).getStringVal() RecpCnt, "+ 
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ( '/*/*/OspProperty/RecpINN/text()' ).getStringVal() RecpINN, "+ 
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ( '/*/*/OspProperty/RecpKPP/text()' ).getStringVal() RecpKPP, "+ 
+                 "        XMLTYPE (MES.T_MES_DATA).EXTRACT ( '/*/*/OspProperty/RecpBIK/text()' ).getStringVal() RecpBIK  "+                
+                 " FROM   usr_fssp_mes mes                                                                               "+
+                 " WHERE  MES.T_ID = :mes_id                                                                             ";                  
+        sql = execSQLSelect(sql, makeArray(SQLParam("mes_id", mes_id)));          
+        if(sql and sql.movenext )                    
+            set_field(sql.value("INTERNALKEY"   ), InternalKey    );
+            set_field(sql.value("IPINTERNALKEY" ), IPInternalKey  );
+            set_field(sql.value("DOCDATE"       ), DocDate        , v_date);
+            set_field(sql.value("DOCNUM"        ), DOCNUM         ); 
+            set_field(sql.value("AMOUNT"        ), AMOUNT         , v_money );             
+            set_field(sql.value("DEBTORNAME"    ), DEBTORNAME     , v_string);              
+            set_field(sql.value("IPNum"         ), IPNum          , v_string);              
+            set_field(sql.value("DEBTORINN"     ), DebtorINN      );              
+            set_field(sql.value("RESTRDOCID"    ), RESTRDOCID     );                               
+            set_field(sql.value("RESTRDOCNUMBER"), RESTRDOCNUMBER );                               
+            set_field(sql.value("RESTRDOCDATE"  ), RESTRDOCDATE   , v_date);                
+            set_field(sql.value("IPNUM"         ), IPNUM          );                                                                
+            if(       sql.value("DATA"          )!= NullVal)  set_datablock() end;                        
+        end;        
+                  
+    end;
+
+    private macro get_debtor_name()
+       var party = TBFile ("party.dbt", "R", 0);
+       party.rec.partyid = ClientID;
+       if (party.getEQ()) return trim(party.rec.name); end;
+       return DebtorName;
+    end;
+    
+    private macro ArrayToStr(ar : Tarray)
+      var str = " ", i = 0;       
+      while(i < ar.size)
+         str =  trim(str) + "'" + ar[i].Account + "',";            
+         i = i + 1;
+      end;
+      return substr(str, 1, strlen(str) - 1);      
+    end;
+
+    private  macro showAskedMsg(account)      
+        return String("ID сообщения: " + mes_id + "|| Счет " + account + " принадлежит другому клиенту." + "|| ИНН клиента в запросе: " + DebtorINN + "|| Продолжить? ");
+    end;   
+           
+    private macro getSumm(account, sum)
+       record rate (ratedef);       
+       var FIID = Get_Fiid(Account), ConvSuma ;      
+       if(  FIID != 0 )        
+           ПолучитьКурс(rate, 0, FIID, 7);
+           ПолучитьЗначениеКурса(rate, {curdate});           
+           if( ConvSum(ConvSuma , Money(Sum), {curdate}, 0, FIID, 7 ) != 0 )    
+              MsgBox("Не удалось сконвертировать сумму ареста");
+              return $0;
+           end;   
+           return money(ConvSuma);     
+       end;
+       return money(sum);     
+    end;     
+
+    private macro getSummRur(account, sum)
+       record rate (ratedef);       
+       var FIID = Get_Fiid(Account), ConvSuma ;      
+       if(  FIID != 0 )        
+           ПолучитьКурс(rate, FIID, 0, 7);
+           ПолучитьЗначениеКурса(rate, {curdate});           
+           if( ConvSum(ConvSuma , Money(Sum), {curdate}, FIID, 0, 7 ) != 0 )    
+              MsgBox("Не удалось сконвертировать сумму ареста");
+              return $0;
+           end;   
+           return money(ConvSuma);     
+       end;
+       return money(sum);     
+    end;     
+
+       
+    private macro get_input_mesname()
+       var OutFileName = "";
+       var sql = " SELECT   S.T_SESS_FILE                      "+
+                 " FROM   usr_fssp_sess s, usr_fssp_mes m      "+
+                 " WHERE   S.T_ID = M.T_SESS_ID AND M.T_ID = ? ";
+       sql = execSQlselect(sql, makeArray(SQLParam("",mes_id)));
+       if (sql.moveNext) SplitFile(sql.value(0), OutFileName); end;  
+       return OutFileName;      
+    end;       
+
+    private macro moveFile (src:string, dst:string) return (copyFile (src, dst) and removeFile (src)); end;                
+        
+    private macro save_error( DescError )
+       var sql = " INSERT INTO USR_FSSP_ERR_TMP VALUES   (:mesID, :DescError)" ;
+       execSQL(sql, makeArray(SQLParam("", mes_id), SQLParam("", DescError)));         
+    end;    
+          
+    private macro catchUserError (e)       
+       if (RSLDefCon.IsinTrans) RSLDefCon.RollbackTrans; end;
+       save_error(e.message);             
+       exit();
+    end;
+
+
+    private macro register_restrictn(ACCOUNT, AMOUNT, chgMesID)      
+    startQueryCapture ();
+    [
+    DECLARE
+       PID NUMBER;
+    BEGIN
+    INSERT INTO USR_FSSP_RESTRICTN (MESID,
+                                    CLIENT,
+                                    ACCOUNT, 
+                                    BANKDATE, 
+                                    DOCDATE, 
+                                    INTERNALKEY, 
+                                    DOCNUM, 
+                                    AMOUNT,
+                                    CANCELRESTR, 
+                                    CHANGEMESID, ISEXEC) VALUES  (?, ?, ?, ?, ?, ?, ?, ?,  CHR(88), ?, chr(0)) RETURNING ID INTO PID;
+    :pid := PID;                                
+    END;                                
+    ];
+    var sql = endQueryCapture ();  
+    
+    VAR cmd = RsdCommand(sql); 
+
+    cmd.AddParam("", RSDBP_IN, mes_id    );
+    cmd.AddParam("", RSDBP_IN, ClientID  );
+    cmd.AddParam("", RSDBP_IN, ACCOUNT   );
+    cmd.AddParam("", RSDBP_IN, {CURDATE} );
+    cmd.AddParam("", RSDBP_IN, toRSLDate(Docdate));
+
+    cmd.AddParam("", RSDBP_IN, InternalKey);
+    
+    cmd.AddParam("", RSDBP_IN, Docnum    );
+    cmd.AddParam("", RSDBP_IN, Amount    );
+    cmd.AddParam("", RSDBP_IN, chgMesID  );
+    cmd.addParam("pid",  RSDBP_OUT, V_INTEGER);
+    cmd.Execute(); 
+                                   
+    RETURN  cmd.Param("pid").value;                    
+    end;
+   
+    private macro register_claim(ID, CLAIMID, CHANGEDOCID, RESTRICNTID);   
+       VAR SQL = " INSERT INTO USR_FSSP_RESTRICTN_STATE  VALUES  (?, ?, ?, ?, ?, chr(0)) ";                          
+        execSQL(sql,  makeArray(SQLParam("", ID             )
+                               ,SQLParam("", {curdate}      )
+                               ,SQLParam("", CLAIMID        )        
+                               ,SQLParam("", CHANGEDOCID    )
+                               ,SQLParam("", RESTRICNTID    )));   
+    end;
+      
+    macro changeClaim(account, claimID, summ, chgRestrID)  
+       var cmd;
+       //var summ_cur = getSumm(account, summ);
+       var ReasonName = get_input_mesname() + "_" + InternalKey + " № исп/п " + IPNum;             
+       cmd = RsdCommand("{ ? = call rsi_rsb_acclaim.insertacclmcng(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ) } ");        
+       cmd.NullConversion = true;
+       cmd.AddParam("error",          RSDBP_OUT,  V_INTEGER);
+       cmd.AddParam("claimid",        RSDBP_IN,   ClaimID);
+       cmd.AddParam("DocNumber",      RSDBP_IN,   DocNum);
+       cmd.AddParam("Initiator",      RSDBP_IN,   3);
+       cmd.AddParam("ChangeKind",     RSDBP_IN,   1); /*Изменение*/
+       cmd.AddParam("Delta",          RSDBP_IN,   summ);
+       cmd.AddParam("Priority",       RSDBP_IN,   0);
+       cmd.AddParam("Comment",        RSDBP_IN,   substr(string(ReasonName), 1, 140));
+       cmd.AddParam("DocDate",        RSDBP_IN,   toRSLdate(DocDate));
+       cmd.AddParam("SysDate",        RSDBP_IN,   {curdate});
+       cmd.AddParam("StartDate",      RSDBP_IN,   {Curdate});
+       cmd.AddParam("FinishDate",     RSDBP_IN,   date(0,0,0));
+       cmd.AddParam("BackoutRecall ", RSDBP_IN,   0);
+       cmd.AddParam("ChangeDocID",    3/*in_out*/,0);
+       cmd.AddParam("Auto",           RSDBP_IN,   strfor(88));
+       cmd.AddParam("FiscOrgCode",    RSDBP_IN,   strfor(1));     
+       cmd.execute();
+
+       register_claim(register_restrictn(ACCOUNT, AMOUNT, chgRestrID), claimid, cmd.Param("ChangeDocID").value, chgRestrID);         
+       insertAccLinks(mes_id, account, clientid);
+
+       
+
+       if (cmd.Param("error").value != 0) RunError("Не удалось наложить арест на счет " + account); end;
+
+       onError(e)
+       catchUserError(e);
+      
+    end;          
+
+
+    private macro setClient(id)
+       var sql = " update usr_fssp_mes set T_PARTY_ID = ? where t_id = ? ";
+       execSQL(sql, makeArray(SQLParam("", id), SQLParam("", mes_id)));                  
+    end;
+
+    private macro setMessageState(mes_state)
+       var sql = " update usr_fssp_mes set T_MES_STATE = ? where t_id = ? ";
+       execSQL(sql, makeArray(SQLParam("", mes_state), SQLParam("", mes_id)));                  
+    end;
+
+    private macro getClaimAmout(id)
+        var sql = " SELECT   NVL (SUM (acclaimstate.t_currentamount), 0) AMOUNT         "+
+                  " FROM   dacclaim_dbt claim, dacclaimstate_dbt acclaimstate           "+
+                  " WHERE   (claim.t_finishdate = TO_DATE ('01.01.0001', 'dd.mm.yyyy')  "+
+                  "       OR claim.t_finishdate > RSBSESSIONDATA.CURDATE)               "+
+                  "       AND claim.t_claimid = acclaimstate.t_claimid                  "+
+                  "       AND CLAIM.T_CLAIMID                                         = "+ id +
+                  "       and acclaimstate.t_state in (1,2)                             "+
+                  "       AND acclaimstate.t_statedate =                                "+
+                  "       (SELECT MAX (t.t_statedate)                                   "+
+                  "        FROM   dacclaimstate_dbt t                                   "+
+                  "        WHERE  t.t_claimid = claim.t_claimid                         "+
+                  "               AND t.t_statedate <= RSBSESSIONDATA.CURDATE)          ";
+        sql = RsdRecordset(sql);
+        sql.movenext();
+        return sql.value(0, null, v_money);
+    end;
+      
+    macro RollBack();
+       var sql, sqlDel;
+       sql = execSQLSelect("select r.account, CHANGEDOCID from USR_FSSP_RESTRICTN r, USR_FSSP_RESTRICTN_STATE s where r.id = s.id and  mesid =  :m_mesid order by s.bankdate desc",
+                            makeArray(SQLParam("", mes_id))); 
+       rsldefcon.BeginTrans;                            
+       while (sql.moveNext())
+           sqlDel = execSQLSelect("select 1 from dacclmcng_dbt where T_CHANGEDOCID = ?", makeArray(SQLParam("",sql.value("CHANGEDOCID"))));          
+           if (sqlDel.moveNext()) 
+              if (0 == execStoredFunc("rsi_rsb_acclaim.CancelAcClmCng", v_integer, makeArray(SQLParam("" , sql.value("CHANGEDOCID")), SQLParam("", {curdate}),SQLParam("", ""))))      
+                  execSQL(" delete FROM dacclmcngstate_dbt a WHERE a.t_changedocid = ?      ", makeArray(SQLParam("", sql.value("CHANGEDOCID"))));                  ;                                          
+                  execSQL(" delete FROM dacclmcng_dbt t WHERE t_changedocid        = ?      ", makeArray(SQLParam("", sql.value("CHANGEDOCID"))));                                                               
+              else
+                  RunError("Не удалось выполнить отмену претензии" + sql.value("CHANGEDOCID"));
+              end;    
+           end;              
+       end; 
+
+       execSQL("delete from USR_FSSP_ACCOUNTS_LINK     where T_MES_ID = ?"    , makeArray(SQLParam("", mes_id)));    
+       execSQL("delete from USR_FSSP_RESTRICTN_STATE s where S.ID in (select r.id from USR_FSSP_RESTRICTN r where r.mesid = ? )", makeArray(SQLParam("", mes_id)));
+       execSQL("delete from USR_FSSP_RESTRICTN         where mesid = ? "      , makeArray(SQLParam("", mes_id)));              
+       execSQL("delete from USR_FSSP_ANSWER            where t_mes_id = ? "   , makeArray(SQLParam("", mes_id)));                   
+
+       setMessageState( 0);
+       setClient      (-1);
+       rsldefcon.CommitTrans;       
+       return 0;        
+       
+    onError(e)      
+       catchUserError(e);
+    end;
+
+    private macro getMesState(ID)
+       var sql = "select t_mes_state from usr_fssp_mes where t_id = ?";
+           sql = execSQLselect(sql, makeArray(SQLParam("",ID)));  
+           if (sql and sql.moveNext()) return sql.value(0, null, v_integer); end;
+           return - 1;            
+    end;    
+
+    macro setClaimid_Chgmes(account, claimid:@integer, chgMes:@integer)
+     var sql = " SELECT   R.ACCOUNT account, S.CLAIMID  claimid, r.MESID mesID "
+             " FROM   USR_FSSP_RESTRICTN r, USR_FSSP_RESTRICTN_STATE s       " +
+             " WHERE   R.ID = S.ID                                           " +
+             " and R.INTERNALKEY =                                          '" + RestrDocId             + "'"
+             " and R.DOCDATE     =                                          '" + toRSLdate(RestrDocDate)+ "'"
+             " and R.DOCNUM      =                                          '" + RestrDocNumber         + "'"
+             " and r.account     =                                          '" + account + "'" +
+             " AND S.CLAIMID = (SELECT   MAX (CLAIMID) FROM   USR_FSSP_RESTRICTN_STATE WHERE   id = R.ID)";
+     sql = RsdRecordset(sql);
+
+     if(sql.moveNext())
+        claimID = sql.value("claimid", null, v_integer);
+        chgMes  = sql.value("mesid"  , null, v_integer);
+        return true;
+     end;
+     return false;
+   end;
+ 
+   private  macro checkRestrictnClaim()
+
+       macro checkRestricnt(amount)
+          var sql = RsdRecordset("select 1 from USR_FSSP_RESTRICTN r, usr_fssp_mes m where "
+                                 " M.T_ID = R.MESID  and M.T_MES_TYPE  =                    "  + mes_kind +
+                                 "                   and R.AMOUNT      =                    "  + amount   +
+                                 "                   and R.CANCELRESTR = chr(88)          "  +
+                                 "                   and R.DOCNUM      =                    '" + DocNum + "'");
+          return sql.movenext();
+       end;
+
+
+       var sql = RsdRecordset("select 1 from usr_fssp_mes where T_INTERNALKEY = " + InternalKey );
+
+       //if (sql and sql.moveNext()) return true; end;
+
+       if (mes_kind == 5) return checkRestricnt(amount);
+       else
+          var i = 0;
+          for(i, 0, DataBlock.size - 1)     
+             if(checkRestricnt(DataBlock[i].summ)) return true; end;
+          end;
+       end;
+       return false;   
+    end;
+
+
+macro getRSDAllRestrcintAccount()
+   var sql = " SELECT   R.ACCOUNT account, S.CLAIMID  claimid, r.MESID mesID "
+             " FROM   USR_FSSP_RESTRICTN r, USR_FSSP_RESTRICTN_STATE s       "
+             " WHERE   R.ID = S.ID                                           "
+             " and R.INTERNALKEY =                                          '" + RestrDocId             + "'"
+             " and R.DOCDATE     =                                          '" + toRSLdate(RestrDocDate)+ "'"
+             " and R.DOCNUM      =                                          '" + RestrDocNumber         + "'"
+             " AND S.CLAIMID = (SELECT   MAX (CLAIMID) FROM   USR_FSSP_RESTRICTN_STATE WHERE   id = R.ID) order by r.id desc";
+   return RsdRecordset(sql);
+end;
+     
+
+macro cancel_account(action_mode)
+   var all_clients_found = TArray();
+   var RestricntAccount;
+   var restrictnClient;
+
+   if  (check_mandatory_field    ())  RestrictionAnswerType = 5;
+   //elif(checkRestrictnClaim      ())  RestrictionAnswerType = 8; /*арест наложен ранее*/
+   elif(not ExistsRestrictn (@restrictnClient)) RestrictionAnswerType = 6; /*арест не найден*/  
+   else 
+      all_clients_found = IdentityClient(@this, action_mode == MULTI_ACTION_MODE);                                 
+      if  (all_clients_found.size() >= 1) 
+          ClientID = all_clients_found[0];
+          if(ClientID != restrictnClient)
+             RestrictionAnswerType = 13;
+          end;
+      elif(all_clients_found.size() == 0) RestrictionAnswerType = 2;
+          ClientID = -1;          
+      end;
+   end;
+
+   if(RestrictionAnswerType == 0)
+   var matrix = TStateList();
+   RestricntAccount = getRSDAllRestrcintAccount();  
+   
+   arrestRecoveryAmountData = XMLElement( "ArrestRecoveryAmountData" );
+   restrictedData           = XMLElement( "RestrictedData"    );
+   nonRestrictedData        = XMLElement( "NonRestrictedData" );
+
+   var claim_summ_cur = $0;
+   var claim_summ     = $0;
+   var rest_summ      = money(amount); 
+   
+   
+   while(RestricntAccount.movenext())
+
+       arrestRecoveryAmountData = XMLElement( "ArrestRecoveryAmountData" );
+       arrestRecoveryAmountData.addChild( XMLElement( "ExternalKey"        , getExternalKey()                         ) );                                         
+       arrestRecoveryAmountData.addChild( XMLElement( "ActDate"            , toFSSPdate({curdate})                    ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "KindData"           , "95"                                     ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "DebtorName"         , get_debtor_name()                        ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "Acc"                , RestricntAccount.value("account")        ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "BicBank"            , {MFO_BANK}                               ) );               
+
+       var summDelta    = getClaimAmout(RestricntAccount.value("claimid"));      
+       var summDeltaRur = summDelta;
+
+       if(Get_Fiid(RestricntAccount.value("account")) != 0)
+          summDeltaRur = ROUND(getSummRur(RestricntAccount.value("account"), summDelta), 0);
+       end;
+
+       if (summDelta == $0) continue; end;     
+
+       claim_summ = min(summDeltaRur, claim_summ = money(rest_summ));          
+
+
+       if(Get_Fiid(RestricntAccount.value("account")) == 0)
+          claim_summ_cur = claim_summ;
+       else
+          claim_summ_cur = getSumm(RestricntAccount.value("account"), claim_summ);
+       end;
+
+       if(claim_summ > $0)
+              arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmount"     , claim_summ_cur));
+              arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmountRub"  , claim_summ    ));
+
+          if  (claim_summ >= summDeltaRur)
+              arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState", 9           ));              
+              matrix.add(9);
+          else
+              arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState", 19          ));   
+              matrix.add(19);
+          end;
+
+              rest_summ  = money(rest_summ) - money(claim_summ); 
+              if (rest_summ < $0) rest_summ = $0; end;                                                   
+
+              changeClaim(RestricntAccount.value("account") , RestricntAccount.value("claimid") , claim_summ_cur, RestricntAccount.value("mesid"));  
+
+              RestrictedAmountRub = RestrictedAmountRub + claim_summ;
+              RestrictedAmount    = RestrictedAmount    + claim_summ_cur;                
+              RestrictedData   .addChild(arrestRecoveryAmountData); 
+
+       else
+          arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmount"       , $0 ));
+          arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmountRub"    , $0 ));
+
+          arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState", 20 )); 
+          RestrictedData   .addChild(arrestRecoveryAmountData); 
+          matrix.add(20);
+       end;       
+   end;
+   end;
+
+   ExternalKey = getExternalKey();
+   RegAnswer(mes_id, ExternalKey);
+
+   Report = XMLElement("ns:Report", null, makeArray( XMLAttribute( "xmlns:ns", "http://www.red-soft.biz/schemas/fssp/common/2011/0.5" )));
+   Report.addChild(XMLElement( "ExternalKey"           , ExternalKey             ));
+   Report.addChild(XMLElement( "RestrictnInternalKey"  , InternalKey             ));
+   Report.addChild(XMLElement( "IpInternalKey"         , IpInternalKey           ));
+   Report.addChild(XMLElement( "DocDate"               , toFSSPdate({curdate})   ));
+   Report.addChild(XMLElement( "RestrDocDate"          , DocDate                 ));   
+   Report.addChild(XMLElement( "RestrDocNumber"        , DocNum                  ));   
+
+      
+   if(RestrictionAnswerType == 0) RestrictionAnswerType = 3; end;
+
+   setClient(clientID);
+   setMessageState(1);
+
+   Report.addChild(XMLElement( "RestrictionAnswerType" , RestrictionAnswerType));   
+   Report.addChild(XMLElement( "RestrictedAmount"      , money(RestrictedAmount   )));   
+   Report.addChild(XMLElement( "RestrictedAmountRub"   , money(RestrictedAmountRub)));   
+
+   if (RestrictedData   .childs.size != 0) Report.addChild(RestrictedData      ); end;   
+   if (NonRestrictedData.childs.size != 0) Report.addChild(NonRestrictedData   ); end;   
+
+   Report.addChild(XMLElement("SignDateTime", toFSSPDateTime( date, time )));
+   
+   SetOutPut(ReportTxtFile, false);      
+   println(Report);   
+   SetOutput(null, true);  
+
+   var OutFileName = getMesName(mes_id);
+   if(not moveFile(ReportTxtFile, Params.fssp_dir_export + "/" + OutFileName ))            
+      RunError("Не удалось скопировать файл "+ OutFileName + "| в каталог "+ Params.fssp_dir_export);                
+   end;   
+   
+  // writeRegAnswer(Params.fssp_dir_export + "/" + OutFileName);
+  
+   
+   if (RSLDefCon.IsinTrans) rsldefcon.CommitTrans;   end;      
+   if(not (Action_Mode == MULTI_ACTION_MODE)) viewfile(Params.fssp_dir_export + "/" + OutFileName); end;   
+
+   return 0;   
+
+onError(e)  
+   catchUserError(e);
+end;
+
+macro cancel_accountBIS(action_mode)
+   var all_clients_found = TArray();
+   var RestricntAccount;
+   var restrictnClient;
+
+   if  (check_mandatory_field ())  RestrictionAnswerType = 5;
+   else 
+      all_clients_found = IdentityClient(@this, action_mode == MULTI_ACTION_MODE);                                 
+      if  (all_clients_found.size() >= 1) ClientID = all_clients_found[0]; end;
+   end;   
+
+
+   if(RestrictionAnswerType == 0)  
+      var matrix = TStateList();
+
+   var i = 0;
+
+   while(i < dataBlock.size)
+      var accTmp = RSL_Account(dataBlock[i].account);
+
+      if((accTmp.rec.client != 0) and (accTmp.rec.client != clientID) and (not getTrue(true, showAskedMsg(dataBlock[i].account))))       
+         ArrestRecoveryAmountDataBlock.add(TArestRecoveryBlock(dataBlock[i].account,    1)); /*счет принадлежит другому клиенту*/                
+         matrix.add(1);
+    elif(accTmp.rec.account == "")
+         ArrestRecoveryAmountDataBlock.add(TArestRecoveryBlock(dataBlock[i].account,    2)); /*счет не найден*/
+         matrix.add(2);
+    elif(not existsRestrictnAcc(accTmp.rec.client, dataBlock[i].account))
+         ArrestRecoveryAmountDataBlock.add(TArestRecoveryBlock(dataBlock[i].account,    4)); /*арест не был наложен*/
+         matrix.add(4);
+    elif(accTmp.rec.open_close == "З")
+         ArrestRecoveryAmountDataBlock.add(TArestRecoveryBlock(dataBlock[i].account,   12)); /*счет закрыт*/                
+         matrix.add(12);
+   
+    else 
+         ArrestRecoveryAmountDataBlock.add(TArestRecoveryBlock(dataBlock[i].account,    0)); 
+     end;
+      i = i + 1;
+   end;
+
+   
+   arrestRecoveryAmountData = XMLElement( "ArrestRecoveryAmountData" );
+   restrictedData           = XMLElement( "RestrictedData"    ); 
+   nonRestrictedData        = XMLElement( "NonRestrictedData" );
+
+   var claim_summ_cur = $0;
+   var claim_summ     = $0;
+   
+   i = 0;
+   while(i < ArrestRecoveryAmountDataBlock.size)
+
+       arrestRecoveryAmountData = XMLElement( "ArrestRecoveryAmountData" );
+       arrestRecoveryAmountData.addChild( XMLElement( "ExternalKey"        , getExternalKey()                         ) );                                         
+       arrestRecoveryAmountData.addChild( XMLElement( "OwnerInternalKey"   , getOwnerInternalKey(ArrestRecoveryAmountDataBlock.get(i).acc)) );
+       arrestRecoveryAmountData.addChild( XMLElement( "ActDate"            , toFSSPdate({curdate})                    ) );       
+       arrestRecoveryAmountData.addChild( XMLElement( "KindData"           , "95"                                     ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "DebtorName"         , get_debtor_name()                        ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "Acc"                , ArrestRecoveryAmountDataBlock.get(i).acc ) );
+       arrestRecoveryAmountData.addChild( XMLElement( "BicBank"            , {MFO_BANK}                               ) );               
+
+       if (  ArrestRecoveryAmountDataBlock.get(i).acc_state != 0)
+             arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState", ArrestRecoveryAmountDataBlock.get(i).acc_state ) );                         
+             nonRestrictedData.addChild(arrestRecoveryAmountData);
+       else
+          debugbreak;
+
+          var claimid = 0, chgmes = 0;
+          amount = money(amount);
+
+
+          setClaimid_Chgmes(ArrestRecoveryAmountDataBlock.get(i).acc, @claimid, @chgmes);            
+
+          var summDelta = money(getClaimAmout(claimid));
+
+          var s = summDelta;
+          if(s > amount)  s = amount; end;
+
+          if(Get_Fiid(ArrestRecoveryAmountDataBlock.get(i).acc) == 0)
+             claim_summ_cur = claim_summ = s;
+          else
+             claim_summ_cur = getSumm(ArrestRecoveryAmountDataBlock.get(i).acc, s);
+          end;  
+          
+          if(s != $0)
+             arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmount"     , claim_summ_cur));
+             arrestRecoveryAmountData.addChild( XMLElement( "ArrestAmountRub"  , claim_summ    ));
+
+             RestrictedAmountRub = RestrictedAmountRub + claim_summ;
+             RestrictedAmount    = RestrictedAmount    + claim_summ_cur;                
+
+            
+             if(amount < summDelta)
+                arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState",  19       ));              
+                matrix.add(19);
+             else
+                arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState",  9        )); 
+                matrix.add(9);
+             end;          
+
+                changeClaim(ArrestRecoveryAmountDataBlock.get(i).acc , claimid , s, chgmes);  
+                RestrictedData   .addChild(arrestRecoveryAmountData);           
+          else
+                arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState",  4        )); 
+                matrix.add(4);
+                NonRestrictedData   .addChild(arrestRecoveryAmountData);                     
+          end;
+       end;
+       i = i + 1;
+   end;
+   end;
+
+   ExternalKey = getExternalKey();
+   RegAnswer(mes_id, ExternalKey);
+
+   Report = XMLElement("ns:Report", null, makeArray( XMLAttribute( "xmlns:ns", "http://www.red-soft.biz/schemas/fssp/common/2011/0.5" )));
+   Report.addChild(XMLElement( "ExternalKey"           , ExternalKey             ));
+   Report.addChild(XMLElement( "RestrictnInternalKey"  , InternalKey             ));
+   Report.addChild(XMLElement( "IpInternalKey"         , IpInternalKey           ));
+   Report.addChild(XMLElement( "DocDate"               , toFSSPdate({curdate})   ));
+   Report.addChild(XMLElement( "RestrDocDate"          , DocDate                 ));   
+   Report.addChild(XMLElement( "RestrDocNumber"        , DocNum                  ));   
+
+   // матрица уведомлений    
+   if(RestrictionAnswerType == 0) 
+      if((not matrix.inList(9, 19)) and (    matrix.inList(1,2,4,12)))  RestrictionAnswerType = 2;
+    elif((    matrix.inList(9, 19)) and (not matrix.inList(1,2,4,12)))  RestrictionAnswerType = 3;
+    elif((    matrix.inList(9    )) and (    matrix.inList(1,2,4,12)))  RestrictionAnswerType = 4;
+    else                                                                RestrictionAnswerType = 2;
+     end;
+   end;
+
+   setClient(clientID);
+   setMessageState(1);
+
+   Report.addChild(XMLElement( "RestrictionAnswerType" , RestrictionAnswerType));   
+   Report.addChild(XMLElement( "RestrictedAmount"      , money(RestrictedAmount   )));   
+   Report.addChild(XMLElement( "RestrictedAmountRub"   , money(RestrictedAmountRub)));   
+
+   if (RestrictedData   .childs.size != 0) Report.addChild(RestrictedData   ); end;   
+   if (NonRestrictedData.childs.size != 0) Report.addChild(NonRestrictedData); end;   
+
+   Report.addChild(XMLElement("SignDateTime", toFSSPDateTime( date, time )));
+   
+   SetOutPut(ReportTxtFile, false);      
+   println(Report);   
+   SetOutput(null, true);  
+
+   var OutFileName = getMesName(mes_id);
+   if(not moveFile(ReportTxtFile, Params.fssp_dir_export + "/" + OutFileName ))            
+      RunError("Не удалось скопировать файл "+ OutFileName + "| в каталог "+ Params.fssp_dir_export);                
+   end;   
+   
+  // writeRegAnswer(Params.fssp_dir_export + "/" + OutFileName);
+  
+   
+   if (RSLDefCon.IsinTrans) rsldefcon.CommitTrans;   end;      
+   if(not (Action_Mode == MULTI_ACTION_MODE)) viewfile(Params.fssp_dir_export + "/" + OutFileName); end;   
+
+   return 0;   
+
+onError(e)  
+   catchUserError(e);
+end;
+
+
+
+
+macro create(action_mode) 
+   if(mes_kind == 5) cancel_account(); 
+   else              cancel_accountBIS(); 
+   end
+
+end;
+
+
+/*конструктор*/
+FSSP_CANCEL_RESTRICTN();
+end;
+
+//var o = TFSSP_CANCEL_RESTRICTN(872980,5 ) ;  
+  //   o.create();
+   // o.rollback();          
+	//    exit(1);

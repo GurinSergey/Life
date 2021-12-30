@@ -1,0 +1,250 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   joy Банк ЭВ С-33316
+
+       Макрос  алгоритма расчёта базовых сумм по комиссиям 
+       Выдача наличных (с оформл. заявки) для Инд.Предпринимателей
+          - 5.3.3  (                 до 100 тыс. руб включительно);
+          - 5.3.4  (от 100 тыс. руб  до 300 тыс. руб. включительно);
+          - 5.3.5  (от 300 тыс. руб  до 600 тыс. руб. включительно);
+          - 5.3.6  (от 600 тыс. руб  до   1 млн. руб. включительно);
+          - 5.3.7  (от   1 млн. руб. до   3 млн. руб. включительно);
+          - 5.3.8  (от   3 млн. руб. до   5 млн. руб. включительно).
+        При снятии выше 5 млн. или при превышении общей суммы снятия 5 млн. руб. снимается комиссия 5.3.9
+
+       Тип комиссии - единовременная. Пакетная.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ptinter, cb_sql, globals, oprinter;
+import CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+  record sfbassum( "sfbassum.str" );
+
+/* Символ кассы, по которому берётся данная комиссия */
+CONST CommCashSymbol = "('58')";    // прочие
+
+CONST {EVChTarif 5.3.3 MIN} =       $0,
+      {EVChTarif 5.3.3 MAX} = $100000,
+
+      {EVChTarif 5.3.4 MIN} = $100000,
+      {EVChTarif 5.3.4 MAX} = $300000,
+      
+      {EVChTarif 5.3.5 MIN} = $300000,
+      {EVChTarif 5.3.5 MAX} = $600000,
+      
+      {EVChTarif 5.3.6 MIN} = $600000,
+      {EVChTarif 5.3.6 MAX} = $1000000,
+      
+      {EVChTarif 5.3.7 MIN} = $1000000,
+      {EVChTarif 5.3.7 MAX} = $3000000,
+      
+      {EVChTarif 5.3.8 MIN} = $3000000,
+      {EVChTarif 5.3.8 MAX} = $5000000;
+      
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+    var stat, SymbSum = $0, // сумма по символам из чека
+              TotalCashSum = $0, // общая сумма с начала месяца
+              UsedPack = $0, // сумма использованного пакета
+              SumOfBases = $0; //  сумма уже посчитанных баз
+    var PackRest = $0; // оставшийся пакет
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var query, rs, sql, cmd, ComCode, Min, Max;
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+    rs    = null;
+    sql   = null;
+    cmd   = null;
+    
+    //Получаем значения минимума и максимума для каждой комиссии
+
+   SQL = "SELECT subStr(com.t_code, 1, 5) cod";
+   SQL = SQL + "  FROM dsfcomiss_dbt com ";
+   SQL = SQL + " WHERE com.t_feetype     = " + sfCalcal.FeeType;
+   SQL = SQL + "   AND com.t_number      = " + sfCalcal.CommNumber;
+
+   rs = rsdRecordSet(SQL);
+   if (rs and rs.MoveNext())
+      ComCode = rs.Value("cod", null, V_STRING);
+   end;
+
+    if (ComCode == "5.3.3")
+        Min = {EVChTarif 5.3.3 MIN};
+        Max = {EVChTarif 5.3.3 MAX};
+    elif (ComCode == "5.3.4")
+        Min = {EVChTarif 5.3.4 MIN};
+        Max = {EVChTarif 5.3.4 MAX};
+    elif (ComCode == "5.3.5")
+        Min = {EVChTarif 5.3.5 MIN};
+        Max = {EVChTarif 5.3.5 MAX};
+    elif (ComCode == "5.3.6")
+        Min = {EVChTarif 5.3.6 MIN};
+        Max = {EVChTarif 5.3.6 MAX};
+    elif (ComCode == "5.3.7")
+        Min = {EVChTarif 5.3.7 MIN};
+        Max = {EVChTarif 5.3.7 MAX};
+    elif (ComCode == "5.3.8")
+        Min = {EVChTarif 5.3.8 MIN};
+        Max = {EVChTarif 5.3.8 MAX};
+    end;
+
+    if ( docKind == CASH_PS_OUTORDER )                                            // Комиссия по чекам
+    
+        if( GetTarifInfo( sfcontr, EndDate, EndDate, 3, sfcalcal.CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType ) )
+          
+             if    ( ( valtype (GetGlobalParameter ("IPEV_SymbSumPackGlob" + string (cashDoc.AutoKey))) == 0)           // Если глобальные переменные еще не определены, значит это первая комиссия по чеку 
+                and ( valtype (GetGlobalParameter ("IPEV_TotalCashSumPackGlob"+ string (cashDoc.AutoKey))) == 0)  // такого типа, значит глобальные перемнные определяем
+                and ( valtype (GetGlobalParameter ("IPEV_SumOfBasesPackGlob"+ string (cashDoc.AutoKey))) == 0) 
+                and ( valtype (GetGlobalParameter ("IPEV_UsedPackGlob" + string (cashDoc.AutoKey))) == 0 ) )
+                
+
+                rs = GetComBank52RecordSet( cashDoc.IsCurrency, cashDoc.DocKind, cashDoc.AutoKey, CommCashSymbol );
+                while (rs and rs.moveNext())
+                    SymbSum = SymbSum + rs.value(0, null, V_MONEY);
+                end;
+                  
+                  var tpBegDate = date(0,0,0);
+                  cmd = rsdcommand("   SELECT t_begin " +
+                                   "     FROM dsfcontrplan_dbt " +
+                                   "    WHERE T_SFCONTRID = ?  " +
+                                   "      AND t_end       = TO_DATE('01.01.0001','dd.mm.yyyy') " +
+                                   " ORDER BY t_begin DESC ");
+                  cmd.addparam( "ID", RSDBP_IN, sfcontr.id );
+                  rs = rsdrecordset( cmd );
+                  if ( rs and rs.movenext )
+                     tpBegDate = SQL_ConvTypeDate( rs.value(0, null, V_DATE) );
+                  end;
+                  //  Накопленный итог считается с начала месяца. А использование пакета - с даты перехода на ТП
+                TotalCashSum = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, true, sfcontr );
+                UsedPack = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, true, sfcontr, null, tpBegDate );
+                
+
+            /************************************************************/
+                /*Определяем глобальные параметры для их дальнейшей передачи. Имя переменной уникально для каждого чека, для подстраховки*/
+                SetGlobalParameter("IPEV_SymbSumPackGlob" + string (cashDoc.AutoKey), SymbSum);
+                SetGlobalParameter("IPEV_TotalCashSumPackGlob" + string (cashDoc.AutoKey), TotalCashSum);
+                SetGlobalParameter("IPEV_SumOfBasesPackGlob" + string (cashDoc.AutoKey), SumOfBases);
+                SetGlobalParameter("IPEV_UsedPackGlob" + string (cashDoc.AutoKey), UsedPack);
+        
+                /************************************************************/
+                else 
+                /************************************************************/
+                /*Получаем глобальные параметры и не разрушаем*/
+                SymbSum      = GetGlobalParameter("IPEV_SymbSumPackGlob"+ string (cashDoc.AutoKey), false);
+                TotalCashSum = GetGlobalParameter("IPEV_TotalCashSumPackGlob"+ string (cashDoc.AutoKey), false);
+                SumOfBases   = GetGlobalParameter("IPEV_SumOfBasesPackGlob"+ string (cashDoc.AutoKey), true); // Разрушаем, перезапишем ниже
+                UsedPack     = GetGlobalParameter ("IPEV_UsedPackGlob" + string (cashDoc.AutoKey), false);
+        
+                /************************************************************/
+            end;
+        // Алгоритм отбора базы комиссии аналогичен непакетным комиссиям
+        
+            If (TotalCashSum == 0) // Если это первый чек за месяц
+                If (SymbSum - SumOfBases > 0 ) // Если еще есть с чего списывать
+                    If (  (SymbSum - SumOfBases) >= (Max-Min) )  // 
+                        CommSum = Max - Min;
+                    else
+                        CommSum = SymbSum - SumOfBases;
+                    end;
+                else 
+                    CommSum = 0;
+                end;
+            Else // Если это не первый чек за месяц
+                If (TotalCashSum >= Max) // Не попадаем в базу комиссии, переходим к следующей
+                    CommSum = 0;
+                elif ((TotalCashSum > Min) and (TotalCashSum < Max )) // Попали в первую комиссию, которая должна быть удержана с чека
+                    If ((SymbSum  >= Max - TotalCashSum) ) // т.е. всё аналогично первому чеку, но вместо минимума используем накопленную за месяц сумму
+                        CommSum = Max -  TotalCashSum; 
+                    else
+                        CommSum = SymbSum; // SumOfBases здесь не нужен, т.к. будет равен нулю (первая комиссия по чеку)
+                    end;
+                else // т.е. TotalCashSum <= min, тогда всё аналогично тому, как для первого чека за месяц. 
+                    If (SymbSum - SumOfBases > 0 )
+                        If (  (SymbSum - SumOfBases) >= (Max-Min) )  
+                            CommSum = Max - Min;
+                        else
+                            CommSum = SymbSum - SumOfBases;
+                        end;
+                    else 
+                        CommSum = 0;
+                    end;
+                end;
+            end;
+        end;
+    end;
+        
+    if (( CommSum < $0 ) or (CommSum > SymbSum) ) // На всякий случай
+        CommSum = $0;
+    end;
+    
+    PackRest = MaxValue - SumOfBases - UsedPack; // Определяем остаток пакета БЕЗ УЧЕТА текущей базы комиссии
+    // Добавляем рассчитанную базу к общей сумме баз
+    SumOfBases = SumOfBases + CommSum;
+    SetGlobalParameter("IPEV_SumOfBasesPackGlob" + string (cashDoc.AutoKey), SumOfBases); // перезаписываем глобальную переменную
+    
+    // А теперь определяем нужно ли списывать эту комиссию в зависимости от того, остались ли бесплатные платежи по пакету
+
+    If (PackRest > 0)
+        If (CommSum <= PackRest)
+            CommSum = 0;
+        else 
+            CommSum = CommSum - PackRest;
+        end;
+    end;
+    
+    CommSum = CommSum * TarifValue / 100;
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2  = SF_BASETYPE_SUM;
+    sfbassum.baseSum2   = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы: ", GetErrMsg );
+    end;
+
+ 
+    
+end;/*CalcCommissionSum*/
+
+        
+        
+        
+        
+        
+        
+      
+      
+      
+      
+      
+      
+      
+      

@@ -1,0 +1,141 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: lib_fc_corporate.mac v.1
+// @author  : 2012-12-20 zip_z. 
+// @desc    : Общие функции для работы с корпоративными картами из Фронта
+// @changes : none
+// -------------------------------------------------------------------------------------------------
+import lib_sqltools, globals, fg_Life_parm;
+
+private var bank = fg_life_subject ({OURBANK});
+
+const SF_PRIORITY_PASS_ONLY = 1;
+const SF_PRIORITY_PASS_NONE = 2;
+
+const SF_TYPE_DMSB = 1;
+const SF_TYPE_DRB  = 2;
+
+// -------------------------------------------------------------------------------------------------
+// Константы
+// -------------------------------------------------------------------------------------------------
+
+/** состояния sms-оповещений (системный справочник 10002) **/
+const FC_SMS_STATE_DISABLED = 0; // отключено
+const FC_SMS_STATE_ENABLED  = 1; // включено
+
+/** состояния корпоративных карт (системный справочник 10003) **/
+const FC_STATE_NEW              = 1 ; // Новая                               
+const FC_STATE_IS_MAKING        = 2 ; // На изготовлении                     
+const FC_STATE_IS_MADE          = 3 ; // Изготовлена                         
+const FC_STATE_SERVED           = 4 ; // Обслуживается                       
+const FC_STATE_BLOCKED          = 5 ; // Заблокирована                       
+const FC_STATE_STOLEN           = 6 ; // Украдена                            
+const FC_STATE_LOST             = 7 ; // Утеряна                             
+const FC_STATE_CLOSED           = 8 ; // Закрыта                             
+const FC_STATE_REJECTED         = 9 ; // Отклонена                           
+const FC_STATE_DONTMAKE         = 10; // Не изготавливать                    
+const FC_STATE_TOBECLOSED       = 11; // К закрытию                          
+const FC_STATE_NO_ACTIVATION    = 12; // Не активирована                     
+const FC_STATE_WITHDRAW         = 13; // Изъять карту                        
+const FC_STATE_CONTACT_ISSUER   = 14; // Необходимо связаться с эмитентом    
+const FC_STATE_FRAUD            = 15; // Изъять, подозрение в мошенничестве  
+const FC_STATE_NO_DT            = 16; // Без снятия                          
+const FC_STATE_EXPIRED          = 17; // Истекла                             
+const FC_STATE_PIN_BLOCKED      = 18; // PIN Блокировка                      
+
+// -------------------------------------------------------------------------------------------------
+// Функции SQL-фильтров, используемых в процедуре
+// -------------------------------------------------------------------------------------------------
+macro GetSfContr_Object_InFilterCondition ()
+    return (  "SELECT t_account FROM daccount_dbt "
+              + "\n    WHERE     regexp_like (t_account, '^40[5-7]|^4080[2,7]') "
+              + "\n      AND regexp_like (to_char (t_balance), '^40[5-7]|^4080[2,7]') "
+              + "\n      AND t_open_close = chr (0) AND t_chapter = 1 AND instr (t_usertypeAccount, 'D') > 0 "
+              + "\n      AND substr (t_account, 11, 1) = '9'"
+           );
+end;
+
+macro GetSfConcom_ObjectId_InFilterCondition ()
+    return ( "SELECT t_id FROM dsfcontr_dbt WHERE t_object IN ( " + GetSfContr_Object_InFilterCondition () +  " ) "
+             + "\n AND t_objectType = 1 AND t_servKind = 3 "
+             + "\n AND t_partyid IN (SELECT DISTINCT t_objectid FROM usr_vw_com_cardinfo)"
+           );
+end;
+
+macro GetCodeCommission_RegexpFilter ()
+    return " REGEXP_INSTR (TRIM (t_Code), '^(12.1.[1-2])') = 1 ";
+end;
+
+
+// -------------------------------------------------------------------------------------------------
+// Функции для использования в макросах расчета базовой суммы
+// -------------------------------------------------------------------------------------------------
+
+// @desc   : является ли лицевой счёт счётом СКС (определяется по пользовательскому типу D )
+// @param  : account V_STRING - лицевой счёт
+// @return : V_BOOL (true, если является)
+macro Acc_IsCardAccount (account:string):bool
+    var sql = GetSfContr_Object_InFilterCondition () + "\n AND t_Account = :m_account";
+    sql = execSqlSelect (sql, makeArray (SQLParam ("m_account", account)), false);
+    return sql.moveNext ();
+end;
+
+// @desc : подсчет базовой суммы комиссий 12.х для заданного partyid
+// @param: partyid          V_INTEGER - ID субъекта
+// @param: is_priority_pass V_BOOL    - учитывать ли карты PRIORITY PASS
+  Macro Com_FC_GetBaseQuantity(partyid, dateend, dbms, prior_pass, sms)
+
+ var sqwyrt, rs, rsbcode, priority_pass, smstxt;
+   
+  if (dbms)
+    rsbcode = " and VW.RSBCODE = 9605 ";
+  else
+    rsbcode = " and VW.RSBCODE = 9604 ";
+  end;
+  
+  if (valtype(prior_pass) == V_UNDEF)
+    priority_pass = " ";
+  elif(prior_pass)
+    priority_pass = " and VW.M_PRIORITY_PASS = 'X' ";
+  else
+    priority_pass = " and VW.M_PRIORITY_PASS = '0' ";
+  end;
+  
+  if (sms)
+    smstxt = " and VW.M_SMS = 1 ";
+  else
+    smstxt = " ";
+  end;
+  
+  sqwyrt = " SELECT   count(1) " +
+           "  FROM   usr_vw_com_cardinfo vw " +
+           " WHERE   VW.DATE_BEGIN BETWEEN (SELECT   TRUNC (to_date('"+dateend+"','dd.mm.yyyy'), 'month') - INTERVAL '3' YEAR FROM   DUAL) " +
+           "                           AND  (SELECT   TO_DATE (LAST_DAY (to_date('"+dateend+"','dd.mm.yyyy'))) - INTERVAL '1' YEAR FROM   DUAL) " +
+           "         and VW.T_OBJECTID = " + partyid + priority_pass + smstxt + rsbcode;
+  rs = RSDRecordSet(sqwyrt);
+  if (rs and rs.moveNext)
+    return rs.value(0);
+  else
+    return 0;
+  end;
+
+  End;
+
+// -------------------------------------------------------------------------------------------------
+// Функции, используемые для скроллингов
+// -------------------------------------------------------------------------------------------------
+
+// @desc: возвращает базовый запрос для скроллинга с информацией по картам
+macro FC_GetSqlQuery ():string
+    var sql = "SELECT --+index (c usr_front_cardinfo_idx0)"
+            + "\n      rs_code_client, p.t_partyid, p.t_name, fc_name, rsbcode, date_begin, date_end, cardkind_name, cardtype,"
+            + "\n       (SELECT t_name FROM dllvalues_dbt WHERE t_list = 10003 AND t_element = c.status) status,"
+            + "\n       (SELECT t_name FROM dllvalues_dbt WHERE t_list = 10002 AND t_element = c.sms) sms,"
+            + "\n       CASE WHEN EXISTS (SELECT 1 FROM dsfconcom_dbt WHERE t_objectid IN (SELECT t_id FROM dsfcontr_dbt WHERE t_partyid = p.t_partyId)"
+            + "\n                           AND t_ObjectType = 659 AND (t_FeeType, t_CommNumber) = ANY (SELECT t_FeeType, t_Number FROM dsfcomiss_dbt"
+            + "\n                                       WHERE " + GetCodeCommission_RegexpFilter () + " AND t_FeeType = 1))"
+            + "\n           THEN chr (1) ELSE '0' END no_commission"
+            + "\n FROM usr_front_cardinfo c, dobjcode_dbt ok, dparty_dbt p"
+            + "\n WHERE     c.rs_code_client = ok.t_code  AND ok.t_codeKind = 1 AND ok.t_ObjectType = 3 AND ok.t_State = 0  AND ok.t_objectid = p.t_partyid";
+    return sql;
+end;
+

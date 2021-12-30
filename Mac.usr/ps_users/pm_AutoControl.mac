@@ -1,0 +1,372 @@
+/*------------------------------------------------------------------------------
+                     Библиотека интерпретируемых модулей
+
+ Filename    : pm_AutoControl.mac
+ Description : Макрос шага автоматического контроля (сопоставления с дубликатом)
+               для платежей, загруженных из Fine Reader. Заменяет собой шаг обычного
+               контроля документа.
+
+ Programmer  : EVG (Евгений Гуцу)
+ 2011-02-17  : Создан
+ 2014-02-21  : Jushmanov C-19151 Логгирование массово выполненных шагов 
+------------------------------------------------------------------------------*/
+import pm_setst, cbsttls, PTInter, pm_note;
+import OprInter, oralib; //Jushmanov 2014-02-21 C-19151
+
+var PaymentObj:RsbPayment;
+var TablesArray = TArray(0),
+    FieldsArray = TArray(0);
+
+const NOTEKIND_ReasonForFalure = 1010;
+
+/* Ошибки поиска дубликата */
+const DPLSRCHERROR_DuplNotFound = 1,
+      DPLSRCHERROR_MoreThanOneDupl = 2,
+      DPLSRCHERROR_ErrorCreatingLink = 3;
+
+
+MACRO AddToArray( qArray, qValue )
+    var n = 0;
+
+    while( n < qArray.Size )
+        if ( qArray(n) == qValue )
+            return;
+        end;
+        n = n + 1;
+    end;
+
+    qArray( qArray.Size ) = qValue;
+END;
+
+
+MACRO FillErrorNote( errCode, PaymentId )
+
+    if ( errCode == DPLSRCHERROR_DuplNotFound )
+        InsertNoteForPayment( PaymentID, NOTEKIND_ReasonForFalure, 
+                              "Не найден дубликат документа");
+    elif ( errCode == DPLSRCHERROR_MoreThanOneDupl )
+        InsertNoteForPayment( PaymentID, NOTEKIND_ReasonForFalure, 
+                              "По документу найдено более одного дубликата");
+    elif ( errCode == DPLSRCHERROR_ErrorCreatingLink )
+        InsertNoteForPayment( PaymentID, NOTEKIND_ReasonForFalure, 
+                              "Ошибка привязки дубликата - к дубликату уже привязан другой документ");
+    end;
+
+END;
+
+
+/* Закрытие дубликата */
+MACRO ExecuteDuplicateClosure( DuplId, DocID )
+    var cmd, SQL, error, params, retval;
+
+    cmd = rsdCommand( "Update DpsDupAor_dbt Set " +
+                      " t_Control      = CHR(88), " +
+                      " t_OperControl  = " + {Oper} + ", " +
+                      " t_CurrentState = 1 " +           // Закрыт
+                      "Where t_OrderId = " + DuplId );
+    SQL_Execute( cmd );
+
+    params = makeArray( SQLParam( "duplId", DuplId ),
+                        SQLParam( "paymId", DocID ),
+                        SQLParam( "bankDate", {CurDate} ),
+                        SQLParam( "ssDate", Date ),
+                        SQLParam( "ssTime", string(Time) ),
+                        SQLParam( "oper", {Oper} ),
+                        SQLParam( "retVal", V_INTEGER, RSDBP_OUT )
+                      );
+    retval = execStoredFunc( "USR_INSERT_DUPLICATE_LINK", V_UNDEF, params );
+    error = params.Value(6).value;
+
+    if ( error != 0 )
+       return DPLSRCHERROR_ErrorCreatingLink;
+    end;
+
+    return 0;
+END;
+
+
+MACRO GetControlFieldsArray( OrderDocKind )
+    var ControlNumber = 0,
+        ExistsPmcoRecord = false,
+        ErrCode,
+        TableName,
+        FieldName;
+    var SQL, rs;
+
+    /* Получим номер описателя контроля */
+    if ( OrderDocKind == 1 )    // Платёжное поручение
+
+        GetRegistryValue( "PS\\PAYORDER\\ORDER\\DUPCONTROL\\CONTROL_NUMBER", V_INTEGER, ControlNumber, ErrCode );
+        if ( ErrCode > 0 )
+            msgbox ("Не задан номер описателя контроля для дубликатов.|Используется описатель № 1.");
+            ControlNumber = 1;
+        end;
+
+    elif ( OrderDocKind == 2 )  // Платёжное требование
+
+        GetRegistryValue( "PS\\PAYORDER\\DEMAND\\DUPCONTROL\\CONTROL_NUMBER", V_INTEGER, ControlNumber, ErrCode );
+        if ( ErrCode > 0 )
+            msgbox ("Не задан номер описателя контроля для дубликатов.|Используется описатель № 2.");
+            ControlNumber = 2;
+        end;
+
+    elif ( OrderDocKind == 3 )  // Рублевое инкассовое поручение
+
+        GetRegistryValue( "PS\\PAYORDER\\REQORDER\\DUPCONTROL\\CONTROL_NUMBER", V_INTEGER, ControlNumber, ErrCode );
+        if ( ErrCode > 0 )
+            msgbox ("Не задан номер описателя контроля для дубликатов.|Используется описатель № 3.");
+            ControlNumber = 3;
+        end;
+
+    end;
+
+    /* Выясним, есть ли по платежу реквизиты валютной операции */
+    SQL = " select 1 From dpmco_dbt Where t_PaymentId = " + PaymentObj.PaymentId;
+    rs = rsdRecordSet( SQL );
+    if ( rs and rs.moveNext )
+        ExistsPmcoRecord = true;
+    end;
+
+    /* Опраделим по макету поиска из описателя контроля список полей, по которому будем 
+       осуществлять поиск дубликата */
+    SQL = " select   fld.t_fmt_table, fld.t_fmt_table || '.' || fld.t_fmt_field ";
+    SQL = SQL + "  from   ddupctrl_dbt ctrlDesc, dmakettabfld_dbt fld ";
+    SQL = SQL + " where   ctrlDesc.t_DuplicateControlId = " + ControlNumber;
+    SQL = SQL + "   and   fld.t_MaketId                 = ctrlDesc.t_SearchMaketId ";
+    rs = rsdRecordSet( SQL );
+    while ( rs and rs.moveNext )
+
+        TableName = rs.value( 0, null, V_STRING );
+        FieldName = rs.value( 1, null, V_STRING );
+       
+        /* !!! Временно !!! */
+        /* Пока не известна связь между названиями заблокированных в макете полей и именами
+           полей в таблицах БД, делаем фильтрацию по подстроке здесь. */
+
+        debugbreak;
+        if (   ( index( FieldName, "dpmrmprop_dbt.t_number" )               > 0 )       // N (домер) документа
+            or ( index( FieldName, "dpmrmprop_dbt.t_date" )                 > 0 )       // Дата документа
+            or ( index( FieldName, "dpmpaym_dbt.t_valuedate" )              > 0 )       // Дата значения
+            or ( index( FieldName, "dpmpaym_dbt.t_payeraccount" )           > 0 )       // Счёт плательщика
+            or ( index( FieldName, "dpmprop_dbt.t_bankcode" )               > 0 )       // БИК получателя
+            or ( index( FieldName, "dpmrmprop_dbt.t_receivercorraccnostro") > 0 )       // Корсчёт получателя
+            or ( index( FieldName, "dpmpaym_dbt.t_receiveraccount" )        > 0 )       // Счёт получателя
+            or ( index( FieldName, "dpmpaym_dbt.t_amount" )                 > 0 )       // Счёт получателя
+           )
+
+            AddToArray( TablesArray, TableName );
+            AddToArray( FieldsArray, FieldName );
+
+        /* Поля структуры dpmco_dbt проверяются только в том случае, если по платежу существует
+           запись в этой таблице */
+        elif ( ( index( FieldName, "dpmco_dbt" ) > 0 ) and ExistsPmcoRecord )
+
+            /* dpmco_dbt.t_paymentid проверять не нужно - естественно, у дубликата оно другое */
+            if ( FieldName != "dpmco_dbt.t_paymentid" )
+                AddToArray( TablesArray, TableName );
+                AddToArray( FieldsArray, FieldName );
+            end;
+        end;
+    end;
+
+    return true;
+END;
+
+
+/* Превращает в передаваемом параметре имя таблицы для платежей
+   в имя таблицы для дубликатов. */
+MACRO GetDUPTblName( tValue:string )
+
+    /* Приходится для dpmrmprop_dbt и dpmco_dbt делать отдельное правило */
+    if ( index( tValue, "dpmrmprop_dbt" ) > 0 )
+        tValue = StrSubst( tValue, "dpmrmprop_dbt", "dpmdurmpp_dbt" );
+    elif ( index( tValue, "dpmco_dbt" ) > 0 )
+        tValue = StrSubst( tValue, "dpmco_dbt", "dpmdupco_dbt" );
+    else
+        tValue = StrSubst( tValue, "pm", "pmdu" );
+    end;
+
+    return tValue;
+END;
+
+
+MACRO ExecuteDuplicateSearch( PaymObj, DuplicateId:@integer, DuplicatePack:@integer )
+
+    var n;
+    var SQL, rs;
+    var FromClause,
+        WhereClause,
+        FieldName_Dup;
+
+    /* Собираем строку FROM по массиву TablesArray */
+    n = 0;
+    FromClause = "";
+    WhereClause = "";
+
+    while( n < TablesArray.Size )
+
+        if ( n > 0 )
+            FromClause  = FromClause  + ", ";
+            WhereClause = WhereClause + " AND ";
+        end;
+
+        FromClause = FromClause + TablesArray(n);
+
+        /* Также в FromClause необходимо добавить соответствующую таблицу дубликатов */
+        FromClause = FromClause + ", " + GetDUPTblName( TablesArray(n) );
+
+        /* Также в WhereClause связываем нужные таблицы по t_PaymentId */
+        WhereClause = WhereClause + TablesArray(n) + ".t_PaymentId = " +  PaymObj.PaymentId + "\n";
+
+        /* По t_PaymentId нужно связать также все таблицы дубликатов.
+           Связать придется жестко с dPmDuPaym_dbt, но это не так плохо,
+           т.к. записи в dPmDuPaym_dbt НЕ быть не может, иначе нет и дубликата. */
+        WhereClause = WhereClause + " AND " + GetDUPTblName( TablesArray(n) ) + ".t_PaymentId = dPmDuPaym_dbt.t_PaymentId \n";
+
+        /* Если присутствует условия поиска по dpmprop_dbt, то надо указать, что брать нужно
+           только кредитовые свойства платежа (t_DebetCredit = 1). */
+        if ( TablesArray(n) == "dpmprop_dbt" )
+            WhereClause = WhereClause + " AND dpmprop_dbt.t_DebetCredit = 1 "
+                                      + " AND dpmduprop_dbt.t_DebetCredit = 1 \n";
+        end;
+     
+        n = n + 1;
+    end;
+
+    /* Добавляем в WhereClause условия по полям, по которым делается сопоставление */
+    n = 0;
+    while( n < FieldsArray.Size )
+
+        FieldName_Dup = GetDUPTblName( FieldsArray(n) );
+
+        /* Для dpmco_dbt.t_contractnumber нужно привести null к chr(1), т.к. в дубликате в этом поле
+           chr(1), если оно не заполнено. */
+        if ( FieldsArray(n) == "dpmco_dbt.t_contractnumber" )
+            WhereClause = WhereClause + " AND NVL(" + FieldsArray(n) + ", CHR(1)) = " + FieldName_Dup + "\n";
+        else
+            WhereClause = WhereClause + " AND " + FieldsArray(n) + " = " + FieldName_Dup + "\n";
+        end;
+
+        n = n + 1;
+    end;
+
+    n = 0;
+    SQL = " Select DPmDuPaym_dbt.t_PaymentId, DPmDuPaym_dbt.t_NumberPack ";
+    SQL = SQL + "  From " + FromClause;
+    SQL = SQL + " Where " + WhereClause;
+
+    rs = rsdRecordSet( SQL );
+
+    while ( rs and rs.moveNext() )
+        DuplicateId = rs.value( 0, null, V_INTEGER );
+        DuplicatePack = rs.value( 1, null, V_INTEGER );
+        n = n + 1;
+    end;
+
+    /* Дубликатов не найдено */
+    if ( n == 0 )
+        return DPLSRCHERROR_DuplNotFound;
+    /* Найдено более одного дубликата */
+    elif ( n > 1 )
+        return DPLSRCHERROR_MoreThanOneDupl;
+    end;
+
+    return 0;
+END;
+
+
+MACRO ExecuteStep( doc, paymDoc, DocKind )
+
+    var obj, cmd, rs, stat;
+    var DuplPaymentId, DuplNumberPack;
+
+    if( DocKind == PS_PAYORDER )
+        obj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+    elif( DocKind == PS_CPORDER )
+        obj = GenObject( "RsbPsCpOrder", PaymentObj.DocumentID );
+    elif( DocKind == PS_INRQ )
+        obj = GenObject( "RsbRequestOrder", PaymentObj.DocumentID );
+    end;
+
+    if ( GetControlFieldsArray( obj.DocKind  ) )
+
+        stat = ExecuteDuplicateSearch( PaymentObj, @DuplPaymentId, @DuplNumberPack );
+                                                        
+        if ( stat == 0 )
+            PaymentObj.NumberPack = DuplNumberPack;
+            stat = ExecuteDuplicateClosure( DuplPaymentId, PaymentObj.DocumentID );
+            if ( stat != 0 )
+                FillErrorNote( stat, PaymentObj.DocumentID );
+            end;
+        else
+            FillErrorNote( stat, PaymentObj.DocumentID );
+        end;
+    end;
+
+    if ( stat == 0 )
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    else
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+  
+    return 0;
+END;
+
+
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+   
+    var DuplId, cmd, rs;
+    private var logquery;
+
+    //Jushmanov 2014-02-21 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if (( message == OP_BACKOUT_STEP ) and (errTrn == 0))
+      
+        cmd = " Select t_DupPaymentId From DDupPmLnk_dbt " +
+              "  Where t_PaymentId = " + PaymentObj.DocumentID;
+        rs = rsdRecordSet( cmd );
+        if ( rs and rs.moveNext() )
+
+            DuplId = rs.value( 0, null, V_INTEGER );
+
+            /* Удаление связи */
+            cmd = rsdCommand( "Delete From DDupPmLnk_dbt " +
+                              " Where t_DupPaymentId = " + DuplId +
+                              "   and t_PaymentId    = " + PaymentObj.DocumentID );
+            SQL_Execute( cmd );
+
+            /* Обновление статуса дубликата */
+            cmd = rsdCommand( "Update DpsDupAor_dbt Set " +
+                              " t_Control      = CHR(0), " +
+                              " t_OperControl  = 0, " +
+                              " t_CurrentState = 0  " +           // Открыт
+                              "Where t_OrderId = " + DuplId );
+            SQL_Execute( cmd );
+
+        end;
+    end;
+
+    return 0;
+END;

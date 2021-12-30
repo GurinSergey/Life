@@ -1,0 +1,636 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29030 - "Обработка невыясненной суммы"
+// Шаг       : 53    - "Обработка невыясненной суммы"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+// Изменения:
+// KS 12.04.2012  I-00176185 Правлю остатки в смс 
+// Chesnokov D.S. 10.06.2012 Отправка письма в Lotus по заявке С-10370
+// Gurin S. 19.02.2013 C-14957 Меняем дату значения документа при списании с невыясненных на текущую.
+// TAM      12.08.2013 C-21757 - обработка ED108
+// KS 06.12.2013 Перенос пользовательских доработок в 31ю сборку
+// Jushmanov 2014-02-25 C-19151 Логгирование массово выполненных шагов
+// SDA 11.03.2014  - Зачисление с невыясненных не должно порождать документ
+//-----------------------------------------------------------------------------
+
+import PaymInter, BankInter, WldInter, PTInter, OprInter, CTInter, "rmconst.mac", "cbsttls.mac", oralib, likepy, pmsummo, "pm_common.mac", pm_tools;
+import "check_val_acc.mac";
+import FrontRoute, FrontCommon, lib_menu_common, lib_registry;
+import "navk.mac";
+import "op_lib.mac", "Send_lotus.mac", "fg_Life_parm.mac", lib_pm_check;
+
+var PaymentObj:RsbPayment;
+private var fgBank = fg_life_subject({OurBank});
+
+PRIVATE CLASS TCategory( _GroupID:integer, _AttrID:integer )
+    VAR GroupID:integer = _GroupID;
+    VAR AttrID:integer  = _AttrID;
+END;
+
+
+//------------------------------------------------------------------------------
+// Получить список категорий платежа
+//------------------------------------------------------------------------------
+PRIVATE MACRO GetCategoryForPayment( PaymentID:integer ):TArray
+    var CatList:TArray = TArray();
+    var query:string =  "select T_GROUPID, T_ATTRID " +
+                        "  from dobjatcor_dbt " +
+                        " where t_ObjectType = :ObjectType " +
+                        "   and t_Object = LPAD(:PaymentID, 10, '0');";
+    var params:TArray = makeArray( SQLParam( "ObjectType", OBJTYPE_PAYMENT ), 
+                                   SQLParam( "PaymentID", PaymentID ) );
+    var rs:RsdRecordset = execSQLselect( query, params, true );
+    if( rs )
+        while( rs.moveNext() )
+            CatList[CatList.size] = TCategory( rs.value(0), rs.value(1) );
+        end;
+    end;
+    return CatList;
+ONERROR(x)
+    return CatList;
+END;
+
+
+private macro istransacc(acc, fiid)
+    var cmd = RSDCommand ("select 1 from daccount_dbt where t_chapter = 1 and t_code_currency = ? and t_account = ? and t_type_account like '%Y%'");
+    cmd.addparam("fiid", RSDBP_IN, fiid);
+    cmd.addparam("acc",  RSDBP_IN, acc);
+    var rs = RSDRecordset(cmd);
+    if (rs.movenext)
+        return true;
+    end;
+    return false;
+end;
+
+
+private macro statvk(payment)
+    var cmd = RSDCommand ("SELECT 1 "+
+                          "  FROM doprcurst_dbt cur, doproper_dbt opr "+
+                          " WHERE     t_documentid = LPAD ("+payment+", 34, '0') "+
+                          "   AND cur.t_id_operation = opr.t_id_operation "+
+                          "   AND cur.t_numvalue = 1 "+
+                          "   AND cur.t_statuskindid = 117");
+    var rs = RSDRecordset(cmd);
+    if (rs.movenext)
+        return true;
+    end;
+    return false;
+end;
+
+
+//-----------------------------------------------------------------------------
+// Создать требование/поручение банка
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CreateBankPayment( byvariant:integer, stat:@integer ):RsbPayment
+    stat = 0;
+    var Payment:RsbPayment = null; // платеж 
+    var BankPayment:object = null; // первичный документ
+    var pi       : TRecHandler = TRecHandler( "pmaddpi.dbt" );
+    var piAccount: string  = "";
+    var piClient : integer = 0;       
+    var DC       : integer = IfThenElse( PaymentObj.IsCredit(), 1, 0 );
+    if( byvariant == 3 ) // Платеж с уточ. записями
+        if( ( PaymentObj.PIList( DC ).First() == 0 ) and ( PaymentObj.PIList( DC ).Current( pi ) == 0 ) )
+            piAccount = pi.rec.Account;
+            piClient  = pi.rec.AccountClient;
+        end;
+    end;
+
+    // Заполнение полей кредитового платежа
+    if( PaymentObj.IsCredit() )
+
+        // Создание рублевого кредитового платежа
+        if( ( PaymentObj.PayerFIID == PaymentObj.BaseFIID )
+        and ( PaymentObj.PayerFIID == PaymentObj.ReceiverFIID )
+        and ( PaymentObj.PayerFIID == 0 /*NATCUR*/ ) )
+            BankPayment = GenObject( "RsbBankPayment", 0 );
+            Payment     = BankPayment.Payment();
+            BankPayment.Origin     = MEMORDER_FDOC_PROCUNKNOWNPM; // Обработка невыясненного платежа
+            BankPayment.Oper       = {oper}; 
+            BankPayment.Status     = 1/*MEMORDER_STATUS_POST*/;
+            Payment.DocKind        = DLDOC_BANKPAYMENT;
+            Payment.Purpose        = PM_PURP_BANKPAYMENT;
+            Payment.BaseFIID       =
+            Payment.PayerFIID      = 
+            Payment.ReceiverFIID   = PaymentObj.PayerFIID;
+            Payment.BaseAmount     = PaymentObj.PayerAmount;
+            Payment.ReceiverAmount = PaymentObj.PayerAmount;
+            Payment.PayerAmount    = PaymentObj.PayerAmount;
+        else
+            BankPayment              = GenObject( "RsbBbCpOrder", 0 );
+            Payment                  = BankPayment.Payment();
+            BankPayment.Origin       = CP_OR_PROCUNKNOWNPM; // Обработка невыясненного платежа
+            BankPayment.Oper         = {oper}; 
+            BankPayment.CurrentState = 0/*CP_ST_DEFERRED*/;
+            Payment.DocKind          = BBANK_CPORDER;
+            Payment.Purpose          = PM_PURP_BANKPAYMENT;
+            Payment.ComissCharges    = PM_CHRG_SHA;
+            Payment.BaseFIID         = PaymentObj.BaseFIID;
+            Payment.PayerFIID        = PaymentObj.BaseFIID;
+            Payment.ReceiverFIID     = PaymentObj.ReceiverFIID;
+            Payment.BaseAmount       = PaymentObj.BaseAmount;
+            Payment.PayerAmount      = PaymentObj.BaseAmount;
+            Payment.ReceiverAmount   = PaymentObj.ReceiverAmount;
+        end;
+
+        Payment.OrderFIID        = Payment.BaseFIID;
+        Payment.OrderAmount      = Payment.BaseAmount;
+        Payment.IsFixPayerAmount = "X";
+        stat = Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                                   {OurBank}, 
+                                   IfThenElse( Payment.DocKind == DLDOC_BANKPAYMENT, PTCK_BIC, PTCK_CONTR ),
+                                   "", 
+                                   "",
+                                   "",
+                                   PaymentObj.FuturePayerFIID, 
+                                   1/*CHAPT1*/, 
+                                   PaymentObj.FuturePayerAccount
+                                 );
+        if( stat ) return null; end;
+
+        stat = Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                      {OurBank}, 
+                                      IfThenElse( Payment.BaseFIID == NATCUR, PTCK_BIC, PTCK_SWIFT ), 
+                                      "", 
+                                      "",
+                                      "",
+                                      PaymentObj.ReceiverFIID, 
+                                      1/*CHAPT1*/, 
+                                      IfThenElse( byvariant == 1, PaymentObj.ReceiverAccount, 
+                                                                  IfThenElse( byvariant == 3, piAccount, "" ) ),
+                                      -1, 
+                                      ""
+                                    );
+        if( stat ) return null; end;
+
+        Payment.Ground = substr( "Перечисление по назначению средств по док. " + PaymentObj.Number + " от " + PaymentObj.Date + " '" + PaymentObj.Ground + "'", 1, 600 );
+
+    else // Заполнение полей дебетового платежа
+
+        BankPayment            = GenObject( "RsbBankClaim", 0 );
+        Payment                = BankPayment.Payment();
+        BankPayment.Origin     = MEMORDER_FDOC_PROCUNKNOWNPM; // Обработка невыясненного платежа
+        BankPayment.Oper       = {oper}; 
+        BankPayment.Status     = 1/*MEMORDER_STATUS_POST*/;
+        Payment.DocKind        = DLDOC_BANKCLAIM;
+        Payment.Purpose        = PM_PURP_BANKPAYMENT;
+        Payment.BaseFIID       = PaymentObj.BaseFIID;
+        Payment.PayerFIID      = PaymentObj.PayerFIID;
+        Payment.ReceiverFIID   = PaymentObj.FutureReceiverFIID;
+        Payment.BaseAmount     = PaymentObj.BaseAmount;
+        Payment.PayerAmount    = PaymentObj.PayerAmount;
+        Payment.ReceiverAmount = PaymentObj.FutureReceiverAmount;
+        Payment.OrderFIID      = Payment.BaseFIID;
+        Payment.OrderAmount    = Payment.BaseAmount;
+
+        stat = Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                                   {OurBank}, 
+                                   IfThenElse( byvariant == 1, PTCK_BIC, PTCK_CONTR ),
+                                   "", 
+                                   "",
+                                   "",
+                                  PaymentObj.PayerFIID, 
+                                   1/*CHAPT1*/, 
+                                   IfThenElse( byvariant == 1, PaymentObj.PayerAccount, 
+                                                               IfThenElse( byvariant == 3, piAccount, "" ) ),
+                                   -1,
+                                   "",
+                                   ""
+                                 );
+        if( stat ) return null; end;
+
+        stat = Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                      {OurBank}, 
+                                      PTCK_BIC, 
+                                      "", 
+                                      "",
+                                      "",
+                                      PaymentObj.FutureReceiverFIID, 
+                                      1/*CHAPT1*/, 
+                                      PaymentObj.FutureReceiverAccount
+                                    );
+        if( stat ) return null; end;
+
+        Payment.DemandAcceptTerm = PM_DEMAND_TERM_WITHOUTACCEPT;
+        Payment.DemandAccept = PM_DEMAND_ACCEPT_NONE;
+        Payment.Ground = substr( "Списание средств по док. " + PaymentObj.Number + " от " + PaymentObj.Date + " '" + PaymentObj.Ground + "'", 1, 600 );
+
+    end;
+
+    Payment.Number      = PaymentObj.Number;
+    Payment.Priority    = PaymentObj.Priority;
+    Payment.PaymentKind = "Э";
+    if( Payment.DocKind == DLDOC_BANKCLAIM )
+        Payment.ShifrOper   = "02";
+    else
+        Payment.ShifrOper   = "01";
+    end;
+
+    Payment.PayDate      = PaymentObj.ValueDate;
+    Payment.ClientDate   = 
+    Payment.Date         = {curdate};
+    Payment.ValueDate    = PM_GetDefaultValueDate(Payment.Department, Payment.PrimDocKind);
+    Payment.NumberPack   = 0;
+    Payment.Origin       = 2;
+    Payment.ToBackOffice = PaymentObj.ToBackOffice;
+    Payment.FeeType      = PaymentObj.FeeType;
+    Payment.DefComID     = PaymentObj.DefComID; 
+    // заполняются налоговые данные
+    Payment.TaxAuthorState = PaymentObj.TaxAuthorState;
+    Payment.BttTICode      = PaymentObj.BttTICode;
+    Payment.OKATOCode      = PaymentObj.OKATOCode;
+    Payment.TaxPmGround    = PaymentObj.TaxPmGround;
+    Payment.TaxPmPeriod    = PaymentObj.TaxPmPeriod;
+    Payment.TaxPmNumber    = PaymentObj.TaxPmNumber;
+    Payment.TaxPmDate      = PaymentObj.TaxPmDate;
+    Payment.TaxPmType      = PaymentObj.TaxPmType;
+
+    if( byvariant == 3 )
+        // Копируем из исходного платежа уточ. записи
+        stat = CopyPIFromPaymIntoOthePaym( PaymentObj, Payment, DC );
+        if( stat ) return null; end;
+    end;
+    // Установить признак автозапуска операции.
+    BankPayment.LaunchOper = true;
+    // Копируем из исходного платежа категории
+    CopyPaymentCategories(Payment, PaymentObj);
+    // Копируем из исходного платежа примечания
+    CopyPaymentNotes(Payment, PaymentObj);
+    return Payment;
+END;
+
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+MACRO ExecuteStep( doc, first, KindDoc )
+    debugbreak;
+    var PayPayment:RsbPayment = null;
+    var Action:integer = 0;
+    var stat:integer = 0;
+    var RegVal:bool = false;
+    var err;
+
+    GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\НЕВЫЯСНЕННЫЕ\\НОВЫЙ_ДОКУМЕНТ", V_BOOL, RegVal, err );  
+
+    var msg, notresident, m, df;
+    var mn = Tarray();
+
+    var paymtr:RsbPaymTransaction;
+    var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+    var RestAcc = $0;
+    var acc_rec = PaymentObj.FutureReceiverAccount;
+    var acc_rec_fiid = PaymentObj.ReceiverFIID;
+    var cmd, rs;
+    var dlgvarCarry = -1, dlgvarOut = -1; // KS 28.02.2011 глобальная переменная для единичного вопроса о зачислении
+    var Theme, Email = "";
+    Array Text;
+    Array Buttons;
+
+
+    macro IsClientAccount ( acc )
+        Var val, err;
+        if ( (GetRegistryValue ("PS\\REQOPENACC\\СЧЕТА КЛИЕНТОВ", V_STRING, val, err)) and (err==0) )
+            if ( CompareStrWithMasks (val, acc) ) // неклиентский счет
+                return false;
+            end;
+        end;
+        return true;
+   end;
+
+   
+    private macro НеВыгружать();
+        var sql, cmd, rs;
+        sql = " select T_USERFIELD1 from dcorschem_dbt where T_FIID = ? and t_number = ?";
+        cmd = RSDCommand( sql );
+        cmd.AddParam( "dp", RSDBP_IN, PaymentObj.OutCorschemFIID );
+        cmd.AddParam( "nu", RSDBP_IN, PaymentObj.OutCorschem );
+        rs = RSDRecordSet( cmd );
+        if ( rs.MoveNext )
+            return ( Trim(rs.value(0)) == "to_close");
+        end;
+        return false;
+    end;
+
+
+    macro ins_carry(receiver_account, sum, ground, receiverfiid, receiversum)
+        paymtr = PaymentObj.MakeTransaction();
+        paymtr.Chapter      = 1;
+        // TAM 08.12.2014 R-508546
+        if( PaymentObj.FuturePayerFIID == receiverfiid )
+            paymtr.FIID          = PaymentObj.FuturePayerFIID;
+            paymtr.Sum           = PaymentObj.FuturePayerAmount;
+        else
+            paymtr.FIIDPayer     = PaymentObj.FuturePayerFIID;
+            paymtr.FIIDReceiver  = receiverfiid;
+            paymtr.SumPayer      = PaymentObj.FuturePayerAmount;
+            paymtr.SumReceiver   = PaymentObj.FutureReceiverAmount;
+        end;
+        if( PaymentObj.NumberPack > 0)
+            paymtr.Number_Pack = PaymentObj.NumberPack;
+        else
+            paymtr.Number_Pack = 1;
+        end;
+        paymtr.ResultCarry = AVIZOCARRY;
+        paymtr.Kind_Oper  = " 6";
+        paymtr.Shifr_Oper = "09";
+        paymtr.AccountPayer      = PaymentObj.FuturePayerAccount;
+        paymtr.AccountReceiver   = receiver_account;
+        paymtr.Date_Carry    = {curdate};
+        paymtr.Department    = PaymentObj.Department;
+        paymtr.Ground        = Ground;
+        paymtr.Numb_Document = PaymentObj.Number;     
+        paymtr.ClaimID       = PaymentObj.ClaimID;
+
+        if( not paymtr.Carry() )
+            MsgBox("Ошибка при актуализации платежа");
+            return false;
+        else
+            //29.05.2012 Chesnokov D.S. Отправка письма в Lotus по заявке С-10370
+            //03.04.2013 zmp добалены ЭВ-Саратов и ВУЗ
+            //zmp 28.07.2014 R-418310-5
+            //if (fgBank.is_PRBB or fgBank.is_EXV or fgBank.is_VUZ)
+                if (PaymentObj.Dockind == 320)
+                    if ((PaymentObj.ReceiverBankID == {OurBank}) and (CheckPension(paymtr.AccountReceiver)))
+                        Theme = "Зачисление пенсий";
+                        GetRegistryValue("PRBB\\ЗАЧИСЛЕНИЕ ПЕНСИЙ\\ПОЛУЧАТЕЛЬ", V_STRING, Email, stat);
+                        if ((stat == 0) and (trim(Email) != ""))
+                            Send_l(Theme, GetPensLetter(Paymentobj, paymtr), 73, Email); 
+                        end;
+                    end;
+                end;
+            //end;
+        end;
+        return true;
+    end;
+
+
+    //SDA 01.03.2012 - запрет пакетного выполнения только для роботов - люди пусть сами думают, своей головой 
+    if (({oper} >= 20000) or ({oper} == 10000) or ({oper} == 10001))
+        if( IsOprMultiExec() ) // KS 16.02.2012 I-00154809 Запрет запуска шага в безынтерфейсном режиме (для запрета запуска через обработчики)
+            return 1;
+        end;
+    end;
+
+    //zmp 08.11.2013 R-279854 проверяем на то что макрос выполняет не обработчик
+    if((index(RSL_GetIdentProgram(), "ГЛАВНАЯ КНИГА") != 0) and IsOprMultiExec())
+        return 1;
+    end;
+
+    // Для внутренних и межфилиальных платежей
+    if (НеВыгружать())
+    //SDA - закрываем внешние платежи в исходящей СР которых установлен признак закрытия без выгрузки в МБР
+        PaymentObj.SetReceiverPI( PAYMENTS_GROUP_INTERNAL,                   
+                                  {OurBank},
+                                  PaymentObj.ReceiverBankCodeKind,
+                                  PaymentObj.ReceiverBankCode,
+                                  PaymentObj.ReceiverBankName,
+                                  PaymentObj.ReceiverBankCorrAcc,
+                                  PaymentObj.ReceiverFIID,
+                                  PaymentObj.chapter,
+                                  PaymentObj.ReceiverAccount,
+                                  PaymentObj.Receiver,
+                                  PaymentObj.ReceiverName,
+                                  PaymentObj.ReceiverINN,
+                                  null,
+                                  null,
+                                  -1,
+                                  PM_CORRPOS_TYPE_USER);
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+        if( not InsertPaymentPropStat( PaymentObj.PaymentID, PM_FINISHED ) )
+            msgbox("Ошибка при вставке статуса платежа");
+            return 1;
+        end;
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+        if (not(ins_carry(acc_rec, PaymentObj.PayerAmount, PaymentObj.Ground, PaymentObj.ReceiverFIID, PaymentObj.ReceiverAmount)))
+            return 1;
+        end;
+        return 0;
+    end;
+
+    //Восстановлени FuturePayerAccount после создание уточн. записи из списка всех входящих
+    //TAM 24.12.2013 adaptation for 2031
+    cmd = RSDCommand(" SELECT  NVL (ad.t_account_receiver, ad.t_account_receiver)  " +
+                     "   FROM  dpmdocs_dbt pm, dacctrn_dbt ad                      " +
+                     "  WHERE  PM.T_ACCTRNID = AD.T_ACCTRNID AND pm.t_paymentid = ? AND ad.t_state  = 1" );
+    cmd.addparam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+    rs = RSDRecordset(cmd);
+
+    if (rs.movenext)
+        PaymentObj.FuturePayerAccount = rs.value(0);
+    end;
+
+    if (IsFrontPayment(PaymentObj))
+        Text(0) = "Документ имеет признак выгрузки во внешнюю систему";
+        Text(1) = "Что сделать с документом?";
+        Buttons(0) = "Выгрузить";
+        Buttons(1) = "Зачислить";
+        Buttons(2) = "Закрыть без проводки";
+        Buttons(3) = "Отменить";
+    else
+        Text(0) = "Что сделать с документом?";
+        Buttons(0) = "Зачислить";
+        Buttons(1) = "Закрыть без проводки";
+        Buttons(2) = "Отменить";
+    end;
+
+    dlgvarCarry = ConfWin( Text, Buttons );
+
+    if (Buttons(dlgvarCarry) == "Закрыть без проводки")
+        PaymentObj.CloseUnknown();
+        //if( RegVal == true )
+            // Сегменту "Состояние платежа" статуса исходного платежа присваивается значение "Закрыт".
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+        //end;
+        return 0;
+
+    elif (Buttons(dlgvarCarry) == "Выгрузить")
+        //Gurin S. 19.02.2013 C-14957
+        PaymentObj.ValueDate = {curdate};
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO, 
+                                      OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED, 
+                                      OPR_PAYM_DO, OPR_PM_ST_ENTER, 
+                                      OPR_STATUS_FRONT, OPRSTAT_FRONT_YES, 
+                                      OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                      OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NONE ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        else
+            return 0;
+        end;
+
+    elif (Buttons(dlgvarCarry) == "Отменить")
+        return 1;
+
+    else //"Зачислить на указанный счет"
+
+        //TAM 12.08.2013 C-21757 - сводные закрываем без проводки - не реагируем на зачисление 
+        if(PaymentObj.purpose == PM_PURP_MULTI)
+            PaymentObj.CloseUnknown();
+            if( RegVal == true )
+                // Сегменту "Состояние платежа" статуса исходного платежа присваивается значение "Закрыт".
+                if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+                    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                    return 1;
+                end;
+            end;
+            return 0;
+        end;
+
+        if (PaymentObj.IsTransit)
+            // если платеж переделали с входящего на транзитный - нужно направить на выгрузку в МБР
+            if( УстановитьСтатусыПлатежа(OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT,
+                                         OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO,
+                                         OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                         OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED,
+                                         OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NONE,
+                                         OPR_PAYM_DO, OPR_PM_ST_DISCHARGE))
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+            PaymentObj.PaymStatus = PM_READY_TO_SEND;
+            PaymentObj.PropStatus = PM_PROP_READY;
+            if (not(ins_carry(acc_rec, PaymentObj.PayerAmount, PaymentObj.Ground, PaymentObj.ReceiverFIID, PaymentObj.ReceiverAmount)))
+                return 1;
+            end;
+            return 0;
+        elif ( ( PaymentObj.PIList(1).Size > 0 ))
+            if( ( PaymentObj.PIList(1).First() == 0 ) and ( PaymentObj.PIList(1).Current(pi) == 0 ) )
+                if (not(ins_carry(pi.rec.Account, pi.rec.pmamount, pi.rec.ground, pi.rec.fiid, pi.rec.amount)))
+                    return 1;
+                else
+                    acc_rec = pi.rec.Account;
+                    acc_rec_fiid = pi.rec.fiid;
+                end;
+                while( PaymentObj.PIList(1).Next() == 0 )
+                    if( PaymentObj.PIList(1).Current( pi ) == 0 )
+                        if (not(ins_carry(pi.rec.Account, pi.rec.pmamount, pi.rec.ground, pi.rec.fiid, pi.rec.amount)))
+                            return 1;
+                        end;
+                    end;
+                end;
+            else
+                return 1;
+            end;
+        elif ( ( СчетСуществуетИОткрыт( PaymentObj.PayerFIID, PaymentObj.FuturePayerAccount, 1) ) and
+               ( СчетСуществуетИОткрыт( PaymentObj.ReceiverFIID, PaymentObj.FutureReceiverAccount, 1) ) )
+            if ( IsClientAccount(acc_rec)
+            and (PaymentObj.PayerFIID != 0)
+            and (IsAccValid(PaymentObj.FutureReceiverAccount, msg, notresident)
+            and (valtype(msg)!=V_UNDEF) and (msg != "")))
+                msgbox(msg);
+                mn = get_valid_accounts(PaymentObj.ReceiverAccount, PaymentObj.ReceiverFiid, notresident);
+                if(mn(0) == "нет доступных счетов");
+                    msgbox( "нет доступных счетов для зачисления");
+                    return 1;
+                else
+                    m = menu(mn,null,"Выберете счет получателя");
+                end;
+                PaymentObj.FutureReceiverAccount = acc_rec = mn(m);
+            end;
+            if (not(ins_carry(acc_rec, PaymentObj.PayerAmount, PaymentObj.Ground, PaymentObj.ReceiverFIID, PaymentObj.ReceiverAmount)))
+                return 1;
+            end;
+        else
+            msgbox("Укажите счет для зачисления (по ctrl+z)");
+            return 1;
+        end;
+    end;
+
+    //Gurin S. 19.02.2013 C-14957
+    PaymentObj.ValueDate = {curdate};
+    // Закрыть запись о невыясненной сумме исходного платежа.
+    PaymentObj.CloseUnknown();
+
+//SDA 11.03.2014  - Зачисление с невыясненных не должно порождать документ
+//    if( RegVal == true )
+        // Сегменту "Состояние платежа" статуса исходного платежа присваивается значение "Закрыт".
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+//    end;
+
+    //Seleznev необходимость обработки поступившей суммы распоряжениями по транзитному счету
+    if( (PaymentObj.BaseFiid != NATCUR)
+    and (istransacc(acc_rec, acc_rec_fiid))
+    and ((paymentObj.Dockind == WL_INDOC)
+      or (paymentObj.Dockind == 322)
+      or (paymentObj.Dockind == BBANK_CPORDER)))
+        PaymentObj.FutureReceiverAccount = PaymentObj.FuturePayerAccount = acc_rec;
+        if( УстановитьСтатусыПлатежа( 119, 1, OPR_PAYM_DO,  OPR_PM_ST_ENTER ) )
+           msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+           return 1;
+        end;
+    end;
+
+    //Если ВК, то изменяем сегменты
+    if (statvk(PaymentObj.paymentid))
+        if( УстановитьСтатусыПлатежа( 304, 1, 292, 4 ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+    //PaymentObj.StatusInfo = "Списан с картотеки невыясненных"; //10.11.2014 Адаптация под хф 95
+    return 0;
+END;
+
+
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    var cmd;
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    //Jushmanov 2014-02-25 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if (( message == OP_BACKOUT_STEP ) and (errTrn==0))
+        // KS 12.04.2012  I-00176185 Правлю остатки в смс 
+        cmd = RSDCommand("begin " + "\n" +
+                         "  update USR_vpaym_dbt " + "\n" +
+                         "     set notification_type = abs(notification_type), " + "\n" +
+                         "         payeraccrest      = case when payeraccrest    is not null then round(?,2) else null end, " + "\n" +
+                         "         receiveraccrest   = case when receiveraccrest is not null then round(?,2) else null end  " + "\n" +
+                         "   where paymentid = ? and notification_type < 0; " + "\n" +
+                         "end;" );
+        if (PaymentObj.PayerFIID == 0)
+            cmd.addParam("", RSDBP_IN, abs(resta(PaymentObj.PayerAccount,    {curdate}, {curdate}, PaymentObj.chapter)));
+            cmd.addParam("", RSDBP_IN, abs(resta(PaymentObj.ReceiverAccount, {curdate}, {curdate}, PaymentObj.chapter)));
+        else
+            cmd.addParam("", RSDBP_IN, abs(restac(PaymentObj.PayerAccount,   PaymentObj.PayerFIID, {curdate}, {curdate}, PaymentObj.chapter)));
+            cmd.addParam("", RSDBP_IN, abs(restac(PaymentObj.ReceiverAccount,PaymentObj.PayerFIID, {curdate}, {curdate}, PaymentObj.chapter)));
+        end;
+        cmd.addParam("", RSDBP_IN, PaymentObj.paymentid);
+        cmd.Execute();
+    end;
+    
+    //TAM 03.12.2014 I-00536743. Запрос оформлен 217756. Решаем костылём.
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0))
+        Rsdcommand("update drminprop_dbt set T_OUTDATE = TO_DATE( '"+{curdate}+"', 'DD.MM.YYYY' ) where T_PAYMENTID = "+PaymentObj.PaymentID).execute;
+    end;
+    
+    return 0;
+end;

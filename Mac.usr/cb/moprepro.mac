@@ -1,0 +1,484 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29018 - "Предобработка мемориального документа"
+// Шаг      : 10    - "Предобработка"
+// Описание : Макрос шага
+// Изменения: Убрал преобразование TO_DATE(sysdate, 'DD/MM/YYYY HH24:MI:SS') сделал просто sysdate LAO 
+// KS 02.12.2013 Адаптация под 31ю сборку
+//-----------------------------------------------------------------------------
+import PaymInter, pmdefbo, pm_syscont, pmchk117, mochkrst, pmterror, pmsummo, pmprepromass;
+
+//Seleznev
+import FrontRoute, FrontCommon;
+
+// EVG
+import AvtoCode;
+//EVG
+import "SetVOStaff.mac";
+import "doc_comiss.mac";
+// KS 22.10.2010 I-068571 Процедура массовой проводки комиссий из внешних систем
+import "BankOrderToComiss.mac";
+// KS 09.06.2011 C-761 Выгрузка проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+import "MemOrderToLimit.mac";
+//SDA 2030 /* отсутствует неявный импорт для ReadNoteForPayment и т.п. */
+import pm_note;
+import OprInter, oralib; //Jushmanov 2014-02-20 C-19151
+
+private var PaymentObj:RsbPayment;
+
+
+/* EVG Функция корректировки номера пользователя в уточняющих записях
+   (по умолчанию опер = пользователь, выполняющий шаг). */
+MACRO PIInList_CorrectOper ( Payment )
+    var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+    var stat:integer = 0;
+
+    if( Payment.PIList( PRT_Debet ).Size > 0 )
+
+        if( ( Payment.PIList( PRT_Debet ).First() == 0 ) and ( Payment.PIList( PRT_Debet ).Current( pi ) == 0 ) )
+            pi.rec.oper = Payment.Oper;
+            stat = Payment.PIList( PRT_Credit ).Update( pi );
+        end;
+
+        while( Payment.PIList( PRT_Debet ).Next() == 0 )
+            if( Payment.PIList( PRT_Debet ).Current( pi ) == 0 )
+                pi.rec.oper = Payment.Oper;
+                stat = Payment.PIList( PRT_Debet ).Update( pi );
+            end;
+        end;
+
+    end;
+
+    if( Payment.PIList( PRT_Credit ).Size > 0 )
+
+        if( ( Payment.PIList( PRT_Credit ).First() == 0 ) and ( Payment.PIList( PRT_Credit ).Current( pi ) == 0 ) )
+            pi.rec.oper = Payment.Oper;
+            stat = Payment.PIList( PRT_Credit ).Update( pi );
+        end;
+
+        while( Payment.PIList( PRT_Credit ).Next() == 0 )
+            if( Payment.PIList( PRT_Credit ).Current( pi ) == 0 )
+                pi.rec.oper = Payment.Oper;
+                stat = Payment.PIList( PRT_Credit ).Update( pi );
+            end;
+        end;
+
+    end;
+
+end;
+
+                                                                                                      
+/* A.Gregeradsky - 29.01.2010 - Функции проверки и автоматического проставления кодов 811 на документах комиссий иностранным банкам-корреспондентам */
+private macro TestPaymentComiss(pmid)
+
+    var SQL, cmd, rs;
+
+    SQL = "SELECT 1 FROM usr_frncomm_paym WHERE t_paymentid = ?";
+
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("pmid", RSDBP_IN, pmid);
+    cmd.Execute();
+    rs = RsdRecordSet(cmd);
+
+    if(rs.MoveNext())
+        return false;   /* Код не проставлен */
+    else
+        return true;  /* Код проставлен или платеж в нем не нуждается */
+    end;
+
+end;
+
+
+private macro SetCodeFor402(pmid, code)
+
+    var SQL, cmd, rs;
+    var id;
+
+    SQL = "select t_attrid from dobjattr_dbt where T_OBJECTTYPE = 501 AND T_GROUPID = 3 and trim(t_nameobject) = ?";
+
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("code", RSDBP_IN, code);
+    cmd.Execute();
+    rs = RsdRecordSet(cmd);
+
+    if(rs.MoveNext())
+        id = rs.value(0);  /* Есть такой код */
+    else
+        id = 0;            /* Нет такого кода */
+    end;
+
+
+    if(id != 0)  /* Код есть, проставляем категорию */
+
+        RslDefCon.BeginTrans();
+        // 04.02.2013 вообще интересно, зачем форматировать sysdate если нужны все данные LAO, к тому же такое преобразование неверное
+        SQL = "INSERT INTO DOBJATCOR_DBT  VALUES " +
+              "(501, 3, ?, lpad(?,10,'0'),'X',  " +
+              "TO_DATE(?,'DD.MM.YYYY'), ?, TO_DATE('31.12.9999 00:00:00', 'DD.MM.YYYY HH24:MI:SS'), " +
+              "/*TO_DATE(sysdate, 'DD/MM/YYYY HH24:MI:SS')*/ sysdate , to_date('01-01-0001 '||substr(to_char(sysdate, 'DD-MM-YYYY HH24:MI:SS'), 12), 'DD.MM.YYYY HH24:MI:SS'), NULL)";
+
+        cmd = RsdCommand(SQL);
+        cmd.AddParam("id", RSDBP_IN, id);
+        cmd.AddParam("pmid", RSDBP_IN, pmid);
+        cmd.AddParam("date", RSDBP_IN, {curdate});
+        cmd.AddParam("oper", RSDBP_IN, {oper});
+        cmd.Execute();
+
+        RslDefCon.CommitTrans();
+
+    end;
+
+OnError
+
+    if(RslDefCon.IsInTrans);
+        RslDefCon.RollbackTrans();
+    end;
+
+end;
+/* End */
+  
+
+MACRO ExecuteStep( doc, paymDoc )
+    var stat:integer = 0;
+    var IsSummaryMemord :bool = false;
+    var AcNer, errAn;
+
+    // KS 22.10.2010 I-068571 Процедура массовой проводки комиссий из внешних систем
+    var stat_kom = 1; // Показывает был ли документ обработан по технологии массовой проводки комиссий из внешних систем (1 - не был, 0 - был)
+    // KS 09.06.2011 C-761 Выгрузка проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+    var stat_lim = 1; // Показывает был ли документ обработан по технологии выгрузки проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+    // KS 19.10.2011 Тип "Исправительный"
+
+    if( stat == 0 )
+
+        /*SDA 13.06.2012 - убираем лишние пробелы из назначения платежа, которые приводят к ошибочному определению террористов */
+        While (index(PaymentObj.Ground,"  "))
+            PaymentObj.Ground = strsubst(PaymentObj.Ground,"  "," ");
+        end;
+        
+        /* EVG Заполнение параметров, необходимых для валютного контроля */
+
+        /* EVG Заполнение примечания вида 111 "Паспорта, коды валютного контроля"
+               шаблоном для ввода информации */
+        if ( strLen (ReadNoteForPayment (PaymentObj.paymentID, 111)) == 0 )
+            InsertNoteForPayment(PaymentObj.paymentID, 111, "ХХХХХХХХ/2412/0000/Х/0{xxxxx}$;ХХХХХХХХ/2412/0000/Х/0{xxxxx}$;");
+        end;
+
+
+        /* EVG Заполнение данных о валютной операции исходя из
+           паспорта сделки, если он есть в назначении платежа. */
+        УстановитьКодВОиПаспортСделкиИзПримечания( PaymentObj );
+    
+        /* EVG Для плательщика-нерезидента - перенос страны нерезидента в категорию платежа 
+           118 "Код страны нерезидента-отправителя". */
+        UpdateNRCountryInPaymetnCat( PaymentObj, PaymentObj.Payer, 118 );
+
+        /* EVG Для получателя-нерезидента - перенос страны нерезидента в категорию платежа 
+           119 "Код страны нерезидента-получателя". */
+        UpdateNRCountryInPaymetnCat( PaymentObj, PaymentObj.Receiver, 119 );
+
+        /* A.Gregeradsky - 29.01.2010 - Проставить код формы 402 для комиссий иностр. банкам-корресп. */
+        if( not(TestPaymentComiss(PaymentObj.PaymentID)) )
+            SetCodeFor402(PaymentObj.PaymentID, "811");
+        end;
+
+        //Контроль
+        stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+    
+        /* EVG Проставление кода ВО там, где это необходимо */
+        AvCodeVo(PaymentObj);
+    
+        GetRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ДЛЯ ВК", V_STRING, AcNer, errAn);
+
+        /* A.Gregeradsky - 01.02.2010 - Код ВО для платежа комиссии за ВК */
+        if( index(strlwr(trim(PaymentObj.Ground)),"комиссия за валютный контроль") != 0 )
+            if(not(CompareStrWithMasks (AcNer, PaymentObj.PayerAccount)))
+                PaymentObj.VO_Code = 212; /* 99090 - Прочие */
+            end;
+        end;
+
+        /* A.Gregeradsky - 18.02.2010 - Замена опечаток в коде ВО в основании */
+        if( (index(PaymentObj.Ground,"{V") == 1) and (index(PaymentObj.Ground,"}") == 9) ) /* Есть код ВО в основании платежа */
+            PaymentObj.Ground = Strsubst(PaymentObj.Ground,"{V0","{VO"); /* Замена "0" (ноль) на "O" (лат.) */
+            PaymentObj.Ground = Strsubst(PaymentObj.Ground,"{VО","{VO"); /* Замена "О" (рус.) на "O" (лат.) */
+        end;
+
+        //Направление
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_INTERNAL );
+        end;
+
+        //Уточнение причастности к терроризму - Не требуется
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_TERR, OPR_PAYM_ST_TERR_NOTNEED );
+        end;
+
+        //Квитовка - не сквитован
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_UNKVIT );
+        end;
+
+        //ЦАБС - проведен по счетам МФР 
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_CABS, OPR_PM_ST_MFR_YES );
+        end;  
+
+        //Обработка в БО - нет
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_BO_PROCESS, OPR_PAYM_ST_BO_NO );
+        end;
+
+        // ПЗО
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NOTNEED );
+        end;
+
+        // РО - не требуется
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED );
+        end;
+
+        // МФ
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_BRANCH, OPR_PAYM_ST_BRANCH_NO );
+        end;
+
+        // КАРТ - нет
+        if( stat == 0 )
+            stat = УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO );
+        end;
+
+        if( stat != 0 )      
+            msgbox("Ошибка при установке статуса платежа");
+            return 1;
+        end;
+    end;
+
+    //Seleznev Установка Выгрузка во Фронт = Требуется 
+    //для платежей которым назначена категория "внешняя систма"
+    if (IsFrontPayment(PaymentObj))
+        InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_YES);
+    end;
+
+    IsSummaryMemord = IsSummaryPayment( PaymentObj );
+
+    // KS 22.10.2010 I-068571 Процедура массовой проводки комиссий из внешних систем
+    if( stat == 0 ) // Проверка банковского ордера.
+                    // Устанавливается подходит ли корреспонденция и пользовательский тип
+                    // под технологию проводки комиссий из внешних систем
+
+        stat = ПроверкаБОКомиссия( PaymentObj );
+        if ( stat != 0 )
+            stat = BO_CheckAccRest( PaymentObj );
+            if ( stat != 0 )
+
+                /* KS
+                Добавить в статусы блока 10000124 Предобработка мемориального документа
+                Состояние платежа - закрыт */      
+                // KS 22.10.2010 I-068571 Закрываем банковский ордер
+                PaymentObj.PaymStatus = PM_FINISHED;
+                stat_kom =
+                stat = УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT,   OPR_PAYM_ST_ACPT_ACCEPTED,
+                                                 OPR_PAYM_STATE,    OPR_PM_ST_CLOSE );
+            end;
+        end;
+
+    end;
+
+    // KS 09.06.2011 C-761 Выгрузка проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+    if( stat == 0 ) // Проверка мемориального ордера.
+                    // Устанавливается подходит ли корреспонденция
+                    // под технологию выгрузки проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+
+        stat = ПроверкаМОЛимитОвердрафта( PaymentObj );
+        if ( stat != 0 )
+            stat = BO_CheckAccRest( PaymentObj );
+            if ( stat == 0 )
+
+                /* KS
+                Добавить в статусы блока 10000124 Предобработка мемориального документа
+                Состояние платежа - закрыт */      
+                // KS 22.10.2010 I-068571 Закрываем банковский ордер
+                PaymentObj.PaymStatus = PM_FINISHED;
+                stat_lim =
+                stat = УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT,   OPR_PAYM_ST_ACPT_ACCEPTED,
+                                                 OPR_PAYM_STATE,    OPR_PM_ST_CLOSE );
+            end;
+        end;
+
+    end;
+
+    if( stat == 0 ) // Системный контроль
+        stat = ExecuteSysControlStep( PaymentObj );
+        if( stat < 0 )
+            return 1;
+        elif( stat > 0 )
+            return 0;
+        end;
+    end;
+
+    /*Chesnokov D. 17.10.2011 - поступления на 40821 только с 40821 или с кассы 103-фз*/
+    if ((substr(PaymentObj.ReceiverAccount,1,5) == "40821") and not ((substr(PaymentObj.PayerAccount,1,5) == "40821") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "20202") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "20207") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "40906") or
+                                                                     //Gurin S. 08.07.2015 R-601564-1
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "30305") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "30306") or
+                                                                     /* EVG 14/8/2015 Провели, отключил.
+                                                                     // EVG 14/8/2015 Для документов, вернувшихся на к/сч Пробизнесбанка
+                                                                     (PaymentObj.PayerAccount == "30110810401070000035") or
+                                                                     */
+                                                                     (index(PaymentObj.PayerName, "40821") != 0)))
+        MsgBox("Операция не соответствует режиму спецсчета получателя - документ помещен в отвергнутые");
+        PaymentObj.PaymStatus = PM_REJECTED;
+        PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_REJECTED ); 
+        stat = УстановитьСтатусыПлатежа(OPR_PAYM_STATE,OPR_PM_ST_REJECT);
+        PaymentObj.notes.addnote(42,"Операция не соответствует режиму спецсчета получателя");
+        return 0;
+    end;
+
+    if( ( not IsSummaryMemord ) and ( stat == 0 ) ) // Контроль по 117-И
+        stat = КонтрольПо117И( PaymentObj );
+        if( stat < 0 )
+            return 1;
+        elif( stat > 0 )
+            return 0;
+        end;
+    end;
+
+    if( ( stat == 0 ) and // Проверка остатков по счетам
+        ( stat_kom != 0 ) and // KS 22.10.2010 I-068571 Не был ранее закрыт по технологии массовой проводки комиссий из внешних систем
+        ( stat_lim != 0 ))    // KS 09.06.2011 C-761 Выгрузка проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+        stat = MO_CheckAccRest( PaymentObj );
+    end;
+    //если отвергли, сбросить ручную обработку, чтобы можно было после перезапуска запланировать предобработку
+    if (GetOprStatus(OPR_PAYM_STATE)==OPR_PM_ST_REJECT) 
+        stat = УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED );
+    end;
+
+    /* EVG Выполнение корректировки номера пользователя в уточняющих записях */
+    PIInList_CorrectOper ( PaymentObj );
+
+    if ( stat_kom == 0 )    // KS 22.10.2010 I-068571 Если всё ок
+        // KS 22.10.2010 I-068571 Создание комиссии
+        ComCreatePayment(PaymentObj);
+    elif ( stat_lim == 0 )  // KS 09.06.2011 C-761 Если всё ок
+        // KS 09.06.2011 C-761 Создание проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+        LimCreatePayment(PaymentObj);
+    end;
+
+    return stat;
+END;
+
+
+macro PostStepAction( message,     /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,      /* статус выполнения шага. Если параметр  */
+                                   /* не равен 0, произошла ошибка           */
+                      primDoc,     /* указатель на первичный документ        */
+                      ID_Oper,     /* внутренний идентификатор операции      */
+                      Number_Step, /* Номер шага операции (из настроек)      */
+                      KindOper,    /* номер вида операции                    */
+                      KindDoc,     /* номер вида первичного документа        */
+                      KindStep,    /* вид шага операции                      */     
+                      ID_Step)     /* внутренний идентификатор шага операции */
+
+    private var obj;
+    private var logquery;
+
+    //Jushmanov 2014-02-20 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn==0))
+        if (PaymentObj.DocKind == 70) /*SDA - только для мемордеров */
+            // KS 19.10.2011 Тип "Исправительный"
+            obj = GenObject( "RsbMemorialOrder", PaymentObj.DocumentID );
+
+            if (Index(obj.UserTypeDocument, "И") > 0)
+                obj.UserTypeDocument = StrSubst(obj.UserTypeDocument, "И" ,"");
+                obj.TypeDocument = obj.TypeDocument + "И";
+            end;
+        end;
+    end;
+    return 0;
+end;
+
+
+/* -----------------------------------------------------------------------------
+   Массовое выполнение шага "Предобработка мемориального ордера"
+   ----------------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------------
+   Предтранзакционные действия 
+   Все проверки отражаются только на временной таблице dpmprepro_tmp,
+   никакие изменения в БД не делаются
+   ----------------------------------------------------------------------------- */
+macro PrepMassExecuteStep() 
+
+    // Подготовительные действия
+    var stat:integer = execStoredFunc( "RSI_BB_MOPREPRO.MassPreprocessPrepare", V_INTEGER );
+
+    if( not stat )
+        stat = PM_MassPreproPrepare();
+    end;
+  
+    // Системный контроль
+    if( not stat )
+        stat = execStoredFunc( "RSI_BB_MOPREPRO.MassSysControlPrepare", V_INTEGER );
+    end;
+
+    // Проверка остатка
+    if( not stat )
+        stat = execStoredFunc( "RSI_BB_MOPREPRO.MassCheckRestPrepare", V_INTEGER );
+    end;
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+end;
+
+/* -----------------------------------------------------------------------------
+   Транзакционные действия 
+   Всё, что напроверяли, отражается на статусах документа, платежа, операции 
+   ----------------------------------------------------------------------------- */
+macro MassExecuteStep()
+
+    var stat:integer = execStoredFunc( "RSI_BB_MOPREPRO.MassPreprocessExecute", V_INTEGER );
+
+    if( not stat )
+        stat = PM_MassPreproExecute();
+    end;
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+end;
+
+
+/* -----------------------------------------------------------------------------
+   Действия после транзакции
+   Заполняем лог обработки платежей для отчета 
+   ----------------------------------------------------------------------------- */
+macro PostMassExecuteStep()
+
+    var stat:integer = execStoredFunc( "RSI_PM_PREPRO.MassFillLog", V_INTEGER );
+
+    if( stat )
+        MemoryError( stat );
+    end;
+
+    return stat;
+
+end;

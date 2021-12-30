@@ -1,0 +1,155 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29019 - "Картотека 1"
+// Шаг      : 10    - "Помещение в картотеку 1"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+// KS 06.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку1
+// Gurin S. N. 14.11.2012 I-00283869-3
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov 2014-02-21 C-19151 Логгирование массово выполненных шагов
+
+import pm_common, pm_setst, payconst, payinter, "catfdoc.mac", "sf_lib.mac", lib_const;
+// KS 06.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку1
+import "interbankmes_lib.mac";
+import OprInter, oralib; //Jushmanov 2014-02-21 C-19151
+
+var PaymentObj:RsbPayment;
+
+MACRO ExecuteStep( doc, paymDoc )
+
+  /*Зубко С. I-00043098 Тема: Ульяновск . Картотека №1.
+    При постановке документов в картотеку №1 неверно открывается внебалансовый счет.
+    Внебалансовый счет 90901 открывается не в разрезе срока акцепта, а в разрезе даты документа. 
+    Счет пытается открыться не по сроку акцепта, а по дате документа. Например хотим поставить документ от  25.04.2011г. в К1
+    (03.05.2011г. хочу это сделать) , а счет программа пытается открыть вместо 03.05.+ 5 рабочих дней (т.е. 11.05.2011г.) на 25.04.2011г.
+
+    Из-за чего и как лечим:
+    При открытие внебалансового счета 90901, дата картотеки, то есть срок акцепта, а соответственно, и дата в счете определяется по значению поля T_PAYDATE таблицы DPMRMPROP_DBT.
+    Дата инициализуруется в строке макроса CATFDOC.MAC:
+    ParmA[regList.registration(MC_TYPE_PARAMETR_INDEXDATE )] = m_payment.PayDate   ;
+    При вводе документа срок акцепта определяется автоматически и при нажатии F9 эта дата попадает в таблицу и потом при постановке в картотеку 1, счет определяется корректно.
+
+    Вставка же документов из FineReadr происходит пакетом, а в нем эта дата инициализируется так:
+    nt_pmrmprop (v_cnt).t_paydate := doc.doc_date;
+    Из-за этого мы видим, что проблема только с документами из FineReader.
+
+    Меняем t_paydate дату на dpspaydem.t_acceptdate + 1 рабочий день. Короче, эту дату нужно поменять до инициализации счета. Может, и в самом макросе шага "постановка на картотеку 1"
+    При этом дата поменяется и в таблице. Списание, значит, также отработает нормально.
+  */
+
+    var PayOrder = GenObject( "RsbPSPayOrder", PaymentObj.PaymentID );
+    /*zmp 17.04.2013 00356051 добавлено USR_PAYMENT_OR_ABBYY_FC*/
+    if  ((PayOrder.Origin == PSPO_OR_FINEREADER) or 
+       (PayOrder.Origin == PSPO_OR_PAYEEBANK)  or 
+       (PayOrder.Origin == USR_PAYMENT_OR_ABBYY_FC) or //TAM 20.09.2012 I-00255774-2
+       (PayOrder.Origin == PSPO_OR_MANUAL)) //TAM 03.03.2014 R-339241
+        if (PayOrder.AcceptPeriod > 0)
+            PaymentObj.PayDate = PayOrder.AcceptDate; //Gurin S. N. 14.11.2012 I-00283869-3 PayOrder.AcceptDate подразумевает уже дату платежа + число дней срока на акцепт + 1
+        end;
+    end;
+    /*END I-00043098*/
+
+    // Для документов ПЗО вызовем функцию начисления комиссий
+    if( IsSfCommPayment( PaymentObj ) )
+        if( not chargeComission( PaymentObj.PaymentID ) )
+            MsgBox("Ошибка при начислении комиссии");
+            return 1;
+        end;
+    end;
+
+    // Объекты для КУ
+    var FD_Index1 :PaymIndex1_FirstDoc    = PaymIndex1_FirstDoc( PaymentObj.PaymentID );
+    var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+
+    // Счета КУ
+    var СистемныйСчетДляКартотек:string = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+    var ВнебалСчетКартотеки1    :string = FD_Index1.FindAndOpenAccount( "Картотека 1", 0, PaymentObj.PayerBankEnterDate );
+
+    // Выполнить проводку по внебалансу
+    var paymtr:RsbAccTransaction = PaymentObj.MakeTransaction();
+
+    /* Лавренов: для конвертированных документов К1 проводку не создаем */
+    if(PaymentObj.origin != 10001 )
+
+        if( paymtr == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+
+        paymtr.Chapter         = 3;       
+        //Gurin S. 17.04.2015 I-00562686-1
+        paymtr.Date_Carry      = {curdate};
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 47;
+        paymtr.Kind_Oper       = " 1";
+        paymtr.Shifr_Oper      = "09";
+        paymtr.Department      = PaymentObj.Department;
+        paymtr.AccountPayer    = ВнебалСчетКартотеки1;
+        paymtr.AccountReceiver = СистемныйСчетДляКартотек;
+        paymtr.FIID            = PaymentObj.PayerFIID;
+        paymtr.Sum             = PaymentObj.FuturePayerAmount;
+        paymtr.Ground          = "Постановка в Картотеку 1 документа № " + string(PaymentObj.Number)   + 
+//Seleznev A49725
+                                 " от "                                  + string(PaymentObj.Date)+
+                                 " к счету "                             + string(PaymentObj.PayerAccount);
+
+        if( not paymtr.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;  
+    end;
+
+    // KS 19.09.2012 C-13246 В данном случае дата значения документа равна дате поступления в банк
+    PaymentObj.ValueDate = PaymentObj.PayerBankEnterDate;
+    // KS 06.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку1
+    InternetBankMessPaym(PaymentObj.PaymentID,
+                         PaymentObj.PayerAccount,
+                         PaymentObj.ReceiverAccount,
+                         PaymentObj.PayerAmount,
+                         PaymentObj.ValueDate,
+                         PaymentObj.FuturePayerFIID,
+                         "",
+                         11,
+                         PaymentObj.PayerAccount,
+                         PaymentObj.ReceiverAccount);
+    InternetBankMessPaym(PaymentObj.PaymentID,
+                         PaymentObj.PayerAccount,
+                         PaymentObj.ReceiverAccount,
+                         PaymentObj.PayerAmount,
+                         PaymentObj.ValueDate,
+                         PaymentObj.FuturePayerFIID,
+                         "",
+                         21,
+                         PaymentObj.PayerAccount,
+                         PaymentObj.ReceiverAccount);
+
+  // Здесь можно вставлять дополнительные проводки для шага
+
+    return 0;
+END;
+
+
+//Jushmanov 2014-02-21 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

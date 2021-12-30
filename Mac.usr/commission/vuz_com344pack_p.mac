@@ -1,0 +1,152 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Банк ВУЗ
+
+       Макрос пользовательского алгоритма расчёта базовых сумм комиссии 3.4.4pack
+       "Прочие платежи в пользу клиентов (юр.лиц,ИП,физ.лиц в рамках зарплатных 
+        проектов, подтвержденных договором) других банков, принятые до 16-00 по 
+        системе "Интернет-Клиент"".
+
+       Тип комиссии - периодическая.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, VuzComLib;
+import lib_packetCommission;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+record sfbassum( "sfbassum.str" );
+
+
+
+/*
+    Расчет для периодических комиссий
+*/
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcal_addr /* EVG Адрес алгоритма (sfcalcal) */, sfcontrStruc /*Cтруктура sfcontr*/, CommNumber_sfacrpay )
+
+debugbreak;
+    record sfcontr ( sfcontr );
+    record calcal  ( sfcalcal );
+
+    var stat;
+    var DayEndTime, DocTime, DocDate, CommSum = $0, CommNumber;
+
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+       SetBuff( calcal, sfcalcal_addr );
+
+       CommNumber = calcal.CommNumber;               // CommNumber берём из алгоритма
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       CommNumber = CommNumber_sfacrpay;             // CommNumber берём тот, который пришёл из sfacrpay.mac
+    end;
+    
+
+    /* Сформируем массив платежей, превышающих лимит */
+    var PaymentsOverLimit = CollectPaymentsInformation( sfcontr, BeginDate, EndDate, CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType );
+
+    var n = 0;
+    while( n < PaymentsOverLimit.Size )
+
+       if( valtype(PaymentsOverLimit(n)) != V_UNDEF )  // На всякий случай
+
+          /* Обрабатываются только документы, у которых счёт плательщика является объектом по ДО.
+             Таким образом, комиссия по каждому документу сверх лимита будет оплачиваться в рамках того
+             ДО, по счёту которого проведён документ. */
+          if( PaymentsOverLimit(n).AccountPayer == sfcontr.Object )
+
+
+             /* Проверки комиссии */
+
+             if( PaymentsOverLimit(n).Origin == CLB_DocOrigin )
+
+                if( not (isConnectedPacketCommissionOnDate( PaymentsOverLimit(n).AccountPayer, EndDate )) )
+                    /* Чтение настройки с временем окончания опердня */
+                    DayEndTime = GetOperDayEndTime();
+
+                    if (     ( ( VUZ_isAccount_Jur( PaymentsOverLimit(n).AccountPayer )                    // Плательщик - юр. лицо                                                      (
+                               or VUZ_isAccount_IP( PaymentsOverLimit(n).AccountPayer ) )                  // Плательщик - ИП
+                             and
+                             ( VUZ_isAccount_Jur( PaymentsOverLimit(n).AccountReceiver )                   // Получатель - юр. лицо
+                               or VUZ_isAccount_IP( PaymentsOverLimit(n).AccountReceiver )
+                               or VUZ_isAccount_Incomplete( PaymentsOverLimit(n).AccountReceiver )   )     // Получатель - счёт незавершенных расчётов RR
+                           )
+                         or
+                           ( ( ( VUZ_isAccount_Jur( PaymentsOverLimit(n).AccountPayer )                      // Плательщик - юр. лицо
+                                 or VUZ_isAccount_IP( PaymentsOverLimit(n).AccountPayer ) )                  // Плательщик - ИП
+                                and VUZ_typeAccount_SalaryProject( PaymentsOverLimit(n).AccountPayer )       // Польз. тип счета плательщика содержит Z - зарплатный проект
+                             )
+                             and
+                             ( VUZ_isAccount_Phis( PaymentsOverLimit(n).AccountReceiver )                    // Получатель - физ. лицо
+                               or VUZ_isAccount_Incomplete( PaymentsOverLimit(n).AccountReceiver ) )         // Получатель - счёт незавершенных расчётов
+                           )
+                        )
+
+                        /* Получим время платежа */
+                        DocTime = gettimeP( PaymentsOverLimit(n).PaymID, EndDate, @DocDate );
+                        if ( ( DocTime < DayEndTime ) or ( DocDate < EndDate ) )
+
+                           // Тариф = Сумма или Сумма за единицу
+                           if ( ( TarifType == 1 ) or ( TarifType == 3 ) )
+                              CommSum = CommSum + TarifValue;
+                           // Тариф = Процент
+                           elif ( TarifType == 2 )        
+                              CommSum = CommSum + PaymentsOverLimit(n).Amount * TarifValue / 100;
+                           end;
+
+                        end;
+                    end;
+
+                end;
+
+             end;
+
+
+          end;
+
+       end;
+
+       n = n + 1;
+    end;
+
+
+
+    
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > $0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_SUM;
+    sfbassum.baseSum  = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/

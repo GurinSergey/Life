@@ -1,0 +1,176 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: lib_sqltools.mac
+// @author  : 2012-05-03 zip_z. 
+// @desc    : утилиты для работы с SQL
+// @changes : 2013-01-03 zip_z. + isNull 
+//                              + notNull
+//            2013-01-04 zip_z. + CopySql2Rsl (с) R-Style NSk
+//            2013-01-06 zip_z. + ORAString 
+//                              + ORADate
+//                              + ORAInteger
+//                              + ORAMoney
+//                              + ORATime
+//            2013-01-08 zip_z. + alter_session_set
+//                              ~ endQueryCapture ()
+//            2013-01-17 zip_z. ~ endQueryCapture ()
+//            2013-05-01 zip_z. - isNull  (перенесено в lib_types)
+//                              - notNull (перенесено в lib_types)
+//            2013-05-01 zip_z. + DB_FindValueByPrimaryKey
+//            2013-05-01 zip_z. + DB_DeleteValueByPrimaryKey
+//            2013-07-15 zip_z. + DB_GetValueByPrimaryKey
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+// SDA 08.05.2014  обработка исключения значения NULL
+// -------------------------------------------------------------------------------------------------
+
+import oralib, likepy, bankinter, lib_types;
+
+private var _sql;
+
+macro alter_session_set (what:string)
+    var cmd = RSDCommand ("alter session set " + what);
+    return cmd.execute ();
+end;
+
+macro sqlOutHandler (str)
+    _sql = string (_sql, " \n", str);
+end;
+
+macro startQueryCapture ()
+    _sql = "";
+    setOutHandler ("sqlOutHandler");
+end;
+
+macro endQueryCapture ()
+    setOutHandler (null);
+    return _sql; 
+end;
+
+/* @desc  : преобразование в RSL некоторых OCI Internal Datatypes 
+ * @readme: http://docs.oracle.com/cd/B19306_01/appdev.102/b14250/oci03typ.htm
+ * про NullConversion читал, слышал, использовал. Задрало.
+ * Реализована конверсия в ORAString, ORADate, ORAInteger, ORAMoney, ORATime
+ */
+ 
+macro ORAString ( str ):string
+    if ( notNull (str) and (str != StrFor (0)) and (str != StrFor (1)) )
+        return str;
+    end;
+    return "";
+end;
+
+macro ORADate ( dt ):date
+    if ( notNull (dt) and (dt != Date (2,1,1)-1) )
+        return Date (dt);
+    end;
+    return Date (0,0,0);
+end;
+
+macro ORATime ( tm ):time
+    if ( notNull (tm) ) return Time (tm); end;
+    return Time (0,0,0);
+end;
+
+macro ORAMoney ( sum ):money
+    if ( notNull (sum) ) return Money (sum); end;
+    return $0;
+end;
+
+macro ORAInteger ( num ):integer
+    if ( notNull (num) ) return Int (num); end;
+    return 0;
+end;
+
+/* @desc  : копирование sql (TRSBDataSet, RSDRecordSet) в RSL (TRecHandler, file, record)
+ * Написана благодаря тому факту, что RS-Bank 6 так никуда и не ушёл от Btrieve-эмулятора.
+ * Пример использования в конструкторе класса-наследника:
+ *
+ *    class (TRecHandler) RSL_Account (acc:string, curr:integer)
+ *      InitTRecHandler ("account");
+ *      macro RSL_Account_Init (acc:string, curr:integer)
+ *        var sql = "select * from daccount_dbt where t_account = :acc and t_code_currency = :curr";
+ *        var parm = makeArray (SqlParam ("acc", acc), SqlParam ("curr", curr));
+ *        sql = execSqlSelect (sql, parm);
+ *        if (sql.moveNext ())
+ *          copySql2Rsl (sql, this);
+ *        end;
+ *      end;
+ *      RSL_Account_Init (acc:string, curr:integer)
+ *    end;
+ */
+macro CopySql2Rsl ( sql, rsl )
+    Var i = 0;
+    ClearRecord (rsl);
+    if ( (ValType (rsl) == V_FILE) or (ValType (rsl) == V_STRUC) )
+        while ( i < FldNumber (rsl) )
+            if ( ValType (sql.value ("t_"+FldName (rsl, i))) == 26 )
+            elif (  ValType (rsl(i)) == V_STRING )
+                rsl(i) = OraString (sql.value ("t_"+FldName (rsl, i)));
+            elif (  ValType (rsl(i)) == V_DATE )
+                rsl(i) = OraDate (sql.value ("t_"+FldName (rsl, i)));
+            else
+                rsl(i) = sql.value ("t_"+FldName (rsl, i));
+            end;
+            i = i + 1;
+        end;
+    else // TRecHandler
+        while ( i < rsl.FldNumber )
+            // SDA 08.05.2014  обработка исключения значения NULL
+            if  (  ValType (sql.value ("t_"+rsl.FldName(i))) == 26)
+            elif (  ValType (rsl.(i)) == V_STRING )
+                rsl.(i) = OraString (sql.value ("t_"+rsl.FldName(i)));
+            else
+                rsl.(i) = sql.value ("t_"+rsl.FldName(i));
+            end;
+            i = i + 1;
+        end;
+    end;
+end;
+
+// @desc  : поиск значения по простому первичному ключу (1 constrained field)
+// @return: значение key_column_name (может быть любого типа)
+// @test  : msgbox (DB_GetValueByPrimaryKey ("t_name", V_STRING, "dperson_dbt", "t_oper", 10444));
+macro DB_GetValueByPrimaryKey (value_column_name:string, value_column_datatype:integer, table_name:string, key_column_name:string, key_value:variant, filter:string):variant
+    // минимальная защита от особо хитрых
+    if (index (string (value_column_name, table_name, key_column_name, key_value, filter), ";") > 0 )
+        runError ("Ошибка при передаче параметров в DB_GetValueByPrimaryKey ()");
+    end;
+    
+    // по умолчанию возвращаем нулевое значение типа (для дат получается очень интересно, угу)
+    var ret = null;
+    
+    // поехали
+    var sql = "select $value_column_name$ from $table_name$ where $column_name$ = :m_key_value and $filter$";
+    
+    // если фильтр не задан, вкладываем "пустышку"
+    filter = nvl_ex (filter, " (1 = 1) ");
+    
+    sql = strSubst (sql, "$value_column_name$" ,strlwr (value_column_name));
+    sql = strSubst (sql, "$table_name$"        ,strlwr (table_name       ));
+    sql = strSubst (sql, "$column_name$"       ,strlwr (key_column_name  ));
+    sql = strSubst (sql, "$filter$"            ,strlwr (filter           ));
+    
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_key_value", key_value)));
+    if (sql.moveNext ())
+        ret = sql.value (0, null, value_column_datatype);
+    end;
+
+    return ret;
+onError (e)
+    runError (strsubst (e.err.environment.error (0).descr, "[Oracle][ODBC][Ora]", " ")); // мусор не нужен
+end;
+
+// @desc  : поиск ключа 
+// @return: V_BOOL (true, если значение найдено)
+macro DB_FindValueByPrimaryKey (table_name:string, key_column_name:string, key_value:variant, filter:string):bool
+    const FOUND = 1; // буквально получается select 1 from table_name where key_column_name = key_value and filter;
+    return (FOUND == DB_GetValueByPrimaryKey (FOUND, V_INTEGER, table_name, key_column_name, key_value, filter));
+end;
+
+// @desc  : удаление значения по простому первичному ключу (1 constrained field)
+// @test  : msgbox (DB_DeleteValueByPrimaryKey ("dpmpaym_dbt", "t_oper", 10444));
+macro DB_DeleteValueByPrimaryKey (table_name:string, column_name:string, key_value:variant)
+    var sql = "delete from $table_name$ where $column_name$ = :m_key_value";
+    sql = strSubst (sql, "$table_name$" , strlwr (table_name  ));
+    sql = strSubst (sql, "$column_name$", strlwr (column_name ));
+    return execSql (sql, makeArray (SqlParam ("m_key_value", key_value)));
+end;

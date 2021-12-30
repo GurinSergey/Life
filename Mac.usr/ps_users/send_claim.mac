@@ -1,0 +1,420 @@
+/*************************************************************************/
+/*     Дополнение к автоматизированной банковской системе RS-Bank        */
+/*                                                                       */
+/*    Имя файла        : send_claim.mac                                  */
+/*                                                                       */
+/*    Программист      : Котов С.С.                                      */
+/*                                                                       */
+/*    Создан           : 25.09.2011                                      */
+/*                                                                       */
+/*    Выполнено по заявкам: C-5169 "отправка уведомлений пользователям   */
+/*                                  по действиям с претензиями"          */
+/*                          C-5170 "Доработка отчета по претензиям"      */
+/*                          C-7337 "Реализация отправки писем в Lotus по */
+/*                                  претензиям. Уточнение постановки для */
+/*                                  RS"                                  */
+/*                                                                       */
+/*************************************************************************/
+
+import Globals;
+import oralib, likepy;
+import "FrontCommon.mac";
+import "Send_lotus.mac";
+
+var maxTypeCount = 20; // Максимальное количество типо сотрудников
+
+private var oConnection_lib = ActiveX("ADODB.Connection");
+
+   var oConnection;
+   var connstring, procname = "rsb6_get_responsible_account"/*"prc_responsible"*/, note;
+   var bo_id, eCode;
+//   var rset, rs, cmd_claim;
+// SDA 13.06.2012 - переопределение rs на шаге валютного контроля
+private  var rset, rs, cmd_claim;
+
+private macro init
+
+   // Констринг беру из любого из правил, указанных в PRBB\USR_CLAIM\RULES
+   GetRegistryValue("PRBB\\USR_CLAIM\\ФРОНТ ЮЛ", V_INTEGER, bo_id, eCode);
+   if ( eCode > 0 )
+     return -51;
+   else
+
+     cmd_claim = RSDCommand("select rule_id,  state, connstring, extprocname, execcarry_type, note, need_ask from usr_route_parm "+
+                            "where state = 0 and bo_id = " + bo_id // Фронт-ЮЛ
+                           );
+     rs = RSDRecordset(cmd_claim);
+
+     if (rs.movenext) // Берём первое подходящее правило
+       connstring = rs.value("connstring");
+       note       = rs.value("note");
+       oConnection = oConnection_lib;
+       oConnection.CursorLocation = 3;
+       oConnection.Open(connstring);
+       return 0;
+
+     else
+       return -52;
+     end;
+
+   end;
+
+   OnError
+     return -59;
+end;
+
+private macro CloseCon
+
+   if (oConnection and (oConnection.State == 1) )
+      oConnection.Close();
+   end;
+
+end;
+
+private macro getMail(account,bic,responsible,mail,tablenumber)
+
+   array aInput, aOutput;
+
+/*
+Описание функции для получения параметров Ответственных лиц по Счету клиента - prc_responsible
+*    Аргумент:  @account     - счет клиента
+*               @bic         - БИК банка
+*               @responsible - тип ответственного сотрудника
+
+*  Возвращает:  @mail        - адрес в лотус, если присутствует, 0 - если нет
+*               @att_number  - табельный номер сотрудника
+*               @fio         - Фамилия, имя, отчество сотрудника
+*               @birthday    - день рождения сотрудника
+*               @ret_out     > 0 - если все удачно, иначе - ошибка
+*               @error_msg   - сообщение об ошибке
+*/
+
+   //Инициализация входных параметров
+   aInput(0) = bic;         //@bic         - БИК банка
+   aInput(1) = account;     //@account     - счет клиента
+   aInput(2) = responsible; //@responsible - тип ответственного сотрудника
+
+   //Инициализация выходных параметров
+   aInput(3) = "";       //@mail        - адрес в лотус, если присутствует, 0 - если нет
+   aInput(4) = 0;        //@att_number  - табельный номер сотрудника
+   aInput(5) = "";       //@fio         - Фамилия, имя, отчество сотрудника
+   aInput(6) = date();   //@birthday    - день рождения сотрудника
+   aInput(7) = 0;        //@ret_out     > 0 - если все удачно, иначе - ошибка
+   aInput(8) = "";       //@error_msg   - сообщение об ошибке
+
+//   rset = RSADORecordset(ExecuteFrontProcEx(procname, aInput, oConnection));
+   rset = RSADORecordset(ExecuteFrontProc(procname, aInput, oConnection));
+
+   if (not(rset))
+     return -61;
+   end;
+
+   if ((ValType(rset.rs.ActiveCommand.Parameters(8).value) != 26) and (rset.rs.ActiveCommand.Parameters(8).value > 0))
+     SetParm(3, rset.rs.ActiveCommand.Parameters(4).value); //@mail        - адрес в лотус, если присутствует, 0 - если нет
+     SetParm(4, rset.rs.ActiveCommand.Parameters(5).value); //@att_number  - табельный номер сотрудника
+     return 0;
+   elif (ValType(rset.rs.ActiveCommand.Parameters(8).value) == 26)
+     return -62;
+   else
+     return rset.rs.ActiveCommand.Parameters(8).value;
+   end;
+
+   OnError
+     return -69;
+end;
+
+macro getClaimLetter(claimid, LetterText, Account)
+/*
+Уполномоченные сотрудники банка должны получать информацию, содержащую следующие разделы: Наименование Клиента; 
+Счет клиента;
+Статус документа;
+Дата ввода документа;
+Изменяющие документы;
+Дата документа;
+Номер документа;
+Вид претензии;
+Тип претензии;
+Инициатор ограничения;
+Первоначальная сумма претензии;
+Срок действия документа с..... до......
+Примечание.
+*/
+   var Letter = "";
+   cmd_claim = RSDCommand("select a.t_nameaccount, -- Наименование счета;" + "\n" +
+                    "       t.t_account, --Счет клиента;" + "\n" +
+                    "       statespr.t_name t_state, --Статус документа;" + "\n" +
+                    "       to_char(t.t_sysdate,'DD.MM.YYYY') t_sysdate, --Дата ввода документа;" + "\n" +
+                    "       'Изменяющий документ - ' || decode(c.t_changedoc,'X','Да','Нет') t_changedoc, --Изменяющие документы;" + "\n" +
+                    "       to_char(t.t_docdate,'DD.MM.YYYY') t_docdate, --Дата документа;" + "\n" +
+                    "       t.t_docnumber, --Номер документа;" + "\n" +
+                    "       claimkindspr.t_name t_claimkind, --Вид претензии;" + "\n" +
+                    "       restkindspr.t_name t_restkind, --Тип претензии;" + "\n" +
+                    "       c.t_initiator,--Инициатор ограничения;" + "\n" +
+                    "       t.t_startamount, --Первоначальная сумма претензии;" + "\n" +
+                    "       to_char(t.t_startdate,'DD.MM.YYYY') t_startdate," + "\n" +
+                    "       to_char(t.t_finishdate,'DD.MM.YYYY') t_finishdate, --Срок действия документа с..... до......" + "\n" +
+                    "       decode(t_comment,chr(1),' ',t_comment) t_comment --Примечание." + "\n" +
+                    "  From dacclaim_dbt t, usr_claim c, daccount_dbt a, dacclaimstate_dbt s,"
+                    "       dllvalues_dbt claimkindspr, dllvalues_dbt restkindspr, dllvalues_dbt statespr" + "\n" +
+                    " where t.t_claimid = ?" + "\n" +
+                    "   and t.t_claimid = c.t_claimid" + "\n" +
+                    "   and t.t_claimid = s.t_claimid" + "\n" +
+                    "   and claimkindspr.t_list = 2520" + "\n" +
+                    "   and claimkindspr.t_element(+) = t.t_claimkind" + "\n" +
+                    "   and restkindspr.t_list = 2522" + "\n" +
+                    "   and restkindspr.t_element(+) = t.t_restkind" + "\n" +
+                    "   and statespr.t_list = 2521" + "\n" +
+                    "   and statespr.t_element(+) = s.t_state" + "\n" +
+                    "   and a.t_account = t.t_account" + "\n" +
+                    " order by s.t_stateid desc"); // Чтобы взялась претензия с последним введённым статусом
+
+   cmd_claim.addparam("CI",RSDBP_IN,claimid);
+   rs = RSDRecordset(cmd_claim);
+
+   if (rs.movenext) // Берём первое подходящее правило
+     Letter = rs.value("t_nameaccount")+";\n"+
+              rs.value("t_account")+";\n"+ 
+              rs.value("t_state")+";\n"+  
+              rs.value("t_sysdate")+";\n"+   
+              rs.value("t_changedoc")+";\n"+
+              rs.value("t_docdate")+";\n"+
+              rs.value("t_docnumber")+";\n"+
+              rs.value("t_claimkind")+";\n"+
+              rs.value("t_restkind")+";\n"+
+              rs.value("t_initiator")+";\n"+
+              rs.value("t_startamount")+";\n"+
+              "Срок действия документа с " + rs.value("t_startdate") +  " до " + rs.value("t_finishdate") +  ";\n"+
+              rs.value("t_comment")+".\n";
+     SetParm(1, Letter);
+     SetParm(2, rs.value("t_account"));
+     // Сохраним текст письма
+     cmd_claim = RsdCommand("update usr_claim set t_userfield1 = substr(?,1,320) where t_claimid = ?");
+     cmd_claim.AddParam("", RSDBP_IN, Letter);
+     cmd_claim.AddParam("", RSDBP_IN, claimid);
+     cmd_claim.execute();
+     return 0;
+   end;
+
+   return -71;
+
+   OnError
+     return -79;
+end;
+
+macro Send_letter( Theme, Letter, mail, bank_lotus_code, tablenumber, send_to);
+/*
+PROCEDURE rsb6_f_notice
+(
+    @iud                int                   ,
+    @f_notice           int             = NULL,
+    @bank_lotus_code    int             = NULL,
+    @f_user             int             = NULL,
+    @c_alert            int             = NULL,
+    @date_time          datetime        = NULL,
+    @adres              varchar(255)    = NULL,
+    @send_to            varchar(255)    = NULL,
+    @table_number       int             = NULL,
+    @descr              varchar(100)    = NULL,
+    @note               varchar(2048)   = NULL,
+    @stat               int             = NULL
+)
+*/
+   array aInput, aOutput;
+
+   if ((ValType(send_to)==26) or (strlen(send_to)==0))
+      send_to = mail;
+   end;
+
+   //Инициализация входных параметров
+   aInput(0)  = 1;               //@iud             - код операции 
+   aInput(1)  = 0;               //@f_notice        - идентификатор 
+   aInput(2)  = bank_lotus_code; //@bank_lotus_code - Банк получателя (код банка в Lotus Notes)
+   aInput(3)  = null;            //@f_user          - номер операциониста создавшего запись 
+   aInput(4)  = null;            //@c_alert         - тип сообщения
+   aInput(5)  = date();          //@date_time       - дата (если NULL, то процедура поставит текущую дату)
+   aInput(6)  = mail;            //@adres           - эл.адрес получателя
+   aInput(7)  = send_to;         //@sendto          - отв.адрес ???
+   aInput(8)  = tablenumber;     //@tablenumber     - табельный номер получателя
+   aInput(9)  = theme;           //@descr           - тема письма
+   aInput(10) = letter;          //@note            - текст письма
+   aInput(11) = 10;              //@stat  - статус  = 10 - сообщение не отправлялось 
+ 
+   //Инициализация выходных параметров
+   // см aInput(1)
+
+//   rset = RSADORecordset(ExecuteFrontProcEx("rsb6_f_notice", aInput, oConnection));
+   rset = RSADORecordset(ExecuteFrontProc("rsb6_f_notice", aInput, oConnection));
+
+   if (not(rset))
+     return -81;
+   end;
+
+//msgbox("rset.rs.ActiveCommand.Parameters(2).value="+rset.rs.ActiveCommand.Parameters(2).value);
+
+   return rset.rs.ActiveCommand.Parameters(2).value;  //@f_notice        - идентификатор
+
+   OnError
+     return -89;
+end;
+
+macro sendClaimMails(claimid, vAccount, vTheme, vLetter)
+   var respmask, responsible, mail;
+   var Theme = "Уведомление о заведении претензии по счету";
+   var Letter, tablenumber, bank_lotus_code;
+   var errinit, errmail, errletter, errsend;
+   var account, send_to;
+
+   errinit = init;
+   if (errinit < 0)
+     return errinit;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\SEND_LOTUS", V_STRING, respmask, eCode);
+   if (( eCode > 0 )or(respmask == ""))
+     CloseCon;
+     //Не найдена настройка SEND_-LOTUS
+     return -91;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\OE0_CODE", V_INTEGER, bank_lotus_code, eCode);
+   if ( eCode > 0 )
+     bank_lotus_code = 0;
+     //Не найдена настройка OE0_CODE
+     //return -92;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\SEND_TO", V_STRING, send_to, eCode);
+   if ( eCode > 0 )
+     //Не найдена настройка SEND_TO
+     send_to = "";
+     //return -93;
+   end;
+
+   if ((strlen(vAccount)>0)and
+       (strlen(vTheme  )>0)and
+       (strlen(vLetter )>0)
+      )
+
+     account = vAccount;
+     Theme   = vTheme;
+     Letter  = vLetter;
+
+   else
+
+     errletter = getClaimLetter(claimid, letter, account);
+
+     if (errletter != 0)
+       CloseCon;
+       return errletter;
+     end;
+
+   end;
+
+//   msgbox(send_to);
+//   send_to = "Sergey S Kotov/IT/Probusiness Bank";
+
+   responsible = 1; // Переберём варианты
+   while (responsible<=maxTypeCount)
+     if (CompareStrWithMasks(respmask,""+responsible)==0)
+       errmail = getMail(account,{MFO_Bank},responsible,mail,tablenumber);
+//       errmail = 0; // KS 01.07.2012 C-7970 Пока Тихомиром не объяснит как тут быть
+       if (errmail == 0) // Получили почту, если не получили, то не обращаем внимание и переходим к следующему
+//         mail = send_to;// KS 01.07.2012 C-7970 Пока Тихомиров не объяснит как тут быть, если mail пуст, то отправки не происходит
+         errsend = Send_letter( Theme, Letter, mail, bank_lotus_code, tablenumber, send_to);
+//         return errsend;
+//       else
+//         return errmail;
+       end;
+     end;
+     responsible = responsible + 1;
+   end;
+
+   CloseCon;
+
+   return 0;
+
+   OnError
+     return -99;
+end;
+
+macro send_use_MailFront(vAccount, vTheme, vLetter)
+   var respmask, responsible, mail;
+   var Theme = "Уведомление о заведении претензии по счету";
+   var Letter, tablenumber, bank_lotus_code;
+   var errinit, errmail, errletter, errsend;
+   var account, send_to;
+
+   errinit = init;
+   if (errinit < 0)
+     return errinit;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\SEND_LOTUS", V_STRING, respmask, eCode);
+   //LAO в Вузе указаны типы от 1 до 5 ти
+   //1 -Куратор 2 -Экономист 3 -Офисменеджер 3 -Менеджер 4 -Риск менеджер
+   if (( eCode > 0 )or(respmask == "")) //Типы, которые будут включены
+     CloseCon;
+     //Не найдена настройка SEND_LOTUS
+     return -91;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\OE0_CODE", V_INTEGER, bank_lotus_code, eCode);
+   if ( eCode > 0 )
+     bank_lotus_code = 0;
+     //Не найдена настройка OE0_CODE
+     //return -92;
+   end;
+
+   GetRegistryValue("PRBB\\USR_CLAIM\\SEND_TO", V_STRING, send_to, eCode);
+   if ( eCode > 0 )
+     //Не найдена настройка SEND_TO
+     send_to = "";
+     //return -93;
+   end;
+
+   if ((strlen(vAccount)>0)and
+       (strlen(vTheme  )>0)and
+       (strlen(vLetter )>0)
+      )
+
+     account = vAccount;
+     Theme   = vTheme;
+     Letter  = vLetter;
+
+//  else
+
+ //    errletter = getClaimLetter(claimid, letter, account);
+
+  //   if (errletter != 0)
+ //      CloseCon;
+ //      return errletter;
+ //    end;
+     else
+     CloseCon;
+     return -1;
+   end;
+
+   responsible = 1; // Переберём варианты
+   while (responsible<=maxTypeCount)
+     if (CompareStrWithMasks(respmask,""+responsible)==0)
+       errmail = getMail(account,{MFO_Bank},responsible,mail,tablenumber);
+       if (errmail == 0) // Получили почту, если не получили, то не обращаем внимание и переходим к следующему
+         errsend = Send_letter( Theme, Letter, mail, bank_lotus_code, tablenumber, send_to);
+       end;
+     end;
+     responsible = responsible + 1;
+   end;
+
+   CloseCon;
+
+   return 0;
+
+   OnError
+     return -99;
+end;
+
+
+
+//msgbox(getClaimLetter(963066));
+
+//msgbox(sendClaimMails(963066));

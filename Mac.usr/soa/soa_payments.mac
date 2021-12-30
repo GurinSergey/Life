@@ -1,0 +1,537 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: soa_payments.mac v.8
+// @author  : 2013-07-01 zip_z. 
+// @desc    : ТК Life - Вставка платежей (II этап реализации)
+// @changes : none
+// -------------------------------------------------------------------------------------------------
+import soa_payment_class, soa_carry_class, lib_pm_check,"soa_carryproc.mac", "CurDateProc.mac", "soa_category.mac";
+
+// @desc  : проверка разнесения по сумме (упрощенный вариант), выполняется ПОСЛЕ вставки
+// @return: V_BOOL (true, если все верно)
+// Обязательно округлять через round, иначе 100.86 != 100.86
+private macro checkCarrySumExact (paymentid:integer):bool
+    var sql = "select round(sum ( u.SUM_PAYER ),2) t_carryamount, round(p.t_amount,2) t_amount, p.t_baseamount, p.t_payamount, p.t_dockind"
+            + "  from usr_pmdocs u, dpmpaym_dbt p"
+            + " where u.paymentid = p.t_paymentid and u.paymentid = :pid and u.chapter = 1 "
+            + " group by p.t_amount, p.t_baseamount, p.t_payamount, p.t_dockind";
+    
+    sql = execSqlSelect (sql, makeArray (SQLParam ("pid", paymentid)), false);              
+    if (sql.moveNext ())
+        if (sql.value ("t_dockind", null, V_INTEGER) == SOA_CB_MULTYDOC)
+            return true;
+        end;
+        return (sql.value ("t_carryamount", null, V_MONEY) == sql.value ("t_amount", null, V_MONEY));
+    end;
+    return true;
+end;
+
+//LAO Интеграция ЮКИЛ ИК Проверка на возможность удаления /отзыва документа
+macro isDocRevokable(paymentid)
+    private var cm_d = RSDCommand("select T_PAYMSTATUS from dpmpaym_dbt where t_paymentid = ?");
+    cm_d.addparam("pmid", RSDBP_IN,paymentid);
+    private var r_s = RSDRecordset(cm_d);
+    if (not(r_s.movenext))
+        runError ("платеж с ид: "+paymentid+" не найден в системе",-301);
+    end;
+    
+    var docKind = PM_GetDocKind (PaymentID);
+    
+    // выгруженные в МБР - запрещено
+    if (PM_IsOprStep_State (PaymentID, docKind, "Ф", OPR_STEP_EXECSTEP))
+        runError ("Документ выгружен в МБР, удалять нельзя",-302);
+    end;
+    
+    // выгруженные во Фронт - запрещено
+    if (PM_IsOprStep_State (PaymentID, docKind, "f", OPR_STEP_EXECSTEP))
+        runError ("Документ выгружен во Фронт, удалять нельзя",-303);
+    end;
+    
+    // клиентские платежи - запрещено
+    if ((docKind == SOA_PS_PAYORDER) and (PM_IsClientPSPayment (PaymentID)))
+        runError ("Документ является клиентским платежом, удалять нельзя",-304);
+    end;
+    
+    // платежи на ФМ - запрещено
+    if (PM_isLockedByFMControl (PaymentID))
+        runError ("Документ обрабатывается финмониторингом, удалять нельзя",-305);
+    end;
+    return r_s.value("T_PAYMSTATUS");
+
+end;
+//Проверка на допустимость фазы по счету
+private macro checkphacc (curp,curr, acc_rec, acc_pay, carry_date, oper, msg)
+
+    if (date(carry_date) != {curdate})
+
+        var cmd = RSDCommand (
+          " select max(ph.t_phase) " +
+          "   from daccount_dbt ac, dopdphase_dbt ph " +
+          "  where     (ac.t_account = ? or ac.t_account = ?)" +
+          "        and ac.t_chapter = usr_common.get_chapter (ac.t_account) " +
+          "        and (ac.t_code_currency = ?  or ac.t_code_currency = ? )" +
+          "        and ph.t_account = ac.t_account " +
+          "        and ph.t_chapter = ac.t_chapter " +
+          "        and ph.t_currency = ac.t_code_currency " +
+          "        and ph.t_phasedate >= (select max (t_phasedate) " +
+          "                                 from dopdphase_dbt " +
+          "                                where     t_account = ac.t_account " +
+          "                                      and t_chapter = ac.t_chapter " +
+          "                                      and t_currency = ac.t_code_currency " +
+          "                                      and t_phasedate <= ? )" 
+        );
+    
+        cmd.addparam("acc_pay", RSDBP_IN, acc_pay);
+        cmd.addparam("acc_rec", RSDBP_IN, acc_rec);
+        cmd.addparam("fiidp", RSDBP_IN, curp);
+        cmd.addparam("fiidr", RSDBP_IN, curr);
+        cmd.addparam("carry_date", RSDBP_IN, date(carry_date));
+    
+        var rs = RSDRecordset(cmd);
+    
+        if ((rs.movenext) and (valtype(rs.value(0)) != V_SPECIAL_VALUE /*null*/))
+
+            if( not( CheckObjectRestriction(92, 0, 0,"dphases_dbt" ,  "t_Phase = "+int(rs.value(0)), "", null, int(oper)) ));
+                setparm(6,"Нет доступа к счету находящемуся в фазе "+int(rs.value(0)));
+                return false;   
+            end;
+
+            return true;
+        else
+            return true; //если не записи в dopdphase_dbt то значит оба счета - покрытие, фазу не проверяем
+        end;
+        
+    else
+        return true; //если дата совпадает, пропускаем
+    end;
+end;
+
+//Проверяем доступность проведения для платежей с стандартным методом проведения, по R-528953-2
+private macro chec_for_run( ch_paymentid, err_st )
+    var rs, cmd, err, ch;
+    //проверяем только отложенные платежи
+    cmd = RSDCommand("SELECT pm.t_oper t_oper, "+
+                     "       pm.t_fiid t_fiid_payer, "+
+                     "       pm.t_payfiid t_fiid_receiver, "+
+                     "       pm.t_payeraccount, "+
+                     "       pm.t_receiveraccount, "+
+                     "       pm.T_VALUEDATE t_date "+
+                     "FROM dpmpaym_dbt pm, dpmrmprop_dbt prop "+
+                     "WHERE pm.t_paymentid = ? AND pm.t_paymentid = prop.t_paymentid AND pm.T_PAYMSTATUS = 0 ");
+
+    cmd.addParam("pmid", RSDBP_IN, ch_paymentid); 
+    rs = RSDRecordset(cmd);
+    while (rs.MoveNext)
+       ch = checkphacc (rs.value("T_FIID_PAYER"),rs.value("T_FIID_RECEIVER") , rs.value("T_RECEIVERACCOUNT"),rs.value("T_PAYERACCOUNT"), rs.value("T_DATE") , rs.value("T_OPER"), err);
+       if (not ch)
+          setparm( 1, err );
+          return -400;
+       end;
+    end;    
+    return 0;
+end;
+
+//проверяем все проводки на фазу
+private macro check_for_backout(del_paymentid,del_oper,del_errm)
+var    rs, cmd,err,ch;
+        cmd = RSDCommand(
+        " SELECT   arch.T_ACCTRNID,"+
+        " pm.T_PAYMENTID,"+
+        " arch.T_CHAPTER,"+
+        " arch.T_DATE_CARRY,"+
+        " arch.T_FIID_RECEIVER,"+
+        " arch.T_FIID_PAYER,"+
+        " ARCH.T_ACCOUNT_PAYER,"+
+        " arch.T_ACCOUNT_RECEIVER,"+
+        " arch.T_SUM_RECEIVER,"+
+        " arch.T_SUM_PAYER, "+
+        " ARCH.T_PRIORITY "+
+        "  FROM   dacctrn_dbt arch,"+
+        " dpmdocs_dbt pm"+
+        "  WHERE       pm.T_PAYMENTID = ? "+
+        " AND pm.T_ACCTRNID = ARCH.T_ACCTRNID ");
+        cmd.addparam("pmid", RSDBP_IN, del_paymentid);
+    
+    rs = RSDRecordset(cmd);
+    
+    while (rs.MoveNext)
+    
+        ch = checkphacc (rs.value("T_FIID_PAYER"),rs.value("T_FIID_RECEIVER") , rs.value("T_ACCOUNT_RECEIVER"),rs.value("T_ACCOUNT_PAYER"), rs.value("T_DATE_CARRY") , del_oper, err);
+        if (not ch)
+            setparm( 2, err );
+            return -400;
+        end;
+    
+    end;
+    
+    return 0;
+
+end;
+
+/*VDN 11.08.2015 Проверяем возможность провести платеж - в связи с ввеедением временной администрации*/
+macro check_run_operaton ( paymentid )
+    var rs = RSDRecordset (" SELECT 1 FROM dpmpaym_dbt pmpaym "+
+                           " WHERE  ( ( pmpaym.t_dockind = 200 "+
+                           "     AND ( REGEXP_LIKE (pmpaym.t_payeraccount, '^405|^406|^407|^40802|^40807|^40821') "+
+                           "     AND REGEXP_LIKE (pmpaym.t_receiveraccount, '^47405') ) ) "+
+                           "   OR    ( pmpaym.t_payerbankid = pmpaym.t_receiverbankid "+
+                           "     AND ( REGEXP_LIKE (pmpaym.t_payeraccount, '^405|^406|^407|^40802|^40807|^40821|^423|^426|^40817|^40820') "+
+                           "     AND REGEXP_LIKE (pmpaym.t_receiveraccount, '^306') ) ) ) "+
+                           "     AND pmpaym.t_payerbankid = 3045 "+
+                           "   AND pmpaym.t_paymentid = " + paymentid);
+        
+    if (rs and rs.MoveNext) return true; end;
+  
+    return false;
+end;
+
+
+// @desc  : вставка платежа (usr_soa_payments.insert_payment)
+// @return: V_INTEGER (paymentid созданного платежа)
+macro insert_payment(doc  :object   // p1   - описание основных параметров документа                    
+                    ,pay  :object   // p2   - описание параметров плательщика (дебет)                   
+                    ,rcv  :object   // p3   - описание параметров получателя (кредит)                   
+                    ,sum  :object   // p4   - описание финансовых параметров платежного документа       
+                    ,med  :object   // p5   - описание банка-посредника (для переводов)                 
+                    ,usr  :object   // p6   - описание пользовательских полей                           
+                    ,tax  :object   // p7   - описание дополнительных параметров налогового платежа     
+                    ,dem  :object   // p8   - описание дополнительных параметров платежного требования  
+                    ,opr  :object   // p9   - описание параметров обработки документа в RS-Bank         
+                    ,cur  :object   // p10  - описание дополнительных параметров перевода               
+                    ,vo   :object   // p11  - описание дополнительных реквизитов по валютной операции   
+                    ,cln  :object   // p12  - описание параметров физ.лица (для кассовых документов)    
+                    )
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    var cmd_symb, cat_error;
+    var p = SOAPayment ();
+    p.insertPaymentInit (doc, pay, rcv, sum, med, usr, tax, dem, opr, cur, vo, cln);
+    p.insertPaymentExecute (); 
+
+    /*VDN 12.02.2015 Вставка категорий, в рамках проекта интеграции ИК*/
+    if ((p.origin == 2) and (p.error == EXIT_NOERROR)) 
+      cat_error = usr_set_category_payment(p);
+      if (cat_error != EXIT_NOERROR) runError(TrimErrMsg(cat_error)); end;
+    end;
+
+    if (rslDefCon.IsInTrans) rslDefCon.CommitTrans (); end;
+    
+    if (p.error != EXIT_NOERROR) runError (TrimErrMsg(p.error)); end; 
+    
+    // удаление проводки, которая самостоятельно сгенерировалась на вставке платежа
+    //LAO удаляем только если профодку не нужно было формирвоать
+    if  (safeGetPropMandatory (opr, "makeCarryFromPayment",V_INTEGER)!=1)
+        var c = SOACarry ();
+        c.paymentid = p.payment_id;
+        c.delCarryFromRegTable ();
+    end;
+    
+    if (p.error == EXIT_NOERROR) 
+        if ((p.doc_kind == 15 ) or
+            (p.doc_kind == 286) or
+            (p.doc_kind == 70)    )
+            // Последний параметр  суммы нигде не учитывается, но я его оставил...
+            cmd_symb = rsdcommand( "Begin ? := usr_parse_cash_symbols (?, ?, ?); END;" );
+            cmd_symb.addParam( "err",     RSDBP_RETVAL, V_STRING  );  
+            cmd_symb.addParam( "pid", RSDBP_IN,     p.payment_id  );  
+            cmd_symb.addParam( "sumb",  RSDBP_IN, p.cash_symbs  );  
+            cmd_symb.addParam( "sum",  RSDBP_IN, p.debet_sum   ); 
+            cmd_symb.execute;
+        end;
+    end;    
+         
+    return p.payment_id;
+end;
+
+// @desc  : добавление проводки (usr_soa_payments.add_carry)
+// @return: V_INTEGER (paymentid созданного платежа)
+//LAO добавляем 4-е параметра для адаптации 2031
+    /*var FIID_PAYER        :integer; // NUMBER(5)    //LAO 20.31
+    var FIID_RECEIVER     :integer; // NUMBER(5)    //LAO 20.31
+  
+    var SUM_PAYER         :money;   // NUMBER(32,12)   //LAO 20.31
+    var SUM_RECEIVER      :money;   // NUMBER(32,12)   //LAO 20.31*/
+    
+macro add_carry (payment:object, carry:object)
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    // получение всего, что нам напередавали
+    var PackID      = safeGetProp (payment, "PackID"    , V_INTEGER); // не используется
+    var Payment_ID  = safeGetProp (payment, "Payment_ID", V_INTEGER);
+    var Num_doc     = safeGetProp (payment, "Num_doc"   , V_STRING );
+    var Pack        = safeGetProp (payment, "Pack"      , V_INTEGER);
+    
+    var PayerAccount    = safeGetProp (carry, "PayerAccount"    ,V_STRING);
+    var ReceiverAccount = safeGetProp (carry, "ReceiverAccount" ,V_STRING);
+    var Ground          = safeGetProp (carry, "Ground"          ,V_STRING);
+    var Sum             = safeGetProp (carry, "Sum"             ,V_MONEY );
+    var SUM_PAYER       = safeGetProp (carry, "SUM_PAYER"       ,V_MONEY );
+    var SUM_RECEIVER    = safeGetProp (carry, "SUM_RECEIVER"    ,V_MONEY );
+    var Oper_carry       = safeGetPropMandatory (carry, "Oper"   ,V_INTEGER);
+    var Shifr_oper_carry = safeGetPropMandatory (carry, "Shifr_Oper"      ,V_STRING );
+    var Kind_oper_carry  = safeGetPropMandatory (carry, "Kind_Oper"       ,V_STRING );
+    var DATECARRY        = safeGetPropMandatory (carry, "DATE_CARRY"      ,V_DATE);
+    private var  dell_carry;
+    // если шаг зачисления выполнен и есть проводки шага зачисления - не даем вставлять add_carry до отката этого шага!
+    // if (PM_HasCarry_OprStep_State (Payment_ID, PM_GetDocKind (Payment_ID), "6", OPR_STEP_EXECSTEP))
+    //    runError ("По платежу есть проводки на выполненном шаге зачисления.");
+    // end;
+    if (PackID == 10)
+        dell_carry = rsdcommand( "DELETE FROM usr_pmdocs  WHERE paymentid = ?" );
+        dell_carry.addParam( "paymid",  RSDBP_IN,     Payment_ID );  
+        dell_carry.execute;
+    end;  
+    // инициализация класса проводки по полученным параметрам 
+    var c = SOACarry ();
+    c.paymentid        = Payment_ID;
+    c.payer_account    = PayerAccount;
+    c.receiver_account = ReceiverAccount;
+    c.sum              = Sum;
+    c.SUM_PAYER        = SUM_PAYER;
+    c.SUM_RECEIVER     = SUM_RECEIVER;
+    c.pack             = Pack;
+    c.num_doc          = Num_doc;
+    c.ground           = Ground;
+    c.oper             = Oper_carry;
+    c.shifr_oper       = Shifr_oper_carry;
+    c.kind_oper        = Kind_oper_carry;
+    c.date_carry       = DATECARRY;
+    
+    // поехала транзакция
+    rslDefCon.BeginTrans ();
+    
+    c.makeRunCarryStepPrepare ();     // дозаполнение, проверки по бизнес-логике
+
+    // Golovkin 21.07.2014 R-415986 WTF?! зачем это вообще? убрал до выяснения
+    // c.makeRunCarryStepExecute ();     // вставка
+    // c.makeRunCarryStepPostAction ();  // действия после вставки, привязка payment <-> carry
+    
+    rslDefCon.CommitTrans ();
+    
+    return null;
+onerror (e) 
+    if (rslDefCon.IsInTrans ()) 
+        rslDefCon.RollbackTrans ();
+    end; 
+    catchUserError (e);
+end;
+
+
+// @desc  : удаление документа
+// @return: void
+macro usr_delete_payment (paymentid:integer, oper:integer)
+    var g_errorstatus;
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+    
+    // ---------------------------------------------------------------------------------------------
+    // ПРОВЕРКИ
+    // ---------------------------------------------------------------------------------------------
+   /* var   inter_mode = SetDialogFlag(0);
+    var   stats = SetRSTrace(true);
+    SetDialogFlag(inter_mode);
+    */                                      
+    if (isDocRevokable(paymentid)>=0)
+     //проверяем фазу
+        if (check_for_backout(PaymentID,oper,g_errorstatus) != 0 )
+            runError (g_errorstatus,-911);
+        end;
+    end;
+    
+    // ---------------------------------------------------------------------------------------------
+    // ТРАНЗАКЦИЯ ОТКАТА И УДАЛЕНИЯ
+    // 1. откат шагов операции (если есть)
+    // 2. удаляем первичку
+    // 3. удаляем платеж и все, что с ним связано
+    // ---------------------------------------------------------------------------------------------
+    var stat = 0;
+    // 1
+    rslDefCon.BeginTrans ();
+    if (PM_FindOperation (paymentid))
+        stat = PM_RollbackOperation (paymentid);
+        if (EXIT_SUCCESS != stat)
+            runError (RSL_GetSystemError (stat));
+        end;
+    end;
+    // 2
+    PM_DeletePrimaryDocumentPaym (paymentid);
+    // 3
+    stat = execStoredFunc ("pm_common.DeletePayment", V_INTEGER, makeArray (SqlParam ("p_PaymentID", PaymentID)));
+    if (stat != EXIT_SUCCESS)
+        if (rslDefCon.IsInTrans ()) rslDefCon.RollbackTrans (); end;
+        runError (RSL_GetSystemError (stat));  
+    end;
+    // ~
+    rslDefCon.CommitTrans ();
+  /*  inter_mode = SetDialogFlag(0);
+    stats = SetRSTrace(false);
+    SetDialogFlag(inter_mode);*/
+    return null;
+onerror (e) 
+    if (rslDefCon.IsInTrans ()) 
+        rslDefCon.RollbackTrans ();
+    end; 
+  /*  inter_mode = SetDialogFlag(0);
+    stats = SetRSTrace(false);
+    SetDialogFlag(inter_mode);*/
+    runError(e.message,-401);
+   // catchUserError (e);   
+end;
+
+
+// @desc  : старты операции (run_operation, rsb_execute_step, rsb_execute_step_nolog, exec_steps_for_temp делают одно и то же)
+// @return: void
+macro run_operation( paymentid:integer, carryproc:integer )
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    private var docKind, v_errortxt, cmd;
+    private var check_carry;
+    private var v_real_count_carry;
+    private var LastOperDay;
+    private var g_errorstatus;   
+    
+    /*VDN 11.08.2015 В связи с введение временной администрации в ПРбБ*/
+    if ( check_run_operaton ( paymentid ) )
+      runError ("Операция запрещения", -555);
+    end;
+
+    LastOperDay = GetLastOperDay();
+    if (LastOperDay > {curdate}) //Меняем день
+        usr_SetOperDay(); //устанавливаем последний отрытый ОД
+    end;
+
+    if( not PM_FindPayment( paymentid ) )
+        runError( "Платеж с ID: " + paymentid + " не найден в РС", -105 );
+    end;
+
+    docKind = PM_GetDocKind( PaymentID );
+
+    //Gurin S. 10.12.2014 Для 20020 (выгрузка в МБР) проверка не нужна
+    if ({oper} != 20020)
+       // пусть допередают проводки перед стартом операции. При проводке руками ругнётся outsidecarry.
+       if( docKind != SOA_CB_MULTYDOC )
+          if(not checkCarrySumExact( PaymentID ) )
+             runError( "Сумма проводок меньше суммы платежа, старт операции запрещён", -106 );
+          end;
+       end;
+    end;
+
+    if (carryproc==1)
+      //  rslDefCon.BeginTrans;
+
+        // инициализация операции
+        cmd = rsdcommand( "begin usr_operations_proc.start_operations (?,?,?); end;" );
+        cmd.addParam( "dockind", RSDBP_IN,     docKind   );  
+        cmd.addParam( "paymid",  RSDBP_IN,     paymentid );  
+        cmd.addParam( "err",     RSDBP_RETVAL, V_STRING  );  
+        cmd.execute;
+
+        if( cmd.Param(2).value != "no_error" )
+            runerror( cmd.Param(2).value, -550 );
+        end;
+
+        // выполнение проводок 
+        check_carry = SOA_RunMakeCarryAll( docKind, paymentid, v_errortxt,v_real_count_carry );
+        if( check_carry != 0 )
+              if (v_real_count_carry>0) //если все таки проводки подвязались, удалить их можно будет только с закрытым шагом зачисления
+            //так как для 20.30 нет реализации интера удаления проводок не на шаге операции
+                cmd = rsdcommand( "begin usr_operations_proc.finish_operations (?,?,?); end;" );
+                cmd.addParam( "dockind", RSDBP_IN,     docKind   );  
+                cmd.addParam( "paymid",  RSDBP_IN,     paymentid );  
+                cmd.addParam( "err",     RSDBP_RETVAL, V_STRING  );  
+                cmd.execute;
+              end; 
+            runerror( v_errortxt, check_carry );
+        end;
+
+        // завершение операции
+        cmd = rsdcommand( "begin usr_operations_proc.finish_operations (?,?,?); end;" );
+        cmd.addParam( "dockind", RSDBP_IN,     docKind   );  
+        cmd.addParam( "paymid",  RSDBP_IN,     paymentid );  
+        cmd.addParam( "err",     RSDBP_RETVAL, V_STRING  );  
+        cmd.execute;
+
+        if( cmd.Param(2).value != "no_error" )
+            runerror( cmd.Param(2).value, -555 );
+        end;     
+
+      //  rslDefCon.CommitTrans;
+    else
+        //Проверка на возможность провести платеж, R-528953-2
+        // LAO для фронта проверку не делаем.
+   //     if (not Opr_IsStepExecuteSymb(paymentid,docKind,"f","X",11000120))
+            if (chec_for_run( paymentid, g_errorstatus ) != 0)
+                runError ( g_errorstatus, -911 );
+            end;
+     //   end;
+
+        if( not PM_ExecuteOperation( paymentid, docKind ) )
+            runError( TrimErrMsg( getErrMsg() ) );
+        end;
+
+        /*VDN 30.06.2015 Обработка отвергнутых мемриков или банковских ордеров*/
+        if ((docKind == 70) or (docKind == 286))
+          cmd = rsdcommand("SELECT UTL_RAW.cast_to_varchar2 (t_text) NoteText FROM dnotetext_dbt WHERE t_documentid = LPAD (?, 10, '0') AND t_notekind = 42");
+          cmd.addParam( "paymentid", RSDBP_IN, paymentid );
+ 
+          var rs = RSDRecordset( cmd );
+          if ( rs.MoveNext ) RunError( rs.value("NoteText") ); end; 
+        end;
+    end;
+    
+    onerror(e) 
+    /*    if( rslDefCon.IsInTrans ) 
+            rslDefCon.RollbackTrans;
+           
+        end; */
+        runerror( e.message, e.err );
+//      catchUserError (e);   
+end;
+
+macro rsb_execute_step (parm:object)
+    var paymentID :integer   = safeGetProp (parm, "paymentID"  , valType (paymentID));
+    var docKind   :integer   = safeGetProp (parm, "docKind"    , valType (docKind  ));
+    var packMode  :integer   = safeGetProp (parm, "packMode"   , valType (packMode ));
+    var logging   :bool      = safeGetProp (parm, "logging"    , valType (logging  ));
+    
+    docKind = nvl_ex (docKind, PM_GetDocKind (PaymentID));
+    
+    // пусть допередают проводки перед стартом операции. При проводке руками ругнётся outsidecarry.
+    if (docKind != SOA_CB_MULTYDOC)
+        if (not checkCarrySumExact (PaymentID))
+            runError ("Сумма проводок меньше суммы платежа, старт операции запрещён");
+        end;
+    end;
+
+    if (not PM_ExecuteOperation (paymentID, docKind))
+        runError (getErrMsg ());
+    end;
+// onerror (e) catchUserError (e);   
+end;
+
+macro rsb_execute_step_nolog (parm:object)
+    var paymentID :integer   = safeGetProp (parm, "paymentID"  , valType (paymentID));
+    var docKind   :integer   = safeGetProp (parm, "docKind"    , valType (docKind  ));
+    var packMode  :integer   = safeGetProp (parm, "packMode"   , valType (packMode ));
+    var logging   :bool      = safeGetProp (parm, "logging"    , valType (logging  ));
+
+    docKind = nvl_ex (docKind, PM_GetDocKind (PaymentID));
+    
+    // пусть допередают проводки перед стартом операции. При проводке руками ругнётся outsidecarry.
+    if (docKind != SOA_CB_MULTYDOC)
+        if (not checkCarrySumExact (PaymentID))
+            runError ("Сумма проводок меньше суммы платежа, старт операции запрещён");
+        end;
+    end;
+
+    if (not PM_ExecuteOperation (paymentID, docKind))
+        runError (getErrMsg ());
+    end;
+// onerror (e) catchUserError (e);   
+end;
+
+macro exec_steps_for_temp ( )
+    return null;
+end;

@@ -1,0 +1,952 @@
+// ПользовательскиеПроверкиПредобработки
+// EVG 9/12/2011 Перенёс --> DEV 7.12.11 I-00117075-2 Добавлена проверка на наличие ссылки на НДС в основании для п/п из клиент-банка, кроме налоговых п/п
+// KS 12.07.2012 C-12598
+// Gurin S. N. 16.07.2012 R-83851-2
+// VV 18.02.2013 C-17836
+// RR 24.02.2013 По заявке C-17570 добавлена check_SKS_ReceiverAccount_EXV
+// Gurin S. 18.03.2013 I-00341646-2
+// Gurin S. 03.04.2013 C-18484
+// Gurin S. 21.05.2013 R-192203-2
+// Gurin S. 09.08.2013 C-22197
+// Gurin S. 24.09.2013 C-23092
+// Gurin S. 27.09.2013 R-257057-2 изменения в check_SKS_PayerAccount
+// Gurin S. 08.10.2013 R-262647-1
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+// TAM 06.02.2015 C-37507 - меняется алгоритм определния счета СКС
+// TAM 10.02.2015 C-28461 - проверки дат, для докмуентов ABBY
+//-------------------------------------------------------------------------------------------------------
+import BankInter,Rsbdataset,OprInter,"pmtax.mac","AvtoTypePayment.mac";
+import "rmcmptl.mac","FrontRoute.mac";
+import "PaymTestFormat.mac";
+import "diver.mac";
+import "fg_Life_parm.mac", "lib_compare.mac", "lib_const.mac", "lib_pm_check.mac", "lib_account.mac";
+
+//TAM 17.01.13 C-6639 - счета запрещенные к дебетованию п\п
+private const Acc_deposit = "410* - 422*, 425*, 427* - 440*"; 
+
+private const fdBank = fg_life_subject({OurBank});
+// VV 18.02.2013 C-17836 >>>>>
+private var Per_PP_IK, errCode;
+GetRegistryValue("COMMON\\Period_PP_IK", V_INTEGER, Per_PP_IK, errCode);
+if (errCode > 0)
+   msgbox("Проверьте значение настройки COMMON\\Period_PP_IK");
+   return false;
+end;
+// VV 18.02.2013 C-17836 <<<<<< 
+//Kozina проверка срока действия полномочий директора I-095365
+private macro CheckOfficer(PartyID):date
+   var rsd = rsdrecordset("select T_DATETO from DOFFICER_DBT where T_ISFIRSTPERSON = 'X' and T_PARTYID = "+PartyID);
+   if (rsd.movenext())
+      return rsd.value(0);
+   else
+      return date("01.01.0001");
+   end;
+end;
+
+//Kozina Проверка наличия адреса в поле плательщик (ЦБ РФ № 2634-У по заявке C-3467)
+private macro CheckPayerAddress(PaymentID):bool
+   //Если платеж на счет 30111 или 30231, то проверяем наличие адреса плательщика
+   var rsd = rsdrecordset("select 1 from dpmrmprop_dbt rm, dpmpaym_dbt paym       "+
+     "where (REGEXP_LIKE (rm.t_ground, '(30111|30231)\\d{15}')                   "+
+     "or SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('30111', '30231'))            "+
+     "and RM.T_PAYMENTID = PAYM.T_PAYMENTID                                      "+
+     "and RM.T_PAYMENTID ="+PaymentID);
+   if (rsd.movenext())
+      //Адрес пишется в поле Плательщик, выделяется // //
+      rsd = rsdrecordset("select 1 from dpmrmprop_dbt                       "+
+        "where rsb_mask.comparestringwithmask('*//?*//*', T_PAYERNAME) = 1 "+
+        "and t_paymentid ="+PaymentID);
+      if (rsd.movenext())
+         return true;
+      else
+         return false;
+      end;
+   else 
+      return true;
+   end;
+end;
+
+
+private macro typeaccH(account, chapter)
+   var cmd = rsdcommand ("select 1 from daccount_dbt where t_account = ? and t_usertypeaccount like '%H%' and t_chapter = ?");
+   cmd.addparam("acc",RSDBP_IN, account);
+   cmd.addparam("chapter",RSDBP_IN, chapter);
+   var rsd = rsdrecordset(cmd);
+   if (rsd.movenext())
+      return true;
+   else
+      return false;
+   end;
+end;
+
+private macro typeaccD(account, chapter)
+   var cmd = rsdcommand ("select 1 from daccount_dbt where t_account = ? and t_usertypeaccount like '%D%' and t_chapter = ?");
+   cmd.addparam("acc",RSDBP_IN, account);
+   cmd.addparam("chapter",RSDBP_IN, chapter);
+   var rsd = rsdrecordset(cmd);
+   if (rsd.movenext())
+      return true;
+   else
+      return false;
+   end;
+end;
+
+macro check_SKS_sf_AccountPayer(account)
+   If ((index(Substr(Account,11,1),"9"))or
+       (typeaccD(Account, 1))) // KS 18.11.2010 I-084287 В региональных банках признаком счета СКС является
+                               //                        наличие пользовательского типа D
+      //Kozina алгоритм изменен по I-054221, I-054487, I-054185
+      if (typeaccH(Account, 1)) ;
+      elif (not ВходитВГруппу({oper},192))
+         MsgBox("Счет-плательщика СКС - документ отвергнут");
+         return 1; //ош - в отвергнутые
+      elif(Gettrue(true, "Счет-плательщика -  СКС. Провести документ?"))
+         ;
+      else
+         MsgBox("Счет-плательщика СКС - документ отвергнут");
+         return 1; //ош - в отвергнутые
+      end;
+   end;
+   return 0;
+end;
+
+
+macro check_SKS_PayerAccount(PaymentObj)
+   If((index(Substr(PaymentObj.PayerAccount,11,1),"9"))or
+      (typeaccD(PaymentObj.PayerAccount, 1))) // KS 18.11.2010 I-084287 В региональных банках признаком счета СКС является
+                                              //                        наличие пользовательского типа D
+      //Kozina алгоритм изменен по I-054221, I-054487, I-054185
+      if (((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40302") and (PaymentObj.shifroper == "02"))
+           or (typeaccH(PaymentObj.PayerAccount, 1)))
+         ;
+      elif(ВходитВГруппу({oper},192) and (not IsOprMultiExec()) and (Gettrue(true, "Счет-плательщика -  СКС. Провести документ?")))
+         return 0;
+      else
+         PaymentObj.notes.addnote(42,"Счет-плательщика -  СКС");
+         MsgBox("Счет-плательщика СКС - документ отвергнут");
+         return 1; //ош - в отвергнутые
+      end;
+   End;
+   return 0;
+end;
+
+macro check_SKS_Sf_AccountReceiver(Account)
+   If((index(Substr(Account,11,1),"9"))or
+         (typeaccD(Account, 1))) // KS 18.11.2010 I-084287 В региональных банках признаком счета СКС является
+                                                    //                        наличие пользовательского типа D
+      if (typeaccH(Account, 1))
+         ;
+      elif(not ВходитВГруппу({oper},192))
+         MsgBox("Счет-получетеля СКС - документ отвергнут");
+         return 1; //ош - в отвергнутые
+      elif(Gettrue(true, "Счет-получетеля -  СКС. Провести документ?"))
+             ;
+      else
+         MsgBox("Счет-получетеля СКС - документ отвергнут");
+         return 1; //ош - в отвергнутые
+      end;
+   End;
+   return 0;
+end;
+
+
+macro check_SKS_ReceiverAccount(PaymentObj)
+   /*20.02.2013 zmp C-6733 >>>*/
+   var PayerINN :String = "", ReceiverINN :String = "";
+   SplitFullINN(PaymentObj.PayerINN, PayerINN, null);
+   SplitFullINN(PaymentObj.ReceiverINN, ReceiverINN, null);
+   if(    (Substr(PaymentObj.receiverAccount, 11,1) == "9") 
+        and (regexp_like(PaymentObj.receiverAccount,"^4070(2|3)|^40802")) 
+        and (typeaccD(PaymentObj.receiverAccount,1)) 
+        and (PayerINN != ReceiverINN) 
+        and (PaymentObj.DocKind == 201)
+       )
+      if((ВходитВГруппу({oper},ACS_GRP_PM_PAYM_SKS)) and (not IsOprMultiExec())  and (Gettrue(true, "Счет-получетеля - СКС. Провести документ?")) )
+         return 0;
+      else
+         PaymentObj.notes.addnote(42,"Не верный ИНН/КПП");
+         MsgBox("Не верный ИНН/КПП. Документ отвергнут");
+         return 1; //ош - в отвергнутые
+      end;
+   end;
+   /*<<< 20.02.2013 zmp C-6733*/
+   return 0;
+end;
+
+//RR 21.02.2013 C-17570
+ macro check_SKS_ReceiverAccount_EXV(PaymentObj)
+   debugbreak;
+   if(   (PaymentObj.Origin == PSPO_OR_CLB) or 
+         (PaymentObj.Origin == PSPO_OR_MANUAL ) or
+         (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC)  )
+ 
+      var PayerINN :String = "", ReceiverINN :String = "";
+      SplitFullINN(PaymentObj.PayerINN, PayerINN, null);
+      SplitFullINN(PaymentObj.ReceiverINN, ReceiverINN, null);
+      //TAM 06.02.2015 C-37507
+      if( typeaccD(PaymentObj.receiverAccount, 1) and 
+         ((Substr(PaymentObj.receiverAccount, 12,1) == "9") or (Substr(PaymentObj.receiverAccount, 11,1) == "9")) and 
+         (PaymentObj.PayerBankCode == PaymentObj.ReceiverBankCode) and
+         (PayerINN != ReceiverINN) )
+         
+         if( (ВходитВГруппу({oper},ACS_GRP_PM_PAYM_SKS)) and
+             (not IsOprMultiExec()) and 
+             (Gettrue(true, "Счет-получетеля - СКС. Провести документ?")))
+            return 0;
+         else
+            PaymentObj.notes.addnote(42,"Операция не соответствует режиму счета получателя");
+            MsgBox("Операция не соответствует режиму счета получателя. Документ отвергнут");
+            return 1;
+         end;
+      //TAM 06.02.2015 C-37507
+      elif( typeaccD(PaymentObj.PayerAccount, 1) and 
+            ((Substr(PaymentObj.PayerAccount, 12,1) == "9") or (Substr(PaymentObj.PayerAccount, 11,1) == "9")))
+         if(ВходитВГруппу({oper},ACS_GRP_PM_PAYM_SKS) and 
+            (not IsOprMultiExec()) and
+            (Gettrue(true, "Счет-плательщика - СКС. Провести документ?")))
+            return 0;
+         else
+            PaymentObj.notes.addnote(42,"Счет плательщика СКС");
+            MsgBox("Счет плательщика СКС");
+            return 1;
+         end;
+      end;
+      return 0;
+   end;
+   return 0;
+END;
+
+//Gurin S. 21.05.2013 R-192203-2
+macro Check_Over (PaymentObj)
+   debugbreak;
+   var PayerAccount :RSL_Account = RSL_Account(PaymentObj.PayerAccount, 0) ;
+
+   if(PayerAccount.check_type_account("О"))
+      PaymentObj.notes.addnote(42,"Типа счет плательщика - Овердрафт. Документ отвергнут");
+      MsgBox("Тип счета плательщика - Овердрафт. Документ отвергнут");
+      return 1;
+   end;
+   return 0;
+end;
+
+
+macro get_names(ptid)
+   var cmd = RSDCommand("select t_name||'|'||t_shortname||'|'||t_addname  from dparty_dbt where t_partyid = ?");
+   cmd.addparam("ptid", RSDBP_IN, ptid);
+   var rs = RSDRecordset(cmd);
+   rs.movenext();
+   return (rs.value(0));
+end;
+
+macro ПроверитьЗапрещенныеСимволы(str);
+   var nosymb="" + StrFor(26)+StrFor(9)+StrFor(13); 
+   var i=1;
+   while (i<=strlen(str))
+      if ((index(nosymb, substr(str,i,1)))!=0)
+         return False;
+      end;
+   i=i+1;
+   end;
+   return True;
+end;
+
+MACRO not_in(val)
+   var i = 1,str;
+   while(getparm(i,str))
+      if(val == str)
+         return false;
+      end;
+      i=i+1;
+   end;
+   return true;
+END;
+
+macro СчетВнешнего(RecAccount,note)
+   var rs, cmd;
+  //!!!Seleznev
+   if (not(RecAccount))
+      return;
+   end;
+                                                
+   cmd = RSDCommand("select t_balance from dbalance_dbt where t_balance= ? ");
+   cmd.addParam("acc",RSDBP_IN, Substr(RecAccount,1,5));
+
+   if ((Substr(RecAccount,6,3) != "810" ) and (Substr(RecAccount,6,3) != "000"))
+      //MsgBox(Substr(RecAccount,6,3));
+      setParm(1,"Валюта счета получателя не 810");
+      return 1;
+   End;
+
+   rs = RSDRecordset(cmd);
+   if( rs.moveNext() )
+      return 0;
+   else
+      //Gurin S. 09.02.2015 Вьюнова сказал разрешить переводы на 30212 - спецсчет в РКЦ
+      if ( Substr(RecAccount,1,5) != "30212")
+         setParm(1,"Балансовый счет счета получателя не соответствует плану счетов");
+         return 1;
+      end;
+   end;
+end;//macro
+
+/*VV*/
+Macro CheckValuedate(PaymentObj)
+   // VV 18.02.2013 C-17836
+   var cmd1, rsd1;
+   // Gurin S. 18.03.2013 I-00341646-2
+   if( (({curdate} - PaymentObj.Date) > (Per_PP_IK-1)) and (PaymentObj.DocKind == PS_PAYORDER) and inList (PaymentObj.Origin,1,2,2100))          
+      cmd1 = rsdcommand(" select 1 from doproper_dbt opr, doprstep_dbt step "+ 
+                        " where OPR.T_ID_OPERATION = STEP.T_ID_OPERATION "+
+                        " and OPR.T_DOCUMENTID = lpad('"+PaymentObj.paymentid+"',34,'0') and opr.t_dockind = "+PaymentObj.dockind+" and t_kind_action = 228 ");
+      rsd1 = rsdrecordset(cmd1);
+      if (rsd1.movenext())
+         //Был на картотеке
+      else
+         MsgBox("Дата документа отстает от текущей более чем на"+" "+Per_PP_IK+" "+"дней.");
+         PaymentObj.notes.addnote(42,"Дата документа отстает от текущей более чем на"+" "+Per_PP_IK+" "+"дней.");
+         return true;
+      end;
+   end;
+   return false;
+end;
+
+private macro Счет(acc,valdate,note,type_ac)
+   var rs, cmd;
+   cmd = RSDCommand("SELECT ac.t_account,ac.t_open_close, ac.t_datenochange, ac.t_type_account "+
+                    "  FROM daccount_dbt ac" +
+                    " WHERE ac.t_account=?");
+
+   cmd.addParam("acc",RSDBP_IN,  Acc);
+   rs = RSDRecordset(cmd);
+   if( rs.moveNext() )
+      If (index(rs.value("t_open_close"),"З"))
+         setparm(2,"Счет-плательщика закрыт");
+         MsgBox("Счет-плательщика закрыт -  документ помещен в отвергнутые");
+         return 1;
+      elif (index(rs.value("t_type_account"),"Т")) //zmp 02.08.2012 I-00228262-2 стояла неверная кодировка символа "Т"
+         setparm(2,"Счет-плательщика имеет Арест на дебет");
+         MsgBox("Счет-плательщика имеет Арест на дебет -  документ помещен в отвергнутые");
+         return 1;
+      elif (rs.value("t_datenochange")>valdate)
+         setparm(2,"Счет-плательщика имеет запрет проводок до " + rs.value("t_datenochange"));
+         MsgBox("Счет-плательщика имеет запрет проводок до " + rs.value("t_datenochange")+ " -  документ помещен в отвергнутые");
+         return 1;
+      else
+         setparm(3,rs.value("t_type_account"));
+         return 0;
+      end;
+   else
+      setparm(2,"Счет-плательщика не найден в БД");
+      MsgBox("Счет-плательщика не найден в БД - документ помещен в отвергнутые");
+      return 1;
+   end;
+End;//macro
+
+PRIVATE MACRO AccountIsMask( Account ):bool
+   if( Index( Account, "*" ) or
+       Index( Account, "?" ) )
+      return true;
+   else
+      return false;
+   end;
+END;
+
+/* Проверка на числовой номер */
+private macro IsDigitInNumber( Number )
+   var stat = 0, i = 1, ch, DigitString = "0123456789";
+      while( (not stat) and (i <= strlen(Number)) )
+         ch = SubStr( Number, i, 1 );
+         if(  Index( DigitString, ch ))
+            stat = 1;
+         end;
+         i = i + 1;
+      end;
+   return stat;
+end;
+
+//Номер не состоит из 0
+private macro Is0Number( Number )
+   var stat = 0, i = 1, ch,nol="0";
+   while( (not stat) and (i <= strlen(Number)) )
+      ch = SubStr( Number, i, 1 );
+      if( not Index( nol, ch ))
+         stat = 1;        
+      end;
+      i = i + 1;
+   end;
+   return stat;
+End;
+
+private Macro ПроверитьРазноску(paymentobj)  //не проверено
+   var query :string ="select adpi.t_account "+ 
+                      "from dpmpaym_dbt pm, dpmaddpi_dbt adpi "+
+                      "where pm.t_paymentid = adpi.t_paymentid "+
+                      "and adpi.t_account not in(select t_account from daccount_dbt) "+
+                      "and pm.t_paymentid = "+ paymentObj.PaymentID;
+   var rs:RsdRecordset = execSQLselect(query);
+   if( rs.moveNext() )
+      MsgBox("Счета " + rs.Value(0) + "нет в БД");
+      return 1;
+   End;
+End;//macro
+
+private Macro ПроверитьГлаву(paymentobj)
+   var ch,chFakt,balacc:integer;
+   var query :string ="   select ac.t_chapter "+ 
+                          "from daccount_dbt ac "+
+                         "where ac.T_ACCOUNT="+"'"+paymentObj.PayerAccount+"'";
+   var rs:RsdRecordset = execSQLselect(query);
+
+   if( rs.moveNext() )
+      ch = rs.Value(0); //Глава счета плательщика из базы
+   else
+      MsgBox("Ошибка получения Главы счета"); 
+      return 1;  //в ошибки, тк неизвестно почему так
+   End;
+
+   balacc=int(substr(paymentObj.PayerAccount,1,5));   
+   if ((balacc >= 98000) and (balacc <= 98090))   
+      chFakt=5;   
+   elif ((balacc >= 93001) and (balacc <= 97001))   
+      chFakt=4;
+   elif (((balacc >= 90601) and (balacc <= 91904)) or (balacc == 99999) or (balacc == 99998)) 
+      chFakt=3;
+   elif ((balacc >= 80101) and (balacc <= 85501))
+      chFakt=2;
+   else
+      chFakt=1;
+   End;
+
+   If ((ch==chFakt) and (chFakt==1));
+      return 0;
+   else
+      return 1;
+   End;
+End;
+
+private Macro СравнитьКорсчетПолучателя(paymentObj);
+   var RecCorAcc,rs;
+   var query1:string ="select bd.t_coracc    "+
+                  "from dbankdprt_dbt bd "+
+                  "where bd.T_PARTYID=   "+paymentObj.ReceiverBankID; 
+   rs = execSQLselect(query1);
+   if( rs.moveNext() )
+      RecCorAcc=rs.Value(0);
+   else
+      MsgBox("Ошибка получения корсчета"); 
+      return 1;  //в ошибки, тк неизвестно почему так
+   end;
+   If (PaymentObj.ReceiverCorrAccNostro!=RecCorAcc)
+      return 1;//ошибка
+   end;
+   return 0;
+end;
+
+/**************
+Нумерация из ТЗ
+***************/
+MACRO ПользовательскиеПроверкиПредобработки(PaymentObj,Bn_Stat)
+   var clacc;//счета клиентов
+   var PaymentKind;//Str!  тип платежа из формы ввода
+   var note;//примечание "Счет"а и "СчетВнешнего"
+   var PayerINN:string = "", ReceiverINN:string = "";
+   var PayerKPP:string = "", ReceiverKPP:string = "";
+   var type_ac, cmd1, rsd1, tmpacc, innpaym, inndb;
+   var AcNer="";/*маски счета нерез.*/
+   var errAn:integer; /*код ошибки*/
+   var flag = false;
+ 
+   macro СчетРасчетный(acc)
+      var cmd = RSDCommand("select 1 from daccount_dbt where t_chapter = 1 and t_account = ? and t_type_account like '%Ч%'");
+      cmd.AddParam("acc", RSDBP_IN,acc);
+      var rs = RSDRecordset(cmd);
+      return rs.movenext;
+   end;
+
+   //Gurin S. 03.06.2016 R-647756-2
+   if ( (PaymentObj.DocKind == PS_PAYORDER) and inList(PaymentObj.Origin, 1, 2, 2100) and 
+         PM_isTaxPayment(PaymentObj.ReceiverAccount) and (PaymentObj.BttTICode != "0") and
+        (PaymentObj.BttTICode == PaymentObj.UIN) 
+       )
+       Msgbox("КБК не может совпадать с УИН (поле <Код>)");
+       PaymentObj.notes.addnote(42, "КБК не может совпадать с УИН (поле <Код>)");
+       return 1;
+   end;
+
+   //Gurin S. 23.07.2014 C-31516-8
+   if ((fdBank.is_SLD) and inList(PaymentObj.Origin,10000,10002))
+      var acc_rec = RSL_Account(PaymentObj.ReceiverAccount, Acc_GetFiidByAccount(PaymentObj.ReceiverAccount));
+      if (acc_rec.rec.open_close == "З")
+         var acc_futrec = execStoredFunc ("usr_get_futrecacc_solid", V_STRING, makeArray(SQLParam("", PaymentObj.Paymentid))); 
+         PaymentObj.FutureReceiverAccount = acc_futrec;
+      end;
+   end;
+
+   //1. Контроль шифра (Шифр платежа должен быть 01, 02, 06, 16)
+   //Gurin S. I-00554758-2 04.03.2015
+   if( PaymentObj.DocKind == PS_PAYORDER )
+       var obj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+       if( obj.DocKind == PSPOKIND_CASH_REQUEST )
+          flag = true;
+       end;
+   end;
+   if (flag)
+      if(not_in(PaymentObj.shifroper,"03"))
+         Msgbox("Неверный шифр операции: "+PaymentObj.shifroper);
+         PaymentObj.notes.addnote(42,"Неверный шифр операции: "+PaymentObj.shifroper);
+         return 1;
+      end;
+   elif (not_in(PaymentObj.shifroper,"01", "02", "06", "16", "17"))
+      Msgbox("Неверный шифр операции: "+PaymentObj.shifroper);
+      PaymentObj.notes.addnote(42,"Неверный шифр операции: "+PaymentObj.shifroper);
+      return 1;
+   end;
+
+   //1 Номер документа не должен состоять из нулей и имеет хотя бы одну цифру
+   If((PaymentObj.number!=0) and (Is0Number(PaymentObj.number)))
+   else
+      MsgBox("Номер документа нулевой - документ помещен в отвергнутые");
+      PaymentObj.notes.addnote(42,"Номер документа нулевой");
+      return 1 ;
+   End;
+   //2
+   If(money(PaymentObj.BaseAmount)<0)  //или = ???
+      MsgBox("Сумма платежа отрицательная - документ помещен в отвергнутые");
+      PaymentObj.notes.addnote(42,"Сумма платежа отрицательная");
+      return 1 ;   
+   elIf(PaymentObj.PayerAmount==0)
+      MsgBox("Сумма документа не укзана");
+      PaymentObj.notes.addnote(42,"Сумма документа не укзана");
+      return 1;
+   End;
+   //3 Счета не могут быть масками (допустимые длины и символы в счетах), при условии, что счета вообще заданы. 
+   //Для внутрибанковских документов счет плательщика != счету получателя.
+   If ((PaymentObj.PayerAccount!="") and (PaymentObj.ReceiverAccount!=""))
+      If(AccountIsMask(PaymentObj.PayerAccount) or AccountIsMask(PaymentObj.ReceiverAccount));
+         MsgBox("Счет плательщика или получателя не должен содержать * либо ? - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,"Счет плательщика или получателя не должен содержать * либо ?");
+         return 1 ;
+      End;
+   End;
+
+   //Gurin S. 03.04.2013 C-18484
+   if (stringEqMask(PaymentObj.ReceiverAccount, "30214*") and (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC))
+      MsgBox("Л/сч получателя содержит не допустимый балансовый счет второго порядка");
+      PaymentObj.notes.addnote(42,"Л/сч получателя содержит не допустимый балансовый счет второго порядка");
+      return 1 ;
+   end;
+
+   If(PaymentObj.payerBankID==PaymentObj.ReceiverBankID)
+      If(PaymentObj.PayerAccount==PaymentObj.ReceiverAccount)
+         MsgBox("Счет плательщика не должен быть равен счету получателя(во внутр. платеже) - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,"Счет плательщика не должен быть равен счету получателя");
+         return 1 ;
+      /*SDA 05.10.2011 - поступления на 40821 только с 40821 или с кассы 103-фз*/
+      elif ((substr(PaymentObj.ReceiverAccount,1,5) == "40821") and not ((substr(PaymentObj.PayerAccount,1,5) == "40821") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "20202") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "20207") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "40906") or
+                                                                     //Gurin S. 08.07.2015 R-601564-1
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "30305") or
+                                                                     (substr(PaymentObj.PayerAccount,1,5) == "30306") or
+                                                                     (index(PaymentObj.PayerName, "40821") != 0)))  
+         MsgBox("Операция не соответствует режиму спецсчета получателя - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,"Операция не соответствует режиму спецсчета получателя");
+         return 1 ;
+      End;
+   End;
+   //4
+   //TAM C-6639 17.01.13
+   if(PaymentObj.Dockind == PS_PAYORDER)
+      //Gurin S. 25.03.2015 R-561959-2 Добавил проверку на происхождение, описанную в C-6639 
+      if ((not CompareStrWithMasks(Acc_deposit,PaymentObj.PayerAccount)) and InList(PaymentObj.Origin, 1, 2, 6))
+         MsgBox("Вы пытаетесь списать средства с депозитных счетов ЮЛ и ИП в РКО. \n Такие операции необходимо проводить в ББ. \n Документ помещен в отвергнутые.");
+         PaymentObj.notes.addnote(42,"Запрещено дебетование счета");
+         return 1 ;
+      end;
+      //TAM C-16968 17.01.13
+      if (not CompareStrWithMasks("306*",PaymentObj.PayerAccount))
+         MsgBox("Запрещено дебетовать п\\п клиентов счет 306*.\n Документ помещен в отвергнутые.");
+         PaymentObj.notes.addnote(42,"Запрещено дебетование 306* счета");
+         return 1 ;
+      end;
+   end;
+   //end TAM
+
+   If(PaymentObj.numberPack<0)
+      MsgBox("Номер пачки не может быть меньше 0 - документ помещен в отвергнутые");
+      PaymentObj.notes.addnote(42,"Номер пачки не может быть меньше 0");
+   End;
+
+   /* EVG 9/12/2011 Перенёс изменения, выполненные DEV 7.12.11 (раскомментирована проверка НДС) */
+   //5 //DEV Дылдина раскомментировала 7.12.11 по заявке I-00117075-2
+   If (PaymentObj.BaseFiid==0) // только для рублевых
+      If (PaymentObj.ShifrOper=="01")
+         If((CompareStrWithMasks("401-404",PaymentObj.ReceiverAccount)) and   //по результатам ПСИ 3.03
+            (not(index(strUpr(PaymentObj.ground), "НДС")>0)))      
+            PaymentObj.notes.addnote(42,"В основании не указан НДС");
+            MsgBox("В основании не указан НДС - документ помещен в отвергнутые");
+            return 1; //ош - в отвергнутые
+          End;                
+      End;
+   End;
+   //6
+   /*VV C-17836*/
+   if ((PaymentObj.ShifrOper=="01") and (CheckValuedate(PaymentObj)))
+      return 1;
+   end;
+   //7
+   If(not((PaymentObj.date<={curdate}) or (PaymentObj.paydate<=PaymentObj.date)))
+      MsgBox("Дата документа с ошибкой - документ помещен в отвергнутые");
+      PaymentObj.notes.addnote(42,"Дата документа с ошибкой");
+      return 1;
+   end;
+   //TAM 10.02.2015 C-28461
+   debugbreak;
+   if((PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC) and
+      inList (PaymentObj.ShifrOper,"01","02","06") and
+      ({curdate} - PaymentObj.Date < 0))
+      MsgBox("Дата документа некорректна - документ помещен в отвергнутые");
+      PaymentObj.notes.addnote(42,"Дата документа некорректна");
+      return 1;
+   end;
+   //8
+   If(Счет(PaymentObj.payerAccount,paymentObj.valuedate,note,type_ac))
+      PaymentObj.notes.addnote(42,note);
+      return 1; //ош - в отвергнутые
+   End;
+   //9
+   If(ПроверитьГлаву(paymentobj))
+      PaymentObj.notes.addnote(42,"Глава счета плательщика не 1");
+      MsgBox("Глава счета плательщика не 1 - документ помещен в отвергнутые");
+      return 1; //ош - в отвергнутые
+   End;
+   //10
+   If(ПроверитьРазноску(paymentobj))
+      PaymentObj.notes.addnote(42,"Счет разноски по дебету не найден в БД");
+      MsgBox("Счет разноски по дебету не найден в БД - документ помещен в отвергнутые");
+      return 1; //ош - в отвергнутые
+   End;
+   //Seleznev
+   If(not ((PaymentObj.priority >= 1) and (PaymentObj.priority <=5))) //TAM 12.12.13 C-25730
+       //Gurin S. 09.08.2013 C-22197
+      if ((PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC) and (PaymentObj.priority == 0))
+         MsgBox("Очередность платежа не может быть\"0\"");
+         PaymentObj.notes.addnote(42,"Очередность платежа не может быть\"0\"");
+      else
+         MsgBox("Очередность платежа указана неверно");
+         PaymentObj.notes.addnote(42,"Очередность платежа указана неверно");
+      end;
+      return 1;
+   End;
+
+   If (strlen(PaymentObj.PayerAccount)!=20);
+      MsgBox("Счет плательщика не двадцатизначный");
+      PaymentObj.notes.addnote(42,"Счет плательщика не двадцатизначный");
+      return 1;
+   End;
+
+   if(isdigitalNumber(PaymentObj.payeraccount) != 0)
+      Msgbox("В счете плательщика встречаются нечисловые символы: "+PaymentObj.payeraccount);
+      PaymentObj.notes.addnote(42,"В счете плательщика встречаются нечисловые символы: "+PaymentObj.payeraccount);
+      return 1;
+   end;
+
+   if (Substr(PaymentObj.payeraccount,6,3) != "810" )
+      msgbox("Валюта счета плательщика не 810");
+      PaymentObj.notes.addnote(42,"Валюта счета плательщика не 810");
+      return 1;
+   End;
+
+   /* EVG Документы с незаданным счётом получателя (с НДС в разноске платежа)
+      этой проверки не проходят. */
+   If (strlen(PaymentObj.ReceiverAccount) != 0)
+      If (strlen(PaymentObj.ReceiverAccount)!=20);
+         MsgBox("Счет получателя не двадцатизначный");
+         PaymentObj.notes.addnote(42,"Счет получателя не двадцатизначный");
+         return 1;
+      End;
+   End;
+
+   if(isdigitalNumber(PaymentObj.receiveraccount) != 0)
+      Msgbox("В счете получателя встречаются нечисловые символы: "+PaymentObj.receiveraccount);
+      PaymentObj.notes.addnote(42,"В счете получателя встречаются нечисловые символы: "+PaymentObj.receiveraccount);
+      return 1;
+   end;
+
+   /* EVG Документы с незаданным счётом получателя (с НДС в разноске платежа)
+      этой проверки не проходят. */
+   If (strlen(PaymentObj.ReceiverAccount) != 0)
+      if ((Substr(PaymentObj.receiveraccount,6,3) != "810" ) and (Substr(PaymentObj.receiveraccount,6,3) != "000"))
+         Msgbox("Валюта счета получателя не 810");
+         PaymentObj.notes.addnote(42,"Валюта счета получателя не 810");
+         return 1;
+      End;
+   End;
+
+   //2.10. БИК банка получателя задан и состоит из 9 символов
+   If (not((PaymentObj.ReceiverBankCodeKind==3)and(strlen(PaymentObj.ReceiverBankCode)==9)))
+      MsgBox("У получателя не задан 9 значный БИК");
+      PaymentObj.notes.addnote(42,"У получателя не задан 9 значный БИК");
+      return 1;
+   End;
+   //7.В корсчете получателя д.б. только цифры
+   if(isdigitalNumber(PaymentObj.Receivercorraccnostro) != 0)
+      Msgbox("В корсчете получателя встречаются нечисловые символы: "+PaymentObj.Receivercorraccnostro);
+      PaymentObj.notes.addnote(42,"В корсчете получателя встречаются нечисловые символы: "+PaymentObj.Receivercorraccnostro);
+      return 1;
+   end;
+
+   //2.9. Наличие наименования плательщика
+   If(PaymentObj.PayerName=="")
+      MsgBox("Наименование плательщика не задано");
+      PaymentObj.notes.addnote(42,"Наименование плательщика не задано");
+      return 1;
+   End;
+   //2.11. Наличие наименования получателя
+   If(PaymentObj.ReceiverName=="")
+      MsgBox("Наименование получателя не задано");
+      PaymentObj.notes.addnote(42,"Наименование получателя не задано");
+      return 1;
+   End;
+
+   //2.12. Наличие назначения платежа
+   //Gurin S. 28.05.2014 R-384441-2
+   If(strlen(trim(PaymentObj.ground))==0)
+      MsgBox("Назначение платежа не задано");
+      PaymentObj.notes.addnote(42,"Назначение платежа не задано");
+      return 1;
+   End;
+   
+   //недопустимые символы
+   if (not ПроверитьЗапрещенныеСимволы(PaymentObj.PayerName))
+      MsgBox("В наименовании плательщика встречаются недопустимые символы");
+      PaymentObj.notes.addnote(42,"В наименовании плательщика встречаются недопустимые символы");
+      return 1;
+   end;
+
+   if (not ПроверитьЗапрещенныеСимволы(PaymentObj.ReceiverName))
+      MsgBox("В наименовании получателя встречаются недопустимые символы");
+      PaymentObj.notes.addnote(42,"В наименовании получателя встречаются недопустимые символы");
+      return 1;
+   end;
+
+   if (not ПроверитьЗапрещенныеСимволы(PaymentObj.ground))
+      MsgBox("В назначении платежа встречаются недопустимые символы");
+      PaymentObj.notes.addnote(42,"В назначении платежа встречаются недопустимые символы");
+      return 1;
+   end;
+   
+   // A.Gregeradsky - 30.11.2009 - Добавлена проверка внешнего рублевого платежа на соответствие формату УФЭБС по длине полей 
+   if((PaymentObj.IsExternal) and (PaymentObj.BaseFIID == 0))
+      var tr = ПроверитьПоФорматуУФЭБС(PaymentObj);
+      if(strlen(trim(tr)) > 0)
+         MsgBox(tr);
+         PaymentObj.notes.addnote(42,tr);
+         return 1;
+      end;
+   end;
+
+   //Gurin S. 24.09.2013 C-23092
+   if (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC)
+      tmpacc = RSL_Account (PaymentObj.PayerAccount);
+      SplitFullINN(PaymentObj.PayerINN,innpaym,null);
+      SplitFullINN(ПолучитьКодСубъекта(tmpacc.rec.client,16),inndb,null);
+      if ((PaymentObj.PayerBankID == {OurBank}) and (inndb != innpaym))
+         MsgBox("ИНН плательщика не совпадает с ИНН в БД - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,"ИНН плательщика не совпадает с ИНН в БД");
+         return 1 ;
+      end;
+      tmpacc = RSL_Account (PaymentObj.ReceiverAccount);
+      SplitFullINN(PaymentObj.ReceiverINN,innpaym,null);
+      SplitFullINN(ПолучитьКодСубъекта(tmpacc.rec.client,16),inndb,null);
+      //Gurin S. 08.10.2013 R-262647-1 Добавил 426*
+      if ((PaymentObj.ReceiverBankID == {OurBank}) and (inndb != innpaym ) and (innpaym != 0)/*платежи на физ. лицо - ИНН = 0*/
+            and (strupr(trim(ReadNoteForObject(4/*Лицевой счет*/,"010000000" + PaymentObj.ReceiverAccount,154))) != "ДА")
+            and not stringEqMask(PaymentObj.ReceiverAccount,"423*,426*"))
+         MsgBox("ИНН получателя не совпадает с ИНН в БД - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,"ИНН получателя не совпадает с ИНН в БД");
+         return 1 ;
+      end;
+   end;
+
+   //11.ИНН плательщика/получателя должен только цифры.
+   //12.ИНН плательщика/получателя должен быть не больше 12 симв.
+   //13.КПП плательщика/получателя должен быть не больше 9 симв.
+   //14.КПП плательщика/получателя должен только цифры.
+   If  (SplitFullINN(PaymentObj.PayerINN,PayerINN,PayerKPP))
+      MsgBox("Ошибка ИНН");
+   else
+      if(strlen(PayerINN) > 12)
+         MsgBox("Длина ИНН плательщика не должна превышать 12 символов");
+         PaymentObj.notes.addnote(42,"Длина ИНН плательщика не должна превышать 12 символов");
+         return 1; //ош
+      end;
+
+      if(isdigitalNumber(PayerINN) != 0)
+         Msgbox("В ИНН плательщика встречаются нечисловые символы: "+PayerINN);
+         PaymentObj.notes.addnote(42,"В ИНН плательщика встречаются нечисловые символы: "+PayerINN);
+         return 1;
+      end;
+
+      if(strlen(PayerKPP) > 9)
+         MsgBox("Длина КПП плательщика не должна превышать 9 символов");
+         PaymentObj.notes.addnote(42,"Длина КПП плательщика не должна превышать 9 символов");
+         return 1; //ош
+      end;
+
+      if(isdigitalNumber(PayerKPP) != 0)
+         Msgbox("В КПП плательщика встречаются нечисловые символы: "+PayerKPP);
+         PaymentObj.notes.addnote(42,"В КПП плательщика встречаются нечисловые символы: "+PayerKPP);
+         return 1;
+      end;
+   end;
+
+   //Gurin S. I-00554758-2 04.03.2015
+   if( not flag )
+      If  (SplitFullINN(PaymentObj.ReceiverINN,ReceiverINN,ReceiverKPP))
+          MsgBox("Ошибка ИНН");
+      else
+         if(strlen(ReceiverINN) > 12)
+            MsgBox("Длина ИНН получателя не должна превышать 12 символов");
+            PaymentObj.notes.addnote(42,"Длина ИНН получателя не должна превышать 12 символов");
+            return 1; //ош
+         end;
+
+         if(isdigitalNumber(ReceiverINN) != 0)
+            Msgbox("В ИНН получателя встречаются нечисловые символы: "+ReceiverKPP);
+            PaymentObj.notes.addnote(42,"В ИНН получателя встречаются нечисловые символы: "+ReceiverKPP);
+            return 1;
+         end;
+
+         if(strlen(ReceiverKPP) > 9)
+            MsgBox("Длина КПП получателя не должна превышать 9 символов");
+            PaymentObj.notes.addnote(42,"Длинна КПП получателя не должна превышать 9 символов");
+            return 1; //ош
+         end;
+
+         if(isdigitalNumber(ReceiverKPP) != 0)
+            Msgbox("В КПП получателя встречаются нечисловые символы: "+ReceiverKPP);
+            PaymentObj.notes.addnote(42,"В КПП получателя встречаются нечисловые символы: "+ReceiverKPP);
+            return 1;
+         end;
+      end;
+   end;
+   //14
+  /* EVG Объект - требование */
+   var Pspayord = RsbPSPayOrder(PaymentObj.PaymentID);
+   /* SDA - 02/05/2012 - вынес в общий блок проверок и для внешних и для внутренних */
+   if (check_SKS_PayerAccount(PaymentObj) != 0) // KS 18.11.2010 I-084287 Вынес функцию проверки счета СКС в отдельную
+      return 1;
+   end;
+   /*20.02.2013 zmp C-6733 >>>*/
+   if ((fdBank.is_VUZ) and (check_SKS_ReceiverAccount(PaymentObj) != 0)) 
+      return 1;
+   end;
+   
+   if ((fdBank.is_EXV) and (check_SKS_ReceiverAccount_EXV(PaymentObj) != 0)) 
+      return 1;
+   end;
+
+   //Gurin S. 21.05.2013 R-192203-2
+   if (((PaymentObj.Origin == 19 /*PSPO_OR_PAYEEBANK*/) or (PaymentObj.Origin == USR_PAYMENT_OR_365 )) and (fdBank.is_GEB) and (Check_Over(PaymentObj) != 0))
+      return 1;
+   end;
+
+
+   If( not(PaymentObj.IsExternal)//если внутренний
+          /* EVG Не проверять для документов ПЗО, иначе платежи с разноской (Ctrl-Q) не проходят. */
+          and (Pspayord.Origin != PSPO_OR_SF) )
+
+      Bn_Stat="";//внутренний не пойдет на проверку статуса Банка получателя
+      //14.1
+      GetRegistryValue ("PS\\REQOPENACC\\СЧЕТА КЛИЕНТОВ",v_string,clacc);
+      If((PaymentObj.Origin!=6)and  //не FR
+         (PaymentObj.Dockind != PS_CPORDER) and //не валютный 
+         (not (IsFrontPayment(PaymentObj))) and //не Фронт
+         (СчетРасчетный(PaymentObj.ReceiverAccount)))  //счетПол-клиентский
+      End;
+   //15  
+   ElIf(PaymentObj.IsExternal)//внешний
+      //15.1
+      //Автоматическое определение типа платежа
+      bn_stat="";
+      PaymentKind=PaymentObj.PaymentKind; //запомним что было
+      AvtoTypePaym(PaymentObj, Bn_Stat); //поставим что нужно
+      PaymentObj.Ground = substr(PaymentObj.Ground,1,210); // KS 12.07.2012 C-12598
+      if(PaymentKind!=PaymentObj.PaymentKind) //если было != нужно, то оставляем нужно
+         MsgBox("Тип платежа изменен автоматически"); 
+         initError;
+      End;
+      //12
+      If(bn_stat!="");
+         PaymentObj.notes.addnote(42,"Статус банка получателя:" + "'" + bn_stat + "'");
+         MsgBox("Статус банка получателя: " +"\""+ bn_stat +"\""+ " - документ помещен в отвергнутые");
+         return 1; //ош - в отвергнутые
+      End;
+
+      //15.2
+      If ((substr(PaymentObj.ReceiverBankCode,7)=="001") or (substr(PaymentObj.ReceiverBankCode,7)=="000"))
+         If(strlen(PaymentObj.ReceiverCorrAccNostro)>0)
+            PaymentObj.notes.addnote(42,"Корсчет банка получателя в ПП не должен задаваться для учереждений ЦБ");
+            MsgBox("Корсчет банка получателя в ПП не должен задаваться для учереждений ЦБ - документ помещен в отвергнутые");
+            return 1; //ош - в отвергнутые  
+         End;
+      else
+         If (СравнитьКорсчетПолучателя(PaymentObj))
+            PaymentObj.notes.addnote(42,"Корсчет банка получателя в ПП не соответсвует корсчету в справочнике");
+            MsgBox("Корсчет банка получателя в ПП не соответсвует корсчету в справочнике - документ помещен в отвергнутые");
+            return 1; //ош - в отвергнутые
+         End;
+      end; 
+
+      //Счет получателя внешнего
+      If(СчетВнешнего(PaymentObj.ReceiverAccount,note))
+         MsgBox(note + " - документ помещен в отвергнутые");
+         PaymentObj.notes.addnote(42,note);
+         return 1; //ош - в отвергнутые
+      End;
+   end;//14-15
+
+   setparm(1,bn_stat); //пойдет в макрос Предобработки для направления на "Согласование"
+   //После ПСИ
+   //Проверка ИНН
+   //Msgbox(PaymentObj.dockind);
+   SplitFullINN(PaymentObj.PayerINN,PayerINN,PayerKPP);
+   SplitFullINN(PaymentObj.ReceiverINN,ReceiverINN,ReceiverKPP);
+   GetRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ДЛЯ ВК", V_STRING, AcNer, errAn);
+
+   // Tikh Исправил   
+   if(not((strlen(PayerINN)==10)  or (PayerINN == "0")
+      or( strlen(PayerINN)==12) or (strlen(PayerINN)==0) or (strlen(PayerINN)==5)) and (not index(type_ac,"L")))
+      if (CompareStrWithMasks (AcNer,PaymentObj.PayerAccount))
+         PaymentObj.notes.addnote(42,"Длина ИНН плательщика не 10/12 символов");
+         MsgBox( "Длинна ИНН плательщика не 10/12 символов - документ помещен в отвергнутые");
+         return 1; //ош 
+      end;
+   // Tikh Исправил   
+   elIf (not((strlen(ReceiverINN)==10) or (ReceiverINN == "0")  
+      or(strlen(ReceiverINN)==12) or (strlen(ReceiverINN)==0) or (strlen(PayerINN)==5)))
+      //Gurin S. I-00554758-2 04.03.2015
+      if (not flag) 
+         if (CompareStrWithMasks (AcNer,PaymentObj.ReceiverAccount))
+            PaymentObj.notes.addnote(42,"Длина ИНН получателя не 10/12 символов");
+            MsgBox("Длина ИНН получателя не 10/12 символов - документ помещен в отвергнутые");
+            return 1; //ош 
+         end;
+      end;
+   end;
+
+   if(fdBank.is_VUZ())
+      if((CheckOfficer(PaymentObj.Payer) > date("01.01.0001") ) and  (CheckOfficer(PaymentObj.Payer) < {curdate}))
+        msgbox("Срок полномочий первого лица клиента закончился.");
+      end;
+   end;
+
+   if ( not CheckPayerAddress(PaymentObj.PaymentID) )
+      PaymentObj.notes.addnote(42,"Требование ЦБ РФ № 2634-У. Платеж на счет 30111 и 30231 должен содержать адрес плательщика");
+      MsgBox("Требование ЦБ РФ № 2634-У. Платеж на счет 30111 и 30231 должен содержать адрес плательщика");
+      return 1;
+   end;
+   return 0; //ок, все пользовательские проверки пройдены успешно  
+END;//macro

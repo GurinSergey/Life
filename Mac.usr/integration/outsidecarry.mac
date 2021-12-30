@@ -1,0 +1,440 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: outsidecarry.mac 
+// @author  : авторство народное 
+// @desc    : Общие функции для работы с проводками внешних систем
+// @changes : 
+//             zmp 15.05.2012 I-00194015
+//             zmp 26.10.2012 I-00273955 Дата проводки для платежный требований загруженных через сканер берется теперь не из usr_pmdocs а с текущего опердня.
+//             Chesnokov D.S. 29.05.2012  Отправка письма в Lotus по заявке С-10370
+//             LAO 10.07.2012 I-00216403-3 проводки по внебалансу при ответных входящих из фронта LAO
+//                 04.09.2013 I-00419185 проводки ФР из фронта должны ложится датой из проводки, еслиопер день не закрыт! Иначе расхождение выписок фронта -РС
+//             KS  26.11.2013 Первоначальная адаптация под 31ю сборку
+//             TAM 16.01.2015 I-00544481 ассоциируем usr_pmdocs.sum_payer с dpmpaym_dbt.BaseAmount в 2031
+//             Chesnokov D.S. 07.09.2015 По заявке R-618169 исправлена "древняя" ошибка
+//             VDN 07.10.2015 R-622597
+// -------------------------------------------------------------------------------------------------
+Import BankInter, OprInter, RSD, oralib, "FrontRoute.mac", "FrontCommon.mac", FIInter, "Send_lotus.mac";
+import "fg_Life_parm.mac", "op_lib.mac";
+
+macro rsnvl(p1, p2)
+   if ((valtype(p1) != V_UNDEF) and
+       (p1 !="") and
+       (p1 != strfor(1)) and
+       (p2 != strfor(0)))
+      return p1;
+   else
+      return p2;
+   end;
+end;
+
+
+class usr_pm_docs
+   //класс для регистрации проводок к платежам
+   var
+      payment_id,
+      carrynum,
+      payer_account,
+      receiver_account,
+      sum,
+      date_carry,
+      oper,
+      pack,
+      num_doc,
+      ground,
+      kind_oper,
+      shifr_oper,
+      department,
+      branch,
+      typedoc,
+      usertypedoc,
+      ErrorMessage,
+      //TAM 27.08.2014 I-00511122-2
+      sum_payer,
+      sum_receiver;
+
+   private var cmd, rs;
+
+   macro init
+      payment_id=payer_account=receiver_account=sum=date_carry=oper=
+      pack=num_doc=ground=kind_oper=shifr_oper=typedoc=usertypedoc=null;
+   end;
+
+   macro insert
+      cmd = RSDCommand("begin usr_payments.add_deffered_carry(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?); end;");
+      cmd.addparam("payment_id"      ,RSDBP_IN,payment_id);
+      cmd.addparam("carrynum"        ,RSDBP_IN,carrynum);
+      cmd.addparam("payer_account"   ,RSDBP_IN,payer_account);
+      cmd.addparam("receiver_account",RSDBP_IN,receiver_account);
+      cmd.addparam("sum"             ,RSDBP_IN,sum);
+      cmd.addparam("date_carry"      ,RSDBP_IN,date_carry);
+      cmd.addparam("oper"            ,RSDBP_IN,oper);
+      cmd.addparam("pack"            ,RSDBP_IN,pack);
+      cmd.addparam("num_doc"         ,RSDBP_IN,num_doc);
+      cmd.addparam("ground"          ,RSDBP_IN,ground);
+      cmd.addparam("kind_oper"       ,RSDBP_IN,kind_oper);
+      cmd.addparam("shifr_oper"      ,RSDBP_IN,shifr_oper);
+      cmd.addparam("typedoc"         ,RSDBP_IN,typedoc);
+      cmd.addparam("usertypedoc"     ,RSDBP_IN,usertypedoc);
+      cmd.addparam("department"      ,RSDBP_IN,department);
+      cmd.addparam("branch"          ,RSDBP_IN,branch);
+      cmd.addparam("RetValue"        ,RSDBP_OUT, V_STRING,1024);
+      //TAM 27.08.2014 I-00511122-2
+      cmd.addparam("sum_payer"       ,RSDBP_IN,sum_payer);
+      cmd.addparam("sum_receiver"    ,RSDBP_IN,sum_receiver);
+
+      cmd.execute();
+
+      ErrorMessage = cmd.Param("RetValue").value; 
+      init();
+
+      return (index(ErrorMessage, "no_error")!=0); 
+      OnError(err) 
+         ErrorMessage = getRSDErrorsString(cmd);
+         return false;
+   end;
+
+   macro check_sum(PaymentOBJ)
+      //для мультивалюток не проверяем
+      if ((PaymentOBJ.Dockind == 15) or
+         //TAM 08.05.2014 костыли для исправления заполнения поля sum 
+          ((InList(PaymentOBJ.Dockind,70,430,440)) and (PaymentOBJ.PayerFIID != 0) and
+           (PaymentOBJ.PayerFIID == PaymentOBJ.ReceiverFIID)))
+         return true;
+      end;
+      //функция проверки суммы проводок и платежа
+      // TAM 16.01.2015 I-00544481 учитываем sum_payer вместо sum
+      cmd = RSDCommand("select sum(round(sum_payer, 2)) from usr_pmdocs where chapter = 1 and paymentid = ?");
+      cmd.addparam("pmid",RSDBP_IN,PaymentOBJ.paymentid);
+      rs = RSDRecordset(cmd);
+      if ((rs.movenext) and (valtype (rs.value(0))!=26/*spec val*/) and (round(money(rs.value(0)),2) == round(PaymentOBJ.BaseAmount,2)))
+         return true
+      end;
+      return false;
+   end;
+
+end;
+
+macro IsExternalCarry (PaymentObj)
+   var obj = GetPrimObj(PaymentObj);
+   var cmd, rs;
+   if (IsFrontPayment(PaymentObj))
+      return true;
+   end;
+
+   if ((obj) and ((obj.origin >= 1000)) and
+      // EVG Документы из Diasoft не считаются 
+       ( obj.origin != 1600) )      // 1600 - Diasoft
+      cmd = RSDCommand("select 1 from usr_pmdocs where paymentid = ? and error_text != 'no_error'");
+      cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+      rs = RSDRecordset(cmd);
+
+      if (rs.movenext)
+         return true
+      end;
+   end;
+   return false;
+end;
+
+private macro is_open_date(cdate)
+   var usr_cmd,usr_rsd;
+   usr_cmd = rsdcommand("SELECT * FROM   dcurdate_dbt WHERE   t_curdate = ? AND (t_isclosed = CHR (0) /*OR T_ISSPECMODE = 'X'*/)"); // KS 16.01.2014
+   usr_cmd.AddParam("cur_date", RSDBP_IN, cdate);
+   usr_rsd=rsdRecordSet(usr_cmd);
+   if (usr_rsd.movenext())
+      return true;
+   else
+      return false;
+   end;
+end;
+
+private macro checkCarryPayerAccount ( paymentid, receiverAccount )
+   private var cmd, rs;
+   cmd = rsdCommand("SELECT PAYER_ACCOUNT FROM USR_PMDOCS WHERE PAYMENTID = ?");
+   cmd.addParam("paymid", RSDBP_IN, paymentid);
+   rs = rsdRecordSet(cmd);
+
+   while (rs.moveNext())
+     if (rs.value(0) != receiverAccount) return false; end;
+   end;
+
+   return true;
+end;
+
+macro RunOutsideCarry(PaymentObj, idoperation)
+   // EVG 5/12/2013 Адаптация под 2031
+   var cmd = RSDCommand("select * from usr_pmdocs where paymentid = ? and (acctrnid = 0 or acctrnid is null) "+
+                        "          and ((sum is not null and sum != 0) or (sum_payer is not null and sum_payer != 0) or (sum_receiver is not null and sum_receiver != 0))");
+   cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+   var rs = RSDRecordset(cmd);
+   var paymtr:RsbPaymTransaction;    
+   var sqltext;
+   var i = 0;
+   var pm_docs=usr_pm_docs;
+   private var Theme, Email = "", stat;
+   private var ruleid = ReadFrontRule(PaymentObj.PaymentID); // KS 27.09.2010 I-053538 Зачисление на банковские счета (Кредиты): Номер правила маршрутизации
+   private var SoaGo = IsSoaGo(ruleid); // KS 23.09.2011
+   private var cmdarh,rsarh;    // KS 27.09.2010 I-053538: Для проводок                              
+   private var acc_kredit = ""; // KS 27.09.2010 I-053538: Для анализа подмены счета, отката проводки
+   private var acc_debet  = ""; // KS 27.09.2010 I-053538: Счет подмены
+   private var acc_temp  = "";  // KS 21.11.2011 Обработка без передачи во внешнюю систему
+   private var transit_account = "",err = 0; // KS 27.09.2010 I-053538: Настройка транзитного счета
+   private var acc_otv=false; //LAO если flase значит не ответный входящий
+   private var correctSum = true; // KS 21.11.2011 Сумма корректна
+   private var fgBank = fg_life_subject({OurBank});
+   record opr (operstat);
+
+   GetOperationState(opr);
+
+   // KS 27.09.2010 I-053538: Читаем настройку
+   GetRegistryValue("PRBB\\FRONT\\TRANSIT_ACCOUNT_"+ПолучитьКодФинИн(PaymentObj.ReceiverFIID),V_STRING,transit_account,err);
+   // 10.07.2012 I-00216403-3 Сразу делаем проверку на ответный входящий 47416 для того что бы иметь возможность
+   // вставить правильную дату для проводок по внебалансу LAO 
+   cmdarh =    " SELECT distinct  1 as otv "+
+               "\n            FROM usr_pmdocs doc "+
+               "\n           WHERE doc.paymentid = ? "+
+               "\n             AND substr(doc.payer_account,1,5) = '47416' "; //Счет невыясненных 
+   cmdarh = RSDCommand(cmdarh);
+   cmdarh.addParam("otv", RSDBP_IN, PaymentObj.PaymentID);
+   rsarh = RSDRecordset(cmdarh);
+   if (rsarh.movenext) 
+     acc_otv = true;
+   end;
+
+   // KS 27.09.2010 I-053538 Зачисление на банковские счета (Кредиты)
+   if (((err == 0) and (ruleid > 0) and (transit_account != ""))or(SoaGo))
+      cmdarh =    " SELECT arh.*, doc.t_acctrnid trnid "+
+                  "\n            FROM dpmdocs_dbt doc, dacctrn_dbt arh "+
+                  "\n           WHERE doc.t_paymentid = ? "+
+                  "\n             AND arh.t_acctrnid = doc.t_acctrnid "+
+                  "\n             AND (substr(arh.t_account_receiver,1,5) = '47416' "+       // KS 27.09.2010 I-053538: Счет невыесненных или
+                  "\n                  OR arh.t_account_receiver = '"+transit_account+"' ";  // KS 27.09.2010 I-053538: Транзитный счет
+      if (SoaGo)
+         /*SDA - в Пойдем! используется зачисление ответных на счета незавершенных расчетов */
+         cmdarh =cmdarh + "\n                  OR arh.t_account_receiver = '"+InPaymentAccUnclosed( PaymentObj ).FindAndOpenAccount()+"' ";
+      end;
+      cmdarh =cmdarh + "\n                  )";
+      cmdarh = RSDCommand(cmdarh);
+      cmdarh.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+      rsarh = RSDRecordset(cmdarh);
+
+      if (rsarh.movenext) // KS 27.09.2010 I-053538: Подразумеваю, что может быть или 47416 или транзитный. Два одновременно быть не могут
+         acc_kredit = rsarh.value("t_account_receiver");
+         acc_debet  = rsarh.value("t_account_payer");
+         // KS 27.09.2010 I-053538: Откатим проводку на транзитный счет
+         if (// Если это не ответные входяшие и счет кредита предыдуще проводки - транзитный
+               ((acc_kredit == transit_account))or
+               // Если это ответные входяшие, счет кредита предыдуще проводки - транзитный и дата этой проводки - сегодня
+               ((SoaGo)and({curdate}==rsarh.value("t_date_carry"))and(substr(acc_kredit,1,5) != "47416"))
+            )
+            acc_temp = PaymentObj.FutureReceiverAccount; // KS 21.11.2011 Сохраним счет перед откатом
+            PaymentObj.FutureReceiverAccount = acc_kredit;
+            PaymentObj.FuturePayerAccount    = acc_debet;
+            if( PaymentObj.DeleteTransaction( rsarh.value("trnid") ) )
+               // KS 25.03.2011 Округление!!!! Проводка не откатывается
+               cmd = RSDCommand("update dpmpaym_dbt t set t_futurepayeramount=round(t_futurepayeramount,2),t_futurereceiveramount=round(t_futurereceiveramount,2) where t.t_paymentid = ?");
+               cmd.addParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+               cmd.Execute();
+               PaymentObj = RsbPayment(PaymentObj.PaymentID);
+               if( PaymentObj.DeleteTransaction(rsarh.value("appkind"),rsarh.value("appkey")) )
+                  msgbox("Исходная проводка не удалена");
+                  return 1;
+               end;
+            end;
+            PaymentObj.FutureReceiverAccount = acc_temp; // KS 21.11.2011 Восстановим счет после отката
+         end;
+      end;
+   end;
+
+   if ((PaymentObj.Chapter == 1) and (not(pm_docs.check_sum(PaymentObj))))
+      if (IsSoa(ruleid))// KS 07.09.2011 Обработка веб-сервисов
+         msgbox("Сводный счет не передан из внешней системы");
+         return 1;
+      elif (PaymentObj.Dockind == 320)
+         if (gettrue(false,"Обработка во внешней системе не завершена (проводки не переданы), завершить платеж?"))
+         else
+            return 1;
+         end;
+      else
+         // KS 21.11.2011 Варнинг
+         if (gettrue(false,"сумма проводок переданных из внешней системы не совпадает с суммой платежа, завершить платеж?"))
+            correctSum = false;
+         else
+            // Golovkin R-377610-2 яхЁхфрўр ЄхъёЄр ю°шсъш фы  тэх°эхщ ёшёЄхь√
+            InitError();
+            MemoryError(null,"Сумма проводок переданных из внешней системы не совпадает с суммой платежа");
+            return 1;
+         end;
+      end;
+   end;
+
+   /*VDN 07.10.2015 R-622597*/
+   if ( fgBank.is_PRBB and
+       (inList(PaymentObj.DocKind, 322, 320)) and
+       (inList(PaymentObj.ReceiverAccount, "474228101000000060154", "474228106000000160198")) and
+        not checkCarryPayerAccount (PaymentObj.PaymentID, PaymentObj.ReceiverAccount)
+      )
+         var text_error = "Счета дебета проводок отличаются от счета получателя в платеже";
+         msgBox(text_error);
+         initError();
+         memoryError(null, text_error);
+         return 1;
+
+   end;
+
+   var oObj = GetPrimObj(PaymentObj);
+   while (rs.movenext)
+      i = i + 1;
+      paymtr = PaymentObj.MakeTransaction();
+      paymtr.Chapter         = rs.value("chapter");
+      //zmp 26.10.2012 I-00273955
+      //TAM I-00306559-3 27.12.12 and (PaymentObj.ShifrOper == "02"))
+      //TAM 26.07.2013 R-222627-2
+      //LAO 04.09.2013 I-00419185  Так делать нельзя, происходит расхожение с фронтом
+      //LAO исправил по подсказке TAM, документ может находится на К2 / К1 :  проводить из К2, не фактической датой,не верно
+      //Так что делаем проверку на шаг выгрузки во фронт
+      if ((oObj) and ((oObj.origin == 2100) or (oObj.origin == 3400)) 
+                 and (not Opr_IsStepExecuteSymb(PaymentObj.PaymentID,PaymentObj.dockind,"f","X",11000120))) //Если проводки не из фронта
+         paymtr.Date_Carry      = {Curdate};
+      else
+         paymtr.Date_Carry      = rs.value("Date_Carry");   
+      end;
+      paymtr.Number_Pack     = rs.value("Pack");
+      paymtr.Numb_Document   = rs.value("Num_doc");
+      paymtr.ResultCarry     = 1;
+      paymtr.Kind_Oper       = rsnvl(rs.value("kind_oper")," 1");
+      paymtr.Shifr_Oper      = rsnvl(rs.value("Shifr_Oper"),"09");
+      //zmp 15.05.2012 Зленко_I-00194015-2
+      if((paymentobj.dockind == 320) and 
+         (fgBank.is_GO)              and
+         (PaymentObj.FuturePayerAccount == "30223810500000000002")) 
+         paymtr.Shifr_Oper = "09";
+         paymtr.Kind_Oper  = " 6"; 
+      end;
+      paymtr.Ground          = rs.value("Ground");
+      paymtr.Department      = rs.value("Department");
+      // KS 27.09.2010 I-053538: Подменяем счет
+      if (((err == 0) and (transit_account != "") and 
+          ( (substr(acc_kredit,1,5) == "47416") // Если 47416
+          ) or ((SoaGo)and({curdate}!=rsarh.value("t_date_carry")))) and// Либо следующим днём ответные
+          (paymtr.Chapter == 1)and(acc_kredit!=""))
+         paymtr.AccountPayer    = acc_kredit;
+      elif ((err == 0) and
+            (transit_account != "") and
+            ((acc_kredit == transit_account) or ((SoaGo) and (acc_kredit == InPaymentAccUnclosed( PaymentObj ).FindAndOpenAccount()))) and
+            (paymtr.Chapter == 1))
+         paymtr.AccountPayer    = acc_debet;
+      else
+         paymtr.AccountPayer    = rs.value("Payer_Account");
+      end;
+      //TAM 27.08.2014 I-00511122-2
+      if(rs.value("FIID_Receiver") != -1)
+         paymtr.FIIDReceiver    = rs.value("FIID_Receiver");
+      else
+         paymtr.FIIDReceiver = PaymentObj.FutureReceiverFiid;
+      end;
+      paymtr.FIIDPayer       = rs.value("FIID_Payer");
+      if (correctSum)
+         paymtr.SumReceiver     = money(string(rs.value("sum_receiver")));
+         paymtr.SumPayer        = money(string(rs.value("sum_payer")));
+         //TAM 13.03.2014 R-343940-2
+         if((paymtr.FIIDPayer == 0) and (paymtr.FIIDReceiver == paymtr.FIIDPayer) and (paymtr.SumReceiver == 0))
+            paymtr.SumReceiver = paymtr.SumPayer;
+         end;
+      elif ((not correctSum) and (i==1))
+         paymtr.SumReceiver     = PaymentObj.ReceiverAmount;
+         paymtr.SumPayer        = PaymentObj.PayerAmount;
+      else
+         msgbox("Внешняя система возвратила более одной проводки||автоматическая простановка сумм проводок невозможна!");
+         return 1;
+      end;
+
+      if (ValType(rs.value("Receiver_Account"))==26) // KS 21.11.2011 Обработка без передачи во внешнюю систему
+         paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+      else
+         paymtr.AccountReceiver = rs.value("Receiver_Account");
+      end;
+      paymtr.oper            = rs.value("oper");
+
+      /* EVG 02/12/2009 Для документов с конверсией из одной валюты в другую */
+      if ( (PaymentObj.PayerFIID != PaymentObj.ReceiverFIID) and
+           (PaymentObj.PayerFIID != rs.value("FIID_Payer")) and
+           (PaymentObj.ReceiverFIID != rs.value("FIID_Receiver")) )
+         paymtr = PaymentObj.MakeTransaction();
+         paymtr.Chapter         = rs.value("chapter");
+         //Chesnokov D.S. 07.09.2015 По заявке R-618169 исправлена "древняя" ошибка
+         paymtr.Date_Carry      = rs.value("Date_Carry");
+         /*paymtr.Date_Document   = */
+         paymtr.Number_Pack     = rs.value("Pack");
+         paymtr.Numb_Document   = rs.value("Num_doc");
+         paymtr.ResultCarry     = 1;
+         paymtr.Kind_Oper       = rsnvl(rs.value("kind_oper")," 1");
+         paymtr.Shifr_Oper      = rsnvl(rs.value("Shifr_Oper"),"09");
+         paymtr.Ground          = rs.value("Ground");
+         paymtr.Department      = rs.value("Department");
+         paymtr.AccountPayer    = rs.value("Payer_Account");
+         // KS 11.12.2013 Адаптация под 31ю сборку
+         paymtr.SumReceiver     = money(string(rs.value("sum_receiver")));
+         paymtr.AccountReceiver = rs.value("Receiver_Account");
+         paymtr.oper            = rs.value("oper");
+         //TAM 10.09.12 I-00250558-2
+         paymtr.FIIDReceiver = rs.value("FIID_Receiver");
+         paymtr.FIIDPayer       = rs.value("FIID_Payer");
+         paymtr.SumPayer     = money(string(rs.value("sum_payer")));
+      end;
+
+      // EVG Если получатель внешний, то счёт получателя нужно брать из платежа (корсчёт). 
+      if (PaymentObj.ReceiverBankID != {OurBank})
+         paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+      end;
+      if (((PaymentObj.DocKind == DLDOC_BANKPAYMENT) or (PaymentObj.DocKind == PS_PAYORDER) or (PaymentObj.DocKind == PS_CPORDER)) and (PaymentObj.IsExternal)) 
+         paymtr.Date_Carry = {curdate}; // KS 01.08.2011 Патч 30
+      end;
+
+      // KS 03.02.2011 I-00002528 подтягивать признак СПОД из Первичного документа
+      var obj = GetPrimObj(PaymentObj);
+      if( PaymentObj.DocKind == DLDOC_MEMORIALORDER )
+         paymtr.TypeDocument = obj.TypeDocument;
+      elif( PaymentObj.DocKind == CB_MULTYDOC )
+         paymtr.TypeDocument = obj.Type_Document;
+      end;
+      /*SDA  I-00124234-1 - если в проводке указан робот (больше 10000) пробуем установить операциониста по платежу */
+      if (Paymtr.oper >= 10000)
+         Paymtr.oper = PaymentObj.oper;
+      end;
+      /*SDA - 16.02.2012 зачисление ответных межбанковских по ДПП */
+      if  ((PaymentObj.DocKind == 320) and (not SoaGo) and (substr(paymtr.AccountPayer,1,5) != "47416") and (not acc_otv))
+         PaymentObj.ValueDate   =
+         paymtr.Date_Carry      = PaymentObj.InTransferDate;
+      end;
+      if( not paymtr.Carry )
+         MsgBox("Ошибка при актуализации платежа");
+         return 1;
+      else
+         // zmp 05.08.2014 I-00506298-2
+         if((oObj.origin == 1) and (PaymentObj.PayerChargeOffDate  == date(0,0,0)) and 
+            (paymtr.AccountPayer == PaymentObj.PayerAccount) and (paymtr.FIIDPayer  == PaymentObj.PayerFIID) )
+            PaymentObj.PayerChargeOffDate = paymtr.Date_Carry;
+         end;
+
+         /*29.05.2012 Chesnokov D.S. Отправка письма в Lotus по заявке С-10370*/
+         /*03.04.2013 zmp добалены ЭВ-Саратов и ВУЗ*/
+         // zmp 28.07.2014 R-418310-5
+         //if (fgBank.is_PRBB or fgBank.is_EXV or fgBank.is_VUZ)
+            if (PaymentObj.Dockind == 320)
+               if ((PaymentObj.ReceiverBankID == {OurBank}) and (CheckPension(paymtr.AccountReceiver)))
+                  Theme = "Зачисление пенсий";
+                  GetRegistryValue("PRBB\\ЗАЧИСЛЕНИЕ ПЕНСИЙ\\ПОЛУЧАТЕЛЬ", V_STRING, Email, stat);
+                  if ((stat == 0) and (trim(Email) != ""))
+                     Send_l(Theme, GetPensLetter(Paymentobj, paymtr), 73, Email); 
+                  end;
+               end;
+            end;
+         //end;
+      end;  
+   end;
+   return 0;
+
+   onerror(er)
+      msgbox(er.message);
+      return 1;
+end;

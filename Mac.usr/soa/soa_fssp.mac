@@ -1,0 +1,359 @@
+import rsd,rsexts;
+import globals,lib_registry,likepy;
+import fssp_lib,fssp_accountquery,fssp_restrictn_gmoney,fssp_answerquery,fssp_restrictn;
+
+PRIVATE CONST MES_STATE_LOADED            = 0;
+PRIVATE CONST MES_STATE_PROCESSED         = 1;
+PRIVATE CONST MES_STATE_IN_PROCESSING     = 2;
+PRIVATE CONST MES_STATE_MANUAL_PROCESSING = 3;
+
+PRIVATE CONST MULTI_ACTION_MODE = 2;
+PRIVATE CONST AGENT_ACTION_MODE = 3;
+
+/**
+ * Загрузка
+ */
+class answerLoader
+    var countLoadedFiles    = 0;
+    var countLoadedMessages = 0;
+    var errorMessage        = "no_error";
+end;
+
+macro saveLoaderStat( stats )
+    private var cmd;
+    private var rs = rsdRecordset( "SELECT 1 FROM  usr_fssp_agent_local_log WHERE T_DATE = trunc(SYSDATE)" );
+
+    if( rs.movenext )
+        cmd = rsdCommand( " UPDATE usr_fssp_agent_local_log SET t_files = t_files + :p_files, t_messages = t_messages + :p_messages WHERE T_DATE = trunc(SYSDATE) " );
+        cmd.AddParam( "p_files",    RSDBP_IN, stats.countLoadedFiles );
+        cmd.AddParam( "p_messages", RSDBP_IN, stats.countLoadedMessages );
+        cmd.execute;
+    else
+        cmd = rsdCommand( "INSERT INTO usr_fssp_agent_local_log values(trunc(SYSDATE),:p_files,:p_messages,0,0,0)" );
+        cmd.AddParam( "p_files",    RSDBP_IN, stats.countLoadedFiles );
+        cmd.AddParam( "p_messages", RSDBP_IN, stats.countLoadedMessages );
+        cmd.execute;
+    end;
+end;
+
+private macro load_one_file( fname )
+    var ha = TArray, hd, strm, doc_count, sess_id, mes_id, i;
+    var stat, mes_type, error_mes;
+
+    rsldefcon.BeginTrans;
+
+    strm = TStream( fname, "R" );
+    AddField( ha, "xml", V_STRING,  strm.getsize, 0 );
+    hd = TRecHandler( "xmlread", ha );
+    strm.read2( hd );    
+    
+    sess_id = int( gen_sess_id );
+    load_xml( hd, sess_id, fName );
+    doc_count = get_docs_count_in_session( sess_id );
+
+    if( doc_count == 0 ) runError( "Нет сообщений" ); end;
+
+    i = 1;
+
+    while( i <= doc_count )
+        stat = get_document( sess_id, i );
+
+        if( stat != 2 ) 
+            mes_id   = get_mes_id_by_session_part( sess_id, i );
+            mes_type = set_mes_type( mes_id );
+        end;
+
+        i = i + 1;    
+    end;
+
+    rsldefcon.CommitTrans;
+
+    return doc_count; 
+onerror( x )
+    rsldefcon.RollbackTrans;
+    runError( fName + "  :: " + x.message );
+end;
+
+macro loadFiles( mesTypes )
+    var dir, fullPath = "", fullPathOld = "", i;
+    var fsspPath    = fssp_dir_import, 
+        fsspPathOld = fssp_dir_oldmsg, 
+        fsspMask    = "*.xml";
+
+    var answer   = answerLoader();
+    var mesCount = 0;
+
+    dir = TDirList ( string ( fsspPath, "/", fsspMask ), "f" );
+    dir.sort (0);        
+
+    clear_tmp( "USR_FSSP_ERR_TMP" );
+
+    if( dir.count != 0 )
+        for ( i, 0, dir.count - 1 )
+            fullPath    = string( fsspPath   , "/", dir.name (i) );
+            fullPathOld = string( fsspPathOld, "/", dir.name (i) );
+
+            mesCount = mesCount + load_one_file( fullPath );
+
+            move_file( fullPath, fullPathOld );
+        end;
+    end;
+
+    answer.countLoadedMessages = mesCount;
+    answer.countLoadedFiles    = dir.count;
+
+    saveLoaderStat( answer );
+onerror( x )
+    runError( x.message );
+end;
+
+/**
+ * Обработка сообщений
+ */
+
+/** Процедура устанавливает статус сообщения */
+private macro setMessageState
+    private var mesId    = 0;
+    private var mesState = 0;
+
+    getParm( 0, mesId    );
+    getParm( 1, mesState );
+
+    rsdCommand( " UPDATE USR_FSSP_MES SET T_MES_STATE = " + mesState + " WHERE T_ID = " + mesId + "; " ).execute;
+end;
+
+/** Все сообщения со статусом "В обработке" переводятся на ручную обработку */
+private macro sendAutoMessagesToManualProcessing
+    rsdCommand( " UPDATE USR_FSSP_MES SET T_MES_STATE = " + MES_STATE_MANUAL_PROCESSING + " WHERE T_MES_STATE = " + MES_STATE_IN_PROCESSING + "; " ).execute;
+end;
+
+/** Обработанные сообщения со статусом "В обработке" помечаем как обработанные */
+private macro sendAutoMessagesToProcessed
+    rsdCommand( " UPDATE USR_FSSP_MES MES " + 
+                "        SET MES.T_MES_STATE = " + MES_STATE_PROCESSED     + 
+                "  WHERE     MES.T_MES_STATE = " + MES_STATE_IN_PROCESSING + 
+                "        AND EXISTS(SELECT 1 FROM USR_FSSP_ANSWER ANSWER WHERE ANSWER.T_MES_ID = MES.T_ID); " ).execute;
+end;
+
+/** Обработанные сообщения на ручной обработке помечаем как обработанные */
+private macro sendManualMessagesToProcessed
+    rsdCommand( " UPDATE USR_FSSP_MES MES " + 
+                "        SET MES.T_MES_STATE = " + MES_STATE_PROCESSED     + 
+                "  WHERE     MES.T_MES_STATE = " + MES_STATE_MANUAL_PROCESSING + 
+                "        AND EXISTS(SELECT 1 FROM USR_FSSP_ANSWER ANSWER WHERE ANSWER.T_MES_ID = MES.T_ID); " ).execute;
+end;
+
+private macro checkMesAnswer
+    private var mesId = 0;
+    getParm( 0, mesId );
+
+    return rsdRecordset(" SELECT 1 FROM USR_FSSP_ANSWER WHERE T_MES_ID = " + mesId + "; " ).movenext;
+end;
+
+/** Получаем сообщение */
+private macro getMessageForProcessing
+    private var mesId   = 0; 
+    private var mesType = 0; 
+
+    private var rs = rsdRecordset( " SELECT T_ID, T_MES_TYPE FROM USR_FSSP_MES WHERE T_MES_STATE = " + MES_STATE_LOADED + "; " );
+
+    if( rs.movenext )
+        mesId   = rs.value( "T_ID",       null, V_INTEGER ); 
+        mesType = rs.value( "T_MES_TYPE", null, V_INTEGER ); 
+        setParm( 0, mesId   );
+        setParm( 1, mesType );
+
+        setMessageState( mesId, MES_STATE_IN_PROCESSING );
+        return true;
+    end;
+
+    return false;
+end;
+
+class statProcessing
+    var countProcessedMessages = 0;
+    var countManualMessages    = 0;
+end;
+
+macro saveProcessingStat( stats )
+    private var cmd;
+    private var rs = rsdRecordset( "SELECT 1 FROM  usr_fssp_agent_local_log WHERE T_DATE = trunc(SYSDATE)" );
+
+    if( rs.movenext )
+        cmd = rsdCommand( " UPDATE usr_fssp_agent_local_log SET t_processed = t_processed + :p_processed, t_manual = t_manual + :p_manual WHERE T_DATE = trunc(SYSDATE) " );
+        cmd.AddParam( "p_processed", RSDBP_IN, stats.countProcessedMessages );
+        cmd.AddParam( "p_manual",    RSDBP_IN, stats.countManualMessages );
+        cmd.execute;
+    else
+        cmd = rsdCommand( "INSERT INTO usr_fssp_agent_local_log values(trunc(SYSDATE),0,0,:p_processed,:p_manual)" );
+        cmd.AddParam( "p_processed", RSDBP_IN, stats.countProcessedMessages );
+        cmd.AddParam( "p_manual",    RSDBP_IN, stats.countManualMessages );
+        cmd.execute;
+    end;
+
+    return true;
+
+//onerror return false;
+end;
+
+
+/** Запуск обработки */
+macro processMessages
+    private var curMesId   = 0; 
+    private var curMesType = 0; 
+    private var messageObject; 
+    private var stat = statProcessing;
+
+    /* костыли */
+    /* обработанные сообщения помечаются как обработанные */
+    sendAutoMessagesToProcessed;
+    sendManualMessagesToProcessed;
+    /* необработанные передаются на ручную обработку      */
+    sendAutoMessagesToManualProcessing;
+
+    while( getMessageForProcessing( curMesId, curMesType ) )
+        if   ( curMesType == MT_QUERY )         
+            messageObject = TFSSP_QUERY( curMesId );
+
+        // остальные типы сообщений не тестировались. закомментировал во избежание проблем 
+/*
+        elif ( curMesType == MT_ACCOUNT_QUERY ) 
+            messageObject = TFSSP_ACCOUNTQUERY( curMesId );
+
+        elif ( inList( curMesType, MT_IP_ACT_FIND_ACCOUNT, MT_IP_ACT_ARREST_ACCMONEY, MT_IP_ACT_ENDARREST_ARM_3, MT_IP_ACT_ENDARREST_ARM_1_2 ) ) 
+            messageObject = TFSSP_QUERY_RESTRICTN( curMesId, curMesType ); 
+
+        elif ( inList( curMesType, MT_IP_ACT_GACCOUNT_MONEY, MT_IP_ACT_ENDGACCOUNT_MONEY, MT_IP_ACT_ENDARR_GMONEY ) ) 
+            messageObject = TFSSP_PENALTY( curMesId );   
+*/
+        else
+            /** не известное науке сообщение */
+            setMessageState( curMesId, MES_STATE_MANUAL_PROCESSING );
+            continue;
+        end;
+
+        if( messageObject.Create( AGENT_ACTION_MODE ) == 0 )
+            stat.countProcessedMessages = stat.countProcessedMessages + 1;
+            setMessageState( curMesId, MES_STATE_PROCESSED );
+        else
+            if(not checkMesAnswer(curMesId))  // Golovkin ошибка может выйти если сообщение уже обработано, в этом случает статус не меняем
+                stat.countManualMessages = stat.countManualMessages + 1;
+                setMessageState( curMesId, MES_STATE_MANUAL_PROCESSING );
+            end;
+        end;
+    end;
+
+    saveProcessingStat(stat);
+end;
+
+/**
+ * Формирование ответных файлов
+ */
+macro saveUploadStat( stats )
+    private var cmd;
+    private var rs = rsdRecordset( "SELECT 1 FROM  usr_fssp_agent_local_log WHERE T_DATE = trunc(SYSDATE)" );
+
+    if( rs.movenext )
+        cmd = rsdCommand( " UPDATE usr_fssp_agent_local_log SET t_upload = t_upload + :p_upload WHERE T_DATE = trunc(SYSDATE) " );
+        cmd.AddParam( "p_upload", RSDBP_IN, stats );
+        cmd.execute;
+    else
+        cmd = rsdCommand( "INSERT INTO usr_fssp_agent_local_log values(trunc(SYSDATE),0,0,0,0,:p_upload)" );
+        cmd.AddParam( "p_upload", RSDBP_IN, stats );
+        cmd.execute;
+    end;
+
+    return true;
+
+//onerror return false;
+end;
+
+macro createPacks
+    var i,dir,countPacks = 0,countErrPacks = 0;
+    var _files       = TArray(),
+        _arrFileName = TArray(),
+        _idsess      = 0, 
+        _idmes       = 0;
+    var currSessID   = 0;
+    var currPack     = Pack( 0 );
+
+    dir = TDirList ( string ( fssp_dir_export, "/", "*.xml" ), "f" );
+    dir.sort(0);
+
+    if( dir.count != 0 )
+
+        for ( i, 0, dir.count )
+            _arrFileName = split( dir.name(i), "_" );
+
+            _idSess = _arrFileName[0];
+            _idMes  = _arrFileName[1];
+        
+            if(    ( currSessID != _idSess ) 
+                or ( dir.count  == i       ) )
+
+                if  ( currPack.checkPack ) 
+                    setSerializeForFile( currPack.packFileName );
+                    countPacks = countPacks + 1;
+                elif( currSessID != 0 )
+                    countErrPacks = countErrPacks + 1;
+                end;
+
+                if( dir.count == i ) 
+                    saveUploadStat( countPacks );
+                    return; 
+                end;
+
+                currSessID = _idSess; 
+                currPack   = Pack( currSessID );
+            end;
+
+            currPack.appendMessage( dir.name(i), _idMes );
+        end;
+
+    else
+        runError( "Отсутствуют файлы в папке " + strSubst( fssp_dir_export, "/", "\\" ) );
+    end;
+
+        saveUploadStat( countPacks );
+onerror saveUploadStat( countPacks );
+end;
+
+class localLog
+   var logDate   = date;
+   var files     = 0;
+   var messages  = 0;
+   var processed = 0;
+   var manual    = 0;
+end;
+
+macro getLocalLog(p_date)
+    var retVal = localLog;
+    var _date  = date;
+
+    if( not (p_date == null) )
+        _date = p_date;
+    end;
+
+    var cmd    = rsdCommand( " SELECT   * "
+                             "   FROM   usr_fssp_agent_local_log "
+                             "  WHERE   t_date = TRUNC (:p_date) " );
+        cmd.AddParam( "p_date", RSDBP_IN, _date );
+
+    var rs = rsdRecordset(cmd);
+
+    if( rs.movenext )
+        retVal.logDate   = rs.value( "t_date",      null, v_date    );
+        retVal.files     = rs.value( "t_files",     null, v_integer );
+        retVal.messages  = rs.value( "t_messages",  null, v_integer );
+        retVal.processed = rs.value( "t_processed", null, v_integer );
+        retVal.manual    = rs.value( "t_manual",    null, v_integer );
+    else 
+        retVal.logDate = p_date;
+    end;
+
+    return retVal;
+//    return dttm(date,time);
+onerror
+    return retVal;
+end;
+/**********************************/

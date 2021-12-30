@@ -1,0 +1,1157 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    ███████       █████      █████     ███
+    █████████   ████████   ████████    ███
+    ███   ███   ███        ███         ███
+    ████████     ███████    ███████    ███
+    ██████            ███        ███   ███
+    ███ ████    █████████  █████████   ████████
+    ███   ████    █████      █████     ████████
+
+   R-Style Softlab
+   
+   Имя файла sfground.mac
+
+   Описание:  Формирование назначения платежа или основания ТО по данным удержанной комиссии и буферу ДО. И прочие радости. 
+
+   ChangeLog:
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 23.05.2012 исправил запрос
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 16.10.2013 Добавил возможность менять назначение комиссии при помощи категории "Альтернативное назначение комиссии" (C-23738)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //KS 26.11.2013 Адаптация под 31ю сборку
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 04.02.2014 В рамках адаптации исправил BuildGroundBatch, чтобы назначение не переопределялось.
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 07.02.2014 В BuildGroundBatch приходит "кривой" буфер SfContr, поэтому ввел SfContr_R для пересоздания SfContr
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 19.03.2014 Из-за невнятно работы метода IsAttrPresense, реализована аналогичная проверка CheckingMatchesCat
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 25.03.2014 Поправил GetInVoSum, теперь поиск ведется по полям pm.t_receiveraccount or pm.t_futurereceiveraccount
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 13.05.2014 Добавил ветку для ГЭБа в GetInVoSum
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //EVG 23.06.2014 Сдалел доп. обработку возвращаемой суммы в GetInVoSum()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 05.11.2014 Вернул потерянные доработки Киселева для разовых комиссий в ЭВ
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   // joy 13.11.2014 R-493008 Правка поиска сумму для ЭВ + макрс перенесен из mac.life в mac.cb
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //joy 20.04.2015  I-00558627 Исправления в GetInVoSum
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //joy 14.09.2015  I-00582095 в GetInVoSum добавлен поиск и по pm.t_futurereceiveraccount
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import SfInter, BankInter, PTInter, CTInter, FIInter, globals, RSD, "sf_lib.mac";
+import "sfconpaym.mac";
+// EVG 27/07/2011
+import fg_Life_parm;
+
+private const NOTEKIND_COMISS_GROUND    = 1;
+private const OBJTYPE_SFCOMISS          = 650; 
+private const OBJTYPE_SFSINGDF          = 664; // Удержанная разовая комиссия
+private const NOTEKIND_COMISS_PARTYCODE = 101;  //корректировать при внедрении
+private const NOTEKIND_COMISS_NUM_MONTH = 102;  //корректировать при внедрении
+private const NOTEKIND_COMISS_YEAR      = 103;  //корректировать при внедрении
+// EVG 19/08/2011
+private const NOTEKIND_COMISS_EXTNUMBER   = 104;  // Расширенный номер договора
+private const ATTR_ALTR_GROUND            = 104;
+private const NUM_ATTR_ALTR_GROUND        = 1;
+private const NOTEKIND_COMISS_ALTR_GROUND = 201;
+
+private macro GetCurrencyShortName( CCur ) : string
+
+  var sqlString : string;
+  var rs : RsdRecordset;
+
+  sqlString = "SELECT t_Ccy FROM dfininstr_dbt WHERE t_fiid = " + CCur;
+
+  rs = RsdRecordset( sqlString );
+
+  if( rs.moveNext())
+    return rs.value( 0 );
+  end;
+
+  return "";
+end;
+
+/*заменить спецпеременную без учета регистра*/
+private macro ReplaceSpecVariable( ground, specVar, strToReplace )
+  
+  var VarIndex, groundOut = "";
+
+  VarIndex = Index( StrUpr(ground), specVar );
+  while( VarIndex > 0 )
+    groundOut = groundOut + SubStr( ground, 1, VarIndex -1 ) + strToReplace;
+    ground = SubStr( ground, VarIndex + strlen(specVar) );
+    VarIndex = Index( StrUpr(ground), specVar );
+  end;
+
+  groundOut = groundOut + ground;
+
+  return groundOut;
+
+end;
+
+/*Отрезать незначащие нули в дробной части. Если после точки все нули, то точку тоже вырезать */
+private macro doubleValToStr( doubleVal )
+  
+  var Symbol, loop = true;
+  var retStr = string(doubleVal); 
+
+  while( loop )
+    Symbol = substr( retStr, strlen(retStr), 1 );
+    if( Symbol == "0" )
+       retStr = substr( retStr, 1, strlen(retStr)-1 );
+    elif( Symbol == "." )
+       retStr = substr( retStr, 1, strlen(retStr)-1 );
+       loop = false;
+    else
+       loop = false;
+    end;
+  end;
+
+  if( strlen(retStr) == 0 )
+    retStr = "0";
+  end;
+
+  return retStr;
+end;
+
+
+
+/* EVG Функция возвращает сумму и валюту первичного документа
+   по переданному ID операции. */
+macro GetPrimaryPaymentSum_FI( opID, rSum:@money, rFiid:@integer )
+
+  var SQL, rs;
+
+  SQL = " SELECT paym.t_amount, paym.T_FIID ";
+  SQL = SQL + "  FROM dpmpaym_dbt paym, doproper_dbt op ";
+  SQL = SQL + " WHERE op.t_id_operation = " + opID;
+  /* EVG 9.02.2011 Убрал из-за того, что для ответных платежей op.t_dockind всегда 320,
+     а paym.t_dockind может быть 320, а может 322. В принципе, условие по t_dockind из-
+     лишне, т.к. по t_documentid в dpmpaym_dbt и так есть уникальный индекс.
+  SQL = SQL + "   AND paym.t_dockind = op.t_dockind ";*/
+  SQL = SQL + "   AND paym.t_documentid = LTRIM (op.t_documentid, '0') ";
+
+  rs = rsdRecordSet( SQL );
+  if (rs and rs.MoveNext())
+     rSum  = rs.Value(0, null, V_MONEY);
+     rFiid = rs.Value(1, null, V_INTEGER);
+
+     return true;
+  end;
+
+  return false;
+end;
+
+//А.Киселев получим предыдущий месяц использовать с DateSplit
+private macro GetPreviosMonth(Month:@integer, Year:@integer) :integer; 
+var bufM, bufY;
+ bufM = Month - 1;
+ bufY = Year - 1;
+ if ((bufM > 0) and (bufM <= 12 ) and ( Year > 0))
+  Month = bufM;
+  return 1;
+ elif ( (bufM <= 0)  and ( bufY > 0) )
+  Month = 12;
+  Year = bufY;
+  return 1;
+ else
+  return 0;
+ end;
+end;
+
+/* EVG Функция возвращает номер первичного документа
+   по переданному ID операции. */
+macro GetPrimaryPaymentNumber( opID, rNumber:@string )
+
+  var SQL, rs;
+
+  SQL = " SELECT rmpr.t_number ";
+  SQL = SQL + "  FROM dpmpaym_dbt paym, dpmrmprop_dbt rmpr, doproper_dbt op ";
+  SQL = SQL + " WHERE op.t_id_operation = " + opID;
+  SQL = SQL + "   AND paym.t_dockind    = op.t_dockind ";
+  SQL = SQL + "   AND paym.t_documentid = LTRIM (op.t_documentid, '0') ";
+  SQL = SQL + "   AND rmpr.t_paymentid  = paym.t_paymentid ";
+
+  rs = rsdRecordSet( SQL );
+  if (rs and rs.MoveNext())
+     rNumber = rs.Value(0, null, V_STRING);
+
+     return true;
+  end;
+
+  return false;
+end;
+
+
+/* EVG 27/07/2011 Функция предназначена для определения базовой суммы периодической комиссии
+   за валютный контроль входящих платежей на основании данных таблицы USR_TRNSF_COMISS. */
+macro GetInVoSum( defCom, sfContr )
+
+  var SQL, cmd, rs;
+  var baseSum = $0,
+      fgBank  = fg_life_subject();
+
+  fgBank.ConsrtuctByBic( {MFO_bank} );
+
+  /* Для ПРББ, ВУЗ и НБС запрос один, для ГЭБ и ЭВ - другой, т.к. технологии работы с уведомлениями различаются */
+  if ( fgBank.is_PRBB or fgBank.is_NBS or fgBank.is_VUZ or fgBank.is_SLD)
+  
+        SQL = " SELECT   SUM( NVL(utc.SUM,0) ) ";
+        SQL = SQL + "  FROM   dpmpaym_dbt pm, ";
+        SQL = SQL + "         usr_trnsf_comiss utc, ";
+        SQL = SQL + "         dsfcomiss_dbt com ";
+        /* EVG 21/06/2012 Аналогично CommissLib.mac->GetComCurrencyControlSum(): выявились входящие платежи, у которых 
+           в t_futurereceiveraccount после закрытия встал счёт плательщика. Переходим на t_receiveraccount.
+        SQL = SQL + " WHERE       pm.t_futurereceiveraccount = ? ";*/
+        SQL = SQL + " WHERE       (pm.t_receiveraccount = ? or pm.t_futurereceiveraccount = ?)";  // 14.09.2015 joy I-00582095
+        /*SQL = SQL + " WHERE       (pm.t_receiveraccount = ? )";*/
+
+        /* EVG 25/06/2012 Вернули, т.к. usr_trnsf_comiss.notify_num заполняется PaymentID.
+        /* EVG 21/06/2012 Переход на связку через USR_TRNSF_NOTIFY, как в остальных банках.
+        SQL = SQL + "         AND pm.t_paymentid = utc.notify_num";*/
+        SQL = SQL + "         AND pm.t_paymentid in ( Select Payment_Id From usr_trnsf_notify Where Payment_ID  = utc.notify_num ";//RR 25.06.2012 тут нужно приравнивать Payment_ID а не notify_num
+        SQL = SQL + "                                   and to_char(notify_date, 'YYYY') = to_char(utc.comdate, 'YYYY') ) ";*/
+        SQL = SQL + "         AND pm.t_paymentid = utc.notify_num";
+        
+        SQL = SQL + "         AND utc.comdate BETWEEN ? ";
+        SQL = SQL + "                                AND  ? ";
+        SQL = SQL + "         AND com.t_number  = ? ";
+        SQL = SQL + "         AND com.t_feetype = 1 ";
+        SQL = SQL + "         AND utc.comid = com.t_number ";
+
+  else
+  
+     /* Запрос взят один в один из GebComLib.mac -> GEB_GetComCurrencyControlSum, минимально видоизменён */
+     if ( sfContr.Fiid > 0 )
+
+        SQL = " SELECT   SUM( NVL(utc.SUM,0) ) ";
+        SQL = SQL + "  FROM   dpmpaym_dbt pm, ";
+        SQL = SQL + "         usr_trnsf_comiss utc, ";
+        SQL = SQL + "         dsfcomiss_dbt com ";
+        SQL = SQL + " WHERE       (pm.t_receiveraccount = ? or pm.t_futurereceiveraccount = ?) ";
+//        if (fgBank.is_GEB) 13.11.2014 joy R-493008 Для ЭВ аналогичная связь, поэтому цикл закомментировала
+          SQL = SQL + "         AND pm.t_paymentid in ( Select Payment_Id From usr_trnsf_notify Where notify_num = utc.notify_num ";//RR 13.05.2014
+//        else
+//          SQL = SQL + "         AND pm.t_paymentid in ( Select Payment_Id From usr_trnsf_notify Where Payment_ID  = utc.notify_num ";//RR 25.06.2012 тут нужно приравнивать Payment_ID а не notify_num
+//        end;
+        // EVG 29.07.2011 Проверка даты больше не нужна SQL = SQL + "                                                                          and notify_date = utc.comdate )";
+
+        /* EVG 18.01.2012 Нужна проверка года в дате потому, что с нового года номера уведомлений сбрасываются на 1, в результате 
+           чего появляется дублирование. Поэтому нужно проверить, что год из даты уведомления соответствует году из даты комиссии. */
+        SQL = SQL + "                                   and to_char(notify_date, 'YYYY') = to_char(utc.comdate, 'YYYY') ) ";
+
+        SQL = SQL + "         AND utc.comdate BETWEEN ? ";
+        SQL = SQL + "                                AND  ? ";
+        SQL = SQL + "         AND com.t_number  = ? ";
+        SQL = SQL + "         AND com.t_feetype = 1 ";
+        SQL = SQL + "         AND utc.comid = com.t_number ";
+        
+     else
+        
+        SQL = " SELECT   SUM( NVL(utc.SUM,0) )";
+        SQL = SQL + "  FROM   dpmpaym_dbt pm, ";
+        SQL = SQL + "         usr_trnsf_comiss utc, ";
+        SQL = SQL + "         dsfcomiss_dbt com ";
+        SQL = SQL + " WHERE       (pm.t_receiveraccount = ? or pm.t_futurereceiveraccount = ?) ";
+        SQL = SQL + "         AND pm.t_paymentid = utc.notify_num";
+        SQL = SQL + "         AND (EXISTS (SELECT   1 ";
+        SQL = SQL + "                       FROM   usr_trnsf_notify_rur "; //RR 23.05.2012 исправил таблицу
+        SQL = SQL + "                      WHERE   payment_id = utc.notify_num) ";
+        SQL = SQL + "              OR EXISTS (SELECT   1 ";
+        SQL = SQL + "                           FROM   usr_trnsf_notify "; //RR 13.05.2014 Дебилизм
+        SQL = SQL + "                          WHERE   payment_id = utc.notify_num)) ";
+        SQL = SQL + "         AND utc.comdate BETWEEN ? ";
+        SQL = SQL + "                                AND  ? ";
+        SQL = SQL + "         AND com.t_number  = ? ";
+        SQL = SQL + "         AND com.t_feetype = 1 ";
+        SQL = SQL + "         AND utc.comid = com.t_number ";
+        
+     end;
+
+  end;
+
+  cmd = rsdcommand( SQL );
+  cmd.AddParam("", RSDBP_IN, sfContr.Object);
+  cmd.AddParam("", RSDBP_IN, sfContr.Object);
+  cmd.AddParam("", RSDBP_IN, defCom.DatePeriodBegin);
+  cmd.AddParam("", RSDBP_IN, defCom.DatePeriodEnd);
+  cmd.AddParam("", RSDBP_IN, defCom.CommNumber);
+  rs = rsdRecordSet( cmd );
+
+  if ( rs and rs.moveNext() )
+     /* EVG Если запись по комиссии не найдена, то moveNext() проходит, но значение
+        получается null, что вызывает  ошибку при создании  документа оплаты. Нужно 
+        дполнительно обрабатывать возвращаемое значение.
+     baseSum = rs.Value( 0, null, V_MONEY );*/
+     baseSum = SQL_ConvTypeSum( rs.Value( 0, null, V_MONEY ) );
+  end;
+
+  return baseSum;
+end;
+
+ MACRO CheckingMatchesTP(sfcontrid);
+  var rs;
+  rs = RSDRecordSet (" SELECT   NVL ( " +
+                     "             (SELECT   1 " +
+                     "                FROM   dsfcontrplan_dbt pl, dsfplan_dbt sfpl " +
+                     "               WHERE   PL.T_SFCONTRID = "+sfcontrid+" " +
+                     "                       AND (PL.T_END = TO_DATE ('01.01.0001', 'dd.mm.yyyy') " +
+                     "                            OR PL.T_END > SYSDATE) " +
+                     "                       AND SFPL.T_SFPLANID = PL.T_SFPLANID " +
+                     "                       AND REGEXP_LIKE (SFPL.T_NAME, " +
+                     "                                        '[П,п]реуспеваем|[Р,р]астем')), " +
+                     "             0 " +
+                     "          ) " +
+                     "             need_change " +
+                     "   FROM   DUAL; ");
+  rs.movenext();
+  if (rs.value("need_change") == 1 )
+    return true;
+  else
+    return false;
+  end;
+ END;
+  
+ MACRO CheckingMatchesCat(ObjId);
+  var rs;
+  debugbreak;
+  rs = RSDRecordSet (" SELECT   NVL ( " +
+                     "             (SELECT   1 " +
+                     "                FROM   dobjatcor_dbt atcor " +
+                     "               WHERE       ATCOR.T_OBJECTTYPE = " + OBJTYPE_SFCOMISS +
+                     "                       AND ATCOR.T_GROUPID = " + ATTR_ALTR_GROUND +
+                     "                       AND ATCOR.T_ATTRID = " + NUM_ATTR_ALTR_GROUND +
+                     "                       AND ATCOR.T_OBJECT = " + ObjId +
+                     "                       AND ATCOR.T_VALIDFROMDATE <= to_date('"+{curdate}+"','dd.mm.yyyy')" +
+                     "                       AND ATCOR.T_VALIDTODATE >= to_date('"+{curdate}+"','dd.mm.yyyy'))," +
+                     "             0 " +
+                     "          ) " +
+                     "             cat " +
+                     "   FROM   DUAL ");
+  rs.movenext();
+  if (rs.value("cat") == 1 )
+    return true;
+  else
+    return false;
+  end;
+ END;
+
+/*Пункт 2.2.3.1 */
+private macro MoreAtrSub( party )
+  
+  file persn("persn.dbt") key 0;
+  file objattr("objattr.dbt") key 0;
+  var FindAttr:bool;
+  if( persn.PersonID = party.PartyID)
+   if( getEQ( persn ) )
+    if ( party.LegalForm == PTLEGF_PERSN )
+      if( (persn.IsEmployer == "X") 
+        OR ((CheckObjAttrPresence ( FindAttr, OBJTYPE_PARTY, UniID( party, OBJTYPE_PARTY), 16, 2, "", "", false ) == true) AND (FindAttr == true) ) 
+        OR ((CheckObjAttrPresence ( FindAttr, OBJTYPE_PARTY, UniID( party, OBJTYPE_PARTY), 16, 3, "", "", false ) == true ) AND (FindAttr == true) )
+        )
+        return true;
+      end;
+    end;
+   end;
+  end;
+
+  return false;
+end;
+
+/*Пункт 2.2.3.2 */
+private macro BankPropertyYuris( party )
+
+  var cmd;
+  var rs;
+  
+  var isPro = false;
+
+  if( party.LegalForm != PTLEGF_PERSN )
+    
+    cmd = RsdCommand( "SELECT * FROM dpartyown_dbt WHERE t_PartyID = :PartyID AND (t_PartyKind = 2 OR t_PartyKind = 56)" );
+    cmd.addParam( "", RSDBP_IN, party.PartyID );
+       
+    rs = RsdRecordset( cmd );
+  
+    if( rs.moveNext() )
+      return isPro = false;
+    else
+      return isPro = true;
+    end;
+  end;
+
+  return isPro;
+
+end;
+
+/*Добавление кода ВО в основание документа*/
+macro SfGroundAddVO( ground:@string, ComFIID, PayerID, ReceiverID, DocDate )
+
+  var Flag = false;
+  var err = "";
+
+  file party("party.dbt") key 0;
+
+  GetRegistryValue( "COMMON\\ВЕДЕНИЕ БД ВО В ПРИКЛАДНЫХ БО", V_BOOL, Flag, err);
+  if( Flag )
+    if( ComFIID == NATCUR ) 
+      if( (PayerID == {HeadBankID}) OR (PayerID == {OurBank}) ) 
+        party.PartyID = ReceiverID; 
+      elif( (ReceiverID == {HeadBankID}) OR (ReceiverID == {OurBank}) )
+        party.PartyID = PayerID;
+      end;
+
+      if( getEQ( party ) )
+        if(( party.LegalForm != PTLEGF_PERSN ) AND( party.NotResident == "X" ) )
+          if( DocDate < date(1,9,2012) )
+            ground = "{VO99020} " + ground;
+          else
+            ground = "{VO80050} " + ground;
+          end;
+        end;
+      end;
+    
+    elif( (ComFIID != NATCUR) AND (DocDate >= date(1,9,2012)) )
+      if( (PayerID == {HeadBankID}) OR (PayerID == {OurBank}) )
+        party.PartyID = ReceiverID;
+      elif( (ReceiverID == {HeadBankID}) OR (ReceiverID == {OurBank}) )
+        party.PartyID = PayerID;
+      end;
+      
+      if( getEQ( party ) )
+        if( (party.NotResident != "X") AND ( (MoreAtrSub( party ) == true) OR (BankPropertyYuris( party ) == true) ) ) 
+          ground = "{VO80150} " + ground;
+        end;
+      end;
+    end;
+  end;
+
+  return ground;
+end;
+
+macro BuildGroundTmpl( ComBuf,       // буфер удержанной комиссии
+                       SfComiss,     // буфер вида комиссии
+                       SfContr,      // буфер ДО
+                       Template,     // шаблон основания - примечание вида "Назначение платежа"
+                       fiidCCY,      //  Трехбуквенный код ISO валюты ComBuf.fiid_Sum
+                       fiidTarsclCCY //  Трехбуквенный код ISO валюты ComBuf.fiid_Tarscl
+                     )
+
+  var ground = "";
+  var month, year, ndsSum;
+  var dateStr = "", monthStr = "", sumStr = "", quantityStr = "", ndsStr = "", contractStr = "",
+      percentStr = "", sumPerUnitStr = "", strBegYear = "";
+  private var category, objid;
+ 
+  /* EVG Номер из формы разовой комиссии */
+  var numberStr = "", BaseSum, FiidBaseSum;
+  /* Chesnokov D. Номер и дата письма из формы разовой комиссии*/
+  /*              Год для годовой комиссии 2.2.1               */
+  var PostNumber, PostDate, YearStr;
+    
+  /* EVG 3/10/2011 Обработка новых спецпеременных {НАЧАЛО_ПЕРИОДА} / {КОНЕЦ_ПЕРИОДА} */
+  var dPeriodBeg, dPeriodEnd;
+
+  ground = Template; 
+
+  /*Заменяем в полученном шаблоне спец. переменные их значениями из ComBuf и SfContr*/    
+  if( SfComiss.feeType == SF_FEE_TYPE_PERIOD ) /*периодическая комиссия*/      
+    //debugbreak; //40702810500000011954
+    if ( CheckingMatchesTP(sfcontr.id))
+      ObjId = UniID( sfcomiss, OBJTYPE_SFCOMISS );
+      if (CheckingMatchesCat(ObjId) )
+        Ground   = readNoteForObject( OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, SfComiss), NOTEKIND_COMISS_ALTR_GROUND );
+      end;
+      /* Перестал работать метод IsAttrPresense, переписал проверку запросом в БД
+      ObjId = UniID( sfcomiss, OBJTYPE_SFCOMISS );
+      category = RsbObjCategories(OBJTYPE_SFCOMISS, ObjId);
+      if (category.IsAttrPresense (ATTR_ALTR_GROUND,NUM_ATTR_ALTR_GROUND, NULL, NULL, false, {curdate}))
+        Ground   = readNoteForObject( OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, SfComiss), NOTEKIND_COMISS_ALTR_GROUND );
+      end;
+      */
+    end;
+
+    /*{Date} datePeriodEnd*/
+    dateStr = string( ComBuf.datePeriodEnd );
+
+    /*{Month} - Месяц и год, в котором взимается комиссия (например, "март 2009г.") от {Date}*/
+    DateSplit( ComBuf.datePeriodEnd, NULL, month, year);
+    monthStr = monname(month) + " " + string(year) + " г.";
+    
+    /*{Sum} baseSum, fiid_comm_sum   Базовая сумма, используемая при расчете комиссии в валюте расчета комиссии 
+    с указанием буквенного кода ISO валюты расчета комиссии (например, 2000 USD).*/
+      /* EVG 27/07/2011 Для комиссий за ВК входящих платежей базовая сумма не хранится.
+         Можно попробовать собрать её из USR_TRNSF_COMISS. */
+      if ( index( strLwr(SfComiss.code), "in" ) > 0 )
+
+         /* EVG 8/12/2011 Для этих комиссий базовый код валюты нужно брать не из рассчитанной комиссии (там рубли всегда),
+            а логичнее всего - из ДО, т.к. по данному ДО (счёту) всегда проходят платежи только в одной валюте. */
+         FiidBaseSum = GetCurrencyShortName( SfContr.fiid ); 
+         
+         sumStr = GetInVoSum( ComBuf, SfContr ) + " " + FiidBaseSum;
+
+      else
+        sumStr = string(ComBuf.baseSum) + " " + fiidCCY;
+      end;
+
+    /*{Quantity}*/
+    quantityStr = string(ComBuf.BaseQuant);
+
+    /*{Nds} ndsSum, fiid_comm_sum 
+    Сумма НДС по комиссии в валюте счета-получателя комиссии с указанием буквенного кода ISO валюты. Например "120.50 RUR"*/
+    ndsStr = string(ComBuf.SumNDS) + " " + fiidCCY;
+
+    /*{Contract}*/
+    contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+
+      /*{Year} - Чесноков Д.С. 14 февраля 2010 для комиссии 2.2.1 возьмем год из даты оплаты*/ 
+      DateSplit( ComBuf.datePeriodBegin, NULL, NULL, strBegYear);
+
+      /* EVG 3/10/2011 Обработка новых спецпеременных {НАЧАЛО_ПЕРИОДА} / {КОНЕЦ_ПЕРИОДА} */
+      DateSplit( {CurDate}, NULL, month, year );
+      //dPeriodBeg = trim(string( ComBuf.datePeriodBegin ))
+      dPeriodBeg = trim(string( date(1, month, year) ));
+      dPeriodEnd = trim(string( ComBuf.datePeriodEnd ));
+    
+  elif( SfComiss.feeType == SF_FEE_TYPE_SINGLE ) /*единовременная*/
+    /*{Date} dateFee*/
+    dateStr = string( ComBuf.dateFee );
+    
+    /*{Month}*/
+    DateSplit( ComBuf.dateFee, NULL, month, year );
+    monthStr = monname(month) + " " + string(year) + " г.";
+    
+      /*{Sum} baseSum, fiid_sum */
+      /* EVG Попробуем взять сумму и валюту из первичного документа */
+      BaseSum     = ComBuf.baseSum;
+      FiidBaseSum = ComBuf.fiid_sum;
+      GetPrimaryPaymentSum_FI( ComBuf.Id_Operation, @BaseSum, @FiidBaseSum );
+      sumStr = string(BaseSum) + " " + fiidCCY;
+
+      /* EVG Номер первичного документа */
+      /* {Number} */
+      GetPrimaryPaymentNumber( ComBuf.Id_Operation, @numberStr );
+
+    /*{Quantity}*/
+    quantityStr = "1";
+
+    /*{Nds} sumNDS, fiid_sum */
+    /* EVG 09/09/2011 В ед. комиссии fiidCCY - это валюта платежа, с которого берётся комиссия.
+       Валюта НДС - это валюта платежа оплаты комиссии.
+    ndsStr = string(ComBuf.sumNDS) + " " + fiidCCY;*/
+    ndsStr = string(ComBuf.sumNDS) + " " + GetCurrencyShortName( ComBuf.fiid_sum );
+
+    /*{Contract}*/
+    if( SfContr != null )
+      contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+    end;
+
+  elif( SfComiss.feeType == SF_FEE_TYPE_ONCE ) /*разовая*/
+    /*{Date} commDate*/
+    dateStr = string( ComBuf.DateFee );
+    
+    /*{Month}*/
+    DateSplit( ComBuf.DateFee, NULL, month, year );
+    monthStr = monname(month) + " " + string(year) + " г.";
+    
+    /*{Sum} amountSum*/
+    sumStr = string(ComBuf.BaseSum) + " " + fiidCCY;
+
+    /*{Quantity}*/
+    quantityStr = string(ComBuf.BaseQuant);
+
+    /*{Nds} sumNDS*/
+    ndsStr = string(ComBuf.sumNDS) + " " + fiidCCY;
+
+    /*{Contract}*/
+    if( SfContr != null )
+      contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+    end;
+
+      /* EVG Номер из формы разовой комиссии */
+      /* {Number} */
+      numberStr = ComBuf.Code;
+      
+      /* EVG 19/08/2011 Так как длина поля "Номер" в форме разовой комиссии ограничена,
+         реализовано сохранение номера в примечании вида 104 "Расширенный номер договора".
+         Если примечание задано, номер берётся из него, иначе - из поля "Номер".
+         Заявка № I-00087224-1. */
+      var NumberInNote104 = readNoteForObject_SQL( OBJTYPE_SFSINGDF, ComBuf.Id, NOTEKIND_COMISS_EXTNUMBER );
+      //msgbox ( NumberInNote104 );
+      if ( NumberInNote104 )
+         numberStr = NumberInNote104;
+      end;
+
+      /*09.11.2010 Chesnokov D. Доработка заполнения основания мемордера и проводки для комиссии 3.5.2
+                                на основании заявки I-086612   */
+      if (SfComiss.code == "3.5.2")
+        if(not GetString(PostNumber, "Введите номер уточняющего письма", 20))
+          PostNumber = 0;
+        end;
+        if(not GetDate(PostDate, "Введите дату уточняющего письма"))
+          PostDate = date(0,0,0);
+        end;
+      end;
+  end;
+
+  /**/
+  percentStr = doubleValToStr( ComBuf.Percent );
+  
+  sumPerUnitStr = string( money(ComBuf.Sum_Per_Unit) );
+  if( ComBuf.Sum_Per_Unit > 0 )
+    sumPerUnitStr = sumPerUnitStr + " " + fiidTarsclCCY;
+  end;
+
+  /* EVG Лишний пробел убрать
+  ground = ReplaceSpecVariable( ground, "{DATE}", dateStr );*/
+  ground = ReplaceSpecVariable( ground, "{DATE}", trim(dateStr) );
+  ground = ReplaceSpecVariable( ground, "{MONTH}", monthStr );
+  ground = ReplaceSpecVariable( ground, "{SUM}", sumStr );
+  ground = ReplaceSpecVariable( ground, "{QUANTITY}", quantityStr );
+  ground = ReplaceSpecVariable( ground, "{NDS}", ndsStr );
+  ground = ReplaceSpecVariable( ground, "{CONTRACT}", contractStr );
+  ground = ReplaceSpecVariable( ground, "{PERCENT}", percentStr );
+  ground = ReplaceSpecVariable( ground, "{SUM_PER_UNIT}", sumPerUnitStr );
+
+    /* EVG */
+    ground = ReplaceSpecVariable( ground, "{NUMBER}", numberStr );
+    /*Chesnokov D.*/
+    ground = ReplaceSpecVariable( ground, "{POSTNUMBER}", PostNumber);
+    ground = ReplaceSpecVariable( ground, "{POSTDATE}", PostDate);
+    /*Chesnokov D. Добавил вывод года для комиссии 2.2.1*/
+    ground = ReplaceSpecVariable( ground, "{YEAR}", strBegYear);
+
+    /* EVG 3/10/2011 Добавил обработку новых спецпеременных */
+    ground = ReplaceSpecVariable( ground, "{НАЧАЛО_ПЕРИОДА}", dPeriodBeg);
+    ground = ReplaceSpecVariable( ground, "{КОНЕЦ_ПЕРИОДА}", dPeriodEnd);
+
+
+  return ground;
+end;
+
+macro BuildGround( ComBuf, SfComiss, SfContr )
+  var ground = "";
+  var month, year, ndsSum;
+  var dateStr = "", monthStr = "", sumStr = "", quantityStr = "", ndsStr = "", contractStr = "",
+      percentStr = "", sumPerUnitStr = "", strBegYear = "";
+  var fiidCCY = "";
+  private var category, objid;
+ 
+  /* EVG Номер из формы разовой комиссии */
+  var numberStr = "", BaseSum, FiidBaseSum;
+  /* Chesnokov D. Номер и дата письма из формы разовой комиссии*/
+  /*              Год для годовой комиссии 2.2.1               */
+  var PostNumber, PostDate, YearStr;
+    
+  /* EVG 3/10/2011 Обработка новых спецпеременных {НАЧАЛО_ПЕРИОДА} / {КОНЕЦ_ПЕРИОДА} */
+  var dPeriodBeg, dPeriodEnd;
+
+  ground = readNoteForObject( OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, SfComiss), NOTEKIND_COMISS_GROUND );
+  if( ground == "" )
+   /*генерим назначение по жестко прописанным правилам и возвращаем его.*/
+   ground = "Оплата комиссии " + SfComiss.code;
+
+   ndsSum = ComBuf.SumNDS;
+   fiidCCY = GetCurrencyShortName( ComBuf.fiid_sum );
+   
+   if( ndsSum > $0 )
+     ground = ground + ". В том числе НДС " + ndsSum + " " + fiidCCY +".";
+   else
+     ground = ground + ". НДС не облагается.";
+   end;
+
+  else  
+    /*Заменяем в полученном шаблоне спец. переменные их значениями из ComBuf и SfContr*/    
+    if( SfComiss.feeType == SF_FEE_TYPE_PERIOD ) /*периодическая комиссия*/      
+      debugbreak; //40702810500000011954
+      if ( CheckingMatchesTP(sfcontr.id))
+        ObjId = UniID( sfcomiss, OBJTYPE_SFCOMISS );
+        category = RsbObjCategories(OBJTYPE_SFCOMISS, ObjId);
+        if (category.IsAttrPresense (ATTR_ALTR_GROUND,NUM_ATTR_ALTR_GROUND, NULL, NULL, false, {curdate}))
+          Ground   = readNoteForObject( OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, SfComiss), NOTEKIND_COMISS_ALTR_GROUND );
+        end;
+      end;
+    
+      /*{Date} datePeriodEnd*/
+      dateStr = string( ComBuf.datePeriodEnd );
+
+      /*{Month} - Месяц и год, в котором взимается комиссия (например, "март 2009г.") от {Date}*/
+      DateSplit( ComBuf.datePeriodEnd, NULL, month, year);
+      monthStr = monname(month) + " " + string(year) + " г.";
+
+      /*{Sum} baseSum, fiid_comm_sum   Базовая сумма, используемая при расчете комиссии в валюте расчета комиссии 
+      с указанием буквенного кода ISO валюты расчета комиссии (например, 2000 USD).*/
+      fiidCCY = GetCurrencyShortName( ComBuf.fiid_sum ); 
+
+      /* EVG 27/07/2011 Для комиссий за ВК входящих платежей базовая сумма не хранится.
+         Можно попробовать собрать её из USR_TRNSF_COMISS. */
+      if ( index( strLwr(SfComiss.code), "in" ) > 0 )
+
+         /* EVG 8/12/2011 Для этих комиссий базовый код валюты нужно брать не из рассчитанной комиссии (там рубли всегда),
+            а логичнее всего - из ДО, т.к. по данному ДО (счёту) всегда проходят платежи только в одной валюте. */
+         FiidBaseSum = GetCurrencyShortName( SfContr.fiid ); 
+         
+         sumStr = GetInVoSum( ComBuf, SfContr ) + " " + FiidBaseSum;
+
+      else
+         sumStr = string(ComBuf.baseSum) + " " + fiidCCY;
+      end;
+
+      /*{Quantity}*/
+      quantityStr = string(ComBuf.BaseQuant);
+
+      /*{Nds} ndsSum, fiid_comm_sum 
+      Сумма НДС по комиссии в валюте счета-получателя комиссии с указанием буквенного кода ISO валюты. Например "120.50 RUR"*/
+      ndsStr = string(ComBuf.SumNDS) + " " + fiidCCY;
+
+      /*{Contract}*/
+      contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+      
+      /*{Year} - Чесноков Д.С. 14 февраля 2010 для комиссии 2.2.1 возьмем год из даты оплаты*/ 
+      DateSplit( ComBuf.datePeriodBegin, NULL, NULL, strBegYear);
+
+      /* EVG 3/10/2011 Обработка новых спецпеременных {НАЧАЛО_ПЕРИОДА} / {КОНЕЦ_ПЕРИОДА} */
+      DateSplit( {CurDate}, NULL, month, year );
+      //dPeriodBeg = trim(string( ComBuf.datePeriodBegin ))
+      dPeriodBeg = trim(string( date(1, month, year) ));
+      dPeriodEnd = trim(string( ComBuf.datePeriodEnd ));
+    
+    
+    elif( SfComiss.feeType == SF_FEE_TYPE_SINGLE ) /*единовременная*/
+      /*{Date} dateFee*/
+      dateStr = string( ComBuf.dateFee );
+      
+      /*{Month}*/
+      DateSplit( ComBuf.dateFee, NULL, month, year );
+      monthStr = monname(month) + " " + string(year) + " г.";
+
+      /*{Sum} baseSum, fiid_sum */
+      /* EVG Попробуем взять сумму и валюту из первичного документа */
+      BaseSum     = ComBuf.baseSum;
+      FiidBaseSum = ComBuf.fiid_sum;
+      GetPrimaryPaymentSum_FI( ComBuf.Id_Operation, @BaseSum, @FiidBaseSum );
+      fiidCCY = GetCurrencyShortName( FiidBaseSum ); 
+      sumStr = string(BaseSum) + " " + fiidCCY;
+
+      /* EVG Номер первичного документа */
+      /* {Number} */
+      GetPrimaryPaymentNumber( ComBuf.Id_Operation, @numberStr );
+
+      /*{Quantity}*/
+      quantityStr = "1";
+
+      /*{Nds} sumNDS, fiid_sum */
+      /* EVG 09/09/2011 В ед. комиссии fiidCCY - это валюта платежа, с которого берётся комиссия.
+         Валюта НДС - это валюта платежа оплаты комиссии.
+      ndsStr = string(ComBuf.sumNDS) + " " + fiidCCY;*/
+      ndsStr = string(ComBuf.sumNDS) + " " + GetCurrencyShortName( ComBuf.fiid_sum );
+
+      /*{Contract}*/
+      if( SfContr != null )
+        contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+      end;
+
+    elif( SfComiss.feeType == SF_FEE_TYPE_ONCE ) /*разовая*/
+      
+      var PartyCodeOne, monthPrevStr, MonthFromNote, YearFromNote, PartyId, PartyIdStr, PartyName;
+      
+      /*{Date} commDate*/
+      dateStr = string( ComBuf.DateFee );
+      
+      /*{Month}*/
+      /* EVG 26/07/2011 Ошибка дистрибутива
+      DateSplit( ComBuf.commDate, NULL, month, year );*/
+      DateSplit( ComBuf.DateFee, NULL, month, year );
+      monthStr = monname(month) + " " + string(year) + " г.";
+      
+
+// А.Киселев 13.04.2011
+      PartyCodeOne = readNoteForObject_SQL( OBJTYPE_SFSINGDF, ComBuf.Id, NOTEKIND_COMISS_PARTYCODE );
+
+      /*{MonthPrev}*/
+      DateSplit( ComBuf.DateFee, NULL, month, year );
+      if (GetPreviosMonth(@month, @year))
+       monthPrevStr = monname(month) + " " + string(year) + " г.";
+      else
+       monthPrevStr = "";
+      end;
+
+      /*{MonthFromNote}*/
+      MonthFromNote = readNoteForObject_SQL( OBJTYPE_SFSINGDF, ComBuf.Id, NOTEKIND_COMISS_NUM_MONTH );
+      if ( MonthFromNote != "" )
+       MonthFromNote = monname(int(MonthFromNote));
+      end;
+
+      /*{YearFromNote}*/
+      YearFromNote = readNoteForObject_SQL( OBJTYPE_SFSINGDF, ComBuf.Id, NOTEKIND_COMISS_YEAR );
+      if ( YearFromNote != "" )
+       YearFromNote = YearFromNote + " г.";
+      end;
+
+
+      /*{PartyID}*/
+      PartyId = GetClientId( PartyCodeOne );
+      if (PartyId != 0)
+       PartyIdStr = "( ID " + string(PartyId) + " )";
+      else
+       PartyIdStr = 0;
+      end;
+
+      /*{PartyName}*/
+      PartyName = GetClientName_( PartyId );
+// А.Киселев 13.04.2011
+      
+      
+      /*{Sum} amountSum*/
+      fiidCCY = GetCurrencyShortName( ComBuf.fiid_Sum );
+      /* EVG 26/07/2011 Ошибка дистрибутива
+      sumStr = string(ComBuf.amountSum) + " " + fiidCCY;*/
+      sumStr = string(ComBuf.baseSum) + " " + fiidCCY;
+
+      /*{Quantity}*/
+      /* EVG 26/07/2011 Ошибка дистрибутива
+      quantityStr = string(ComBuf.amount);*/
+      quantityStr = string(ComBuf.baseQuant);
+
+      /*{Nds} sumNDS*/
+      ndsStr = string(ComBuf.sumNDS) + " " + fiidCCY;
+
+      /*{Contract}*/
+      if( SfContr != null )
+        contractStr = "№" + SfContr.number + " от "  + string(SfContr.dateConc);
+      end;
+
+      /* EVG Номер из формы разовой комиссии */
+      /* {Number} */
+      numberStr = ComBuf.Code;
+      
+      /* EVG 19/08/2011 Так как длина поля "Номер" в форме разовой комиссии ограничена,
+         реализовано сохранение номера в примечании вида 104 "Расширенный номер договора".
+         Если примечание задано, номер берётся из него, иначе - из поля "Номер".
+         Заявка № I-00087224-1. */
+      var NumberInNote104 = readNoteForObject_SQL( OBJTYPE_SFSINGDF, ComBuf.Id, NOTEKIND_COMISS_EXTNUMBER );
+      //msgbox ( NumberInNote104 );
+      if ( NumberInNote104 )
+         numberStr = NumberInNote104;
+      end;
+
+      /*09.11.2010 Chesnokov D. Доработка заполнения основания мемордера и проводки для комиссии 3.5.2
+                                на основании заявки I-086612   */
+      if (SfComiss.code == "3.5.2")
+        if(not GetString(PostNumber, "Введите номер уточняющего письма", 20))
+          PostNumber = 0;
+        end;
+        if(not GetDate(PostDate, "Введите дату уточняющего письма"))
+          PostDate = date(0,0,0);
+        end;
+      end;
+
+    end;
+
+    /**/
+    percentStr = doubleValToStr( ComBuf.Percent );
+    
+    sumPerUnitStr = string( money(ComBuf.Sum_Per_Unit) );
+    if( ComBuf.Sum_Per_Unit > 0 )
+      sumPerUnitStr = sumPerUnitStr + " " + GetCurrencyShortName( ComBuf.fiid_Tarscl );
+    end;
+    
+    /* EVG Лишний пробел убрать
+    ground = ReplaceSpecVariable( ground, "{DATE}", dateStr );*/
+    ground = ReplaceSpecVariable( ground, "{DATE}", trim(dateStr) );
+
+    ground = ReplaceSpecVariable( ground, "{MONTH}", monthStr );
+    ground = ReplaceSpecVariable( ground, "{SUM}", sumStr );
+    ground = ReplaceSpecVariable( ground, "{QUANTITY}", quantityStr );
+    ground = ReplaceSpecVariable( ground, "{NDS}", ndsStr );
+    ground = ReplaceSpecVariable( ground, "{CONTRACT}", contractStr );
+    ground = ReplaceSpecVariable( ground, "{PERCENT}", percentStr );
+    ground = ReplaceSpecVariable( ground, "{SUM_PER_UNIT}", sumPerUnitStr );
+
+    /* EVG */
+    ground = ReplaceSpecVariable( ground, "{NUMBER}", numberStr );
+    /*Chesnokov D.*/
+    ground = ReplaceSpecVariable( ground, "{POSTNUMBER}", PostNumber);
+    ground = ReplaceSpecVariable( ground, "{POSTDATE}", PostDate);
+    /*Chesnokov D. Добавил вывод года для комиссии 2.2.1*/
+    ground = ReplaceSpecVariable( ground, "{YEAR}", strBegYear);
+
+    //А.Киселев
+    ground = ReplaceSpecVariable( ground, "{MONTHPREV}", monthPrevStr);
+    ground = ReplaceSpecVariable( ground, "{PARTY_NAME}", PartyName);
+    ground = ReplaceSpecVariable( ground, "{PARTY_ID}", PartyIdStr);
+    ground = ReplaceSpecVariable( ground, "{MONTHFROMNOTE}", MonthFromNote);
+    ground = ReplaceSpecVariable( ground, "{YEARFROMNOTE}", YearFromNote);
+    //А.Киселев
+
+    /* EVG 3/10/2011 Добавил обработку новых спецпеременных */
+    ground = ReplaceSpecVariable( ground, "{НАЧАЛО_ПЕРИОДА}", dPeriodBeg);
+    ground = ReplaceSpecVariable( ground, "{КОНЕЦ_ПЕРИОДА}", dPeriodEnd);
+
+
+  end;
+    
+  return ground;
+
+end;
+
+macro BuildGroundWithVO( ComBuf, SfComiss, SfContr, PayerID, ReceiverID, DocDate )
+
+  var ground = BuildGround( ComBuf, SfComiss, SfContr );
+  ground = SfGroundAddVO( ground, ComBuf.fiid_sum, PayerID, ReceiverID, DocDate);
+
+  return ground;   
+
+end;
+
+// Формирование кода ВО в пакетном режиме 
+macro SfGroundAddVOBatch(FeeType, SfSrvDoc, BlockID, Number_Step)
+  var cmd, rs, strSql;
+  var Flag = false;
+  var err = "";
+  var ObjectType = 0;
+
+  if(FeeType == SF_FEE_TYPE_PERIOD)  
+    ObjectType = OBJTYPE_SFDEFCOM;
+  elif (FeeType == SF_FEE_TYPE_SINGLE)
+    ObjectType = OBJTYPE_OPRSFCOM;
+  else
+    return 0;
+  end;
+
+  var BankID = {OurBank};
+  var OperID = {Oper};
+  var HeadBankID = {HeadBankID};
+
+  cmd = RsdCommand( "SELECT RsbSessionData.OurBank As BankID, RsbSessionData.Oper As OperID, (select t_code from ddp_dep_dbt where  t_status = 2    AND t_accessmode <> 3 AND ( t_parentcode = 0  OR t_parentcode = (SELECT t_code FROM ddp_dep_dbt WHERE t_parentcode = 0  AND t_status = 4))) AS HeadBankID FROM DUAL" );
+  cmd.NullConversion = true;
+
+  rs = RsdRecordset( cmd ); 
+  if( rs.moveNext() )
+    BankID = int(rs.value("BankID"));     
+    OperID = int(rs.value("OperID"));     
+    HeadBankID = int(rs.value("HeadBankID"));     
+  end;
+
+
+
+  GetRegistryValue( "COMMON\\ВЕДЕНИЕ БД ВО В ПРИКЛАДНЫХ БО", V_BOOL, Flag, err);
+  if( Flag == true )
+
+    cmd = RsdCommand();
+    cmd.NullConversion = true;
+
+
+    strSql = " INSERT INTO dsfground_tmp (t_SfDefID, t_ComFIID, t_PartyID, t_DocDate, t_Ground) " +
+             " SELECT " +
+             " sfdef.t_id, sfdef.t_FIID_Sum, " +
+             " DECODE (sidebet.t_PartyID, ?, sicredit.t_PartyID, 0, " +
+             "               DECODE(sidebet.t_PartyID, ?, sicredit.t_PartyID, " +
+             "                            DECODE(sicredit.t_PartyID, ?, sidebet.t_PartyID, " +
+             "                                          DECODE(sicredit.t_PartyID, ?, sidebet.t_PartyID, 0) " +
+             "                                        ) " +
+             "                           ) " +
+             "              ), " ;
+
+    cmd.addParam( "", RSDBP_IN, BankID     );
+    cmd.addParam( "", RSDBP_IN, HeadBankID );
+    cmd.addParam( "", RSDBP_IN, BankID     );
+    cmd.addParam( "", RSDBP_IN, HeadBankID );
+
+    if(FeeType == SF_FEE_TYPE_PERIOD)  
+      strSql = strSql + " ?, " ;
+      cmd.addParam( "", RSDBP_IN, SfSrvDoc.DatePay );
+    else
+      strSql = strSql + " sfdef.t_DateFee, " ;
+    end;
+
+    strSql = strSql + " chr(1) ";
+
+    if(FeeType == SF_FEE_TYPE_PERIOD)  
+      strSql = strSql + " FROM dsfdef_dbt sfdef, doprtemp_tmp tmp, dsfsi_dbt sicredit, dsfsi_dbt sidebet " +
+                        " WHERE sfdef.t_feetype = ? " +
+                        "   AND sfdef.t_id = TO_NUMBER (tmp.t_documentid) ";
+      cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_PERIOD );
+    else
+      strSql = strSql + " FROM dsfdef_dbt sfdef, dsfoprcompay_tmp tmp, dsfsi_dbt sicredit, dsfsi_dbt sidebet " +
+                        " WHERE sfdef.t_FeeType = ? " +
+                        " AND sfdef.t_ID = tmp.t_SfDefID " +
+                        " AND tmp.t_BlockID = ? " +
+                        " AND tmp.t_Number_Step = ? " +
+                        " AND tmp.t_AutoFormDocs = 'X' ";
+
+      cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_SINGLE );
+      cmd.addParam( "", RSDBP_IN, BlockID );
+      cmd.addParam( "", RSDBP_IN, Number_Step );
+    end;
+             
+    strSql = strSql + " AND sicredit.t_objecttype = ?  AND sicredit.t_debetcredit = ?  " +
+                      " AND sicredit.t_objectid = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND sidebet.t_ObjectType = ? AND sidebet.t_DebetCredit = ? " +
+                      " AND sidebet.t_ObjectID = LPAD (TO_CHAR (sfdef.t_id), 10, '0') ";
+
+    cmd.addParam( "", RSDBP_IN, ObjectType         ); 
+    cmd.addParam( "", RSDBP_IN, BANK_CREDIT        );
+    cmd.addParam( "", RSDBP_IN, ObjectType         ); 
+    cmd.addParam( "", RSDBP_IN, BANK_DEBET         );
+
+    cmd.CmdText = strSql;
+    cmd.execute();   
+
+    strSql = " UPDATE dsfground_tmp tmp " +
+             " SET tmp.t_Ground = DECODE(LEAST(to_date('01 09 2012','dd.mm.yyyy'), tmp.t_DocDate), " +
+             "                           tmp.t_DocDate, " +
+             "                           '{VO99020}', " +
+             "                           '{VO80050}') " +
+             " WHERE tmp.t_ComFIID = ? " +
+             "   AND EXISTS( SELECT 1 FROM dparty_dbt pt " +
+             "       WHERE pt.t_PartyID = tmp.t_PartyID " +
+             "         AND pt.t_LegalForm != ? " +
+             "         AND pt.t_NotResident = 'X' ) " ;
+             
+    cmd = RsdCommand( strSql );
+    cmd.NullConversion = true;
+    cmd.addParam( "", RSDBP_IN, NATCUR  );
+    cmd.addParam( "", RSDBP_IN, PTLEGF_PERSN  );
+
+    cmd.execute();   
+
+
+    strSql = " UPDATE dsfground_tmp tmp " +
+             " SET tmp.t_Ground = '{VO80150}' " +
+             " WHERE tmp.t_ComFIID != ? " +
+             "   AND tmp.t_DocDate >= to_date('01 09 2012','dd.mm.yyyy') " + 
+             "   AND EXISTS( SELECT 1 FROM dparty_dbt pt, dpersn_dbt persn " +
+             "       WHERE pt.t_PartyID = tmp.t_PartyID AND persn.t_PersonID = pt.t_PartyID " +
+             "         AND pt.t_NotResident != 'X' " +
+             "           AND " +
+             "           (pt.t_LegalForm = ? " +
+             "           AND persn.t_IsEmployer = 'X' " +
+             "        AND EXISTS (SELECT 1 FROM dobjatcor_dbt attr " +
+             "              WHERE attr.t_ObjectType = ? " +
+             "               AND attr.t_Object = to_char(pt.t_PartyID) " +
+             "               AND attr.t_GroupID = 16 " + // ТИП СУБЪЕКТА
+             "               AND (attr.t_AttrID = 2 " + // адвокат
+             "                               OR attr.t_AttrID = 3)) " + // нотариус
+             "         ) " +
+             "         OR " +
+             "         ( pt.t_LegalForm != ?  " +
+             "        AND NOT EXISTS (SELECT 1 FROM dpartyown_dbt ptown " +
+             "           WHERE ptown.t_PartyID = tmp.t_PartyID AND (ptown.t_PartyKind = 2 OR ptown.t_PartyKind = 56) " +
+             "      ) " +
+             "   )) " ;
+        
+
+    cmd = RsdCommand( strSql );
+    cmd.NullConversion = true;
+    cmd.addParam( "", RSDBP_IN, NATCUR        );
+    cmd.addParam( "", RSDBP_IN, PTLEGF_PERSN  );
+    cmd.addParam( "", RSDBP_IN, OBJTYPE_PARTY );
+    cmd.addParam( "", RSDBP_IN, PTLEGF_PERSN  );
+
+    cmd.execute();   
+  end;
+
+end;
+
+private var ComissIDArray = TArray;
+private var GroundArray = TArray;
+
+private macro GetGroundTemplateCache(SfComiss)
+  var groundTemplate = ""; 
+  var i = 0;
+  var foundIndex = -1;
+  
+  while(i < ComissIDArray.size())
+    if(ComissIDArray[i] == SfComiss.ComissID)
+      foundIndex = i;
+    end;
+    i = i + 1;
+  end;
+
+  if(foundIndex >= 0)
+    groundTemplate = GroundArray[foundIndex];
+  else
+    groundTemplate = readNoteForObject( OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, SfComiss), NOTEKIND_COMISS_GROUND );
+    ComissIDArray[ComissIDArray.size()] = SfComiss.ComissID;
+    GroundArray[GroundArray.size()] = groundTemplate;
+  end;
+
+  return groundTemplate;
+end;
+
+private var FIIDArray = TArray;
+private var CCYArray = TArray;
+
+private macro GetCurrencyShortNameCache(FIID)
+  var CCY = "";
+  var i = 0;
+  var foundIndex = -1;
+  
+  while(i < FIIDArray.size())
+    if(FIIDArray[i] == FIID)
+      foundIndex = i;
+    end;
+    i = i + 1;
+  end;
+
+  if(foundIndex >= 0)
+    CCY = CCYArray[foundIndex];
+  else
+    CCY = GetCurrencyShortName( FIID );
+    FIIDArray[FIIDArray.size()] = FIID;
+    CCYArray[CCYArray.size()] = CCY;
+  end;
+
+  return CCY;
+end;
+
+macro BuildGroundBatch(groundVO:string, ComBuf, SfComiss, SfContr)
+  debugbreak;
+  var ground = "";
+  var ndsSum;
+  var fiidCCY = "";
+  var fiidTarsclCCY = "";
+  
+  FILE SfContr_R ("sfcontr.dbt");
+  SfContr_R.id = SfContr.id;
+  if (GetEQ(SfContr_R)) 
+    SfContr = SfContr_R;
+  else
+    msgbox("Ошибка при создании записи SfContr_R");
+  end;
+  ground = GetGroundTemplateCache(SfComiss);
+  if( ground == "" )
+   /*генерим назначение по жестко прописанным правилам и возвращаем его.*/
+   if((SfContr != null) and (SfContr.ID > 0))
+     ground = "За услуги по договору " + SfContr.Number +" от " + SfContr.DateBegin + ". ";
+   end;
+
+   ground = ground + "Оплата комиссии " + SfComiss.code;
+
+   ndsSum = ComBuf.SumNDS;
+
+   fiidCCY = GetCurrencyShortNameCache(ComBuf.fiid_sum);
+   
+   if( ndsSum > $0 )
+     ground = ground + ". В том числе НДС " + ndsSum + " " + fiidCCY +".";
+   else
+     ground = ground + ". НДС не облагается.";
+   end;
+
+  else  
+    fiidTarsclCCY = GetCurrencyShortNameCache( ComBuf.fiid_Tarscl );
+    fiidCCY       = GetCurrencyShortNameCache( ComBuf.fiid_Sum );
+
+    ground = BuildGroundTmpl( ComBuf, SfComiss, SfContr, ground, fiidCCY, fiidTarsclCCY );
+  end;
+
+  ground = groundVO + ground;
+
+  return ground;
+end;

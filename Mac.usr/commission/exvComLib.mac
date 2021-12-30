@@ -1,0 +1,1123 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    ███████       █████      █████     ███
+    █████████   ████████   ████████    ███
+    ███   ███   ███        ███         ███
+    ████████     ███████    ███████    ███
+    ██████            ███        ███   ███
+    ███ ████    █████████  █████████   ████████
+    ███   ████    █████      █████     ████████
+
+   R-Style Softlab
+   
+   EVG Специфические функции, используемых при расчёте комиссий в банке ЭВ.
+
+ChangeLog:
+
+   //RR 01.11.2012 Добавил возможность вызова EXV_GetComBESPRecordSet без указания конкретного счета.
+   //EVG 28/03/2013 Доработка функции EXV_Cash_IsProperCommission() под пакетные комиссии (заявка C-18655)
+   //EVG 03/04/2013 Добавлена функция EXV_CheckPaymentsOverLimit() (заявка C-18655)
+   //RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+   //RR 20.02.2014 Адаптирую под 2031(daccount$_dbt -> NULL)
+   //joy 15.08.2014 Переношу изменения по модификациям С-31392
+   //joy 30.10.2014 Перенос доработок по модификации С-33886 (для ЭВ)
+   //joy 14.11.2014 I-00532241 в 2031 обязательно надо проверять, что t_state в проводках = 1
+   //joy 27.07.2015 C-37236 Изменения в EXV_GetCom3RecordSet, EXV_isGround_PhisFace, EXV_isAccount_Phis1
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+import CommissLib, RsbDataSet;
+import lib_comiss_common;
+
+CONST HM_DocOrigin      = 1;
+CONST FNB_DocOrigin     = 6;
+CONST ABBY_FC_DocOrigin = 2100;
+
+//RR Из название переменной все ясно
+//private var БИКиБанковГруппы = "044525986, 046311808, 046577781, 042908701, 044583859, 040702756, 042007755, 042406718, 041806835, 044525732, 043601706, 046577859"; //15.08.2014 joy Добавила недостающие БИКи
+private var БИКиБанковГруппы = getBICsBanks();
+
+MACRO EXV_GetCom3RecordSet( Account, Origin, BegDate, EndDate )
+  var query, rs, cmd, SQL;
+  var OriginClause = "";
+  var rcmd, rquery, rrs, stat,zpproject;
+  /*R-634675 добавлены счета исключения*/
+  var SovComAccounts = "'40817810501000000555', '70601810401002790204', '70601810201002790310'";
+
+  /* 15.08.2014 joy Перенос модифкации С-31392 Кроме платежей на счета ФЛ, исключая зарплатные платежи
+  rquery = "select 1 as ss from daccount_dbt acc where ACC.T_ACCOUNT = ? and ACC.T_USERTYPEACCOUNT like '%Z%'";
+  rcmd = rsdcommand(rquery);
+  rcmd.AddParam ("", RSDBP_IN, account);
+  rrs = rsdRecordSet(rcmd);
+  
+  if ((rrs and rrs.movenext()) and (rrs.value("ss")) == 1 )
+  zpproject = "";
+  else
+  zpproject = "and substr ( paym.t_receiveraccount, 1, 3 ) not in ('423', '426') "
+          +"\n and substr ( paym.t_receiveraccount, 1, 5 ) not in ('40817', '40820', '30232', '47422') ";
+  end;
+  --- end joy*/
+    zpproject = "         AND ( (substr (paym.t_receiveraccount, 1, 3) not in ('423', '426') " +
+                "                and substr (paym.t_receiveraccount, 1, 5) not in ('40817', '40820') " +
+                "                and not (substr (paym.t_receiveraccount, 1, 5) in ('30232', '47422', '30301', '30223') " +
+                "                         and (  regexp_like (arh.t_ground, '(40817|40820\\d{15})') " +
+                "                             or regexp_like (arh.t_ground, '(423|426)\\d{17}') " +
+                "                             or regexp_like (prop.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( prop.T_RECEIVERNAME, '(423|426)\\d{17}' ) " +
+                "                             or regexp_like (arh.t_ground, '\\sп/к\\s') " +
+                "                             or regexp_like ( '\\s'||lower(arh.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта|\\sкарт.{0,}\\s\\d{1,}' ) ))) " +
+// 28.10.2014 joy C-33886 для ЭВ еще раз изменилось условие
+                "             OR ( (  (SUBSTR( paym.t_receiveraccount, 1, 3 )  IN ('423', '426') " +
+                "                      or SUBSTR( paym.t_receiveraccount, 1, 5 ) IN ('40817', '40820') ) " +
+                "                   AND (REGEXP_LIKE  ('\\s' || LOWER (arh.t_ground), '(зарплатн.{0,}\\sпроект.{0,})')" +
+                "                        or prop.t_shifroper in ('02','06'))" + // 08.10.2014 joy C-33886
+                // EVG 10/3/2016 Добавил исключение из расчёта комиссии платежей на счета Совкомбанка
+                // EVG 26/4/2016 Добавлено исключение платежей на счёта филиала "Бизнес" Совкомбанка
+                "                   and paym.t_receiverbankid NOT IN ( SELECT code.t_objectid                                           "+
+                "                                                        FROM dobjcode_dbt code                                         "+
+                "                                                       WHERE code.t_code in ( " + BIC_SOVCOMBANK_BRANCH_CENTRAL  + ",  "+ 
+                "                                                                              " + BIC_SOVCOMBANK_BRANCH_BUSINESS + " ) "+ 
+                "                                                         AND code.t_codekind = 3                                       "+
+                "                                                         AND code.t_objecttype = 3 )                                   "+
+                "                   ) " +
+                "                 OR (SUBSTR( paym.t_receiveraccount, 1, 5 ) IN ('30232','47422', '30301', '30223') " +
+                "                     AND (REGEXP_LIKE (arh.t_ground, '(40817|40820\\d{15})') OR REGEXP_LIKE ( arh.t_ground, '(423|426)\\d{17}' ) "  +
+                "                         OR REGEXP_LIKE (arh.t_ground, '\\sп/к\\s') " +
+                "                         OR REGEXP_LIKE( '\\s'||lower(arh.t_ground), '(\\sп\\.карта|п/карта|карточный\\sсчет|\\sбанковск.{0,}\\sкарт.{0,}|\\sпластик.{0,}\\sкарт.{0,})|\\sкарт.{0,}\\s№|\\sпластик/карта|\\sкарт.{0,}\\s\\d{1,}' ) " +
+                "                         OR REGEXP_LIKE (prop.T_RECEIVERNAME, '(40817|40820\\d{15})') OR REGEXP_LIKE ( prop.T_RECEIVERNAME, '(423|426)\\d{17}' ) ) " +
+                "                     AND (REGEXP_LIKE  ('\\s' || LOWER (arh.t_ground), '(зарплатн.{0,}\\sпроект.{0,})') " +
+                "                         or prop.t_shifroper in ('02','06'))" + // 08.10.2014 joy C-33886
+                "             ) ) )" ;
+  if ( Origin == CLB_DocOrigin )
+     OriginClause = " and ord.t_Origin =  "+CLB_DocOrigin;
+  else
+     OriginClause = " and ord.t_Origin <> "+CLB_DocOrigin;
+  end;
+
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта */
+  var fixAccountClause = "";
+  if ( Account )
+     fixAccountClause  = " arh.t_account_payer = " + GetSQLString( Account ) + " AND ";
+  end;
+
+
+  SQL = " SELECT   paym.t_PaymentId, paym.t_PayerAccount, paym.t_ReceiverAccount, paym.t_Amount, paym.t_ReceiverBankId, paym.t_Fiid ";
+  SQL = SQL + "  FROM   dacctrn_dbt arh, ";
+  SQL = SQL + "         dpmdocs_dbt pmd, ";
+  SQL = SQL + "         dpmpaym_dbt paym, ";
+  SQL = SQL + "         dpmrmprop_dbt prop, ";
+  SQL = SQL + "         dpspayord_dbt ord ";
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта
+  SQL = SQL + " WHERE       paym.t_payeraccount = " + GetSQLString( Account );*/
+  SQL = SQL + " WHERE       " + fixAccountClause;
+  SQL = SQL + "             arh.t_date_carry BETWEEN " + GetSQLDate( BegDate ) + " AND " + GetSQLDate( EndDate );
+  SQL = SQL + "         AND PMD.T_ACCTRNID = ARH.T_ACCTRNID ";
+  SQL = SQL + "         AND paym.t_paymentid = pmd.t_paymentid ";
+  SQL = SQL + "         AND paym.t_paymstatus = 32000 ";
+  SQL = SQL + "         AND arh.t_state = 1 "; // 14.11.2014 joy  I-00532241 в 2031 это обязательно
+  SQL = SQL + "         AND paym.t_receiverbankid NOT IN ( SELECT code.t_objectid "; //RR 10.07.2012 Теперь платежи между банками группы комиссией не облагаются
+  SQL = SQL + "                                              FROM dobjcode_dbt code ";
+  SQL = SQL + "                                             WHERE code.t_code IN ("+БИКиБанковГруппы+") ";
+  SQL = SQL + "                                               AND code.t_codekind = 3 ";
+  SQL = SQL + "                                               AND code.t_objecttype = 3) ";
+  SQL = SQL + "         AND prop.t_paymentid     = paym.t_paymentid ";
+  SQL = SQL + "         AND prop.t_shifroper    <> '16' ";
+  SQL = SQL + "         AND paym.t_payerbankid  <> paym.t_receiverbankid ";
+  SQL = SQL + "         AND ord.t_orderid        = paym.t_paymentid ";
+  SQL = SQL + "         AND paym.t_ReceiverAccount NOT IN ("+SovComAccounts+")";
+  SQL = SQL + "         /* Кроме платежей в бюджет */ ";
+  SQL = SQL + "         AND SUBSTR(paym.t_receiveraccount, 1, 3) NOT BETWEEN '401' AND '404' ";
+  SQL = SQL + "         AND prop.t_paymentkind != 'С' ";
+  SQL = SQL + zpproject;
+  SQL = SQL + OriginClause;
+//  getstring (sql);
+       
+  rs = TRsbDataSet( sql, RSDVAL_CLIENT, RSDVAL_STATIC );
+
+  return rs;
+END;
+
+
+
+/* Сетка для комиссий по чекам */
+CONST {EXVTarif 5.2.3 MIN} =       $0,
+      {EXVTarif 5.2.3 MAX} =  $100000,
+      {EXVTarif 5.2.4 MIN} =  $100001,
+      {EXVTarif 5.2.4 MAX} = $1000000,
+      {EXVTarif 5.2.6 MIN} = $1000001,
+      {EXVTarif 5.2.6 MAX} = $5000000;
+
+/* Сетка для комиссий по объявлениям */
+CONST {EXVTarif 5.5.2 MIN} =       $0,
+      {EXVTarif 5.5.2 MAX} =  $100000,
+      {EXVTarif 5.5.3 MIN} =  $100001,
+      {EXVTarif 5.5.3 MAX} = $1000000,
+      {EXVTarif 5.5.4 MIN} = $1000001;
+
+MACRO EXV_Cash_IsProperCommission( Contr, Calcal, Sum )
+   var sql, rs;
+   var TarifNumber, TarifPlan;
+
+   macro CheckMinMax (pSum, pMin, pMax)
+      if ( (pSum >= pMin) and (pSum <= pMax) )
+         return true;
+      end;
+      return false;
+   end;
+
+   /* EVG 28/03/2013 В ЭВ появились пакетные комиссии с "pack" после кода.
+      Это pack нужно отсечь, поэтому берём первые 5 символов кода.
+   SQL = "SELECT com.t_code cod, pln.t_num num ";*/
+   SQL = "SELECT subStr(com.t_code, 1, 5) cod, pln.t_num num ";
+   SQL = SQL + "  FROM dsfcomiss_dbt com, dsfplan_dbt pln, dsfcontrplan_dbt cplan ";
+   SQL = SQL + " WHERE com.t_feetype     = " + Calcal.FeeType;
+   SQL = SQL + "   AND com.t_number      = " + Calcal.CommNumber;
+   SQL = SQL + "   AND cplan.t_sfcontrid = " + Contr.Id;
+   SQL = SQL + "   AND cplan.t_begin     = (SELECT MAX (t_begin) ";
+   SQL = SQL + "                              FROM dsfcontrplan_dbt ";
+   SQL = SQL + "                             WHERE t_sfcontrid = cplan.t_sfcontrid) ";
+   SQL = SQL + "   AND pln.t_sfplanid    = cplan.t_sfplanid ";
+
+   rs = rsdRecordSet(SQL);
+   if (rs and rs.MoveNext())
+      TarifNumber = rs.Value("cod", null, V_STRING);
+      TarifPlan   = rs.Value("num", null, V_INTEGER);
+   end;
+
+   /* Комиссии по чекам */
+   if   ( (TarifNumber == "5.2.3") )
+      return CheckMinMax( Sum, {EXVTarif 5.2.3 MIN}, {EXVTarif 5.2.3 MAX});
+   elif ( (TarifNumber == "5.2.4") )
+      return CheckMinMax( Sum, {EXVTarif 5.2.4 MIN}, {EXVTarif 5.2.4 MAX});
+   elif ( (TarifNumber == "5.2.6") )
+      return ( Sum > {EXVTarif 5.2.6 MIN} );
+
+   /* Комиссии по объявлениям */
+   elif ( (TarifNumber == "5.5.2") )
+      return CheckMinMax( Sum, {EXVTarif 5.5.2 MIN}, {EXVTarif 5.5.2 MAX});
+   elif ( (TarifNumber == "5.5.3") )
+      return CheckMinMax( Sum, {EXVTarif 5.5.3 MIN}, {EXVTarif 5.5.3 MAX});
+   elif ( (TarifNumber == "5.5.4") )
+      return (Sum > {EXVTarif 5.5.4 MIN});
+   end;
+
+   return false;
+END;
+
+
+
+/* EVG */
+PRIVATE VAR PaymentObj, OrderNum = -1, MyRest = $0, _Id_Step;
+
+MACRO EXV_CC_ARM_Commiss_EventHandler (dlg, cmd, id, key) 
+   const  KEY_F1       = 315,
+          KEY_F2       = 316,
+          KEY_F3       = 317,
+          KEY_F9       = 323,
+          KEY_ESC      = 27,
+          KEY_SPACE    = 32,
+          KEY_ENTER    = 13;
+
+   var const_mess = "~ESC~ Выход ~F2~ Выполнить ~SPACE~ Установить ";
+
+   var CommMasc = "", i, isSelect;
+   var query, rs, sql;
+   var CommCount = 5;         // Количество комиссий за ВК
+   var LifeBank,
+       PaymentConstr;
+
+   // EVG 4/08/2011 Для ЭВ - связка Распоряжения с платежом напрямую
+   PaymentConstr = " WHERE uto.PaymentID = ? ";
+   LifeBank = fg_life_subject( {OurBank} );
+   if ( LifeBank.is_GEB )
+      // EVG 4/08/2011 Для ГЭБ - связка Распоряжения с платежом работает по-старому, через Уведомление.
+      PaymentConstr = " WHERE uto.notify_num = ( Select notify_num From usr_trnsf_notify Where Payment_Id = ? ) " +
+                      " AND TO_CHAR( uto.date_value, 'YYYY' ) = TO_CHAR( ?, 'YYYY' ) " +
+                      " AND NOT EXISTS (SELECT   1 " +
+                      "   FROM   usr_trnsf_comiss utc " +
+                      "   WHERE   utc.order_num = uto.order_num AND utc.notify_num = uto.notify_num AND utc.id_step = ?" +
+                      "   AND TO_CHAR( utc.comdate, 'YYYY' ) = TO_CHAR( uto.date_value, 'YYYY' ) )";
+   end;
+
+   /* В ГЭБе 7 комиссий по рублёвым платежам */
+   CommMasc = "'9.%in%'";
+   if ( PaymentObj.BaseFiid > 0 )
+      CommMasc = "'7.%in%'";
+   else
+      if ( LifeBank.is_GEB )
+         CommCount = 7;
+      end;
+   end;
+
+
+        /* Возвращает остаток неразнесённой суммы */
+        macro GetRest( Amnt )
+           var i = 1, Sum = $0, RetSum;
+
+           while (i <= CommCount)
+              Sum = Sum + dlg.( fldIndex(dlg, "Sum" + i) );
+              i = i + 1;
+           end;
+
+           RetSum = Amnt - Sum;
+           if (RetSum < $0) 
+              RetSum = $0;
+           end;
+
+           return RetSum;
+        end;
+
+   
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dlg.rec.Sel1 = "";
+      dlg.rec.Sel2 = "";
+      dlg.rec.Sel3 = "";
+      dlg.rec.Sel4 = "";
+      dlg.rec.Sel5 = "";
+
+      i = 1;
+      query = " Select t_code Code, t_Name Name From DSFCOMISS_DBT " +
+              "  Where t_FeeType = 1 " +        // Периодические
+              "    and t_Code like " + CommMasc;
+      rs = rsdRecordSet(query);
+      while (rs and rs.MoveNext() and (i <= CommCount))
+
+         dlg.( fldIndex(dlg, "Cod" + i) )  = rs.Value("Code", null, V_STRING);
+         dlg.( fldIndex(dlg, "Name" + i) ) = rs.Value("Name", null, V_STRING);
+
+         i = i + 1;
+      end;
+      
+      if (( PaymentObj.BaseFiid > 0 ) and ( substr(PaymentObj.FutureReceiverAccount, 1, 5) != "40807" ))
+         SQL = " SELECT   (uto.transf_sum + sell_sum) rest, uto.order_num ";
+         SQL = SQL + "  FROM   usr_trnsf_order uto ";
+
+         /* EVG 04/08/2011 Поскольку данная функция используется как в ЭВ, так и в ГЭБ, необходимо
+            учесть, что в ГЭБ связка Распоряжения с платежом работает по-старому, через Уведомление.
+         /* EVG 06/06/2011 Переход со связки Платёж<->Распоряжение через Уведомление по notify_num
+            на прямую связь по PaymentId.
+         SQL = SQL + " WHERE   uto.notify_num = ( Select notify_num From usr_trnsf_notify Where Payment_Id = ? ) ";
+         */
+         SQL = SQL + " WHERE   uto.PaymentID = ? ";
+         */
+         SQL = SQL + PaymentConstr;
+         /* 16.01.2014 joy Перенесла выше, только для ГЭБа ищем даты, для ЭВ должно хватить ИД платежа
+          EVG 9/02/2012 Добавлена проверка на год даты распоряжения 
+         SQL = SQL + "         AND TO_CHAR( uto.date_value, 'YYYY' ) = TO_CHAR( ?, 'YYYY' ) ";
+         SQL = SQL + "         AND NOT EXISTS (SELECT   1 ";
+         SQL = SQL + "                           FROM   usr_trnsf_comiss utc ";
+         SQL = SQL + "                          WHERE   utc.order_num = uto.order_num AND utc.notify_num = uto.notify_num AND utc.id_step = ? ";
+         SQL = SQL + "                            AND   TO_CHAR( utc.comdate, 'YYYY' ) = TO_CHAR( uto.date_value, 'YYYY' ) ) ";
+         */
+         cmd = rsdcommand(sql);
+         cmd.AddParam("", RSDBP_IN,PaymentObj.PaymentID);
+         cmd.AddParam("", RSDBP_IN,PaymentObj.ValueDate); // EVG 9/02/2012
+         cmd.AddParam("", RSDBP_IN,_Id_Step);
+                //msgbox (SQL, "|", PaymentObj.PaymentID, " - ", _Id_Step);
+         rs = rsdRecordSet(cmd);
+         if (rs.MoveNext())
+            MyRest = rs.Value(0);
+            OrderNum = rs.Value(1);
+         end;
+       else 
+          MyRest = PaymentObj.BaseAmount;
+       end;
+
+
+      message (const_mess);
+
+      UpdateFields(dlg); 
+      SetFocus(dlg, 0)
+   end;
+   
+   
+   /*Проверки*/
+   if (cmd == DLG_REMFOCUS)
+
+      /* Проверка корректности сумм */
+      if ( subStr(FldName(dlg,id), 1, 3) == "Sum")
+         if ( dlg.(id) < $0 )
+            MsgBox("Базовая сумма комиссии должна быть больше нуля");
+            return CM_CANCEL;
+         end;
+      end;
+
+      UpdateFields(dlg); 
+   end;
+
+   
+   if (cmd == DLG_KEY)
+
+     /*Выход из диалогового окна формирования отчета*/
+     if (KEY == KEY_ESC)
+       if ( getTrue(false, "Выход без сохранения. Вы уверены?") )
+          return CM_CANCEL;
+       end;
+       return CM_IGNORE;
+
+     elif (KEY == KEY_SPACE)
+
+        if ( subStr(FldName(dlg,id), 1, 3) == "Sel")
+           if   ( dlg.(id) == "" )
+              dlg.(id) = "X";
+              dlg.( fldIndex(dlg, "Sum" + SubStr(FldName(dlg,id), 4, 1)) ) = GetRest(MyRest);
+           elif ( dlg.(id) == "X" )
+              dlg.(id) = "";     
+              dlg.( fldIndex(dlg, "Sum" + SubStr(FldName(dlg,id), 4, 1)) ) = $0;
+           end;
+        end;
+
+        UpdateFields(dlg);
+
+     elif ( KEY == KEY_F2 )          //Проверки при вводе
+
+        i = 1;
+        isSelect = false;
+        SelComissions = "";
+        /*FIV Если валюта не рубли значит валютный документ и есть распоряжения по транзитному счету */
+        // debugbreak;
+        if (( PaymentObj.BaseFiid > 0 ) and ( substr(PaymentObj.FutureReceiverAccount, 1, 5) != "40807" ))
+           if (OrderNum != -1)
+              while ( i <= CommCount )
+                 if ( dlg.(fldIndex(dlg, "Sel" + i)) == "X")
+                    isSelect = true;
+                       /*Вставляем комиссию*/
+                       SQL = " BEGIN INSERT INTO usr_trnsf_comiss (order_num, ";
+                       SQL = SQL + "                              notify_num, ";
+                       SQL = SQL + "                              comid, ";
+                       SQL = SQL + "                              SUM, comdate,Id_Step) ";
+                       SQL = SQL + "  VALUES   ( ?, (Select notify_num From usr_trnsf_notify where payment_id = ?),(select t_number from dsfcomiss_dbt where t_code =  ?),?,?,?); ";
+                       SQL = SQL + " EXCEPTION ";
+                       SQL = SQL + "   WHEN OTHERS ";
+                       SQL = SQL + "   THEN ";
+                       SQL = SQL + "      NULL; ";
+                       SQL = SQL + "END; ";
+                       cmd = rsdcommand(sql);
+                       cmd.AddParam("", RSDBP_IN,OrderNum);
+                       cmd.AddParam("", RSDBP_IN,PaymentObj.PaymentID);
+                       cmd.AddParam("", RSDBP_IN,dlg.(fldIndex(dlg, "Cod" + i)));
+                       cmd.AddParam("", RSDBP_IN,dlg.(fldIndex(dlg, "Sum" + i)));
+                       cmd.AddParam("", RSDBP_IN, {curdate});
+                       cmd.AddParam("", RSDBP_IN, _Id_Step);
+                       cmd.Execute;
+                 end;
+                 i = i + 1;
+              end;
+           end;
+        else
+           while ( i <= CommCount )
+              if ( dlg.(fldIndex(dlg, "Sel" + i)) == "X")
+                 isSelect = true;
+                    SQL = " BEGIN INSERT INTO usr_trnsf_comiss (order_num, ";
+                    SQL = SQL + "                              notify_num, ";
+                    SQL = SQL + "                              comid, ";
+                    SQL = SQL + "                              SUM, comdate,Id_Step) ";
+                    SQL = SQL + "  VALUES   ( 0, ?,(select t_number from dsfcomiss_dbt where t_code =  ?),?,?,?); ";
+                    SQL = SQL + " EXCEPTION ";
+                    SQL = SQL + "   WHEN OTHERS ";
+                    SQL = SQL + "   THEN ";
+                    SQL = SQL + "      NULL; ";
+                    SQL = SQL + "END; ";
+                    cmd = rsdcommand(sql);
+                    cmd.AddParam("", RSDBP_IN,PaymentObj.PaymentID);
+                    cmd.AddParam("", RSDBP_IN,dlg.(fldIndex(dlg, "Cod" + i)));
+                    cmd.AddParam("", RSDBP_IN,dlg.(fldIndex(dlg, "Sum" + i)));
+                    cmd.AddParam("", RSDBP_IN, {curdate});
+                    cmd.AddParam("", RSDBP_IN, _Id_Step);
+                    cmd.Execute;
+                    /*FIV Подключаем комиссию к договору, если была отключена - это было сделано для ускорения комиссий за ВК*/
+                    ConnectComissToContr(PaymentObj.FutureReceiverAccount, dlg.(fldIndex(dlg, "Cod" + i)), PaymentObj.BaseFIID);
+              end;
+              i = i + 1;
+           end;
+
+        end;
+       // ComSum = 0;
+
+        if (not isSelect)
+           if ( GetTrue(true, "Не выбрано ни одного тарифа. Вы уверены?") )
+              return CM_SAVE;
+           end;
+           return CM_IGNORE;
+        end;
+
+        return CM_SAVE;
+
+     elif ( KEY == KEY_ENTER )
+        /* При нажатии Enter в последнем поле не закрывать окно */
+        if (id == dlg.fldNumber()-1)
+           SetFocus(dlg, 0);
+           return CM_IGNORE;
+        end;
+
+     elif ( KEY == KEY_F9 )
+        return CM_IGNORE;
+
+     end;
+   
+   end;
+
+END;
+
+
+MACRO EXV_Execute_CC_CommissionChoice( Paym, Id_Step )
+   var DlgLbrPath, DlgLbrName;
+   const NOTEKIND_CC_Commission = 134;
+
+   var LifeBank = fg_life_subject( {OurBank} );
+
+   _Id_step = Id_Step;
+   PaymentObj = Paym;
+
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR", V_STRING, DlgLbrPath);
+   DlgLbrName = "vk.lbr";
+   DlgLbrPath = FindPath(DlgLbrName, DlgLbrPath);
+   var dlg = tRecHandler("StepCom", DlgLbrPath, true);
+
+   /* Для рублёвых платежей в банке ГЭБ панелька немного отличается */
+   if ( LifeBank.is_GEB  and (PaymentObj.BaseFiid == 0) )
+      dlg = tRecHandler("STEPCOM1", DlgLbrPath, true);
+   end;
+
+   if (RunDialog(dlg, "EXV_CC_ARM_Commiss_EventHandler"))
+     // if ( strLen(SelComissions) > 0 )
+         //InsertNoteForPayment(PaymentObj.PaymentID, NOTEKIND_CC_Commission, SelComissions);
+    //  end;
+      //msgbox (SelComissions);
+      return 0;
+   end;
+
+   return 1;
+END;
+
+
+/* EVG 11/08/2011 Аналог функции CommissLib.CheckRestricted(), отражающий особенности
+   банка Экспресс-Волга: наряду с типом Т (арест на дебет) в расчёт также принимаются 
+   счета с типом Д (частичный арест). 
+   Константы TypeRestricted, TypeCover определены в CommissLib.mac. */
+   CONST TypePartArrest = "Д";
+
+MACRO EXV_CheckRestricted( sfcontr )
+    var query, rs;
+    var CountGeneral    = 0,
+        CountRestricted = 0;
+
+    /* Посчитаем общее количество счетов клиента */
+    query = " Select count(*) from DAccount_dbt " +
+            "  Where t_Chapter       = 1 " +
+            "    and t_Open_Close    = Chr(0) " +
+            "    and t_Client        = " + sfcontr.PartyID +
+            "    and SubStr(t_Account, 1, 3) between '405' and '408' ";
+    rs = rsdRecordSet(query);
+    while (rs and rs.moveNext())
+       CountGeneral = CountGeneral + rs.value(0, null, V_INTEGER);
+    end;
+
+
+    /* Посчитаем количество счетов с типом "Т" */
+    query = " Select count(*) from DAccount_dbt " +
+            "  Where t_Chapter       = 1 " +
+            "    and t_Open_Close    = Chr(0) " +
+            "    and t_Client        = " + sfcontr.PartyID +
+            "    and SubStr(t_Account, 1, 3) between '405' and '408' " +
+            "    and instr(t_Type_Account, " + GetSQLString(TypeCover) + ") = 0 " +    // Без покрытия
+            "    and  ( instr(t_Type_Account, " + GetSQLString(TypeRestricted) + ") > 0 "  +
+            "        or instr(t_Type_Account, " + GetSQLString(TypePartArrest) + ") > 0 )";
+    rs = rsdRecordSet(query);
+    while (rs and rs.moveNext())
+       CountRestricted = CountRestricted + rs.value(0, null, V_INTEGER);
+    end;
+
+    /* Если все счета имеют тип Т или Д... */
+    if (CountRestricted == CountGeneral)
+       return true;
+    end;
+
+    return false;
+end;
+
+
+/* EVG 12/08/2011 Функция проверяет наличие по счёту претензий вида "Арест"
+   типа "частичный". */
+MACRO EXV_CheckPartArrestClaim( sfcontr )
+
+    var query, rs;
+
+    query = " Select 1 from DACCLAIM_DBT clm " +
+            "  Where clm.t_Chapter = 1 " +
+            "    and clm.t_Account = " + GetSQLString( sfcontr.object ) +
+            "    and clm.t_Fiid    = " + sfcontr.fiid +
+            "    and clm.t_ClaimKind = 1 " +        // Арест
+            "    and clm.t_RestKind  = 2 " +        // Частичный
+            // Статус претензии = Активен
+            "    AND 1 = (SELECT MAX (t_state) " +
+            "               FROM DACCLAIMSTATE_DBT " +
+            "              WHERE T_CLAIMID = clm.T_CLAIMID) ";
+    rs = rsdRecordSet(query);
+    if ( rs and rs.moveNext() )
+       return true;
+    end;
+
+    return false;
+END;
+
+/*09.09.2011 RR-Проверка на превышение суммы перечислений в 500000 по даннмоу клиенту,
+по внутренним документам ручного ввода и AdobeFineReader'a*/
+MACRO EXV_isJur_to_Phis_NotExternal_5000000( Account, ComDate )
+  var query, rs, cmd,MAmount;
+/* проверка на первышение суммы перечислений в 500000*/ 
+query =  " select nvl(sum (PAYM.T_AMOUNT),0) as sum "
++"\n                 from dpmpaym_dbt paym, "
++"\n                      dpmrmprop_dbt prop, "
++"\n                      dpspayord_dbt ord "
++"\n               where    PAYM.T_PAYMENTID = prop.t_paymentid "
++"\n                    and PAYM.T_PAYMENTID = ORD.T_ORDERID "
++"\n                    and paym.t_payerbankid = paym.t_receiverbankid "
++"\n                    and paym.t_payeraccount in "
++"\n                        ( select acc.t_account "
++"\n                             from daccount_dbt acc "
++"\n                           where     acc.t_chapter = 1 "
++"\n                                and  acc.t_usertypeaccount NOT LIKE '%Z%' "
++"\n                                AND (SUBSTR (acc.t_account, 1, 3) BETWEEN '405' AND '407' "
++"\n                                 OR  SUBSTR (acc.t_account, 1, 5) IN ('40807', '40802'))) "
++"\n                    AND ((SUBSTR (paym.t_ReceiverAccount, 1, 3) IN ('423', '426') "
++"\n                       OR SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('40817', '40820'))) "
++"\n                    and paym.t_paymstatus = 32000 "
++"\n                    and paym.T_VALUEDATE BETWEEN (select trunc(to_date(?), 'MONTH') from dual) "
++"\n                                             AND (to_date(?)) "//Внес маленькую поправочку
++"\n                    and (ORD.T_ORIGIN = 1 or ORD.T_ORIGIN = 6)"
++"\n                    and paym.t_payeraccount = ?; ";
+  cmd = rsdcommand(query);
+  cmd.AddParam("", RSDBP_IN, ComDate);
+  cmd.AddParam("", RSDBP_IN, ComDate);
+  cmd.AddParam("", RSDBP_IN, Account);
+  rs = rsdRecordSet(cmd);
+    if (rs and rs.moveNext())
+        return rs.value("sum")
+     else
+        return 0
+    end;
+END;
+    
+/*11.09.2011 RR-Проверка на превышение суммы перечислений в 500000 по даннмоу клиенту,
+по внешним документам ручного ввода и AdobeFineReader'a*/
+MACRO EXV_isJur_to_Phis_External_5000000( Account, ComDate )
+  var query, rs, cmd;
+/* проверка на первышение суммы перечислений в 500000*/ 
+query =   " select nvl(sum (PAYM.T_AMOUNT),0) as sum "
++"\n            from dpmpaym_dbt paym, "
++"\n                 dpmrmprop_dbt prop, "
++"\n                 dpspayord_dbt ord "
++"\n          where   PAYM.T_PAYMENTID = prop.t_paymentid "
++"\n               and PAYM.T_PAYMENTID = ORD.T_ORDERID "
++"\n               and paym.t_payerbankid <> paym.t_receiverbankid "
++"\n               and          paym.t_payeraccount in "
++"\n                   ( select acc.t_account "
++"\n                        from daccount_dbt acc "
++"\n                      where     acc.t_chapter = 1 "
++"\n                           and  acc.t_usertypeaccount NOT LIKE '%Z%' "
++"\n                           AND (SUBSTR (acc.t_account, 1, 3) BETWEEN '405' AND '407' "
++"\n                            OR  SUBSTR (acc.t_account, 1, 5) IN ('40807', '40802'))) "
++"\n               AND ( (SUBSTR (paym.t_ReceiverAccount, 1, 3) IN ('423', '426') "
++"\n                          OR SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('30232', '40817', '40820') "//RR 23.11.2011 по заявке C-7328 внесены поправки, со счетов 30232 убран аналин на назначение платежа
++"\n                          OR SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('47422') "
++"\n                              and "
++"\n                             (   REGEXP_LIKE (prop.t_ground, '(40817|40820)\\d{15}') "
++"\n                              OR REGEXP_LIKE (prop.t_ground, '(423|426)\\d{17}') "
++"\n                              OR REGEXP_LIKE ('\\s' || LOWER (prop.t_ground), '(\\sпк\\s|\\sп\\.карта|п/карта|карточный\\sсчет|\\sп/к\\s|пластиковых\\sкарт)')))) "
++"\n               and paym.t_paymstatus = 32000 "
++"\n               and paym.t_valuedate BETWEEN (select trunc(to_date(?), 'MONTH') from dual) "
++"\n                                         AND (to_date(?)) "//Внес маленькую поправочку
++"\n               and (ORD.T_ORIGIN = 1 or ORD.T_ORIGIN = 6) "
++"\n               and paym.t_payeraccount = ?; ";
+  cmd = rsdcommand(query);
+  cmd.AddParam("", RSDBP_IN, ComDate);
+  cmd.AddParam("", RSDBP_IN, ComDate);
+  cmd.AddParam("", RSDBP_IN, Account);
+  rs = rsdRecordSet(cmd);
+    if (rs and rs.moveNext())
+        return rs.value("sum")
+     else
+        return 0
+    end;
+END;
+
+/*12.09.2011 RR-все ниже перечисленное наглым образом взаимствовано(украдено) из VuzComLib'a и доработано под нужны ЭВ*/
+
+/*Документы ручного ввода*/
+MACRO VUZ_GetCom3121RecordSet( Account, Origin, BegDate, EndDate )
+  var query, rs, cmd, SQL;
+  var OriginClause = "";
+
+  if ( Origin == HM_DocOrigin  )
+     OriginClause = " and ord.t_Origin =  "+HM_DocOrigin ;
+  else
+     OriginClause = " and ord.t_Origin <> "+HM_DocOrigin ;
+  end;
+
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта */
+  var fixAccountClause = "";
+  if ( Account )
+     fixAccountClause = " paym.t_payeraccount = " + GetSQLString( Account ) + " AND ";
+  end;
+
+  SQL = " SELECT   paym.t_PaymentId, paym.t_PayerAccount, paym.t_ReceiverAccount, paym.t_Amount, paym.t_Fiid, ";
+  SQL = SQL + "    CASE WHEN paym.t_payerbankid = paym.t_receiverbankid THEN 'int' ELSE 'ext' END Orientation ";
+  SQL = SQL + "  FROM   dpmpaym_dbt paym, ";
+  SQL = SQL + "         dpmrmprop_dbt prop, ";
+  SQL = SQL + "         dpspayord_dbt ord ";
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта
+  SQL = SQL + " WHERE       paym.t_payeraccount = " + GetSQLString( Account );*/
+  SQL = SQL + " WHERE       " + fixAccountClause;
+  SQL = SQL + "             paym.t_paymstatus = 32000 ";
+  SQL = SQL + "         AND prop.t_paymentid = paym.t_paymentid ";
+  SQL = SQL + "         AND prop.t_shifroper <> '16' ";
+  SQL = SQL + "         AND ord.t_orderid = paym.t_paymentid ";
+  SQL = SQL + "         AND EXISTS ";
+  SQL = SQL + "               (SELECT ARH.T_ACCTRNID ";
+  SQL = SQL + "                  FROM   dpmdocs_dbt pmd, dacctrn_dbt arh ";
+  SQL = SQL + "                 WHERE       pmd.t_paymentid = paym.t_paymentid ";
+  SQL = SQL + "                         AND ARH.T_ACCTRNID = PMD.T_ACCTRNID ";
+  SQL = SQL + "                         AND arh.t_chapter = 1 ";
+  SQL = SQL + "                         AND arh.t_state = 1 "; // 14.11.2014 joy  I-00532241 в 2031 это обязательно
+  SQL = SQL + "                         AND arh.t_date_carry BETWEEN "+GetSQLDate( BegDate )+" AND "+GetSQLDate( EndDate )+") ";
+  SQL = SQL + OriginClause;
+
+  cmd = rsdcommand(SQL);
+  cmd.prepared = true;
+  rs = TRsbDataSet( sql );
+
+  return rs;
+END;
+
+/*Документы FineReaderBank*/
+
+MACRO VUZ_GetCom3131RecordSet( Account, Origin, BegDate, EndDate )
+  var query, rs, cmd, SQL;
+  var OriginClause = "";
+
+  if ( Origin == FNB_DocOrigin )
+     OriginClause = " and ord.t_Origin =  "+FNB_DocOrigin ;
+  else
+     OriginClause = " and ord.t_Origin <> "+FNB_DocOrigin ;
+  end;
+
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта */
+  var fixAccountClause = "";
+  if ( Account )
+     fixAccountClause = " paym.t_payeraccount = " + GetSQLString( Account ) + " AND ";
+  end;
+
+  SQL = " SELECT   paym.t_PaymentId, paym.t_PayerAccount, paym.t_ReceiverAccount, paym.t_Amount, paym.t_Fiid, ";
+  SQL = SQL + "    CASE WHEN paym.t_payerbankid = paym.t_receiverbankid THEN 'int' ELSE 'ext' END Orientation ";
+  SQL = SQL + "  FROM   dpmpaym_dbt paym, ";
+  SQL = SQL + "         dpmrmprop_dbt prop, ";
+  SQL = SQL + "         dpspayord_dbt ord ";
+  /* EVG 06/04/2011 Доработка для возможности вызова без указания конкретного счёта
+  SQL = SQL + " WHERE       paym.t_payeraccount = " + GetSQLString( Account );*/
+  SQL = SQL + " WHERE       " + fixAccountClause;
+  SQL = SQL + "             paym.t_paymstatus = 32000 ";
+  SQL = SQL + "         AND prop.t_paymentid = paym.t_paymentid ";
+  SQL = SQL + "         AND prop.t_shifroper <> '16' ";
+  SQL = SQL + "         AND ord.t_orderid = paym.t_paymentid ";
+  SQL = SQL + "         AND EXISTS ";
+  SQL = SQL + "               (SELECT ARH.T_ACCTRNID ";
+  SQL = SQL + "                  FROM   dpmdocs_dbt pmd, dacctrn_dbt arh ";
+  SQL = SQL + "                 WHERE       pmd.t_paymentid = paym.t_paymentid ";
+  SQL = SQL + "                         AAND ARH.T_ACCTRNID = PMD.T_ACCTRNID ";
+  SQL = SQL + "                         AND arh.t_chapter = 1 ";
+  SQL = SQL + "                         AND arh.t_state = 1 "; // 14.11.2014 joy  I-00532241 в 2031 это обязательно
+  SQL = SQL + "                         AND arh.t_date_carry BETWEEN "+GetSQLDate( BegDate )+" AND "+GetSQLDate( EndDate )+") ";
+  SQL = SQL + OriginClause;
+
+  cmd = rsdcommand(SQL);
+  cmd.prepared = true;
+  rs = TRsbDataSet( sql );
+
+  return rs;
+END;
+
+MACRO EXV_isAccount_Jur( Account )
+   var BalAcc1 = int( SubStr( Account, 1, 3 )),
+       BalAcc2 = int( SubStr( Account, 1, 5 ));
+
+   if (    ( (BalAcc1 >= 405)
+         and (BalAcc1 <= 407) )
+        or ( BalAcc2 == 40807 )
+        or ( BalAcc2 == 40802 )
+      )
+      return true;
+   end;
+
+   return false;
+END;
+// 15.08.2014 joy В рамках переноса С-31392 меняю условия отбора в функциях EXV_isAccount_Phis, EXV_isAccount_Phis1 и EXV_isGround_PhisFace
+MACRO EXV_isAccount_Phis( Account )
+   var BalAcc1 = int( SubStr( Account, 1, 3 )),
+       BalAcc2 = int( SubStr( Account, 1, 5 ));
+
+   if (    ( (BalAcc1 == 423)
+         or  (BalAcc1 == 426) )
+        or ( BalAcc2 == 40817 )
+        or ( BalAcc2 == 40820 )
+      )
+      return true;
+   end;
+
+   return false;
+END;
+
+// 15.08.2014 joy С-31392 
+MACRO EXV_isAccount_Phis1( Account )
+   var BalAcc2 = int( SubStr( Account, 1, 5 ));
+
+   if ( (BalAcc2 == 47422) 
+       or (BalAcc2 == 30232) 
+       or (BalAcc2 == 30301) 
+       or (BalAcc2 == 30223)
+        ) 
+      return true;
+   end;
+
+   return false;
+END;
+
+// 15.08.2014 joy С-31392
+MACRO EXV_isGround_PhisFace( Ground )
+   if (    (index( Ground, "40817810" ) > 0)
+        or (index( Ground, "40820810" ) > 0)
+        
+        or (index( Ground, "42301810" ) > 0)
+        or (index( Ground, "42302810" ) > 0)
+        or (index( Ground, "42303810" ) > 0)
+        or (index( Ground, "42304810" ) > 0)
+        or (index( Ground, "42305810" ) > 0)
+        or (index( Ground, "42306810" ) > 0)
+        or (index( Ground, "42307810" ) > 0)
+        
+        or (index( Ground, "42601810" ) > 0)
+        or (index( Ground, "42602810" ) > 0)
+        or (index( Ground, "42603810" ) > 0)
+        or (index( Ground, "42604810" ) > 0)
+        or (index( Ground, "42605810" ) > 0)
+        or (index( Ground, "42606810" ) > 0)
+        or (index( Ground, "42607810" ) > 0)
+        or (index( Ground, "п.карта " ) > 0)
+        or (index( Ground, "п/карт" ) > 0) 
+        or (index( Ground, " п/к " ) > 0) 
+        or (index( Ground, " пластик/карта " ) > 0) 
+        or (index( Ground, "карточный счет" ) > 0)
+        or ( (index( Ground, "банковск" ) > 0)
+            and (index( Ground, "карт" ) > 0) )
+        or ( (index( Ground, "карт" ) > 0)
+            and (index( Ground, "№" ) > 0) )
+        or ( (index( Ground, "пластик" ) > 0)
+            and (index( Ground, "карт" ) > 0) )
+      )
+
+      return true;
+   end;
+
+   return false;
+END;
+
+// 15.08.2014 joy С-31392 Поиск в основании социальных выплат
+// 29/ 2/2016 EVG Добавление для зарплатного проекта SovCom
+MACRO EXV_isGround_ZP( Ground )
+
+   // 29/ 2/2016 EVG !!!
+   Ground = StrLwr( Ground );
+
+   // EVG 13/3/2016 Необходимо перед проверкой назначения платежа
+   // исключить из него зарплатный проект
+   Ground = StrSubst( Ground, ZP_PRJ_GROUND, "" );
+
+
+   if (    (index( Ground, "зар.плата" )      > 0)
+        or ( (index( Ground, "заработн" )     > 0)
+            and (index( Ground, "плат" )      > 0) )
+        or (index( Ground, "зарплат" )          > 0)
+        or (index( Ground, "аванс" )            > 0)
+        or (index( Ground, "пособи" )           > 0)
+        or (index( Ground, "стипенд" )          > 0)
+        or (index( Ground, "алимент" )          > 0)
+        or (index( Ground, "беременност" )      > 0)
+        or (index( Ground, "дивиденд" )         > 0)
+        or ( (index( Ground, "погашен" )        > 0)
+            and (index( Ground, "кредита" )   > 0) )
+        or ( (index( Ground, "кредитн" )        > 0)
+            and (index( Ground, "договор" )   > 0) )
+        or (index( Ground, "отпуск" )           > 0)
+        or (index( Ground, "премия" )           > 0)
+        or (index( Ground, "премии" )           > 0)
+        or (index( Ground, "премиальн" )        > 0)
+        or (index( Ground, "больничн" )         > 0)
+        or (index( Ground, "з/п" )              > 0)
+        or ( (index( Ground, "материаль" )    > 0)
+            and (index( Ground, "помощь" )    > 0) )
+        or (index( Ground, " зп " )             > 0)
+        or (index( Ground, "увольнен" )         > 0)
+
+        // EVG 29/2/2016 Добавил
+        or ( (index( Ground, "оплат" )        > 0)
+            and (index( Ground, "труда" )     > 0) )
+      )
+      return true;
+   end;
+   return false;
+END;
+
+// 28.10.2014 joy С-33886 Поиск в основании зарплатного проекта
+MACRO EXV_isGround_ZProject( Ground )
+   if (    
+         (index( Ground, "зарплатн" ) > 0)
+            and (index( Ground, "проект" ) > 0) 
+      )
+
+      return true;
+   end;
+
+   return false;
+END;
+
+
+// 15.08.2014 joy С-31392 Поиск в наименовании получателя
+MACRO EXV_isReceiverText( ReceiverText )
+   if (    (index( ReceiverText, "40817810" ) > 0)
+        or (index( ReceiverText, "40820810" ) > 0)
+        
+        or (index( ReceiverText, "42301810" ) > 0)
+        or (index( ReceiverText, "42302810" ) > 0)
+        or (index( ReceiverText, "42303810" ) > 0)
+        or (index( ReceiverText, "42304810" ) > 0)
+        or (index( ReceiverText, "42305810" ) > 0)
+        or (index( ReceiverText, "42306810" ) > 0)
+        or (index( ReceiverText, "42307810" ) > 0)
+        
+        or (index( ReceiverText, "42601810" ) > 0)
+        or (index( ReceiverText, "42602810" ) > 0)
+        or (index( ReceiverText, "42603810" ) > 0)
+        or (index( ReceiverText, "42604810" ) > 0)
+        or (index( ReceiverText, "42605810" ) > 0)
+        or (index( ReceiverText, "42606810" ) > 0)
+        or (index( ReceiverText, "42607810" ) > 0)
+      )
+      return true;
+   end;
+   return false;
+END;
+
+
+/* EVG 13/09/2011 Добавил PRIVATE, иначе возникает переопределение 
+   при импорте одновременно exvComLib.mac и vuzComLib.mac */
+   
+   /*14.09.2011 02:11:43 RR- У меня кривые руки =) */
+PRIVATE CONST UsTypeAc_SalProj = "Z";
+
+MACRO EXV_typeAccount_SalaryProject( Account )
+   var query, com, rs, isCur, tbl;
+
+   query = " Select 1 from DAccount_dbt" +
+           "  Where t_Account = ? " +
+           "    and instr( t_UserTypeAccount, ? ) > 0 ";
+   com = rsdCommand( query );
+   com.AddParam( "", RSDBP_IN, Account );
+   com.AddParam( "", RSDBP_IN, UsTypeAc_SalProj );
+
+   rs = rsdRecordSet( com );
+   if ( rs and rs.MoveNext() )
+      return true;
+   end;
+
+   return false;
+END;
+
+Macro EXV_GetComBESPRecordSet(Account, Origin, BegDate, EndDate, CommNumForOpt)
+  
+  var sql, rs, cmd;
+  /*27.09.2011 Чесноков Д.С. Исключить из рассчета если получатель 47422 и 30232                                     */
+  /*                         а так же в назначении платежа есть _ПК_, п.карта,п/карта карточный_счет, п/к            */
+  /*                         а так же 40817, 40820 и 15 любых числовых символов или 423, 426 и 17 числовых символов. */
+  if (Account != 0 )
+      sql = " SELECT count(pm.t_paymentid) as count " +
+            "    FROM dpmpaym_dbt pm, " +
+            "         dpmrmprop_dbt prop, " +
+            "         dpspayord_dbt ord, " +
+            "         daccount_dbt acc, " +
+            "         dpmprop_dbt pp " +
+            "   WHERE pm.t_paymentid = prop.t_paymentid " +
+            "         AND pm.t_paymentid = ord.t_orderid " +
+            "         AND pm.t_paymentid = pp.t_paymentid " +
+            "         AND pm.t_payeraccount = ? " +
+            "         AND pm.t_payerbankid != pm.t_receiverbankid " +
+            "         AND prop.t_paymentkind = 'С' " +
+            "         AND prop.t_shifroper != '16' " +
+            "         AND pm.t_paymstatus = 32000 " +
+            "         AND SUBSTR (pm.t_receiveraccount, 1, 3) NOT BETWEEN '401' AND '404' " +
+            "         AND ord.t_origin = ? " +
+            "         AND acc.t_account = pm.t_payeraccount " +
+            "         AND acc.t_chapter = pm.t_chapter " +
+            "         AND acc.t_type_account NOT LIKE '%Z%' " +
+            "         AND pp.t_issender = CHR (0) " +
+            "         AND pp.t_codekind = 3 " +
+            "         AND pp.t_bankcode NOT IN (?) " +
+            "         AND EXISTS (SELECT ARH.T_ACCTRNID " +
+            "                       FROM dpmdocs_dbt pmd, dacctrn_dbt arh " +
+            "                      WHERE pmd.t_paymentid = pm.t_paymentid " +
+            "                        AND ARH.T_ACCTRNID = PMD.T_ACCTRNID " +
+            "                        AND arh.t_state = 1 " + // 14.11.2014 joy  I-00532241 в 2031 это обязательно
+            "                        AND arh.t_chapter = 1 " +
+            "                        AND arh.t_date_carry BETWEEN ? AND ?) " +
+            "         AND NOT ((REGEXP_LIKE( '\\s'||lower(prop.t_ground), '(\\sПК\\s|\\sп\\.карта|п/карта|карточный\\sсчет|\\sп/к\\s)' ) " +
+            "                   OR REGEXP_LIKE ( prop.t_ground, '(40817|40820)\\d{15}' ) " +
+            "                   OR REGEXP_LIKE ( prop.t_ground, '(423|426)\\d{17}' )) " +
+            "                   AND SUBSTR (pm.t_receiveraccount, 1, 5) in ('30232','47422') " +
+            "                 ) ";
+
+       cmd = rsdCommand(sql);
+       cmd.AddParam("account",   RSDBP_IN, Account );
+       cmd.AddParam("origin",    RSDBP_IN, Origin  );
+       cmd.AddParam("bics",      RSDBP_IN, БИКиБанковГруппы  );
+       cmd.AddParam("BeginDate", RSDBP_IN, BegDate );
+       cmd.AddParam("EndDate",   RSDBP_IN, EndDate );
+   
+       rs = rsdRecordSet(cmd);
+   
+       return rs;
+  else
+      sql = "  SELECT DISTINCT (pm.t_payeraccount), pm.t_fiid, ? comid, " +
+            "            (SELECT t_code || ' - ' || t_name " +
+            "               FROM dsfcomiss_dbt "  +
+            "              WHERE t_number = ? AND t_feetype = 1) comminfo "  +
+            "    FROM dpmpaym_dbt pm, " +
+            "         dpmrmprop_dbt prop, " +
+            "         dpspayord_dbt ord, " +
+            "         daccount_dbt acc, " +
+            "         dpmprop_dbt pp " +
+            "   WHERE pm.t_paymentid = prop.t_paymentid " +
+            "         AND pm.t_paymentid = ord.t_orderid " +
+            "         AND pm.t_paymentid = pp.t_paymentid " +
+            "         AND pm.t_payerbankid != pm.t_receiverbankid " +
+            "         AND prop.t_paymentkind = 'С' " +
+            "         AND prop.t_shifroper != '16' " +
+            "         AND pm.t_paymstatus = 32000 " +
+            "         AND SUBSTR (pm.t_receiveraccount, 1, 3) NOT BETWEEN '401' AND '404' " +
+            "         AND ord.t_origin = ? " +
+            "         AND acc.t_account = pm.t_payeraccount " +
+            "         AND acc.t_chapter = pm.t_chapter " +
+            "         AND acc.t_type_account NOT LIKE '%Z%' " +
+            "         AND pp.t_issender = CHR (0) " +
+            "         AND pp.t_codekind = 3 " +
+            "         AND pp.t_bankcode NOT IN (?) " +
+            "         AND NOT ((REGEXP_LIKE( '\\s'||lower(prop.t_ground), '(\\sПК\\s|\\sп\\.карта|п/карта|карточный\\sсчет|\\sп/к\\s)' ) " +
+            "                   OR REGEXP_LIKE ( prop.t_ground, '(40817|40820)\\d{15}' ) " +
+            "                   OR REGEXP_LIKE ( prop.t_ground, '(423|426)\\d{17}' )) " +
+            "                   AND SUBSTR (pm.t_receiveraccount, 1, 5) in ('30232','47422')) " +
+            "         AND PM.T_VALUEDATE between ? and ? ";
+
+       cmd = rsdCommand(sql);
+       cmd.AddParam("",          RSDBP_IN, CommNumForOpt  );
+       cmd.AddParam("",          RSDBP_IN, CommNumForOpt  );
+       cmd.AddParam("origin",    RSDBP_IN, Origin  );
+       cmd.AddParam("bics",      RSDBP_IN, БИКиБанковГруппы  );
+       cmd.AddParam("BeginDate", RSDBP_IN, BegDate );
+       cmd.AddParam("EndDate",   RSDBP_IN, EndDate );
+   
+       rs = rsdRecordSet(cmd);
+   
+       return rs;
+  end;
+end;
+
+
+Macro EXV_GetPaymentsFor312_313Commission( Account, Group, BegDate, EndDate )
+
+  var SQL, rs;
+  var ExtIntClause = "";
+
+
+  if ( Group == PMGROUP_Internal )
+     ExtIntClause = " and paym.t_ReceiverBankID =  paym.t_payerBankId ";
+  elif ( Group == PMGROUP_External )
+     ExtIntClause = " and paym.t_ReceiverBankID <> paym.t_payerBankId ";
+  end;
+
+  SQL =     " select paym.t_PaymentId, paym.t_PayerAccount, paym.t_ReceiverAccount, paym.t_Amount, paym.t_ReceiverBankId, paym.t_Fiid "
+           +"   from dpmpaym_dbt paym, "
+           +"        dpmrmprop_dbt prop, "
+           +"        dpspayord_dbt ord "
+           +" where    paym.T_PAYMENTID = prop.t_paymentid "
+           +"      and paym.T_PAYMENTID = ORD.T_ORDERID "
+           +"      and paym.t_payeraccount in "
+           +"           ( select acc.t_account "
+           +"               from daccount_dbt acc "
+           +"              where acc.t_chapter = 1 "
+           +"                AND  acc.t_usertypeaccount NOT LIKE '%Z%' "
+           +"                AND (   SUBSTR (acc.t_account, 1, 3) BETWEEN '405' AND '407'    "
+           +"                     OR SUBSTR (acc.t_account, 1, 5) IN ('40807', '40802')  ))  "
+           +"      AND (      SUBSTR (paym.t_ReceiverAccount, 1, 3) IN ('423', '426') "
+           +"              OR SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('30232', '40817')   "
+           +"              OR SUBSTR (paym.t_ReceiverAccount, 1, 5) IN ('47422', '40820')  )"
+           +"      and paym.t_paymstatus = 32000 "
+           +"      and ord.t_origin      = 2 "
+           +"      and paym.T_CLOSEDATE between " + getSQLDate( BegDate )
+           +"                               and " + getSQLDate( EndDate )
+           + ExtIntClause;
+  
+  rs = TRsbDataSet( sql );
+
+  return rs;
+end;
+
+
+/* EVG 3/04/2013 Функция определяет, были ли платежи сверх лимита по пакетной комиссии.
+       Для единовременных пакетных комиссий! */
+MACRO EXV_CheckPaymentsOverLimit( sfcontr, BegDate, EndDate, CommNumber, TarifValue:@variant, MinValue:@variant, MaxValue:@variant, TarifType:@integer )
+  var query, rs, cmd, SQL, n = 0;
+  var PmInfoArray = TArray();
+
+
+  // 4-й параметр = 3 - единовременная комиссия
+  if( GetTarifInfo( sfcontr, BegDate, EndDate, 3, CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType ) )
+
+     var mm, yy, monthBegDate;
+     datesplit( BegDate, null, mm, yy );
+     monthBegDate = date( 1, mm, yy );
+
+
+     var tpBegDate = date(0,0,0);
+     cmd = rsdcommand("   SELECT t_begin " +
+                      "     FROM dsfcontrplan_dbt " +
+                      "    WHERE T_SFCONTRID = ?  " +
+                      "      AND t_end       = TO_DATE('01.01.0001','dd.mm.yyyy') " +
+                      " ORDER BY t_begin DESC ");
+     cmd.addparam( "ID", RSDBP_IN, sfcontr.id );
+     rs = rsdrecordset( cmd );
+     if ( rs and rs.movenext )
+        tpBegDate = SQL_ConvTypeDate( rs.value(0, null, V_DATE) );
+     end;
+
+     var TotalPayments = CountPayments( sfcontr.PartyId, max(monthBegDate, tpBegDate), EndDate );
+
+     /* Т.к. CountPayments() учитывает только закрытые платежи, нужно добавить ещё один платёж - который проводится в данный момент */
+     TotalPayments = TotalPayments + 1;
+
+     /* Если количество платежей превысило лимит, возвращаем true. */
+     if( TotalPayments > MaxValue )
+        return true;
+     end;
+  end;
+
+  return false;
+END;
+
+ MACRO EXV_Check_SovComAccounts(PaymObj)
+   if (    (PaymObj.ReceiverAccount == "40817810501000000555")
+        or (PaymObj.ReceiverAccount == "70601810401002790204")
+        or (PaymObj.ReceiverAccount == "70601810201002790310")
+      )
+     return true;
+   else
+     return false;
+   end;
+ END;
+
+

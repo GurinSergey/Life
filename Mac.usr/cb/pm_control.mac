@@ -1,0 +1,469 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29007 - "Контроль"
+// Шаг      : 10    - "Контроль"
+// Описание : Макрос шага
+// Gurin S.  15.03.2013 R-166237-2
+// joy       15.10.2013 C-24098-6 Жаворонкова Н. По платежным поручениям ручного ввода появилась ед. комиссия
+// joy       06.11.2013 R-278975  Жаворонкова Н. Перенесла проверку на необходимость шага ед. комиссии  в  макрос lib_pm_check
+// KS        04.12.2013 Перенос доработок в 31ю сборку
+// Jushmanov 2014-02-20 C-19151 Логгирование массово выполненных шагов
+// joy       18.11.2014  R-488625-2 Изменила простановку категории комиссии
+// LVV       19/05/15 Адаптация клиентской ветки
+// Chesnokov 10.07.2015 Адаптация для ГИС ГМП 1.16
+// Gurin S.  21.12.2015 HotFix 2031.19.25 (Life_1 1.3)_11
+//-----------------------------------------------------------------------------
+import pm_setst, cbsttls, PTInter, CashInter, "pm_answerret.mac", "pmfm.mac";
+import op_lib, CommissLib;
+import "FrontRoute.mac";
+//Kozina Библиотека для работы с банками группы
+import "fg_Life_parm.mac";
+import "ppp.mac"; //VV
+import "pm_chkrst.mac";
+import "pschkrst.mac";
+import OprInter, oralib; //Jushmanov 2014-02-20 C-19151
+
+var obj1; //Ошибка pm_control.mac строка 9[5]: переопределение идентификатора OBJ
+var PaymentObj:RsbPayment;
+var DuplID; //Seleznev ID дубликата, сделано по запросу 136062 
+/*раскомментировать, чтобы при контроле двойным вводом в эту переменную передавался ID дубликата  */
+/*var DuplID:integer;*/
+
+private macro PM_SetErrorStatus( p_PaymentID:integer, p_ErrorStatus:integer, p_ErrorMessage:string )
+
+  var query:string = "update doprtemp_tmp set t_ErrorStatus = :ErrorStatus";
+  var params:TArray = TArray;
+
+  params[0] = SQLParam( "ErrorStatus", p_ErrorStatus );
+
+  if( p_ErrorMessage )
+    query = query + " ,t_ErrorMessage = :ErrorMessage";
+    params[1] = SQLParam( "ErrorMessage", p_ErrorMessage );
+  end;
+
+  query = query + " where t_OrderID = :OrderID";
+  params[ params.size ] = SQLParam( "OrderID", p_PaymentID );
+
+  execSQL( query, params );
+
+end;
+
+MACRO WorkWithRetail():bool
+  var Work_Retail:bool = false;
+  var err:integer = 0;
+
+  GetRegistryValue( "COMMON\\WORK_MODE\\WORK_WITH_RETAIL", V_BOOL, Work_Retail, err );
+  if( err != 0 )
+    msgbox(" Ошибка чтения настройки COMMON\\WORK_MODE\\WORK_WITH_RETAIL ");
+    return false;
+  end;
+
+  return Work_Retail;
+END;
+
+MACRO ExecuteStep( doc, paymDoc )
+
+  var cmd, rs;
+  var note_text:string = "";
+  var Direct = GetOprStatus(OPR_PAYM_DIRECT);
+
+  // Для установки статусов сегментов операции
+  var CTRL_segment:integer = 0;
+
+  //VV C-17836 18.02.13
+    //Gurin S. 15.03.2013 R-166237-2 только для "01"
+    if ((PaymentObj.ShifrOper == "01") and  CheckValuedate(PaymentObj))
+        RejectPayment( PaymentObj, "Дата документа отстает от текущей более чем на 11 дней" );
+        return 0;
+    end;
+
+    //TAM 25.06.2014 C-30410
+    if (PaymentObj.DocKind == PS_CPORDER)
+       if ( ( PaymentObj.ReceiverAccount == "" ) or
+            ( PaymentObj.ReceiverName    == "" ) )
+           RejectPayment( PaymentObj, "Отсутствуют обязательные реквизиты платежа!" );
+           return 0;
+        end;
+    end;
+
+  if( PM_NeedRejectControl() == true )
+
+    if( not GetMultNoteReject( note_text ))
+      SetNoteReject( note_text );
+      if(not strlen(note_text))
+        note_text = "Контроль не выполнен";
+      end;
+    end;
+
+    if( NOT CashgetString( note_text, "Причина отказа (возврата)" ) )
+            msgbox( "Пользователь прервал выполнение шага операции" );
+            return 1;
+    end;
+    
+    PaymentObj.PaymStatus = PM_REJECTED;
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_REJECTED );
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_REJECT ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+    // Заполнить примечание
+    if( strlen( trim( note_text ) ) > 0 )
+      if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, note_text, {curdate} ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+    end;
+
+  else
+
+    if ( not InList( PaymentObj.DocKind, CASH_BOF_OUTORDER, CASH_PS_OUTORDER ) )
+      CTRL_segment = OPR_PAYM_ST_CTRL_CONTROL;
+    elif( WorkWithRetail() )
+      CTRL_segment = OPR_PAYM_ST_CTRL_NOTACCEPTR;     
+    else
+      CTRL_segment = OPR_PAYM_ST_CTRL_NOTINCABSR;     
+    end;
+
+    // Проверка на возможность отказа по 115-ФЗ
+    if( IsPaymentDeniableFM(PaymentObj) )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_TERR, OPR_PAYM_ST_TERR_NEED ) )
+        MsgBox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+      return 0;
+    end;
+
+    if( PaymentObj.Categories.IsAttrPresense( 17, 1, NULL, NULL, false, {curdate} ) )
+       msgbox("Операция по платежу должна быть приостановлена по подозрению в легализации доходов, полученных преступным путем." 
+              " Для создания операции в Финансовом мониторинге платеж необходимо переместить в отложенные или отвергнуть," 
+              " после чего перезапустить операцию обработки.");
+       return 1;
+    end;
+
+    //Seleznev
+    if (IsFrontPayment(PaymentObj))
+       CTRL_segment = OPR_PAYM_ST_CTRL_CONTROL;
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, CTRL_segment ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+    
+    if( GetOprStatus(OPR_PAYM_DOCKIND) == WL_INDOC )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_PREP ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    end;
+
+    if( GetOprStatus(OPR_PAYM_INDEX) > OPR_PAYM_ST_INDEX_NO )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_CABS, OPR_PM_ST_MFR_YES ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    end;
+
+    if ( PaymentObj.DocKind == PS_PAYORDER )
+      var obj = RsbPSPayOrder(PaymentObj.PaymentID);
+    end;
+
+    if( IsDocKindChild(PaymentObj.DocKind, 283/*PMDOC_CLIENTPAYMENT*/) // платеж клиентский
+        and ( (IsExistsClaimReserve(PaymentObj.DocKind, PaymentObj.PaymentID) == 0 ) // есть претензия
+                 or ( GetOprStatus( OPR_PAYM_INDEX ) == OPR_PAYM_ST_INDEX_2) ) //К2
+        and ( (PaymentObj.DocKind != PS_PAYORDER) or (obj.DocKind != 2) //не платежное требование
+            or (obj.AcceptTerm == PSPAYDEM_TERM_WITHOUTACCEPT) or (obj.Accept == PSPAYDEM_ST_ACCEPT) or (obj.Accept == PSPAYDEM_ST_AUTOACCEPT) ) //акцепт есть или не нужен
+        and (PaymentObj.Notes.ReadNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, {curdate}) == "") ) //примечание не заполнено
+      if (PaymentObj.Notes.AddNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, GetCurrentDateTimeUTC({curdate})))
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+    end;
+  end;
+
+  if( not PM_NeedRejectControl() and (PaymentObj.DocKind == DLDOC_BANKCLAIM) AND (PaymentObj.DemandAcceptTerm == PM_DEMAND_TERM_ACCEPT) )
+    if( Direct == OPR_PM_ST_DIR_OUT )
+      // Исходящее требование с акцептом после контроля попадает в АРМ
+      PaymentObj.PaymStatus = PM_READY_TO_SEND;
+      PaymentObj.PropStatus = PM_PROP_READY;
+    end;
+  end;
+
+  /*!!!Seleznev Номер пачки дубликата должен перемещаться в платеж*/
+    if( PaymentObj.DocKind == PS_PAYORDER )
+
+        obj1 = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+
+        if ((Obj1.Origin == PSPO_OR_FINEREADER) or (Obj1.Origin == PSPO_OR_MANUAL))
+
+            if ((valtype(DuplID)!=V_UNDEF) and (DuplID !=0))
+                
+                cmd = RSDCommand("select t_numberpack from DPMDUPAYM_DBT where t_dockind = 261 and t_documentid = ?");
+                cmd.addParam("id", RSDBP_IN, DuplID);
+                rs = RSDRecordset(cmd);
+
+                if (rs.MoveNext())
+                    PaymentObj.numberpack = rs.value(0);
+                else
+                    msgbox("Не найден дубликат для контролируемого платежа");
+                    return 1;
+                end;
+
+            end;
+        end;
+    end;
+
+    /* EVG По кассовым документам единовременная комиссия взимается */
+    if( PaymentObj.DocKind == CASH_PS_OUTORDER )
+        УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NEED );
+    end;
+
+    /*joy 15-10-2013 C-24098-6 По платежным поручениям ручного ввода появилась ед. комиссия*/
+    /*joy 06-11-2013 R-278975  Перенесла проверку в общий макрос*/
+    if (not ( (fgBank.is_GO) or (fgBank.is_NBS)))
+        if ( PaymentObj.DocKind == PS_PAYORDER )
+            var psobj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+            var checkneedpzo = execMacroFile ("lib_pm_check.mac", "GoToPZO", psobj);
+            if (checkneedpzo)
+                УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NEED );
+            end;
+        end;
+    end;
+  
+    /* EVG Единовременные комиссии для входящих валютных платежей по корсчетам */
+    if (IsPaymentForBankCommission( PaymentObj, PaymentObj.PayerAccount ))
+        /* Если платёж за счёт бенефициара, то планируется блок "Единовременные комиссии / бенефициар",
+           а блок "Единовременные комиссии" не планируется. */
+        if(PaymentObj.ComissCharges == PM_CHRG_BEN)
+            УстановитьСтатусыПлатежа( 310 /*Плата за обслуживание / бенефициар*/, 1 /*Требуется*/ );
+            УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NOTNEED );
+        else
+            УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NEED );
+        end;
+    end;
+
+    /* EVG Установка статуса "Требуется" сегмента "ПРББ Позиционирование" для исходящих валютных платежей */
+    if ( (PaymentObj.ReceiverBankID != {OurBank}) and (PaymentObj.BaseFiid > 0) )
+        InsertOprStatus(308, 3);   // 308 "ПРББ Позиционирование", 3"Спозиционирован"
+    end;
+
+    /*Kozina Заполнить примечание Вид тарифа комиссии 3.4 за перевод средств*/
+    var attrid = 0;
+    var m;
+    array mn;
+    var err;
+
+    if((PaymentObj.dockind == PS_PAYORDER) and (PaymentObj.ShifrOper == "01"))
+        if( time > time(14,00) ) //В ПРББ и ГЭБе после 14-00
+
+            /* EVG 22.02.2011 Для ЭВ немного иначе */
+            if ( fgBank.is_EXV )
+                if( GetTrue(true, "Выбрать пункт тарифа платежа после 15-00?") )
+                    mn(0) = "3.4.3 - прочие платежи, принятые с 15-00 до 16-30 на бумажных носителях";
+                    m = menu(mn,"Платеж после 14:00. Выберите пункт тарифа",null);
+                    if( m == 0 ) attrid = 1; end;
+                end;
+            else
+                if(GetTrue(true, "Выбрать пункт тарифа платежа после 14-00?"))
+                    mn(0) = "3.4.3 - прочие платежи, принятые с 14-00 до 15-00 на бумажных носителях";
+                    mn(1) = "3.4.4 - прочие платежи, принятые с 15-00 до 16-00 на бумажных носителях";
+                    m = menu(mn,"Платеж после 14:00. Выберите пункт тарифа",null);
+
+                    if(m == 0)
+                        attrid = 1;
+                    elif(m == 1)
+                        attrid = 2;
+                    end;
+                end;
+            end;
+        end;
+
+        if (attrid>0)
+        /* 18.11.2014 joy  R-488625-2 Иначе при дальнейшем поиске категории происходила ошибк и категория не находилась
+            cmd = RsdCommand("delete from dobjatcor_dbt where t_objecttype = 501 and t_groupid = 10 and t_object = lpad('" + PaymentObj.PaymentID + "', 10,0)");
+            cmd.Execute();
+            cmd = RsdCommand( "insert into dobjatcor_dbt(t_objecttype, t_groupid, t_attrid, t_object, t_general, t_validfromdate, t_validtodate, t_oper) " + 
+                              "values(501, 10, " + attrid + ", lpad('" + PaymentObj.PaymentID + "', 10,0), 'X', to_date('" + {CurDate} + 
+                              "','dd.mm.yyyy'), to_date('31.12.9999','dd.mm.yyyy')," + {oper} + ")");
+            cmd.Execute();
+            */
+        var stat =  PaymentObj.Categories.DisconnectAttr(10, 0);
+        stat = PaymentObj.Categories.ConnectAttr(10, attrid, null, null, {curdate});
+        stat = PaymentObj.Categories.Save(); 
+        end;
+    end;
+
+  return 0;
+END;
+
+private macro GetNarrativeED274(PsDocKind : integer) : string
+  var Narrative : string = 
+    "Положительные результаты всех процедур приема к исполнению " +
+    "(включая положительный результат проверки достаточности денежных средств " +
+    "на счете плательщика), уведомляем о приеме " + 
+    IfThenElse( PsDocKind == PSPOKIND_REQUEST,
+                "инкассового поручения", "платежного требования" ) + 
+    " к исполнению";
+
+  return Narrative;
+end;
+
+macro PostStep( message,     /* данный параметр может принимать следующие       */
+                             /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                             /* произошла ошибка                                */
+                FirstDoc,    /* указатель на первичный документ                 */
+                ID_Oper,     /* внутренний идентификатор операции               */
+                Num_Step,    /* Номер шага операции (из настроек)               */
+                KindOper,    /* номер вида операции                             */
+                KindDoc,     /* номер вида первичного документа                 */
+                KindStep,    /* вид шага операции                               */
+                ID_Step )    /* внутренний идентификатор шага операции          */
+
+  var stat = 0;
+  private var logquery;
+
+  if( ( errTrn == 0 ) and ( message == 1 ) )// на выполнении шага
+    if (PaymentObj.DocKind == PS_PAYORDER)
+      var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+      var Narrative : string = GetNarrativeED274(PsOrder.DocKind);
+      var Queries : string = "InfoCode:8";
+      CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step, true);
+    end;
+  end;
+
+  //Jushmanov 2014-02-20 C-19151
+  if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+     if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+     if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+     logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+               " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+     ExecSQL(logquery, null, false);
+  end;
+
+  return stat;
+end;
+
+
+/* Массовое выполнение шага "Контроль" */
+
+
+/* Простановка примечания "Дата приема к исполнению" для клиентских платежей.
+   Живёт здесь, пока на PL/SQL нет функциональности для работы с примечаниями.
+   Внутри транзакции. */
+
+private macro PM_MassSetNotesForClientPayment()
+  
+  var query:string = "select t.t_OrderID "
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                      "from V_PMMASSOPFOREXE t, "
+                            "dpspayord_dbt pspo, "
+                            "dpmdemand_dbt pmd "
+                      "where pspo.t_OrderID(+) = t.t_PaymentID "
+                        "and pmd.t_PaymentID(+) = t.t_PaymentID "
+                        "and exists ( SELECT * FROM (SELECT t_DocKind FROM doprkdoc_dbt "
+                           "CONNECT BY PRIOR t_DocKind = t_ParentDocKind " 
+                           "START WITH t_DocKind = 283 /*PMDOC_CLIENTPAYMENT*/ ) " // платеж клиентский
+                           "WHERE t_DocKind = t.t_DocKind) "
+                        "and ( PM_RESTFUN.IsExistsClaimReserve(t.t_DocKind, t.t_OrderID ) = 0 "
+                              "or (select t_numvalue "
+                                   "from doprcurst_dbt dc "
+                                   "where dc.t_ID_Operation = t.t_ID_Operation "
+                                     "and dc.t_statuskindid = 304/*OPR_PAYM_INDEX*/ ) = 3 /*OPR_PAYM_ST_INDEX_2*/ ) " // Картотека 2
+                        "and ( (t.t_DocKind != 201 /*PS_PAYORDER*/) "
+                             "or (pspo.t_DocKind != 2) " //не платежное требование 
+                             "or (pmd.t_AcceptTerm = 1 /*PSPAYDEM_TERM_WITHOUTACCEPT*/ ) "
+                             "or (pmd.t_Accept in(1 /*PSPAYDEM_ST_ACCEPT*/, 5 /*PSPAYDEM_ST_AUTOACCEPT*/ ) ) ) "
+                        "and RSI_RSB_KERNEL.GetNote(501 /*OBJTYPE_PAYMENT*/, t.t_PaymentID, 50/*PM_NOTEKIND_PAYM_ACCEPTUATEDATE*/, PM_COMMON.CURDATE) is NULL ";
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          PM_NOTEKIND_PAYM_ACCEPTUATEDATE, 
+                          GetCurrentDateTimeUTC({curdate}),
+                          {curdate},
+                          rs.Value(1),
+                          rs.Value(2) ) )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Дата приема к исполнению\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+
+
+macro PrepMassExecuteStep() 
+  return execStoredFunc( "PM_CONTROL.MassControlStepPrepare", V_INTEGER );
+end;
+
+macro MassExecuteStep()
+  
+  var stat = execStoredFunc( "PM_CONTROL.MassControlStepExecute", V_INTEGER );
+
+  if(stat == 0)
+    //Простановка примечания "Дата приема к исполнению" для клиентских платежей
+    stat = PM_MassSetNotesForClientPayment();
+  end;
+  
+  return stat;
+end;
+
+macro PostMassExecuteStep()
+
+  var stat = 0;
+
+  var AutoCreateNotice = true;
+  GetRegistryValue("PS\\PAYORDER\\DEMAND\\AUTOCREATENOTICE", V_BOOL, AutoCreateNotice);
+
+  if( not stat and AutoCreateNotice )
+    var PsOrder : RsbPsPayOrder = null;
+    var Queries : string = "InfoCode:8";
+    var msg : string = "";
+
+    var rs : Rsdrecordset = execSQLselect
+      ( "select oprtemp.t_OrderID, oprtemp.t_ID_Operation, oprtemp.t_ID_Step " +
+        "  from doprtemp_tmp oprtemp, dpspayord_dbt pspayord, dpmrmprop_dbt rm " +
+        " where oprtemp.t_DocKind = " + PS_PAYORDER +
+        "   and oprtemp.t_ErrorStatus = 0 " +
+        "   and pspayord.t_OrderID = oprtemp.t_OrderID " +
+        "   and (pspayord.t_DocKind = " + PSPOKIND_DEMAND +
+        "       or " +
+        "        pspayord.t_DocKind = " + PSPOKIND_REQUEST + " ) " +
+        "   and pspayord.t_Origin = " + PSPO_OR_PAYEEBANK +
+        "   and rm.t_PaymentID = pspayord.t_OrderID " +
+        "   and rm.t_Reference != chr(1) " +
+        "   and rm.t_Reference is not null "
+      );
+
+    while( rs and rs.moveNext() )
+      PsOrder = RsbPsPayOrder(rs.value("t_OrderID"));
+      var Narrative : string = GetNarrativeED274(PsOrder.DocKind);
+      msg = CreateED274(PsOrder, Queries, Narrative, rs.value("t_ID_Operation"), rs.value("t_ID_Step"));
+
+      if(msg)
+        execSQL( "insert into dpmoprlog_tmp " +
+                 "( t_PaymentID, t_ID_Operation, t_ID_Step, t_Message ) " +
+                 "values " +
+                 "( :PaymentID, :ID_Operation, :ID_Step, :Msg ) ",
+
+                 makeArray( SQLParam("PaymentID", rs.value("t_OrderID")),
+                            SQLParam("ID_Operation", rs.value("t_ID_Operation")),
+                            SQLParam("ID_Step", rs.value("t_ID_Step")),
+                            SQLParam("Msg", msg)
+                          )
+               );
+      end;
+    end;
+
+  end;
+
+  return stat;
+
+end;

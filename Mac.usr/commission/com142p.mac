@@ -1,0 +1,120 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: com142p.mac
+// @author  : 2012-06-21 zip_z. C-10045
+// @desc    : Макрос расчета базовой суммы ежемесячной комиссии 1.4.2 (добор минимальной суммы в течение месяца)
+// @changes : none
+//RR 14.02.2013 Дата начала периода всегда должна быть равна началу месяца указанного в качестве даты окончания периода
+//RR 12.03.2013 В запрос внесена поправка для учета изменения ТП
+// -------------------------------------------------------------------------------------------------
+import sfinter, календарь;
+import lib_SqlTools;
+
+
+macro calcServiceSum (sfcontr_addr, beginDate, endDate, sAddr, sfcontrStruc)
+    debugbreak ();
+    
+    private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+    private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+    
+    var m, y;
+    datesplit (endDate , null, m, y);
+    beginDate = date (1, m, y);
+    
+    record sfcontr (sfcontr);
+    record sfbassum ("sfbassum.str");
+
+    var CommSum = $0;
+    
+    if (valType (sfcontr_addr) != V_UNDEF)
+        setBuff (sfcontr, sfcontr_addr);
+    else
+        copy (sfcontr, sfcontrStruc);
+    end;
+    
+    // определим минимальную сумму, которую мы должны списать с клиента
+    // это берется из параметров комиссии. Но минимальная сумма хранится как dsfconcom_dbt.t_sumMax
+    // Да. все именно так. Это не ошибка - см. ТЗ
+    // Мы должны добрать комиссию 1.4.1 до минимальной гарантированной суммы списания по итогам месяца
+    // Гарантированный минимум - это и есть __максимальная___ сумма комиссии, которая должна рассчитаться
+    // Такой вот ппц...
+
+    startQueryCapture ();
+    
+    [SELECT cc.t_summax
+      FROM dsfconcom_dbt cc, dsfcomiss_dbt com, dsfcontr_dbt contr
+     WHERE cc.t_feetype = com.t_feetype
+       AND cc.t_commnumber = com.t_number
+       AND com.t_code = '1.4.2'
+       AND com.t_feetype = 1
+       AND cc.t_objectid = contr.t_id
+       AND cc.t_objecttype = 659
+       AND (CC.T_DATEEND = TO_DATE ('01.01.0001', 'dd.mm.yyyy') OR CC.T_DATEEND > TRUNC (SYSDATE))
+       AND contr.t_object = :acc];
+
+    var sql = endQueryCapture ();
+    sql = execSqlSelect (sql, makeArray (SqlParam ("acc",  sfcontr.Object)));
+    
+    var maxCommissionSum = $0;
+    if (sql.moveNext ())
+        maxCommissionSum = sql.value ("t_summax");
+    end;
+
+    if (maxCommissionSum > 0)
+        // определим сумму УПК, которые скопились по комиссии 1.4.1 за период расчета
+        startQueryCapture ();
+        
+        [SELECT NVL (SUM (t_sum), 0) m_paidamount
+          FROM dsfdef_dbt
+         WHERE t_sfcontrid = (SELECT t_id
+                                FROM dsfcontr_dbt
+                               WHERE t_object = :acc)
+           AND (t_feetype, t_commnumber) = (SELECT t_feetype, t_number
+                                              FROM dsfcomiss_dbt
+                                             WHERE t_feetype = 1 AND t_code = '1.4.1')
+           AND t_dateperiodbegin >= :begdate
+           AND t_dateperiodend <= :enddate ];
+        
+        sql = endQueryCapture ();
+        sql = execSqlSelect (sql, makeArray (SqlParam ("acc", sfcontr.Object), SqlParam ("begdate", beginDate), SqlParam ("enddate", endDate)));
+        
+        var paidAmount = $0;
+        if (sql.moveNext ())
+            paidAmount = sql.value ("m_paidamount");
+        end;
+        
+        // если конец периода расчета - не последний день месяца...
+        if (nDays (beginDate, endDate) != getDaysInMonth (beginDate))
+            // ...считаем сумму, которую мы должны списать с клиента пропорционально количеству рабочих дней в месяце
+            var mm, yyyy;
+            dateSplit (beginDate, null, mm, yyyy);
+            
+            maxCommissionSum = maxCommissionSum * workDays (beginDate, endDate) 
+                                                / workDays (date (1, mm, yyyy), 
+                                                            date (getDaysInMonth (beginDate), mm, yyyy));
+            
+            // ...и округляем до копеек
+            maxCommissionSum = round (maxCommissionSum, 2);
+        end;
+    end;
+
+    // если сумма рассчитанных УПК по комиссии за месяц меньше, базовая сумма комиссии будет являться разницей
+    if (paidAmount < maxCommissionSum)
+        CommSum = maxCommissionSum - paidAmount;
+    end;
+
+    if ( valType (sfcontrStruc) != V_UNDEF )
+        return (CommSum > 0);
+    end;
+    
+    sfbassum.baseType      = SF_BASETYPE_SUM;
+    sfbassum.baseSum       = CommSum;
+    sfbassum.FIID_baseSum  = 0;
+    
+    sfbassum.baseType2     = SF_BASETYPE_SUM;
+    sfbassum.baseSum2      = CommSum;
+    sfbassum.FIID_baseSum2 = 0;
+
+    if( insertSumList(sfbassum) )
+        msgBox("Ошибка при вставке базовой суммы");
+    end;
+end;

@@ -1,0 +1,563 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: ContractProcessProc.mac v.1
+// @author  : 2013-03-28 TeleshovaAM C-17621
+// @desc    : Обработка панели процедуры создания платежных документов на основе договор к счету
+// @changes : 
+//          #1 05.06.2013 TeleshovaAM R-199913
+//          #2 10.06.2013 TeleshovaAM C-20980
+//          #3 29.07.2013 TeleshovaAM C-22139
+//          #4 09.08.2013 TeleshovaAM
+//          #5 22.08.2013 TeleshovaAM C-22284
+//          #6 23.09.2013 TeleshovaAM I-00426143-2
+//          #7 19.12.2014 TeleshovaAM C-25303
+//          #8 21.01.2015 TeleshovaAM R-530957-2
+//          #9 06.02.2015 TeleshovaAM C-37129
+//          10 12.06.2015 VDN         R-590862
+// -------------------------------------------------------------------------------------------------
+import PTInter, RSD, globals, календарь, "KeyCodes.mac", "PaymProc.mac", PaymInter, BankInter, FIInter;
+//TAM 22.05.2013 сделаем проверку на группу
+import "lib_access.mac", "lib_account.mac", "lib_fg.mac";
+
+//Константы
+const FULL_NAME = 1;
+const PAYMENT_OPERATION    = 24001;
+const CONST_PAY = 3400;
+const CONSTCONTR_REFID = 1000046;
+const CONSTCONTR_REFID_EXV = 1000050;
+const CONSTCONTR_REFID_GO  = 1000048;
+const ORIGIN_CONSTCONTR = 3400;
+const CHAPTER_1 = 1;
+const CONST_INTERNAL_PACK = 603;
+const CONST_EXTERNAL_PACK = 305;
+//Стандартные ошибки
+const ERROR_SUM_OVER_AMOUNT = "Превышен лимит ограничения суммы обязательств по договору";
+const ERROR_ZERO_AMOUNT     = "Средства на счете плательщика отсутствуют";
+//TAM 16.07.2013 R-218520-2
+const ERROR_EXISTS_K2       = "На счете плательщика имеются документы в Картотеке 2";
+//TAM 19.12.2014 С-25303
+const ERROR_GO_K2           = "Документ будет помещен на Картотеку 2";
+
+//Глобальные переменные
+var g_saveCurField; //текущее поле в панели
+var g_Client_ID:integer = 0; //ид клиента из формы процедуры
+var dep_id:integer      = 0; //ид всп
+var Cl_Acc              = ""; //выбранный счет клиента из списка счетов клиента
+var column_orders       = TArray(); // колонки скроллинга
+var ind                 = 0; //нумерация колонок
+var restart_scroll      = true; //перестроить скроллинг
+var count_success       = 0;
+var count_all           = 0;
+
+record department (dp_dep);
+record client (party);
+record account (account);
+
+private macro GetDepName( Name:string):string
+   var select = " SELECT   nvl(PT.T_NAME, ' ') node_name FROM ddp_dep_dbt dp, dparty_dbt pt " +
+                "  WHERE   dp.t_Name = ? AND DP.T_PARTYID = PT.T_PARTYID ";
+   var cmd = RSDCommand(select);
+   cmd.AddParam("name",  RSDBP_IN, Name);
+   var rsl = RSDRecordset(cmd, null, RSDVAL_STATIC);
+   if (rsl.movenext())
+      return rsl.value("node_name");
+   else
+      return "";
+   end;
+end;
+
+private class (TRecHandler) ContrProcPanel(Fulloutputlbr)
+   InitTRecHandler ("contrpro", Fulloutputlbr, TRUE);
+   var exitKey = 0;
+end;
+
+// Параметры формы договора для передачи в БД
+class ContrProcParm()
+   var Date:date, 
+       BranchId:integer = 0, 
+       ClientID:integer = 0,
+       ClientAcc:string = "";
+end;
+
+//Инициализация панели
+private macro InitContrPanel(dlg:ContrProcPanel)
+   var PartyID = 0;
+   dlg.rec.date       = {curdate}; 
+   dlg.rec.BranchCode = "000";
+   dlg.rec.BranchName = GetDepName(dlg.rec.BranchCode);
+   dlg.rec.ClientCode = "";
+   dlg.rec.ClientName = "";
+   dlg.rec.ClientId   = "";
+   dlg.rec.Account    = "";
+end;
+
+// Проверяем заполненность всех обязательных полей
+private macro CheckPanel( dlg:ContrProcPanel ):bool
+   var emptyField = "", gotoField = "";
+   if( dlg.rec.Date == "" ) 
+      gotoField = "Date";
+      emptyField = "Дата";
+   elif(dlg.rec.BranchCode == "") 
+      gotoField = "BranchCode";
+      emptyField = "ВСП";
+   end;  
+   if( emptyField != "" )
+      SetFocus(dlg, FldIndex(dlg,gotoField));
+      msgbox("Для запуска процедуры необходимо заполнить поле <" + emptyField + ">.");
+      return false;
+   end;  
+   return true;
+end; 
+
+// Необходимые функции для построения списка счетов пользователя
+macro AddColumn( col, fld, head, width )
+   Col.value( ind * 6 + 0 ) = fld;  // fieldName
+   Col.value( ind * 6 + 1 ) = head; // header 
+   Col.value( ind * 6 + 2 ) = width; // width
+   Col.value( ind * 6 + 3 ) = 2;    // fldType (2 = FBT)
+   Col.value( ind * 6 + 4 ) = null; // decPoint
+   Col.value( ind * 6 + 5 ) = 0;    // reserv
+   ind = ind + 1;
+end;
+
+//Обработчик списка счетов
+macro AccountsScroll_Proc(rs, cmd, id, key)
+   var rsdcmd, rsdrs;
+   if(cmd == DLG_KEY)
+      if(key == KEY_ENTER)
+         restart_scroll = false;
+         Cl_Acc = rs.value("Account");
+         return CM_CANCEL;
+      elif (key ==KEY_ESC)
+         restart_scroll = false;
+         return CM_CANCEL;
+      end;
+   end;
+   return CM_DEFAULT;
+end;
+
+macro RunClientAccScroll(id_client)
+   var promt, str,rsdcmd, rsl;
+   while(restart_scroll)
+      promt     = "~Esc~ ~Выход~ ~Enter~ ~Выбор~";
+      str = "select AC.T_ACCOUNT Account, AC.T_NAMEACCOUNT NameAccount from daccount_dbt ac where AC.T_CLIENT = ?";
+      rsdcmd = RSDCommand  (str);
+      rsdcmd.AddParam("client", RSDBP_IN, id_client);
+      //Колонки скроллинга
+      AddColumn(column_orders, "Account"    , "Номер счета",        30); 
+      AddColumn(column_orders, "NameAccount", "Наименование счета", 45);
+      rsl = RSDRecordset(rsdcmd, null, RSDVAL_STATIC);
+      RunScroll( rsl, ind, column_orders, "account_scroll", @AccountsScroll_Proc, "Счета клиента", promt, true, null, null, null, null );
+   end;
+   restart_scroll = true;
+end;
+
+// Обработчик панели процедуры
+private macro EventPanel(dlg, cmd, id, key)
+   var curFld = FldName (dlg, id);
+   var res, MenuChoice;
+   var Name:TArray;
+   if( cmd == DLG_INIT )
+      InitContrPanel(dlg);
+      UpdateFields(dlg); 
+   elif( cmd == DLG_SETFOCUS )
+      g_saveCurField = dlg.item(id);
+   elif( cmd == DLG_REMFOCUS )
+      UpdateFields(dlg); 
+   elif( cmd == DLG_KEY )
+      if ( key == KEY_F3 )
+         if(curFld == "BranchCode")
+            if ( ListDepartment (Department) )
+               dlg.rec.BranchCode = Department.name;
+               dep_id = Department.PartyID;
+               Name = GetPartyNames(Department.PartyID, FULL_NAME);
+               dlg.rec.BranchName = Name[0];
+               UpdateFields(dlg);
+            end;
+         elif( curFld == "ClientCode" )
+            if( ListPt(client, PTCK_ALL, null, PTLIST_ALLCLIENT, 0, PTCK_CONTR) );
+               dlg.rec.ClientId = client.partyid;
+               dlg.rec.ClientName = client.name;
+               dlg.rec.ClientCode = ПолучитьКодСубъекта(client.partyid, PTCK_CONTR);
+               dlg.rec.Account = "";
+               UpdateFields(dlg);
+            end;
+         elif ( curFld == "Account" ) 
+            if( dlg.rec.ClientId == "" ) //если клиент не установлен, то по всем счетам
+               if( ListAccount(account, CHAPTER_1, 0, dlg.rec.Account) );
+                  dlg.rec.Account = account.account;
+               end;
+            else
+               Cl_Acc = "";
+               RunClientAccScroll(dlg.rec.ClientId);
+               if( Cl_Acc != "" )
+                  dlg.rec.Account = Cl_Acc;
+               end;
+            end;
+            UpdateFields(dlg);
+         elif ( curFld == "date" ) 
+            dlg.rec.date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         end;
+      elif ( key == KEY_F2 )
+         if( CheckPanel( dlg ) ) //проверки перед сохранением, чтобы были заполнены обязательные поля
+            dlg.exitKey = key;
+            return CM_SAVE;
+         end;
+         return CM_IGNORE;
+      elif ( key == KEY_ESC )
+         dlg.exitKey = key;
+         return CM_SAVE;
+      end;
+      UpdateFields( dlg ); 
+   end;   
+end;
+
+//заполнение параметров для передачи в БД
+private macro FillProcParm(dlg:ContrProcPanel, procParm:@ContrProcParm)
+   procParm.Date = dlg.rec.Date;
+   procParm.BranchId = dep_id;
+   procParm.ClientId = dlg.rec.ClientId;
+   procParm.ClientAcc = dlg.rec.Account;
+end;
+
+macro ContrProcPanelExec(PanelParm:@ContrProcParm):integer
+   var Fulloutputlbr, outlbr, outputlbr="constatnt_contr.lbr";                    
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outlbr);
+   Fulloutputlbr = FindPath(outputlbr, outlbr);
+   if (not Fulloutputlbr)
+      msgbox("Не найдена LBR");
+      exit();
+   end;
+   var dlg:ContrProcPanel = ContrProcPanel(Fulloutputlbr);
+   RunDialog(dlg, @EventPanel);
+   if( dlg.exitKey == KEY_F2 )
+      FillProcParm( dlg, @PanelParm );
+   end;
+   return dlg.exitKey;
+end;
+
+macro PrintReportHead()
+   [Отчет о работе процедуры создания платежных документов на основе договоров постоянных перечислений];
+   [Дата: ########## Время: ######## ](date, time);
+   [ Созданные документы:
+     ┌────────────────┬──────────────────────────┬─────────────────────────┬─────────────────────────┬─────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────┐
+     │  ИД Договора   │ Наименование плательщика │     Счет плательщика    │ Наименование получателя │ Сумма документа (свободный остаток) │                                         Результат создания                                         │];
+end;
+
+macro PrintReportLine(ContractNumber, PayerName, PayerAcc, ReceiverName, Amount, CreationResult)
+   [ ├────────────────┼──────────────────────────┼─────────────────────────┼─────────────────────────┼─────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+     │################│##########################│  ####################   │#########################│#####################################│####################################################################################################│]
+   (
+      ContractNumber:c,
+      PayerName:c,
+      PayerAcc:c,
+      ReceiverName:c,
+      Amount:c,
+      StrSubst (CreationResult, "\n", ""):c
+   );
+end;
+
+macro PrintReportBottom(cnt_succes, cnt_all)
+   [ └────────────────┴──────────────────────────┴─────────────────────────┴─────────────────────────┴─────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────┘];
+   [  Всего отобрано договоров:   #########](cnt_all);
+   [  Успешно созданных платежей: #########](cnt_succes);
+end;
+
+//Обновление T_LAST_PAY и T_PAID_AMOUNT при успешном создании платежа
+macro UpdateInfoIfSuccess(v_contract_id, v_period, v_amount)
+   var command, rsdcmd;
+   command = " UPDATE   usr_regular_contr_dbt rg " +
+             " SET RG.T_PAID_AMOUNT = RG.T_PAID_AMOUNT + ? , " +
+             "     RG.T_LAST_PAY = " +
+             "     CASE " +
+             "         WHEN RG.T_LAST_PAY = TO_DATE('01.01.0001','dd.mm.yyyy') " +
+             "         THEN " +
+             "             RG.T_PAY_DAY " +
+             "         ELSE ";
+   if (v_period == 0) //каждый день
+      command = command + " RG.T_LAST_PAY + INTERVAL '1' DAY ";
+   elif (v_period == 1) //раз в неделю
+      command = command + " RG.T_LAST_PAY + INTERVAL '7' DAY ";
+   elif (v_period == 2) // раз в месяц
+      //Gurin S. 30.09.2015  R-621727-2
+      //command = command + " INTERVAL '1' MONTH ";
+      command = command + " ADD_MONTHS(RG.T_LAST_PAY, 1) ";
+   elif (v_period == 3) // раз в год
+      command = command + " RG.T_LAST_PAY + INTERVAL '1' YEAR ";
+   end;
+   command = command + 
+             "      END " +
+             " WHERE   T_CONTR_ID = ? ";
+   rsdcmd = RSDCommand(command);
+   rsdcmd.addparam("amount"     ,  RSDBP_IN,  v_amount);
+   rsdcmd.addparam("contr_id"   ,  RSDBP_IN,  v_contract_id);
+   rsdcmd.execute();
+end;
+
+//Создание документов на основе Договоров
+macro CreatePaymentForContract( v_contract_id, v_period, v_payer_account, v_payer_name, v_payer_id, v_receiver_account, v_receiver_name, v_receiver_inn, v_receiver_kpp, v_receiver_id, v_amount, v_ground, v_shifr, v_priority, v_bank_id, v_get_acc_rest, v_sum_by_once, v_paid_amount, v_sum_by_oblig )
+   var Paym = UsrPayment(); 
+   var ErrorMes, GenNumber, AccFreeAmount, AccFreeLimitAmount, PaymAmount, Reason = "";
+   var PayerAccount :RSL_Account = RSL_Account(v_payer_account, 0) ; //TAM 16.07.2013 R-218520
+   var ret = 0;
+   
+   /*VDN 12.06.2015 R-590862*/
+   /*if (PayerAccount.sum_k2_rest > 0) //есть неоплаченные доки К2
+      Reason = ERROR_EXISTS_K2 + "/ ";
+   end;*/
+   if (PayerAccount.sum_k2_with40 > 0) //есть неоплаченные доки К2
+      Reason = ERROR_EXISTS_K2 + "/ ";
+   end;
+   
+   Paym.Initialization();
+   Paym.PayerAccount           = v_payer_account; 
+   Paym.PayerName              = v_payer_name;
+   Paym.PayerINN               = ПолучитьКодСубъекта(v_payer_id, PTCK_INN);
+   if(v_receiver_account == " ")
+      Paym.ReceiverAccount     = "";
+      Paym.SkipCheckMask       = skip_recacc_exists;
+   else
+      Paym.ReceiverAccount     = v_receiver_account;
+   end;
+   Paym.ReceiverName           = v_receiver_name;
+   if(v_receiver_id != 0)
+      Paym.ReceiverINN            = ПолучитьКодСубъекта(v_receiver_id, PTCK_INN);
+   else
+      if ((valtype(v_receiver_kpp) != 26) and (trim(v_receiver_kpp) != ""))
+         Paym.ReceiverINN         = v_receiver_inn + "/" + v_receiver_kpp;
+      else
+         Paym.ReceiverINN         = v_receiver_inn;
+      end;
+   end;
+   Paym.ReceiverBIC            = ПолучитьКодСубъекта(v_bank_id, PTCK_BIC);
+   Paym.Oper                   = {oper};
+   if(Paym.ReceiverBIC == ПолучитьКодСубъекта({ourBank}, PTCK_BIC)) //получаетль - наш банк
+      Paym.Pack                = CONST_INTERNAL_PACK;
+   else
+      Paym.Pack                = CONST_EXTERNAL_PACK;
+   end;
+   Paym.NumOperation           = PAYMENT_OPERATION;
+   //TAM 21.01.2015 R-530957-2
+   if(_bank.is_EXV_Voronezh or _bank.is_EXV_Stavropol)
+      ret                      = GenerateReference(CONSTCONTR_REFID_EXV, GenNumber);
+   // TeleshovaAM C-37129 06.02.2015
+   elif (_bank.is_GO)
+      ret                      = GenerateReference(CONSTCONTR_REFID_GO, GenNumber);
+   else
+      ret                      = GenerateReference(CONSTCONTR_REFID, GenNumber);
+   end;
+   Paym.NumDoc                 = int(GenNumber);
+   //формирование суммы документа
+   //TAM 19.12.2014 рассчитываем свободный остаток для всех случаев, нам нужен он для отчета
+   debugbreak;
+   AccGetFreeAmount(AccFreeAmount, AccFreeLimitAmount, v_payer_account, CHAPTER_1, 0, {curdate}, 6); //сумма с учетом претензий
+   //TAM 16.07.2013 R-218520
+   /*AccFreeAmount = AccFreeAmount - PayerAccount.sum_k2_rest;*/ //корректируем сумму на величину неоплаченных доков в К2
+   AccFreeAmount = AccFreeAmount - PayerAccount.sum_k2_with40; //корректируем сумму на величину неоплаченных доков в К2 с учетом приостановления, VDN 12.06.2015 R-590862
+   if( v_get_acc_rest == "X" ) //списываем всю сумму со счета
+      if( v_sum_by_once == 0 )
+         PaymAmount = AccFreeAmount;
+      else // есть ограничение по сумме единовременного списания
+         if( v_sum_by_once > AccFreeAmount)
+            PaymAmount = AccFreeAmount;
+         else
+            PaymAmount            = v_sum_by_once;
+         end;
+      end;
+   else
+      //TAM 19.12.2014 C-25303
+      if(v_amount > AccFreeAmount)
+         Reason = ERROR_GO_K2 + "/ ";
+      end;
+      PaymAmount = v_amount;
+   end;
+   Paym.DebetSum               = 
+   Paym.CreditSum              = PaymAmount;
+   
+      
+   Paym.Ground                 = v_ground;
+   if(v_period == 2)
+      Paym.Ground = Paym.Ground + " Оплата за " + MonName(int(substr(string({curdate}),4,2)));
+   end;
+   Paym.Priority               = v_priority;  //TAM 22.08.2013 C-22284
+   if(v_shifr == 0) //платежное поручение
+      Paym.Shifr               = "01"; // Шифр платежа
+   elif( v_shifr == 1) // инкассовое поручение
+      Paym.Shifr               = "06";          // Шифр платежа
+   end;
+   Paym.DocKind                = DOCKIND_CLIENT_PAYM; //рублевый клиентский платеж
+   Paym.Origin                 = ORIGIN_CONSTCONTR; 
+   Paym.RunOperation           = 0; // платежи должны быть в отложенных
+   Paym.PackMode               = 0; // вставка платежей не массовая
+   Paym.MakeCarryFromPayment   = 1; // проводка по той же корреспонденции, что и сам платеж
+   Paym.transfer_date          = {curdate} ;
+   Paym.ValueDate              = {curdate};
+   Paym.DocDate                = {curdate};
+   Paym.UserField1             = v_contract_id; //TAM 29.07.2013 C-22139 ссылка на ид договора
+   
+   //Проверка на ограничение суммы всех произведенных выплат суммой ограничения списания по договору 
+   //На  ограничение равное нулю не реагируем
+   if( (v_sum_by_oblig != 0) and ((v_paid_amount + PaymAmount) > v_sum_by_oblig))
+      PrintReportLine(v_contract_id, Paym.PayerName, Paym.PayerAccount, Paym.ReceiverName, Paym.DebetSum, Reason + ERROR_SUM_OVER_AMOUNT );
+   elif( PaymAmount <= 0 )
+      PrintReportLine(v_contract_id,Paym.PayerName, Paym.PayerAccount, Paym.ReceiverName, Paym.DebetSum, Reason + ERROR_ZERO_AMOUNT );
+      //TAM 23.09.2013 I-00426143-2
+      if( v_get_acc_rest == "X" ) //списываем всю сумму со счета
+         //Обновляем дату последней оплаты и сумму всех произведенных выплат
+         UpdateInfoIfSuccess(v_contract_id, v_period, 0);//корректируем на 0, т.к. значение PaymAmount <= 0
+      end;
+   else
+      if (not Paym.InsertPayment())
+         ErrorMes = Paym.ErrorMessage;
+         PrintReportLine(v_contract_id, Paym.PayerName, Paym.PayerAccount, Paym.ReceiverName, Paym.DebetSum, ErrorMes );
+      else
+         PrintReportLine(v_contract_id, Paym.PayerName, Paym.PayerAccount, Paym.ReceiverName, Paym.DebetSum, Reason + "Успешно создано" );
+         //Обновляем дату последней оплаты и сумму всех произведенных выплат
+         UpdateInfoIfSuccess(v_contract_id, v_period, PaymAmount);
+         count_success = count_success + 1;
+      end;
+   end;
+end;
+
+//Функция отбора договоров на постоянные перечисления и создания докмуентов 
+macro GetAllConstantContracts(params:ContrProcParm)
+   var select_fields = "", 
+       select_from = " FROM  USR_REGULAR_CONTR_DBT rg LEFT JOIN DPARTY_DBT PAYER ON (RG.T_CLIENT_ID = PAYER.T_PARTYID) " +
+                                                    " LEFT JOIN DPARTY_DBT RECEIVER ON (RG.T_CONTRAGENT_ID = RECEIVER.T_PARTYID)",
+       select_where = " WHERE ",
+       rsdcmd, rsl,
+       direct;
+   select_fields = " SELECT   RG.T_CONTR_ID AS ContrId, " +
+                            " RG.T_PERIODICAL_BASIS as Period, " +
+                            " RG.T_ACCOUNT AS PayerAccount, " +
+                            " RG.T_CLIENT_ID AS Payer, " +
+                            " PAYER.T_NAME AS PayerName, " +
+                            " NVL (RG.T_CONTRAGENT_ACC, ' ') AS ReceiverAccount, " +
+                            " RG.T_CONTRAGENT_ID AS Receiver, " +
+                            " NVL (RECEIVER.T_NAME, RG.T_CONTRAGENT_NAME) AS ReceiverName, " +
+                            " NVL (RG.T_CONTRAGENT_INN, '') AS ReceiverINN, " +
+                            " NVL (RG.T_CONTRAGENT_KPP, '') AS ReceiverKPP, " +
+                            " RG.T_CONTRBANK_ID AS ReceiverBank, " +
+                            " RG.T_SUM AS Amount, " +
+                            " RG.T_GROUND AS Ground, " +
+                            " RG.T_FORM_PAY AS FormPay, " +
+                            " RG.T_PAYMENT_PRIORITY AS PmPriority, " + //TAM 22.08.2013 C-22284
+                            " RG.T_SUM_BY_ONCE as SumByOnce, " +
+                            " RG.T_GET_ACC_REST AS GetAccRest, " +
+                            " RG.T_PAID_AMOUNT as PaidAmount, " +
+                            " RG.T_SUM_BY_OBLIG as SumByOblig ";
+   select_where = select_where + //TAM 12.07.2013 I-00398442 - только по открытым договорам
+                                 " (RG.T_CONTR_END_DATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy') OR RG.T_CONTR_END_DATE >= ?)";
+   if(params.ClientID != 0)
+      select_where = select_where + " AND RG.T_CLIENT_ID = ? ";
+   end;
+   if(params.ClientAcc != "" )
+      select_from = select_from + ", DACCOUNT_DBT ac ";
+      if(params.ClientId != 0)
+         select_where = select_where + " AND RG.T_ACCOUNT = ? ";
+      else
+         select_where = select_where + " AND RG.T_ACCOUNT = ? ";
+      end;
+      select_where = select_where + " and ac.T_ACCOUNT = rg.T_ACCOUNT ";
+      if(params.BranchId != 0)
+         select_where = select_where + " and ac.T_BRANCH = ? ";
+      end;
+   end;
+   
+   //TAM 10.06.2013 C-20980
+   GetCmdLineParm("direction", direct);
+   if(trim(direct) == "external") //внешние перечисления
+      select_where = select_where + " and RG.T_CONTRBANK_ID <> ? ";
+   elif(trim(direct) == "internal") //внутренние перечисления
+      select_where = select_where + " and RG.T_CONTRBANK_ID = ? ";
+   else
+      msgbox("Направление не определено!");
+   end;
+   
+   select_where = select_where + 
+            " AND ( (RG.T_LAST_PAY = TO_DATE ('01.01.0001', 'dd.mm.yyyy') AND RG.T_PAY_DAY = ?) " +
+            " OR (RG.T_LAST_PAY <> TO_DATE ('01.01.0001', 'dd.mm.yyyy') " +
+            " AND (CASE " +
+                 " WHEN RG.T_PERIODICAL_BASIS = 0 " +
+                 " THEN " +
+                    " RG.T_LAST_PAY + INTERVAL '1' DAY " +
+                 " WHEN RG.T_PERIODICAL_BASIS = 1 " +
+                 " THEN " +
+                    " RG.T_LAST_PAY + INTERVAL '7' DAY " +
+                 " WHEN RG.T_PERIODICAL_BASIS = 2 " +
+                 " THEN " +
+                 //Gurin S. 01.09.2015 R-617103-2
+                 //   " RG.T_LAST_PAY + INTERVAL '1' MONTH " +
+                     " ADD_MONTHS(RG.T_LAST_PAY, 1) "
+                 " WHEN RG.T_PERIODICAL_BASIS = 3 " +
+                 " THEN " +
+                    " RG.T_LAST_PAY + INTERVAL '1' YEAR " +
+              " END) <= ? )) ";
+   select_fields = select_fields + select_from + select_where;
+   rsdcmd = RSDCommand(select_fields);
+   
+   rsdcmd.AddParam("date_end", RSDBP_IN, params.Date);
+   if(params.ClientID != 0)
+      rsdcmd.AddParam("client",  RSDBP_IN, params.ClientID);
+   end;
+   if(params.ClientAcc != "" )
+      rsdcmd.AddParam("account", RSDBP_IN, params.ClientAcc);
+      if(params.BranchId != 0)
+         rsdcmd.AddParam("branch",  RSDBP_IN, params.BranchId);
+      end;
+   end;
+   //TAM 10.06.2013 C-20980
+   rsdcmd.AddParam("direction", RSDBP_IN, {ourBank});
+   rsdcmd.AddParam("date1", RSDBP_IN, params.Date);
+   rsdcmd.AddParam("date2", RSDBP_IN, params.Date);
+   rsl = RSDRecordset(rsdcmd, null, RSDVAL_STATIC);
+   PrintReportHead();
+   while (rsl.movenext())
+      CreatePaymentForContract(rsl.value("ContrId"),
+                               rsl.value("Period"),
+                               rsl.value("PayerAccount"),
+                               rsl.value("PayerName"),
+                               rsl.value("Payer"),
+                               rsl.value("ReceiverAccount"),
+                               rsl.value("ReceiverName"),
+                               rsl.value("ReceiverInn"),
+                               rsl.value("ReceiverKpp"),
+                               rsl.value("Receiver"),
+                               rsl.value("Amount"),
+                               rsl.value("Ground"),
+                               rsl.value("FormPay"),
+                               rsl.value("PmPriority"), //TAM 22.08.2013 C-22284
+                               rsl.value("ReceiverBank"),
+                               rsl.value("GetAccRest"),
+                               rsl.value("SumByOnce"),
+                               rsl.value("PaidAmount"),
+                               rsl.value("SumByOblig"));
+      count_all = count_all + 1;
+   end;
+   PrintReportBottom(count_success, count_all);
+end;
+
+//TeleshovaAM 19.12.2014 C-25303 корректировка даты закрытия договора, если счет закрыт
+macro CloseContractsForClosedAccount()
+   var command, rsdcmd;
+   command = "UPDATE   usr_regular_contr_dbt contr                                                                   " +
+             "   SET   CONTR.T_CONTR_END_DATE =   (SELECT   t_close_date                                             " +
+             "                                     FROM   daccount_dbt                                               " +
+             "                                     WHERE   t_account = CONTR.T_ACCOUNT)                              " +
+             "   WHERE   CONTR.T_contr_id IN (SELECT   CONTR.T_CONTR_ID                                              " +
+             "                                FROM   usr_regular_contr_dbt contr, daccount_dbt acnt                  " +
+             "                                WHERE   CONTR.T_CONTR_END_DATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy')  " +
+             "                                    AND ACNT.T_ACCOUNT = CONTR.T_ACCOUNT                               " +
+             "                                    AND ACNT.T_OPEN_CLOSE = 'З')                                       ";
+   rsdcmd = RSDCommand(command);
+   rsdcmd.execute();
+end;
+
+//Точка входа
+   var procParm:ContrProcParm;
+   var KeyProc = ContrProcPanelExec( @procParm );
+   if(KeyProc == KEY_F2)
+      //TeleshovaAM 19.12.2014 C-25303
+      CloseContractsForClosedAccount();
+      GetAllConstantContracts(procParm);
+   end;

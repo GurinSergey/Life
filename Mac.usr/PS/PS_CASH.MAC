@@ -1,0 +1,764 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Макрос скроллинга
+// Описание  : Макрос скроллинга кассовых документов в РКО
+// Изменения:
+// Gurin S. N. I-00128493-1 Выдача наличных за счет овердрафта только по 40 символу
+//-----------------------------------------------------------------------------
+//Lavrenov: 13.12.2012 I-00207807-1
+//Lavrenov: 13.12.2012 I-00207901-1
+//Gurin   : 23.08.2012 23.08.2012 I-00241814-3 Ctr+Z Разрешение оплаты при наличии приостановлений налоговых органов
+//zmp     : 21.11.2012 R-126396-3
+//joy     : 15.02.2013 Жаворонкова Н. C-17206 + рефакторинг кода 
+//joy     : 05.03.2013 Жаворонкова Н. C-1107 Функцинал оповещения о завершении срока действия полномочий сотрудников (пока только для ПРББ)
+//joy     : 20.03.2013 Жаворонкова Н. C-18302 ...а теперь еще для ЭВ и ГЭБ
+// VV     : 13.05.2013 C-19927 Предупреждение об аресте
+//joy     : 22.07.2013 Жаворонкова Н. R-220162 C-1107 - теперь и ВУЗ
+// KS     : 22.11.2013 Перенесены доработки из 30й сборки
+//joy     : 30.01.2014 I-00454531 Перенесена модификация от 25.11.2013 C-23416 Проверка выданных за день чеков по символам
+//Gurin S.: 06.03.2015 R-553728-2 Внесены измненеия в реализацию C-19927 (VV)
+import check117, CashInter, "pm_opr.mac", "pmchoper.mac", "pm_tools.mac", pm_chksave, lib_compare;
+/* EVG */
+import "GenNumber.mac", rsbdataset;
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+import "ChangeReason.mac";
+import "lib_account.mac";
+import "lib_const.mac";
+import "KeyCodes.mac", lib_compare, lib_registry;
+
+import "fg_Life_parm.mac";
+import "send_lotus.mac";
+import  PTInter, lib_party;
+import "diver.mac";
+
+private const fgBank = fg_life_subject({OurBank});
+private var isFirst :bool = true; /*21.01.2013 zmp C-12995*/ 
+
+
+record Pscashord   ( pscshdoc );
+record Pmpaym      ( pmpaym   );
+record Pmrmprop    ( pmrmprop );  
+record CurTr       ( pmcurtr  );
+record PmKz        ( pmkz     );
+
+
+record OldPscashord( pscshdoc );
+record OldPmpaym   ( pmpaym   );
+record OldPmrmprop ( pmrmprop );
+record OldCurTr    ( pmcurtr  );
+record OldPmKz     ( pmkz     );
+
+// номера полей в панели
+const fld_Number    = 1,  
+      fld_Date      = 3,
+      fld_DateValue = 4, 
+      fld_Ground    = 22,
+      fld_AccClient = 9;
+
+class (TPanelFields)TCashDocPanelFields()
+  InitTPanelFields();
+  Number = fld_Number;
+  rmDate = fld_Date;
+  ValueDate = fld_DateValue;
+  Ground = fld_Ground;
+end;
+
+VAR   symbols:TArray = TArray(); 
+  record debet_rec ( "pmprop.dbt" );
+  record credit_rec ( "pmprop.dbt" );
+  ClearRecord( debet_rec );
+  debet_rec.PaymentID = credit_rec.PaymentID = pmpaym.PaymentID;
+  debet_rec.Group     = credit_rec.Group     = PAYMENTS_GROUP_INTERNAL;
+  debet_rec.IsSender  = credit_rec.IsSender  = "X";
+
+// Проверка на числовой номер
+MACRO IsDigitNumber( Number )
+    var stat = 0, i = 1, ch, DigitString = "0123456789";
+    while( (not stat) and (i <= strlen(Number)) )
+        ch = SubStr( Number, i, 1 );
+        if( not Index( DigitString, ch ))
+            stat = 1;
+        end;
+        i = i + 1;
+    end;
+
+return stat;
+END;
+
+/*21.01.2013 zmp C-12995 >>>*/
+macro isK2(Acc :String)
+    debugbreak;
+    var Text :String;
+    var RAcc = RSL_Account(Acc,0);
+    if(RAcc.check_index2)
+       Text = String("ВНИМАНИЕ!\n К расчетному счету имеется картотека №2 на общую сумму ",RAcc.sum_k2_rest,"\n Необходимо проинформировать клиента!");
+       msgBoxEx(Text,MB_OK);
+    end; 
+END;
+/*<<< 21.01.2013 zmp C-12995*/
+
+// VV     : 13.05.2013 C-19927 Предупреждение об аресте >>>>
+macro isAcPr(Acc: String)
+    debugbreak;
+    var Text :String;
+    var RAcc = RSL_Account(Acc,0);
+    if(RAcc.check_claims({curdate}, 1))
+       Text = String("ВНИМАНИЕ!\По счету выставлены активные аресты. Необходимо проинформировать клиента!");
+       msgBoxEx(Text,MB_OK);
+    end;
+end; 
+// VV     : 13.05.2013 C-19927 Предупреждение об аресте <<<<
+    
+Macro UserType(acc:string)
+    var sql = "SELECT   t_usertypeaccount    "
+              "FROM   daccount_dbt t1     "
+              "WHERE   T1.T_ACCOUNT =:acc ";
+    var cmd = RsdCommand (sql);
+    cmd.AddParam ("acc", RSDBP_IN,acc);   
+    cmd.execute();
+    var rs = rsdrecordset (cmd);
+    if(rs.movenext())
+        return rs.value("t_usertypeaccount");
+    else
+        return "";
+    end;
+END;
+
+macro insertnotbalance(paymobj, symb:string)
+var newsymbcash = trechandler("symbcash");
+var symbcash = trechandler("symbcash");
+debugbreak;
+var stat =  paymobj.payment.cashsymbols.first(symbcash);
+while (not(stat))
+    if ((symbcash.rec.Kind = 3) and (symbcash.rec.Symbol==symb) )  //этот символ уже введен ранее
+       return false;
+    end;
+    stat = paymobj.payment.cashsymbols.next(symbcash)
+end;
+
+newsymbcash.rec.Symbol = symb;
+newsymbcash.rec.Sum = Pmpaym.BaseAmount;
+newsymbcash.rec.DocKind = 1;
+newsymbcash.rec.Kind = 3;
+
+if (paymobj.payment.cashsymbols.insert(newsymbcash) ==0) //символ успешно вставлен
+   return true;
+else 
+   return false;
+end;
+end;
+
+//LVV 23.03.15 Добавил процедуру для удаления внебалансовых символов, неверно введенных операми вручную
+macro deletenotbalance(paymobj, symb:string)
+var symbcash = trechandler("symbcash");
+debugbreak;
+var stat =  paymobj.payment.cashsymbols.first(symbcash);
+while (not(stat))
+    if ((symbcash.rec.Kind = 3) and (symbcash.rec.Symbol==symb) )  //этот символ уже введен ранее
+      paymobj.payment.cashsymbols.deletecurrent;
+    end;
+    stat = paymobj.payment.cashsymbols.next(symbcash)
+end;
+end;
+
+
+/* EVG 11/12/2015 Проверка на тарифный план без возможности снятия наличных */
+macro CheckTP_NoCash( pFiid, pAccount, pDate )
+
+   var rs, cmd, query;
+   var НомерТП_БезКеша = 0, err;
+
+
+   GetRegistryValue( "PRBB\\COMISSION\\TP_NO_CASH", V_INTEGER, НомерТП_БезКеша, err );
+   if( ( err != 0 ) or ( valType(НомерТП_БезКеша) == V_UNDEF ) or ( НомерТП_БезКеша == 0 ) )
+      // если не задан ТП, то выходим без сообщений
+      return true;
+   end;
+
+
+   query = " Select pl.t_num from dsfcontr_dbt t, dsfcontrplan_dbt cpl, dsfplan_dbt pl "
+           " where t.t_objecttype  = 1 and t.t_fiid   = ?                              "
+           "   and t.t_servkind    = 3 and t.t_object = ?                              "
+           "   and cpl.t_sfcontrid = t.t_id                                            "
+           "   and  (    cpl.t_end = to_date('01-01-0001','dd-mm-rrrr')                "
+           "          or cpl.t_end > ?                                   )             "
+           "   and pl.t_sfplanid   = cpl.t_sfplanid                                    ";
+   cmd = rsdCommand( query );
+   cmd.AddParam( "", RSDBP_IN, pFiid );
+   cmd.AddParam( "", RSDBP_IN, pAccount );
+   cmd.AddParam( "", RSDBP_IN, pDate );
+   rs = rsdRecordSet( cmd );
+   if( rs and rs.MoveNext() )
+      if( rs.value( 0, null, V_INTEGER ) == НомерТП_БезКеша )
+         return false;
+      end;
+   end;
+
+   return true;
+end;
+
+
+MACRO Новый_Документ( )
+  /* EVG Ввод документа: автоматическое формирование номера по референсу.
+     Только для объявлений на взнос наличными. */
+    if ( ( StrLen( Pmrmprop.Number ) == 0 )
+        and ( Pmpaym.DocKind == CASH_PS_INCORDER ) )
+        //TAM C-37129 24.02.2015
+        if(fgBank.is_GO)
+            Pmrmprop.Number = GenNumberDocument() + "Ю";
+        else
+            Pmrmprop.Number = GenNumberDocument();
+        end;
+    end;
+    
+  /* EVG Установка шифра операции для кассовых документов */
+    if (Pscashord.DocKind == CASH_PS_INCORDER)
+        Pmrmprop.ShifrOper = "04";
+    else
+        Pmrmprop.ShifrOper = "03";
+    end;
+
+    pmpaym.PAYERBANKENTERDATE = {curdate}; // zmp 27.11.2014 фиксим R-501802-2
+
+return 0;
+END;
+
+MACRO Проверить_Документ( Режим )
+    var stat = 0,
+    CHANG_IMPORTANT = -11,
+    CHANG_NOTIMPORTANT = -10;
+
+    var Acc:String;
+    var ErrStr:string = "";
+    record debet_rec ( "pmprop.dbt" );
+    record credit_rec ( "pmprop.dbt" );
+    ClearRecord( debet_rec );
+    debet_rec.PaymentID = credit_rec.PaymentID = pmpaym.PaymentID;
+    debet_rec.Group     = credit_rec.Group     = PAYMENTS_GROUP_INTERNAL;
+    debet_rec.IsSender  = credit_rec.IsSender  = "X";
+    var Text :String;
+    var cshpaym = RsbPSInCashOrder(Pmpaym.paymentid);
+    var symbcash = trechandler("symbcash");
+    cshpaym.payment.cashsymbols.first(symbcash);
+    var newsymbcash = trechandler("symbcash");
+    //var RAcc = RSL_Account(Pmpaym.receiveraccount,0);
+
+
+    // EVG 11/12/2015 Для чеков проверяем, не состоит ли договор обслуживания на тарифном плане, по которому не предусмотрена
+    // возможность получения наличных ( PRBB \ COMISSION \ TP_NO_CASH )
+    // EVG 16/12/2015 Проверка выполняется не только при снятии, но и при внесении наличных средств.
+    debugbreak;
+    var vCheckAccount = Pmpaym.PayerAccount,
+        vClientName   = Pmrmprop.PayerName;
+    if ( Pscashord.DocKind == CASH_PS_INCORDER )
+        vCheckAccount = Pmpaym.ReceiverAccount;
+        vClientName   = Pmrmprop.ReceiverName;
+    end;
+    if( not CheckTP_NoCash( Pmpaym.PayFiid, vCheckAccount, Pmpaym.ValueDate ) )
+       msgbox( "К сожалению, клиент \"" + vClientName + "\" находится на тарифном плане,  "
+               "по которому не предусмотрена работа с наличными денежными средствами. Сохранение документа невозможно." );
+       return 1;
+    end;
+
+
+       /*21.01.2013 zmp C-12995 >>>*/
+    if(Режим == SCR_INSERT) /*ВВОД В ОТЛОЖЕННЫЕ*/
+     /*   if((Pmpaym.DocKind == CASH_PS_INCORDER) and (substr(Pmpaym.ReceiverAccount,6,3) == "810") and (isFirst))
+            isK2(Pmpaym.receiveraccount);
+        end; */
+// VV     : 13.05.2013 C-19927 Предупреждение об аресте >>>>
+           if ( Pscashord.DocKind == CASH_PS_INCORDER ) /* Объявление на взнос наличными в РКО */
+              var RAcc = RSL_Account(Pmpaym.ReceiverAccount,0);
+              if(RAcc.check_index2 and RAcc.check_claims({curdate},1))
+              Text = String("ВНИМАНИЕ!\К счету выставлены  картотека №2 на общую сумму ",RAcc.sum_k2_rest,"\ и активные аресты.\n Необходимо проинформировать клиента!");
+              msgBoxEx(Text,MB_OK);
+              else
+                 if(substr(Pmpaym.ReceiverAccount,6,3) == "810")
+                   isK2(Pmpaym.ReceiverAccount);
+                 end;
+                 if(substr(Pmpaym.ReceiverAccount,6,3) == "810")
+                   isAcPr(Pmpaym.ReceiverAccount);
+                 end;
+              end;
+           end;
+// VV     : 13.05.2013 C-19927 Предупреждение об аресте <<<< 
+   //LVV 13.02.15 C-35855 Простановка забалансовых символов в объявлениях на взнос для счетов 40821 с пользовательскими типами "0","@","}"
+           debugbreak; 
+           if ((Pmpaym.DocKind == CASH_PS_INCORDER) and (substr(Pmpaym.receiveraccount,1,5) == "40821"))
+              stat =  cshpaym.payment.cashsymbols.first(symbcash);
+              while (not(stat))
+                 if ((symbcash.rec.Kind = 1) and (int(symbcash.rec.Symbol)>=2) and (int(symbcash.rec.Symbol)<=32))  //это приходный символ от 02 до 32 
+                   if (index(UserType(Pmpaym.receiveraccount),"0"))
+                       insertnotbalance(cshpaym,"100");
+                       deletenotbalance(cshpaym," 99");  //LVV 23.03.15 Добавил защиту от горе-пользователей, которые путают символы и ставят руками все наоборот.
+                   end;
+                   if (index(UserType(Pmpaym.receiveraccount),"@") or index(UserType(Pmpaym.receiveraccount),"}"))
+                       insertnotbalance(cshpaym," 99");
+                       deletenotbalance(cshpaym,"100");
+                   end;
+                   break;
+                 end;
+                 stat = cshpaym.payment.cashsymbols.next(symbcash)
+              end;
+           end;
+    end; 
+        
+        
+    // Проверяем номер для всех документов, в том числе и отложенных           
+    if( (Режим == SCR_SAVE ) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT) ) 
+   debugbreak;
+        /*18.12.2012 zmp R-135353-3 >>>*/
+        if (((substr(Pmpaym.receiveraccount,6,3) != "810") and (substr(Pmpaym.payeraccount,1,8) == "20202810")) or
+            ((substr(Pmpaym.receiveraccount,1,8) == "20202810") and (substr(Pmpaym.payeraccount,6,3) != "810")))
+            msgbox("Счёт плательщика и получателя в документах зачисления и списания с рублёвой кассы должен быть рублёвым");
+            return fld_AccClient; 
+        end;
+        /*<<< 18.12.2012 zmp R-135353-3*/
+        /*zmp 15.11.2013 C-24449 >>>*/
+        var ClientsCashAccounts = RSL_GetRegistryValue("PRBB/КАССА/СЧЕТА КЛИЕНТОВ", false);
+        if((ClientsCashAccounts != null) and (trim(ClientsCashAccounts) != "")) 
+           if (((not stringEqMask(Pmpaym.receiveraccount, ClientsCashAccounts)) and (substr(Pmpaym.payeraccount   ,1,5) == "20202")) or       
+              (( not stringEqMask(Pmpaym.payeraccount   , ClientsCashAccounts)) and (substr(Pmpaym.receiveraccount,1,5) == "20202")))       
+                 MsgBox("Счет не является счетом клиента.");
+                 return 1;
+           end;
+        end;
+        // LVV 13.02.15 C-35855 
+        if ((Pmpaym.DocKind == CASH_PS_INCORDER) and (substr(Pmpaym.receiveraccount,1,5) == "40821") and (TRIM(symbcash.rec.symbol) == "19"))
+            msgbox("Указанный символ прихода не может быть использован для взноса наличных на балансовый  счет 40821");
+            return 1;
+        end;    
+        /*<<< zmp 15.11.2013 C-24449*/
+        if (((Pmpaym.DocKind == CASH_PS_INCORDER) or (Pmpaym.DocKind == CASH_PS_OUTORDER)) and (Pmpaym.Amount >=600000))
+            msgbox("Сумма операции равна или превышает 600 000 р.|("+Pmpaym.Amount+")|Необходимо ввести данные на физ.лицо для ФМ");
+        end;
+        if( Pmrmprop.Date == date(0,0,0) )
+            msgbox("Дата документа должна быть задана");
+            return fld_Date;
+        end;
+        if( Pmpaym.ValueDate < Pmrmprop.PayDate )
+            msgbox( "Дата валютирования не должна быть|меньше даты платежа" );
+            return fld_DateValue;
+        end;
+        if( Pmpaym.ValueDate > {curdate} )
+            msgbox("Дата значения платежа не должна|превышать текущую операционную дату");
+            return fld_DateValue;
+        end;
+        if((Pmpaym.ValueDate - Pmrmprop.Date) > 10) // Документ не устарел?
+            MsgBox("Документ устарел и не может быть сохранён");
+            return fld_Date;
+        end;
+
+        if( StrLen( Pmrmprop.Number ) == 0 ) 
+            MsgBox("Не задан номер документа");
+            return fld_Number;
+        end;
+
+        if(( not Pscashord.IsCurrency ) and (not fgBank.is_GO))/* Проверки для рублевых */ //TAM C-37129
+            if( IsDigitNumber( Pmrmprop.Number ) )
+                MsgBox("Номер документа нечисловой");
+                return fld_Number;
+            else
+                if( int( Pmrmprop.Number ) == 0 )
+                    MsgBox("Номер документа не может быть нулевым");
+                    return fld_Number;
+                end;
+            end;
+        end;
+
+        if( StrLen( Pmrmprop.Ground ) == 0 )
+            MsgBox("Введите Назначение платежа");
+            return fld_Ground;
+        end;
+
+        ErrStr = PM_CheckPaymAccounts( Pmpaym, NULL, NULL, NULL, 1 );
+        if( strlen(ErrStr) > 0 )
+            msgbox( ErrStr );
+            return 1;
+        end;
+
+       /* Общие проверки по списку */
+       var fld : TCashDocPanelFields = TCashDocPanelFields();
+       stat = CS_ScrolMacroCommonChecks( fld, pmpaym, debet_rec, credit_rec, pmrmprop );
+       if( stat != NOTERROR )
+         return stat;
+       end;
+       /*проверка реквизитов валютной операции*/
+        if( PM_CheckCO(Pmpaym,Pmrmprop,0,0) )
+            return 1;
+        end;
+        /* Проверить по 117-И */
+        if( CheckOnSave_117( Pmpaym, NULL, NULL, NULL ) )
+            return fld_Number;
+        end;
+        /*joy 05.03.2013 C-1107+C-18302+R-220162  Функцинал оповещения о завершении срока действия полномочий сотрудников*/
+        if (not ((fgBank.is_GO) or (fgBank.is_NBS)))
+            if (pmpaym.dockind == CASH_PS_OUTORDER) 
+                execMacroFile ("lib_pm_check.mac", "CheckPersonSigns", pmpaym.payer);
+            end;
+        end;
+            /*joy 25.11.2013 C-23416 Проверка выданных за день чеков по символам*/
+        if ((fgBank.is_PRBB) or (fgBank.is_GEB)) // joy По просьбе Петренко О. отключаю остальные банки
+            var symbmask = "('42', '46', '47', '53', '54', '58', '59', '60', '61')";
+            var recipients = "ЕРЦ-ТП и комиссии";
+            var text_mail = "";
+            var cashpaym = RsbPSInCashOrder(Pmpaym.paymentid);
+            var symbolcash = trechandler("symbcash");
+            var DaysCashSum;
+            cashpaym.payment.cashsymbols.first(symbolcash);
+  
+            if  ( (pmpaym.dockind == CASH_PS_OUTORDER)  and (regexp_instr (symbmask, trim (symbolcash.rec.symbol))) and (Режим != SCR_EDIT) )
+                DaysCashSum = execMacroFile ("CommissLib.mac", "Cash_CalcSymbSum_Period", pmpaym.docKind, cashpaym, symbmask, true, V_UNDEF, false, true, pmpaym.payer );
+                if (DaysCashSum > 0)
+                    text_mail = "Банк: " +PT_GetPartyName (pmpaym.payerbankid)+" Код субъекта: " + ПолучитьКодСубъекта (pmpaym.payer, 1) + "  Наименование: "+ PT_GetPartyName (pmpaym.payer) + "  Дата: " + pmpaym.valuedate;
+                    // send_l ("Досписание при выдаче наличных несколькими чеками", text_mail, 85, recipients); //R-625657 
+                    msgBoxEx ("По счетам клиента уже были проведены чеки в текущем операционном дне! Комиссия за выдачу будет пересчитана автоматически в соответствии с тарифами в течение текущего операционного дня", MB_OK);
+                end;
+            end;
+        end;
+            /*--- end joy*/
+
+    end;
+
+    if( Режим == SCR_DELETE ) /*УДАЛЕНИЕ ДОКУМЕНТА*/
+        if(CheckDeletePayment(Pmpaym.PaymentID))
+            return 1;
+        end;
+    end;
+
+    if( Режим == SCR_EDIT ) /*РЕДАКТИРОВАНИЕ ДОКУМЕНТА*/
+        if( Pscashord.Status != 1 )/* документ находится в открытых или закрытых */
+            stat = CHANG_NOTIMPORTANT;
+            /*При редактировании производим проверку важности внесенных изменений */
+            /* Константы важности внесенных изменений:           */
+            /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+            /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+            /* CHANG_NOTKEEP        - не сохранять изменения */
+            /* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+            /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+                и сохранение изменений можно производить без отката операции      */
+                if( //(Pmpaym.Amount          != OldPmpaym.Amount) or                           
+                    (Pmpaym.PayerAccount    != OldPmpaym.PayerAccount) or
+                    (Pmpaym.NumberPack      != OldPmpaym.NumberPack) or
+                    (Pmpaym.ReceiverAccount != OldPmpaym.ReceiverAccount) or
+                    (Pmpaym.ValueDate       != OldPmpaym.ValueDate) )
+                    stat = CHANG_IMPORTANT; 
+                end;
+        end;
+         
+        if( ( Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "К" ) Or 
+              Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "А" ) Or
+              Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "Е" ) Or
+              Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "е" ) ) 
+            And ( Pmpaym.PaymStatus != PM_REJECTED) )
+            if ( 
+                /* EVG Можно править.
+                (OldPmrmprop.Number           != Pmrmprop.Number          ) or
+                (OldPscashord.Series          != Pscashord.Series         ) or*/
+                (OldPmrmprop.Date             != Pmrmprop.Date            ) or
+                (OldPmpaym.ValueDate          != Pmpaym.ValueDate         ) or
+                (OldPmpaym.ReceiverAccount    != Pmpaym.ReceiverAccount   ) or
+                (OldPmpaym.PayerAccount       != Pmpaym.PayerAccount      ) or
+                (OldPscashord.FIOClient       != Pscashord.FIOClient      ) or
+                (OldPscashord.PaperSeries     != Pscashord.PaperSeries    ) or
+                (OldPscashord.PaperNumber     != Pscashord.PaperNumber    ) or
+                (OldPscashord.PaperIssuedDate != Pscashord.PaperIssuedDate) or
+                (OldPscashord.PaperIssuer     != Pscashord.PaperIssuer    ) or
+                (OldPmpaym.Amount             != Pmpaym.Amount            ) or 
+                /* EVG Можно править.
+                (OldPmrmprop.Ground           != Pmrmprop.Ground          ) or*/
+                (OldPmpaym.NumberPack         != Pmpaym.NumberPack        ) or
+                (OldPscashord.Oper            != Pscashord.Oper           ) or
+                (OldPscashord.Kind_Operation  != Pscashord.Kind_Operation )
+                )                   
+                stat = CHANG_NOTKEEP;
+             
+            elif (       
+                  (Not Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "U", "R") ) 
+                  And
+                  (Not Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "З", "R", 29029) )
+                  And 
+                  (Pmpaym.FutureReceiverAccount != OldPmpaym.FutureReceiverAccount )
+                 )
+                stat = CHANG_NOTKEEP;
+            else
+                stat = CHANG_NOTIMPORTANT;
+            end;
+        else
+            stat = CHANG_NOTIMPORTANT;
+        end;
+    end;
+  
+    if( Режим == SCR_ROLLBACK ) /*ПОМЕЩЕНИЕ ДОКУМЕНТА В ОТЛОЖЕННЫЕ, ОТКАТ ОПЕРАЦИИ*/
+    end;
+
+    if( Режим == SCR_INSERT ) /*ВВОД В ОТЛОЖЕННЫЕ*/
+    end;
+  
+    if(Режим == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                               // (изменения в буферах не сохраняются)
+        return IsImportantChangeForOperPSCashOrder(Pscashord, OldPscashord, Pmpaym, OldPmpaym, Pmrmprop, OldPmrmprop);
+    end;
+
+  return stat;
+END;
+
+/* Установка подсказки для оптимизатора ORACLE */
+
+private const Hint_ByValueDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dpscshdoc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByCloseDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dpscshdoc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByStatus   :string = 
+"/*+FIRST_ROWS LEADING(t pmpaym pmrmprop oproper oprcurst) INDEX(t dpscshdoc_dbt_idx4) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t pmpaym pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByStep     :string = 
+"/*+FIRST_ROWS LEADING(oprstep oproper t pmpaym pmrmprop) INDEX(oprstep doprstep_dbt_idx10) INDEX(t dpscshdoc_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(oprstep oproper t pmpaym pmrmprop)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+
+  // Возможные значения ScrolStates:
+  //   0 Все
+  //   1 Отложенные
+  //   2 Открытые
+  //   3 Закрытые
+  //   4 Отвергнутые
+  //   5 Подготовленные
+  
+    if(  ( ScrolStates == 0 )   // Все
+        or ( ScrolStates == 3 ) ) // Закрытые
+
+        var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+        if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+            return Hint_ByCloseDate;
+        elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+            return Hint_ByValueDate;
+        else
+            return Hint_ByCloseDate;
+        end;
+
+    elif(  ( ScrolStates == 1 )   // Отложенные
+        or ( ScrolStates == 2 )   // Открытые
+        or ( ScrolStates == 4 ) ) // Отвергнутые
+        return Hint_ByStatus;
+
+    elif ( ScrolStates == 5 ) // Подготовленные
+        return Hint_ByStep;
+    end;
+
+return DefaultHint;
+END;
+
+MACRO Проверить_Счет_В_Документе( поле ) /*0-счет кассы, 1-счет клиента*/
+    var новое_значение_счета:string = "";
+    var Text :String;
+
+    if( поле ) /* счет клиента */
+        if( Pscashord.DocKind == CASH_PS_INCORDER ) /* Объявление на взнос наличными в РКО */
+            новое_значение_счета = Pmpaym.ReceiverAccount;
+            /*21.01.2013 zmp C-12995 >>>*/
+            var RAcc = RSL_Account(новое_значение_счета,0);
+       // VV     : 13.05.2013 C-19927 Предупреждение об аресте >>>>     
+            if(RAcc.check_index2 and RAcc.check_claims({curdate},1))
+                Text = String("ВНИМАНИЕ!\К счету выставлены  картотека №2 на общую сумму ",RAcc.sum_k2_rest,"\ и активные аресты.\n Необходимо проинформировать клиента!");
+                msgBoxEx(Text,MB_OK);
+            else
+                if(substr(Pmpaym.ReceiverAccount,6,3) == "810")
+                   isK2(новое_значение_счета,isFirst);
+                end;
+                isFirst = false;
+             
+    /*<<< 21.01.2013 zmp C-12995*/
+
+                if(substr(Pmpaym.ReceiverAccount,6,3) == "810")
+                    isAcPr(новое_значение_счета,isFirst);
+                end;
+                isFirst = false;
+            end;
+        end;
+  // VV     : 13.05.2013 C-19927 Предупреждение об аресте <<<< 
+        if( Pscashord.DocKind == CASH_PS_OUTORDER ) /* Чек в РКО */
+            новое_значение_счета = Pmpaym.PayerAccount;
+        end;
+    else 
+        if( Pscashord.DocKind == CASH_PS_INCORDER ) /* Объявление на взнос наличными в РКО */
+            новое_значение_счета = Pmpaym.PayerAccount;
+        end;
+        if( Pscashord.DocKind == CASH_PS_OUTORDER ) /* Чек в РКО */
+            новое_значение_счета = Pmpaym.ReceiverAccount;
+        end;
+    end;
+    
+return новое_значение_счета;
+END;
+
+
+MACRO getsymbolname(symb)
+    var rs,str;
+    str = "SELECT t_name " +
+          "FROM dlistsymb_dbt " +
+          "WHERE t_dockind = 1 AND t_symb_cash = '"+symb+"' ";
+    rs = trsbdataset(str);
+    if(rs and rs.movenext)
+        return rs.name;
+    else
+        return "";
+    end;
+END;
+
+Macro Type(acc:string)
+    var sql = "SELECT   t_type_account    "
+              "FROM   daccount_dbt t1     "
+              "WHERE   T1.T_ACCOUNT =:acc ";
+    var cmd = RsdCommand (sql);
+    cmd.AddParam ("acc", RSDBP_IN,acc);   
+    cmd.execute();
+    var rs = rsdrecordset (cmd);
+    if(rs.movenext())
+        return rs.value("t_type_account");
+    else
+        return "";
+    end;
+END;
+
+
+private MACRO ProcessPanel( mode:integer, key:integer, field:integer )
+    var cshpaym = RsbPSInCashOrder(Pmpaym.paymentid);
+    var symbcash = trechandler("symbcash");
+    cshpaym.payment.cashsymbols.first(symbcash);
+  
+    if((mode== 2) and ((field==29) or (field==30))) /*((field==18) or (field==19))*/ //Gurin S. 04.03.2014 R-340424-2 --2031  
+        cshpaym.payment.cashsymbols.first(symbcash);
+        if (field==30) //(field==19)
+            //Lavrenov: 13.12.2012 I-00207807-1 I-00207901-1 В ПРББ для чеков названия символов в основание не подтягиваются
+            if(Pscashord.DocKind == CASH_PS_OUTORDER)
+                /* EVG 20/06/2012 I-00209861-1 Для чеков в Пробе попросили выводить также номер, серию и дату чека. Надеюсь,
+                другие банки не против. Если против, нужно сделать проверку на is_PRBB.
+                Pmrmprop.Ground = strsubst(getsymbolname(symbcash.rec.symbol),"Выдачи","Выдано по чеку");*/
+                Pmrmprop.Ground = strsubst( getsymbolname(symbcash.rec.symbol),"Выдачи","Выдано по чеку № " + Pmrmprop.Number 
+                                                                                                       + " " + Pscashord.Series 
+                                                                                                       + " от " + trim(string(Pmrmprop.Date)) + "г." );
+                // EVG 20/06/2012 Для 53 символа - особенное основание.
+                if( int(symbcash.rec.symbol) == 53 )
+                    Pmrmprop.Ground = "Прочие выдачи по чеку № " + Pmrmprop.Number + " " + Pscashord.Series + " от " + trim(string(Pmrmprop.Date)) + "г.";
+                end;
+            else
+                Pmrmprop.Ground = strsubst(getsymbolname(symbcash.rec.symbol),"Выдачи","Выдано по чеку");
+            end;
+        elif (field==29) //(field==18)
+            //Lavrenov: 13.12.2012 I-00207807-1 I-00207901-1 В ПРББ для чеков названия символов в основание не подтягиваются
+            if(Pscashord.DocKind == CASH_PS_OUTORDER)
+                Pmrmprop.Ground = getsymbolname(symbcash.rec.symbol);
+            else
+                Pmrmprop.Ground = strsubst(getsymbolname(symbcash.rec.symbol),"Выдачи","Выдано по чеку");
+            end;
+        end;
+    end;
+    
+    if( key == KEY_F9 /*F9*/)   // Dex - проверка на символ кассы (для чеков и заявлений на выдачу)
+    //SDA проверки только при вводе балансовых символов
+    debugbreak;
+        if (symbcash.rec.kind != 3)
+            /*zmp 21.11.2012 R-126396-3 >>>*/
+            if (((not CompareStrWithMasks("401-407",Pmpaym.receiveraccount,2)) and (substr(Pmpaym.payeraccount,1,5)    == "20202") and (TRIM(symbcash.rec.symbol) == "19")) or       
+                (( not CompareStrWithMasks("401-407",Pmpaym.payeraccount,2))    and (substr(Pmpaym.receiveraccount,1,5) == "20202") and (TRIM(symbcash.rec.symbol) == "58")))       
+                MsgBox("По данному символу может проводить операции только ИП");
+                return 1;
+            end;
+            /*<<< zmp 21.11.2012 R-126396-3*/
+            if ((substr(Pmpaym.receiveraccount,1,5) == "40802") and (substr(Pmpaym.payeraccount,1,5) == "20202") and (TRIM(symbcash.rec.symbol) != "19"))
+                msgbox("Для данных документов кассовый символ должен быть 19");
+                return 1;
+            end;   
+            if ((substr(Pmpaym.receiveraccount,1,5) == "20202") and (substr(Pmpaym.payeraccount,1,5) == "40802") and (TRIM(symbcash.rec.symbol) != "58"))
+                msgbox("Для данных документов кассовый символ должен быть 58");
+                return 1;
+            end;
+            // LVV 13.02.15 C-35855 
+            if ((Pmpaym.DocKind == CASH_PS_INCORDER) and (substr(Pmpaym.receiveraccount,1,5) == "40821") and (TRIM(symbcash.rec.symbol) == "19"))
+                msgbox("Указанный символ прихода не может быть использован для взноса наличных на балансовый  счет 40821");
+                return 1;
+            end;
+        end; 
+        //Gurin S. 13.07.2015 R-603255-2
+        if ((substr(Pmpaym.receiveraccount,1,5) != "20202") and (Pmpaym.DocKind == CASH_PS_OUTORDER))
+           msgbox("Счет кассы должен быть 20202");
+           return 1;
+        end;
+    end;  
+return key;
+END;
+
+MACRO Функция_Пользователя( Режим:integer )
+ /*
+ Возможные значения Режим:
+  UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+  UFN_PANEL_EDIT(2) - функция вызвана из панели корректировки объекта;
+  UFN_SCROL(3) - функция вызвана из панели скролинга, единичный вызов, любая корректировка объекта запрещена;
+  UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, вызов до начала обработки, любая корректировка объекта запрещена;
+ 
+// Пример работы: 
+ if( Режим == UFN_SCROL )
+   return UPDTPAGE;    // Обновить страницу записей и область скролинга
+   //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+ end;
+ */
+    var PaymentObj:Rsbpayment=Rsbpayment(Pmpaym.paymentId);
+    var m;
+    array mn;
+    var cmd;
+ 
+    /*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+    mn(asize(mn)) = "Изменение платежа ФМ";
+    /*SDA 03.04.2012 - обработать без учета арестов */
+    mn(asize(mn)) = "Поставить очередность";
+    /*15-02-2012 Жаворонкова Н. (joy) C-17206*/
+    mn(asize(mn)) = "Изменить вид хранения"; 
+    //Gurin S. 28.08.2015 I-00581174-2
+    if (ВходитВГруппу({oper}, ACS_GRP_CLOSE_DOC))
+      mn(asize(mn)) = "Закрыть документ без проводок";
+    end;
+
+    m=menu(mn,null,"Выберите действие");
+  
+    /*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+    if (m == -2) 
+        return 0; // Обработка ESC
+    elif(mn(m) == "Изменение платежа ФМ")
+        ChangeReason(PaymentObj);
+        return 0;
+    elif(mn(m) == "Поставить очередность")
+        if ((Getint(Pmrmprop.Priority,"Укажите требуемую очередность","Укажите требуемую очередность")) and (Pmrmprop.Priority >=0) and (Pmrmprop.Priority <=6)) 
+            cmd = RSDCommand ("update dpmrmprop_dbt set t_priority = :priority where t_paymentid =:paymentId");
+            cmd.addParam ("priority", RSDBP_IN, Pmrmprop.Priority);
+            cmd.addParam ("paymentId", RSDBP_IN, Pmpaym.paymentId);
+            cmd.execute ();
+            OldPmrmprop.Priority = Pmrmprop.Priority;
+                if (GetTrue(true,"Разрешить оплату при наличии приостановлений налоговых органов?")) //Gurin  23.08.2012 I-00241814-3
+                    execMacroFile ("lib_menu_common.mac", "ChangeType", 1, Pmpaym.paymentId ); 
+                else
+                    execMacroFile ("lib_menu_common.mac", "ChangeType", 0, Pmpaym.paymentId ); 
+                end;
+            msgbox ("Выполнено успешно");
+            return 0;
+        end;
+    /*15-02-2012 Жаворонкова Н. (joy) C-17206*/
+    elif(mn(m) == "Изменить вид хранения") 
+        if (Pmpaym.PaymStatus == PM_FINISHED) // Только для закрытых, если открыт\отложен - хоть обменяйтесь :)
+            execMacroFile ("ea_checks.mac", "CheckEAGroup", pmpaym); 
+        else
+            execMacroFile ("ea_checks.mac","SetEAStoreKind", pmpaym);
+        end;
+    /*---joy end */
+    //Gurin S. 28.08.2015 I-00581174-2
+    elif (mn(m) == "Закрыть документ без проводок")
+      execMacroFile ("lib_menu_common.mac","UsrCloseDoc", PaymentObj);
+      return UPDTPAGE;
+    end; 
+ return  0;
+END;
+

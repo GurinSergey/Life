@@ -1,0 +1,254 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   Макрос комиссии 13.1.0 joy C-27735
+ 
+       "Комиссия за перевод денежных средств на л/сч сотрудников организации по ЗП".
+
+       Тип комиссии - периодическая.
+       
+Changes:
+        01.07.2014 joy R-404644 Минимум комиссии списывается только в том, случае, если он задан
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, cb_sql,  globals, CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+
+
+
+/*
+    Расчет для периодических комиссий
+*/
+/* 01.07.2014 joy R-404644 Добавила прием sfcalcal_addr  и CommNumber_sfacrpay*/
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcal_addr /*  адрес алгоритма (sfcalcal) */, sfcontrStruc /*Cтруктура sfcontr*/, CommNumber_sfacrpay )
+
+    record sfcontr( sfcontr );
+    record calcal (sfcalcal);
+
+    var query, rs, stat, cmd;
+    var CommSum     = $0,
+        CommQuont   = 0,
+        CommNumber ,
+        fgBank,
+        PayerAccountCondition,
+        UserTypeCondition;
+    array arrRecAcc;
+    
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+
+debugbreak;
+        
+
+    arrRecAcc(0) = "40817810701088880007";         
+
+
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+       SetBuff( calcal, sfcalcal_addr );
+       CommNumber = calcal.CommNumber;               
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       CommNumber = CommNumber_sfacrpay;             
+    end;
+
+
+    /*Рассчет комиссии взят из макроса для ПРББ com1310p.mac, переписан под 2031*/
+    /* Сначала нужно проверить, есть ли у клиента вообще счета с типом Z и, если нет,
+       то дальше не идти, комиссия в этом случае не взимается. */
+    query = " Select 1 from daccount_dbt where t_client = :client and instr( t_UserTypeAccount, 'Z' ) > 0 ";
+    cmd = rsdcommand( query );
+    cmd.AddParam( "client", RSDBP_IN, sfcontr.PartyID );
+    rs = rsdRecordSet(cmd);
+    
+    //  01.07.2014 joy R-404644 Получаем значение тарифа
+    GetTarifInfo( sfcontr, EndDate, EndDate, 1, CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType );
+    
+    if (rs and rs.moveNext())
+
+       query = " Select nvl( sum( paym.t_Amount ), 0 ) " +
+               "   From dpmpaym_dbt  paym, " +
+               "        dacctrn_dbt trn, " +
+               "        dpmdocs_dbt  pmd, " +
+               "        daccount_dbt acc  " +
+               "    Where paym.t_Payer                               = :payer " + 
+               "    and paym.t_ReceiverAccount                     in ( :account1, :account2 ) " +
+               "    and paym.t_PaymStatus                          = 32000 " +
+               "    and paym.t_PayerBankID                         = paym.t_ReceiverBankID " +
+               "    and pmd.t_paymentid                            = paym.t_paymentid " +
+               "    and trn.t_acctrnid = pmd.t_acctrnid  " +
+               "    and trn.t_date_carry                     BETWEEN trunc ( :begdate, 'month' ) " +
+               "                                                 AND last_day (:enddate) " +
+               "    and acc.t_Chapter                              = 1 " +
+               "    and trn.t_Chapter                              = 1 " + // joy Чтобы не задваивались
+               "    and trn.t_state                                = 1 " + //     платежи
+               "    and acc.t_Account                              = paym.t_PayerAccount ";
+
+       PayerAccountCondition = " and subStr( paym.t_PayerAccount, 1, 3 ) in ( '405', '406', '407', '408' ) ";
+       UserTypeCondition     = " and instr( acc.t_UserTypeAccount, 'Z' ) > 0 ";
+
+
+       // 1) Считаем сумму оборотов по (ДТ) всех счетов клиента с признаком "Z"
+       cmd = rsdcommand( query + UserTypeCondition );
+       cmd.AddParam( "payer",    RSDBP_IN, sfcontr.PartyID );
+       cmd.AddParam( "account1", RSDBP_IN, arrRecAcc(0)    );
+       cmd.AddParam( "account2", RSDBP_IN, arrRecAcc(1)    );
+       cmd.AddParam( "begdate",  RSDBP_IN, EndDate         );
+       cmd.AddParam( "enddate",  RSDBP_IN, EndDate         );
+       rs = rsdRecordSet(cmd);
+
+
+       if (rs and rs.moveNext())
+          CommSum = rs.value( 0, null, V_MONEY );
+       end;
+
+       // Если сумма оборотов больше нуля (перечисления были), то переходим к п. 2
+       if( CommSum > $0 )
+
+          // 2) Считаем сумму оборотов (ДТ) 405 - 407, 40802, 40807  -  (КТ) счета из массива
+          cmd = null; rs = null;
+          cmd = rsdcommand( query + PayerAccountCondition );
+          cmd.AddParam( "payer",    RSDBP_IN,sfcontr.PartyID );
+          cmd.AddParam( "account1", RSDBP_IN,arrRecAcc(0)    );
+          cmd.AddParam( "account2", RSDBP_IN,arrRecAcc(1)    );
+          cmd.AddParam( "begdate",  RSDBP_IN,EndDate         );
+          cmd.AddParam( "enddate",  RSDBP_IN,EndDate         );
+          rs = rsdRecordSet(cmd);
+          if (rs and rs.moveNext())
+             CommSum = rs.value( 0, null, V_MONEY );
+
+             // 4) Если полученная сумма комиссии меньше минимума из настройки тарифа (в том числе равна нулю), берём минимум
+             //    ... и минимум в настройке задан (01.07.2014 joy R-404644)
+             if (( CommSum == $0 ) and (MinValue != 0) ) 
+                CommSum = $1;    // Базовая сумма 1 возвращается для того, чтобы списалась мин. комиссия
+             end;
+
+          end;
+
+
+       // иначе, переходим к п. 4 (списывается минимальная комиссия)
+       else
+            if (MinValue != 0)  
+                CommSum = $1;    // Базовая сумма 1 возвращается для того, чтобы списалась мин. комиссия, но только в случае заданного минимума в настройках
+            end;
+
+       end;
+
+    end;
+
+
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_SUM;
+    sfbassum.baseSum  = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+
+
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code; 
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

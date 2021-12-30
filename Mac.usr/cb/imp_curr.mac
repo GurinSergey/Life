@@ -1,0 +1,274 @@
+/*============================================================================
+  Макрос импорта курсов валют
+
+  03.03.2009
+  Кулешов С.А.
+  
+  12.12.2012 Chesnokov D.S. C-15682 Добавлена журнализация загрузки.
+============================================================================*/
+import FIInter, Календарь, BankInter, SFInter;
+import likepy, oralib, globals, rsexts;
+
+
+private var   ПутьК_DBF = ""; /* Директория, где находится DBF файл. Если не задана,
+                       поиск производится в каталоге указанном в настройке реестра "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR" */
+private const DBF_NAME = "curcours.dbf"; // имя файла курса ЦБ
+private var   FullNameDbf;
+private var   Value_err;
+
+private const TypeRateCB=7;             // код курса ЦБ
+private const TypeCrossRate=7;          // код курса для кросс-курсов
+private const NumFiKind =1;             // вид финансового инструмента - валюта
+private const ISONatCur = ПолучитьКодФинИн(NatCur);
+
+FILE src() DBF;                 // файл с курсами валют
+
+Class Cl_Curr (pFIID, pISONum, pName, pRateID,pIsInverse,pPoint)
+      var FIID, ISONum, Name, RateID, SinceDate, Rate, Scale,IsInverse, Point  ;
+      FIID = pFIID; ISONum = pISONum; Name = pName; RateId = pRateID; IsInverse=pIsInverse; Point=pPoint;
+end;
+
+var  ListCur=TArray;             // список валют, по которым устанавливается курс ЦБ
+var  DirList;
+
+/*============================================================================
+  Максор формирования списка валют
+============================================================================*/
+macro ReadListCurrency
+
+private var StrSelect : string = " SELECT fi.t_fiid, fi.t_fi_code t_iso_number, fi.t_name, rt.t_rateid, rt.t_isinverse, rt.t_point from dratedef_dbt rt, dfininstr_dbt fi "
+                               + " where rt.t_type=:TypeRateCB and rt.t_fiid=:NatCur and rt.t_otherfi=fi.t_fiid and fi.t_fi_kind=:NumFiKind ";
+
+private var ArrParams : TArray = makeArray( SQLParam("TypeRateCB", TypeRateCB),
+                                            SQLParam("NatCur",NatCur),
+                                            SQLParam("NumFiKind",NumFiKind));
+
+private var ResultRecord  : RsdRecordset = execSQLselect( StrSelect, ArrParams );
+
+while (ResultRecord.MoveNext) 
+      ListCur[ListCur.size]=Cl_Curr(ResultRecord.value("t_fiid"), ResultRecord.value("t_iso_number"), ResultRecord.value("t_name"),
+                                    ResultRecord.value("t_rateid"),
+                                    ResultRecord.value("t_isinverse"),ResultRecord.value("t_point"));
+end;
+
+end;
+
+/*============================================================================
+  Максор расчета и записи кросс-курса (одного)
+============================================================================*/
+macro  SaveCrossRate(pFIID, pIsoFIID, pOtherFiid, pISOOtherFiid,  pType, pSinceDate, pIsInverse, pScale, pPoint)
+
+RECORD tmpRateParm( RateParm );
+
+private var Rate:money;
+private var Rate2: money = pScale*10000;
+private var tmp;
+
+ if (pIsInverse!="X")
+   tmp=ConvSumCross(Rate, Rate2, pSinceDate, pOtherFiid, pFIID);
+ else
+   tmp=ConvSumCross(Rate, Rate2, pSinceDate, pFIID, pOtherFiid);
+ end;
+ if (tmp==false)
+   [|##########| ##############| ##############|############################ |]
+   (pSinceDate, trim(string(pIsoFiid)), trim(string(pIsoOtherFiid)),"Произошла ошибка конвертации валюты.":w);
+   return;
+ end;
+
+ tmpRateParm.FI_Code   = pIsoFiid        ; //- внешний код котируемого финансового инструмента;
+ tmpRateParm.OtherFI   = pIsoOtherFiid   ; //- внешний код базового финансового инструмента;
+ tmpRateParm.Type      = pType           ; //- код вида курса в соответствии со справочником видов курсов;
+ tmpRateParm.SinceDate = pSinceDate      ; //- дата начала действия курса.
+ tmpRateParm.IsInverse = pIsInverse      ; //- признак вида котировки (\0 - прямая, X -  обратная);
+ tmpRateParm.Rate      = MoneyL(Rate)    ; //- значение курса;
+ tmpRateParm.Scale     = pScale          ; //- масштаб;
+ tmpRateParm.Point     = pPoint          ; //- округление (количество знаков);
+
+ if ( УстановитьКурс(tmpRateParm)!=0 )
+   [|##########| ##############| ##############|############################ |]
+   (pSinceDate, trim(string(pIsoFiid)), trim(string(pIsoOtherFiid)),"Произошла ошибка при установлении курса.":w);
+ else
+   [|##########| ##############| ##############|################# |######### |]
+   (pSinceDate, trim(string(pIsoFiid)), trim(string(pIsoOtherFiid)), Rate/10000:r:0:4, pScale:r);
+ end;
+
+end;
+
+/*============================================================================
+  Максор расчета и записи кросс-курсов на основе курсов ЦБ (всех)
+============================================================================*/
+macro CalcCrossRate
+
+private var StrSelect : string = " select rt.t_fiid fiid, fi1.t_iso_number iso_fiid, rt.t_otherfi otheffi, fi2.t_iso_number iso_otherfi, "
+                               + "        rt.t_IsInverse IsInverse, rt.t_scale scale, rt.t_point point" 
+                               + " from dratedef_dbt rt, dfininstr_dbt fi1, dfininstr_dbt fi2 " 
+                               + " where rt.t_type=:TypeRateCB "
+                               + "       and rt.t_fiid<>:NatCur1 and rt.t_otherfi<>:NatCur2"
+                               + "       and rt.t_fiid    = fi1.t_fiid and fi1.t_fi_kind=:NumFiKind1 "
+                               + "       and rt.t_otherfi = fi2.t_fiid and fi2.t_fi_kind=:NumFiKind2 ";
+
+private var ArrParams : TArray = makeArray( SQLParam("TypeRateCB", TypeCrossRate),
+                                            SQLParam("NatCur1",NatCur),
+                                            SQLParam("NatCur2",NatCur),
+                                            SQLParam("NumFiKind1",NumFiKind),
+                                            SQLParam("NumFiKind2",NumFiKind));
+
+private var ResultRecord  : RsdRecordset = execSQLselect( StrSelect, ArrParams );
+
+private var Date1, Date2;
+private var tmpArr;
+private var tmpOtherFIID, tmpFIID;
+
+[ ];
+[ Протокол расчета кросс-курсов на основе курсов ЦБ.]; 
+[ ];
+[+----------+---------------+---------------+------------------+----------+];              
+[| Дата     | Котируемый ФИ | Базовый ФИ    | Курс             | Масштаб  |];
+[+----------+---------------+---------------+------------------+----------+];
+
+while (ResultRecord.MoveNext) 
+
+      Date1=Date2=null;
+      tmpFIID=ResultRecord.value("fiid");
+      tmpOtherFIID=ResultRecord.value("otheffi");
+
+      //----------------------------------------------------------------
+      // выбор дат, на которые необходимо установить кросс-курсы.
+      for (tmpArr, ListCur)
+          if (tmpFIID==tmpArr.FIID)
+             Date1=tmpArr.SinceDate;
+          end;
+          if (tmpOtherFIID==tmpArr.FIID)
+             Date2=tmpArr.SinceDate;
+          end;
+          if ((Date1!=null) and (Date2!=null))
+               break;
+          end; 
+      end;
+      //----------------------------------------------------------------
+
+      if (date1!=null)
+         SaveCrossRate (ResultRecord.value("fiid"), ResultRecord.value("iso_fiid"), 
+                        ResultRecord.value("otheffi"), ResultRecord.value("iso_otherfi"), 
+                        TypeCrossRate, Date1, ResultRecord.value("IsInverse"), 
+                        ResultRecord.value("scale"), ResultRecord.value("point"));
+      end;
+      if ((date2!=null) and (date1!=date2))
+         SaveCrossRate (ResultRecord.value("fiid"), ResultRecord.value("iso_fiid"), 
+                        ResultRecord.value("otheffi"), ResultRecord.value("iso_otherfi"), 
+                        TypeCrossRate, Date2, ResultRecord.value("IsInverse"), 
+                        ResultRecord.value("scale"), ResultRecord.value("point"));
+      end;
+
+end;
+
+[--------------------------------------------------------------------------];
+
+end;
+
+/*============================================================================
+  Максор чтения курсов из DBF файла и записи в БД
+============================================================================*/
+macro SaveRateFromDBF;
+
+private var tmpArr;
+private var SaveDate=null;
+RECORD tmpRateParm( RateParm );
+
+[ Протокол импорта курсов валют ЦБ.]; 
+[ ];
+[+----------+---------------+---------------+------------------+----------+];              
+[| Дата     | Котируемый ФИ | Базовый ФИ    | Курс             | Масштаб  |];
+[+----------+---------------+---------------+------------------+----------+];
+
+while( next( src ) )
+
+ for (tmpArr, ListCur)
+      //debugbreak;
+     if (trim(string(tmpArr.ISONum)) == trim(src.ISO_DIG))
+
+        if (SaveDate!=src.dat)
+            SaveDate=src.dat;
+            if( not getTrue( FALSE, "Дата текущего операционного дня - "+string({curdate})+"        \n" +
+                                    "Во входном файле находятся курсы валют за "+string(SaveDate)+"\n" +
+                                    "Продолжить импорт курсов валют?                     "))
+                  [Дальнейшая загрузка курсов валют прервана];
+                  return false;
+            end; 
+       end;
+
+        tmpArr.SinceDate  = src.dat;
+        tmpArr.rate = moneyL(src.curse*10000);
+        tmpArr.scale = int(src.scale);
+ 
+        tmpRateParm.FI_Code   = ISONatCur            ; //- внешний код котируемого финансового инструмента;
+        tmpRateParm.OtherFI   = tmpArr.ISONum        ; //- внешний код базового финансового инструмента;
+        tmpRateParm.Type      = TypeRateCB           ; //- код вида курса в соответствии со справочником видов курсов;
+        tmpRateParm.IsInverse = strfor(0)            ; //- признак вида котировки (\0 - прямая, X -  обратная);
+        tmpRateParm.Rate      = tmpArr.rate          ; //- значение курса;
+        tmpRateParm.Scale     = tmpArr.scale         ; //- масштаб;
+        tmpRateParm.Point     = tmpArr.Point     ; //- округление (количество знаков);
+        tmpRateParm.SinceDate = tmpArr.	SinceDate     ; //- дата начала действия курса.
+      
+        if ( УстановитьКурс(tmpRateParm)!=0 )
+           [|##########| ##############| ##############|############################ |]
+           (tmpArr.SinceDate, trim(string(ISONatCur)), trim(string(tmpArr.ISONum)), "Ошибка при установке курса.":w);
+        else
+           [|##########| ##############| ##############|################# |######### |]
+           (tmpArr.SinceDate, trim(string(ISONatCur)), trim(string(tmpArr.ISONum)), tmpArr.rate/10000:r:0:4, tmpArr.scale:r);
+        end;
+           [+----------+---------------+---------------+------------------+----------+];
+
+        break;
+
+      end;
+  end; 
+
+end;
+/* [--------------------------------------------------------------------------]; */
+return true; 
+
+end;
+
+/*============================================================================
+MAIN
+============================================================================*/
+
+//--------------------------------------------
+// открытие файла с курсами валют
+
+/*if( trim( ПутьК_DBF ) == "" )
+ GetRegistryValue("HB\\CORE\\IMP_CUR_RATE\\DIRIMPCB", V_STRING, ПутьК_DBF, Value_err);
+end;*/
+
+ПутьК_DBF = "";
+//!!!Seleznev
+if (not selectfile (ПутьК_DBF, "curcours.dbf", "Выбор файла курсов валют"))
+   exit(1);
+end;
+
+
+FullNameDbf=trim(ПутьК_DBF);// + "\\"+DBF_NAME;
+if ( not open( src, FullNameDbf) )
+  msgbox( "Невозможно открыть файл с курсами валют:|",FullNameDbf);
+  exit(1);
+else
+  DirList = TDirList(FullNameDbf, "F");
+end;
+//--------------------------------------------
+
+if (DirList.Count > 0)
+  WriteFiscLog(OLstrproc, "Процедура загрузки курсов валют начала работу.\n" 
+                          "\nПараметры заргужаемого файла:\nИмя файла: " + DirList.Name(0) +
+                          "\nДиректория загрузки: " + FullNameDbf + "\nРазмер файла: " + DirList.Size(0) + " байт." +
+                          "\nДата и время создания: " + DirList.FDate(0) +" " + DirList.FTime(0));
+end;
+
+ReadListCurrency;       // сформировать список валют, по которым необходимо получить курсы.
+if (SaveRateFromDBF==false)        // считать курсы из DBF файла и сохранить в БД.
+  WriteFiscLog(OLfinproc, "Импорт курсов валют завершен не полностью.\nЗагрузка файла " + FullNameDbf + " была прервана.");
+  return;
+end;  
+CalcCrossRate;          // процедура расчета и записи кросс-курсов.
+WriteFiscLog(OLfinproc, "Импорт курсов валют завершен.");
+end;

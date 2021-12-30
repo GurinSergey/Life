@@ -1,0 +1,800 @@
+/*****************************************************************************/
+/* ОТЧЕТ "Параметры шагов, выполняемых вручную"                              */
+/*                                                                           */
+/* Юшманов Дмитрий                                                           */
+/* Начато 29.11.2013                                                         */
+/*                                                                           */
+/* C-22359 (C-19151-6)                                                       */
+/*                                                                           */
+/*****************************************************************************/
+
+import bankinter, RsbDataSet, rsexts, globals, RsbFormsInter, rslx;
+import "KeyCodes.mac", "fastexcel.mac";
+
+private const
+    TYPE_INTEGER = 1, //типы полей формы
+    TYPE_STRING = 7,
+    TYPE_DATE = 9,
+    TYPE_TIME = 10,
+    RES_SIZE = 9, //размер структуры массива результатов:
+                  //0 - код вида документа
+                  //1 - наименование вида документа
+                  //2 - код операции
+                  //3 - наименование операции
+                  //4 - код шага операции
+                  //5 - наименование шага операции
+                  //6 - символ шага операции
+                  //7 - количество обработанных документов
+                  //8 - paymentid документов
+    DOCKIND_SIZE = 3, //размер структуры массива видов документов
+    OPER_SIZE = 4,    //размер структуры массива видов операций
+    STR_OPERATIONS = "199,310,24001,24002,24301", //операции, которыми ограничиваются фильтры (определено аналитиком)
+    CONST_ROBOLIST = "10000,10001,20000,20001,20002,20003,20004,20005,20006,20007,20008,20009,20010,20011,20012,20013,20014,20050,20201,22222,13666,20015",
+    REP_NAME = "Параметры шагов, выполняемых вручную",
+    REP_NAME_UPPER = "ПАРАМЕТРЫ ШАГОВ, ВЫПОЛНЯЕМЫХ ВРУЧНУЮ";
+
+private var 
+    aDockind = TArray(),
+    aOperation = TArray(),
+    aResult = TArray(),
+    startDate : Date = {curdate} - 30, //текущий опердень минус календарный месяц
+    endDate : Date = {curdate},
+    strDayExists : string = "", //дни, за которые отсутствуют платежи
+    formRun : bool = false, //флаг запуска формы
+    debugMode = false, //флаг отображения id документов
+    debugNumDocs = 10; //количество документов, чьи id пишутся в режиме отладки
+
+/*----------------------------------------------------------------------------*/
+//подготовка строки для вставки в запрос
+private macro strFill (arr, structSize, pos, compl_table, isString)
+var i : integer = 0,
+    str : string = "";
+
+    for (i, 0, arr.size/structSize-1)
+        if (arr[structSize*i] == true)
+            if (isString)
+                str = str + ",'" + arr[structSize*i+pos] + "'";
+            else 
+                str = str + "," + arr[structSize*i+pos];
+            end;
+        end;
+    end;
+
+    if (substr(str,1,1) == ",")
+        str = substr(str,2);
+    end;
+
+    if (str != "")
+        str = "\n and " + compl_table + " in (" + str + ") ";
+    end;
+
+    return str;
+
+end; /* End Of strFill */
+
+
+//диалоговая панель с параметрами фильтра
+private class (TRsbPanel) RslPanel(caption: string)
+/*----------------------------------------------------------------------------*/
+    var endOfMultiSelect : bool = false,
+        ctrlName : string = "";
+/*----------------------------------------------------------------------------*/
+    //добавление на панель текстовой метки
+    macro addLabelField(name: string, x: integer, y: integer)
+    var m_label: TRSBLabel;
+
+        m_label = TRSBLabel(x, y, name);
+        addLabel(m_label);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель поля ввода
+    macro addEditField(name: string, dataType: integer, val: variant, textLen: integer, editFlag: bool, 
+                       focusFlag: bool, posX: integer, posY: integer, sizeX: integer, sizeY: integer)
+    var m_edit: TRSBEditField = TRsbEditField(dataType);
+
+        m_edit.name = name;
+        m_edit.setPosition(posX, posY);
+        m_edit.setSize(sizeX, sizeY);
+        m_edit.textLength = textLen;
+        m_edit.editable = editFlag;
+        m_edit.focusable = focusFlag;
+        m_edit.value = val;
+        addControl(m_edit);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель чекбокса
+    macro addCheckBox(name: string, posX: integer, posY: integer)
+    var m_checkbox: TRSBCheckBox = TRSBCheckBox();
+
+        m_checkbox.name = name;
+        m_checkbox.setPosition(posX,posY);
+        m_checkbox.checked = false;
+        addControl(m_checkbox);
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработка выбора элемента скроллинга
+    macro scrollElement (ctrlName, rs, pArray, structSize, cmpStr)
+    var i : integer = 0;
+
+        for (i, 0, pArray.size/structSize)
+            if (pArray[structSize*i+1] == rs.value(cmpStr))
+                pArray[structSize*i] = (pArray[structSize*i] == false); //инвертируем элемент
+            end;
+        end;
+
+        return pArray;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработчик событий скроллингов
+    macro scrollEvent (rs, cmd, id, key)
+    var i : integer = 0;
+
+        if (cmd == DLG_INIT)
+            endOfMultiSelect = false;
+            addMultiAction(rs, KEY_ENTER);
+
+        elif (cmd == DLG_MSEL)
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, "t_dockind");
+            elif (ctrlName == "formOperationEdit")
+                aOperation = scrollElement(ctrlName, rs, aOperation, OPER_SIZE, "kindop");
+            end;
+            return CM_MSEL_CONT_CLEAR;
+
+        elif (cmd == DLG_MSELEND)
+            endOfMultiSelect = true;
+
+        elif ((cmd == DLG_KEY) and (endOfMultiSelect))
+            return CM_CANCEL;
+
+        elif ((cmd == DLG_KEY) and (key == KEY_ENTER))
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, "t_dockind");
+            elif (ctrlName == "formOperationEdit")
+                aOperation = scrollElement(ctrlName, rs, aOperation, OPER_SIZE, "kindop");
+            end;
+            return CM_SELECT;
+        end;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //вспомогательное заполнение массива для построения скроллинга
+    macro addCol (ar, ind, fld, head, width, rdonly)
+        ar.value (ind * 6) = fld;
+        ar.value (ind * 6 + 1) = head;
+        ar.value (ind * 6 + 2) = width;
+        ar.value (ind * 6 + 3 ) = 2;  // fldType
+        ar.value (ind * 6 + 4 ) = -1; // decPoint
+        ar.value (ind * 6 + 5 ) = 0;  // reserv
+    end;
+/*----------------------------------------------------------------------------*/
+    //общие для скроллингов действия
+    macro quickScroll(rs, col, numCols, pArray, structSize, structOffset, ctrlName)
+    var tempstr : string = "",
+        moreThanOne : bool = false,
+        i : integer = 0;
+
+        RunScroll(rs, numCols, col, Null, R2M(this, "scrollEvent"));
+
+        //пересчёт содержимого "подвала" для выбранного фильтра
+        for (i, 0, pArray.size/structSize)
+            if (pArray[structSize*i])
+                if (tempstr == "") tempstr = pArray[structSize*i+structOffset]
+                else moreThanOne = true
+                end;
+            end;
+        end;
+        if (tempstr == "") tempstr = "ВСЕ" end;
+        if (moreThanOne) tempstr = "Несколько" end;
+
+        getControl(ctrlName).value = tempstr;
+
+    end;
+
+
+/*----------------------------------------------------------------------------*/
+    //обработчик события "нажатие клавиши" для всей экранной формы
+    macro onKeyPress (RsbEvent: object)
+    var i : integer = 0;
+
+        //сброс выбранного параметра фильтра
+        if (RsbEvent.KeyCode == KEY_F4)
+
+            ctrlName = RsbEvent.source.name;
+
+            if   (ctrlName == "formDockindEdit")
+                for (i, 0, aDockind.size/DOCKIND_SIZE) aDockind[DOCKIND_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            elif (ctrlName == "formOperationEdit")
+                for (i, 0, aOperation.size/OPER_SIZE) aOperation[OPER_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            end;
+
+        //запуск скроллингов для параметров фильтров
+        elif (RsbEvent.KeyCode == KEY_F3)
+        var col = TArray(),
+            choiceStr : string = "",
+            conditionStr : string = "",
+            rs;
+
+            ctrlName = RsbEvent.source.name;
+
+            if (ctrlName == "formDockindEdit")
+
+                addCol(col, 0, "chosen",    "Выбор",               5, true);
+                addCol(col, 1, "t_dockind", "Код вида документа", 15, true);
+                addCol(col, 2, "t_name",    "Вид документа",      30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aDockind.size/DOCKIND_SIZE-1)
+                    if (aDockind[DOCKIND_SIZE*i]) choiceStr = choiceStr + "," + aDockind[DOCKIND_SIZE*i+1] end;
+                end;
+
+                if (choiceStr != "")
+                    choiceStr = "case when t.t_dockind in (" + substr(choiceStr,2) + ") then 'X' else '' end chosen,";
+                else
+                    choiceStr = "'' chosen,";
+                end;
+
+                //реализуем зависимость списка видов документов от списка операций
+                conditionStr = strFill(aOperation, OPER_SIZE, 3, "t.t_dockind", false);
+
+                if (conditionStr == "")
+                    conditionStr = "t.t_dockind in (29,200)";
+                else 
+                    conditionStr = substr(conditionStr, 7);
+                end;
+
+                //формируем запрос скроллинга с учётом уже выбранных значений фильтров
+                rs = RsdRecordSet(string(
+                   "SELECT distinct " + choiceStr, 
+                   "\n     t_dockind, ",
+                   "\n     t_name ",
+                   "\n    FROM doprkdoc_dbt t ",
+                   "\n   WHERE connect_by_isleaf = 1 ",
+                   "\n   START WITH " + conditionStr,
+                   "\n CONNECT BY prior t_dockind = t_parentdockind ",
+                   "\n   ORDER BY t.t_dockind "),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aDockind, DOCKIND_SIZE, 2, ctrlName);
+
+            elif(ctrlName == "formOperationEdit")
+
+                addCol(col, 0, "chosen", "Выбор",                  5, true);
+                addCol(col, 1, "kindop", "Код вида операции",     15, true);
+                addCol(col, 2, "t_name", "Наименование операции", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aOperation.size/OPER_SIZE-1)
+                    if (aOperation[OPER_SIZE*i]) choiceStr = choiceStr + ",'" + aOperation[OPER_SIZE*i+1] + "'" end;
+                end;
+
+                if (choiceStr != "")
+                    choiceStr = "case when t_kind_operation in (" + substr(choiceStr,2) + ") then 'X' else '' end chosen,";
+                else
+                    choiceStr = "'' chosen,";
+                end;
+
+                //реализуем зависимость списка операций от списка видов документов
+                conditionStr = substr(strFill(aDockind, DOCKIND_SIZE, 1, "t_dockind", false), 7);
+
+                if (conditionStr != "")
+                    conditionStr = string(
+                        "\n   AND ( ",
+                        "\n       t_dockind in ( ",
+                        "\n           select t.t_dockind ",
+                        "\n             from doprkdoc_dbt t ",
+                        "\n            where t_parentdockind = 0 ",
+                        "\n            start with " + conditionStr,
+                        "\n          connect by prior t_parentdockind = t_dockind ",
+                        "\n                    ) ",
+                        "\n       OR " + conditionStr,
+                        "\n       ) ");
+                end;
+
+                //формируем запрос скроллинга с учётом уже выбранных значений фильтров
+                rs = RsdRecordSet(string(
+                    "SELECT " + choiceStr,
+                    "\n     t_kind_operation kindop, t_name ",
+                    "\n  FROM doprkoper_dbt ",
+                    "\n WHERE t_kind_operation in (" + STR_OPERATIONS + ") ",
+                    conditionStr,
+                    "\n ORDER BY t_kind_operation "),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aOperation, OPER_SIZE, 2, ctrlName);
+
+            end;
+
+        //запуск отчёта
+        elif (RsbEvent.KeyCode == KEY_F2)
+            startDate = getControl("formDateStart").value;
+            endDate   = getControl("formDateEnd").value;
+            debugMode = getControl("formIDsCheckBox").checked;
+            debugNumDocs = int(getControl("formIDsEdit").value);
+            formRun = true;
+            close(1);
+        end;
+
+    end;
+
+
+/*----------------------------------------------------------------------------*/
+//создание экранной формы
+    macro init(caption: string)
+    var rs,
+        i : integer = 0,
+        formDockindArr = TArray(),
+        formTypeArr = TArray(),
+        editString = 9000,
+        alLeft = 4, 
+        Line = 2,
+        dateLen = 9,
+        editLen = 25,
+        editHeight = 1,
+        viewLen = 41,
+        viewHeight = 1,
+        alStartDate = alLeft + 20,
+        alFinDate = alLeft + 32,
+        alCombo = alLeft + 16;
+
+        //инициализация массивов параметров фильтра:
+        //вид операции
+        rs = RsdRecordSet(string(
+            "select t_kind_operation kindop, t_name, t_dockind from doprkoper_dbt ",
+            " where t_kind_operation in (" + STR_OPERATIONS + ") order by t_kind_operation"));
+        i = 0;
+        while (rs.moveNext)
+            aOperation[OPER_SIZE*i]   = false;
+            aOperation[OPER_SIZE*i+1] = rs.value("kindop");
+            aOperation[OPER_SIZE*i+2] = rs.value("t_name");
+            aOperation[OPER_SIZE*i+3] = rs.value("t_dockind");
+            i = i + 1;
+        end;
+
+        //вид первичного документа
+        rs = RsdRecordSet(string(
+            "SELECT t.t_dockind, t.t_name ",
+            "\n  FROM doprkdoc_dbt t ",
+            "\n WHERE CONNECT_BY_ISLEAF = 1 ",
+            "\n START WITH t.t_dockind in (29,200) ",
+            "\n CONNECT BY prior t_dockind = t_parentdockind ",
+            "\n ORDER BY t_dockind "));
+        i = 0;
+        while (rs.moveNext)
+            aDockind[DOCKIND_SIZE*i]   = false;
+            aDockind[DOCKIND_SIZE*i+1] = rs.value("t_dockind");
+            aDockind[DOCKIND_SIZE*i+2] = rs.value("t_name");
+            i = i + 1;
+        end;
+
+        //основные параметры формы
+        setCaption(caption);
+        setposition(15,5);
+        setsize(48,9);
+        addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "onKeyPress"));
+        setStatus("F2: Запуск отчёта, F3: Список значений, F4: Сброс поля");
+
+        //создание элементов экранной формы
+        addLabelField("Дата окончания обработки:", alLeft, Line);
+        addLabelField("с", alStartDate-2, Line);
+        addEditField("formDateStart", TYPE_DATE, startDate, 10, true, true, alStartDate, Line, dateLen, editHeight);
+        addLabelField("по", alFinDate-2, Line);
+        addEditField("formDateEnd", TYPE_DATE, endDate, 10, true, true, alFinDate, Line, dateLen, editHeight);
+        Line = Line + editHeight + 1;
+
+        addLabelField("Вид операции:", alLeft, Line);
+        addEditField("formOperationEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLen, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Вид документа:", alLeft, Line);
+        addEditField("formDockindEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLen, editHeight);
+        Line = Line + 2;
+
+        addLabelField("Со списком id документов", alLeft, Line);
+        addCheckBox("formIDsCheckBox", alStartDate - 2, Line);
+        addLabelField("Количество id:", alCombo + 10, Line);
+        addEditField("formIDsEdit", TYPE_STRING, "10", editString, true, true, alFinDate + 5, Line, 4, editHeight);
+
+    end;
+/*----------------------------------------------------------------------------*/    
+    InitTRsbPanel();
+    init(caption);
+/*----------------------------------------------------------------------------*/
+end; /*End of class RslPanel*/
+
+
+/*----------------------------------------------------------------------------*/
+//проверка массива параметра фильтра на наличие выбранных элементов
+private macro arrIsEmpty(pArr:TArray, pStr:integer)
+var isEmpty : bool = true,
+    i : integer = 0;
+    while ((i < pArr.size/pStr) and isEmpty)
+        isEmpty = (not pArr[pStr*i]);
+        i = i + 1;
+    end;
+    return isEmpty;
+end; /* End Of arrIsEmpty */
+/*----------------------------------------------------------------------------*/
+//простейшая сортировка для массива результатов
+private macro sortme(pArr:TArray, pStr:integer) //массив и размер его структуры
+var t, i, j, k;
+    for (j, 1, pArr.size/pStr-1)
+        for (i, 1, pArr.size/pStr-1)
+            if ( (pArr[pStr*(i)+0] < pArr[pStr*(i-1)+0])
+            or   ((pArr[pStr*(i)+0] == pArr[pStr*(i-1)+0]) and (pArr[pStr*(i)+2] < pArr[pStr*(i-1)+2])) )
+                for (k, 0, pStr-1)
+                    t = pArr[pStr*(i)+k];
+                    pArr[pStr*(i)+k] = pArr[pStr*(i-1)+k];
+                    pArr[pStr*(i-1)+k] = t;
+                end;
+            end;
+        end;
+    end;
+    return pArr;
+end; /* End Of sortme */
+/*----------------------------------------------------------------------------*/
+//общие для запросов действия
+private macro quickQuery()
+var rs,
+    cmd,
+    query,
+    roboList,
+    errCode,
+    curDate : Date = startdate,
+    dayExists : bool = false,
+    strDockind : string = "",
+    strKindOperation : string = "",
+    progressCounter : integer = 0,
+    resultSize : integer = 0,
+    i : integer = 0,
+    j : integer = 0;
+
+    //в случае неверного ввода меняем даты местами
+    if (startDate > endDate)
+        curDate = startDate;
+        startDate = endDate;
+        endDate = curDate;
+        curDate = startDate;
+    end;
+
+    //промежуточное окно для этапа подсчёта документов
+    InitProgress(1, "Идёт подсчёт документов...", REP_NAME);
+
+    //считываем список операционистов-роботов
+    if (not getRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS", V_STRING, roboList, errCode, false))
+        msgbox("Значение настройки реестра 'PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS' не задано. Будет использовано значение по умолчанию.");
+        roboList = CONST_ROBOLIST;
+    end;
+
+    //параметры фильтра -> условия для вставки в запрос
+    strDockind       = strFill (aDockind,   DOCKIND_SIZE, 1, "pm.t_dockind",        false);
+    strKindOperation = strFill (aOperation, OPER_SIZE,    1, "op.t_kind_operation", false);
+
+    //подсчитываем количество документов согласно параметрам фильтра, полученное значение используется в прогрессбаре
+    rs = RsdRecordSet(string(
+    " select count(1) pid",
+    "\n  from dpmpaym_dbt pm",
+    "\n      ,doproper_dbt op",
+    "\n      ,doprstep_dbt s",
+    "\n      ,usr_doprstep_robot_dbt r",
+    "\n      ,doprostep_dbt ost",
+    "\n  where lpad(pm.t_paymentid, 34, '0') = op.t_documentid",
+    "\n    and pm.t_dockind = op.t_dockind",
+    "\n    and op.t_id_operation = s.t_id_operation",
+    "\n    and s.t_blockid = ost.t_blockid",
+    "\n    and s.t_number_step = ost.t_number_step",
+    "\n    and s.t_id_operation = r.t_id_operation",
+    "\n    and s.t_id_step = r.t_id_step",
+    "\n    and pm.t_paymStatus in (100, 32000)",
+    "\n    and s.t_isExecute = 'X'",
+    "\n    and not (s.t_oper in (" + roboList + ")",
+    "\n          or r.t_is_robot_step = chr(88)",
+    "\n          or r.t_program = 'ate.exe')",
+    "\n    and pm.t_closeDate between to_date('" + startDate + "') and to_date('" + endDate + "') ",
+        strDockind,
+        strKindOperation
+        ));
+
+    rs.moveNext;
+
+    j = rs.value("pid");
+
+    RemProgress();
+
+    InitProgress(j, "Идёт обработка документов...", REP_NAME);
+
+    query = string(
+        "SELECT pm.t_paymentid",
+        "\n      ,pm.t_dockind",
+        "\n      ,op.t_kind_operation",
+        "\n      ,s.t_number_step",
+        "\n      ,ost.t_name",
+        "\n      ,s.t_symbol",
+        "\n  from dpmpaym_dbt pm",
+        "\n      ,doproper_dbt op",
+        "\n      ,doprstep_dbt s",
+        "\n      ,usr_doprstep_robot_dbt r",
+        "\n      ,doprostep_dbt ost",
+        "\n  where lpad(pm.t_paymentid, 34, '0') = op.t_documentid",
+        "\n    and pm.t_dockind = op.t_dockind",
+        "\n    and op.t_id_operation = s.t_id_operation",
+        "\n    and s.t_blockid = ost.t_blockid",
+        "\n    and s.t_number_step = ost.t_number_step",
+        "\n    and s.t_id_operation = r.t_id_operation",
+        "\n    and s.t_id_step = r.t_id_step",
+        "\n    and pm.t_paymStatus in (100, 32000)",
+        "\n    and s.t_isExecute = 'X'",
+        "\n    and not (s.t_oper in (" + roboList + ")",
+        "\n          or r.t_is_robot_step = chr(88)",
+        "\n          or r.t_program = 'ate.exe')",
+        "\n    and pm.t_closeDate = ? ",
+            strDockind,
+            strKindOperation,
+        "\n  order by pm.t_dockind, op.t_kind_operation, s.t_number_step, ost.t_name, s.t_symbol"
+        );
+
+    //запрос выполняется для каждого дня в отдельности, т.к. нужна статистика по дням с отсутствующими платежами
+    while (curDate != endDate + 1)
+
+        cmd = RSDCommand(query);
+        cmd.addParam("currentDate", RSDBP_IN, curDate);
+        rs = RSDRecordset(cmd);
+
+        dayExists = false;
+
+        while (rs.moveNext)
+            dayExists = true;
+            i = 0;
+            resultSize = aResult.size/RES_SIZE;
+
+            useProgress(progressCounter);
+            progressCounter = progressCounter + 1;
+
+            //ищем существующую запись с соответствующими параметрами
+            while (not (
+                    ((aResult[RES_SIZE*i]   == rs.value("t_dockind")) and //код вида документа
+                     (aResult[RES_SIZE*i+2] == rs.value("t_kind_operation")) and //код операции
+                     (aResult[RES_SIZE*i+4] == rs.value("t_number_step")) and //код шага операции
+                     (aResult[RES_SIZE*i+5] == rs.value("t_name")) and //наименование шага операции
+                     (aResult[RES_SIZE*i+6] == rs.value("t_symbol"))) //символ шага операции
+                or (i == resultSize) ))
+                    i = i + 1;
+            end;
+
+            //Инициализация структуры, если встретился следующий тип документа или источника
+            if (i == resultSize)
+
+                aResult[RES_SIZE*i] = rs.value("t_dockind"); //код вида документа
+
+                j = 0;
+                while (aDockind[DOCKIND_SIZE*j+1] != rs.value("t_dockind"))
+                    j = j + 1;
+                end;
+                aResult[RES_SIZE*i+1] = aDockind[DOCKIND_SIZE*j+2]; //наименование вида документа
+
+                aResult[RES_SIZE*i+2] = rs.value("t_kind_operation"); //код операции
+
+                j = 0;
+                while (aOperation[OPER_SIZE*j+1] != rs.value("t_kind_operation"))
+                    j = j + 1;
+                end;
+                aResult[RES_SIZE*i+3] = aOperation[OPER_SIZE*j+2]; //наименование операции
+
+                aResult[RES_SIZE*i+4] = rs.value("t_number_step"); //код шага
+                aResult[RES_SIZE*i+5] = rs.value("t_name"); //название шага
+                aResult[RES_SIZE*i+6] = rs.value("t_symbol"); //символ шага
+                aResult[RES_SIZE*i+7] = 0; //количество документов
+                aResult[RES_SIZE*i+8] = ""; //paymentid
+            end;
+
+            aResult[RES_SIZE*i+7] = aResult[RES_SIZE*i+7] + 1;
+            
+            if (aResult[RES_SIZE*i+7] < debugNumDocs)
+                aResult[RES_SIZE*i+8] = aResult[RES_SIZE*i+8] + "," + rs.value("t_paymentid");
+            end;
+
+        end;
+
+        if (not dayExists)
+            strDayExists = strDayExists + ", " + curDate;
+        end;
+
+        curDate = curDate + 1;
+    end;
+
+end; /* End Of QuickQuery */
+/*----------------------------------------------------------------------------*/
+//основные расчёты статистики: подготовка и выполнение запроса, заполнение массива результатов
+private macro core()
+var rs,
+    i : integer = 0;
+    
+    //массив инициализируется с ненулевым размером, хотя по факту он пуст. Исправляем.
+    aResult.size = 0;
+
+    //выполенение запроса
+    quickQuery();
+
+    //обрезка строки ID документов
+    if (aResult.size > RES_SIZE)
+        for (i, 0, aResult.size/RES_SIZE-1)
+            if (substr(aResult[RES_SIZE*i+8], 1, 1) == "0")
+                aResult[RES_SIZE*i+8] = substr(aResult[RES_SIZE*i+8], 3);
+            else
+                aResult[RES_SIZE*i+8] = substr(aResult[RES_SIZE*i+8], 2);
+            end;
+        end;
+    end;
+
+    //перегруппируем массив результатов: может возникнуть ситуация, когда запись с новым значением источника 
+    //для существующего значения вида документа оторвана от группы предыдущих записей с этим видом документа
+    if (aResult.size >= RES_SIZE+1) aResult = sortme(aResult, RES_SIZE); end;
+
+    //формирование строки с днями, за которые отсутствуют платежи
+    if (strDayExists != "")
+        strDayExists = "За следующие дни платежи отсутствуют: " + substr(strDayExists,3);
+    end;
+
+    RemProgress();
+    Message("Формирование Excel-файла...");
+
+end; /* End Of Core */
+/*----------------------------------------------------------------------------*/
+//x - строка, y - столбец
+
+private macro Put_Cell_Border(Lst, x, y, string, al)
+    if (valtype(al) == V_UNDEF) al = 3 end;
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = al;
+    Lst.Cells(x, y).Borders.LineStyle = 1;
+end; /*End Of Put_Cell_Border*/
+
+private macro Put_Cell(Lst, x, y, string, al)
+    if (valtype(al) == V_UNDEF) al = 3 end;
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = al;
+end; /*End Of Put_Cell*/
+
+private macro ExcelRep(ComObj)
+    var i : integer = 0,
+        rs,
+        List = ComObj.Sheets(1),
+        tempstr : string = "",
+        sumAll : integer = 0,
+        alLeft = 2,
+        alRight = 4,
+        alCenter = 3;
+    
+    //настраиваем ширины столбцов
+    List.Columns("A:A").ColumnWidth = 9; //код операции
+    List.Columns("B:B").ColumnWidth = 32;//название операции
+    List.Columns("C:C").ColumnWidth = 9; //код вида док-та
+    List.Columns("D:D").ColumnWidth = 20;//название вида док-та
+    List.Columns("E:E").ColumnWidth = 11;//код шага
+    List.Columns("F:F").ColumnWidth = 20;//название шага
+    List.Columns("G:G").ColumnWidth = 10;//символ шага
+    List.Columns("H:H").ColumnWidth = 11;//количество док-тов
+    List.Columns("I:I").ColumnWidth = 20;//id документов
+    
+    //создаём заголовок
+    List.Range("A2:G2").Merge;
+    List.Range("A2:G2").Font.Bold = True;
+    Put_Cell(List, 2, 1, REP_NAME_UPPER, alCenter);
+
+    // --> параметры фильтра
+    List.Range("A4:E4").Merge;
+    List.Range("A4:E4").Value = string("Подразделение (банк): " + {Name_Bank});
+
+    List.Range("F4:J4").Merge;
+    List.Range("F4:J4").Value = string("За период с " + startDate + " по " + endDate);
+
+    List.Range("A6:E6").Merge;
+    List.Range("A6:E6").Value = string("Дата, время формирования отчёта: " + date + " " + time);
+
+    List.Range("F6:J6").Merge;
+    List.Range("F6:J6").Value = "Параметры фильтра:";
+
+    rs = RsdRecordSet(string("select t_name from dperson_dbt where t_oper = " + {oper}));
+    rs.moveNext;
+
+    List.Range("A8:E8").Merge;
+    List.Range("A8:E8").Value = string("Исполнитель: {" + {oper} + "} " + rs.value("t_name"));
+
+    tempstr = "";
+    for (i, 0, aOperation.size/OPER_SIZE)
+        if (aOperation[OPER_SIZE*i] == true) tempstr = tempstr + ", " + aOperation[OPER_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = " ВСЕ" end;
+
+    List.Range("F8:J8").Merge;
+    List.Range("F8:J8").Value = string("Операция:" + tempstr);
+
+    tempstr = "";
+    for (i, 0, aDockind.size/DOCKIND_SIZE)
+        if (aDockind[DOCKIND_SIZE*i] == true) tempstr = tempstr + ", " + aDockind[DOCKIND_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = " ВСЕ" end;
+    
+    List.Range("F9:J9").Merge;
+    List.Range("F9:J9").Value = string("Вид документа: " + tempstr);
+    // <-- параметры фильтра
+
+    // --> заголовки столбцов результатов
+    List.Range("A11:I11").WrapText = True;
+    List.Range("A11:H11").Interior.Color = #B5B5B5;
+    Put_Cell_Border(List, 11, 1, string("Код вида док-та"),         alCenter);
+    Put_Cell_Border(List, 11, 2, string("Название вида документа"), alCenter);
+    Put_Cell_Border(List, 11, 3, string("Код операции"),            alCenter);
+    Put_Cell_Border(List, 11, 4, string("Название операции"),       alCenter);
+    Put_Cell_Border(List, 11, 5, string("Код шага"),                alCenter);
+    Put_Cell_Border(List, 11, 6, string("Название шага"),           alCenter);
+    Put_Cell_Border(List, 11, 7, string("Символ шага"),             alCenter);
+    Put_Cell_Border(List, 11, 8, string("Количество документов"),   alCenter);
+
+    if (debugMode)
+        List.Range("I11:I11").Interior.Color = #B5B5B5;
+        Put_Cell_Border(List, 11, 9, string("ID документов"), alCenter);
+    end;
+    // <-- заголовки столбцов результатов
+
+    // --> заполнение блока результатов
+    if (aResult.size/RES_SIZE != 0)
+        for (i, 0, aResult.size/RES_SIZE-1)
+            Put_Cell(List, 12+i, 1, aResult[RES_SIZE*i  ], alRight); //код операции
+            Put_Cell(List, 12+i, 2, aResult[RES_SIZE*i+1], alLeft);  //наим. операции
+            Put_Cell(List, 12+i, 3, aResult[RES_SIZE*i+2], alRight); //код вида документа
+            Put_Cell(List, 12+i, 4, aResult[RES_SIZE*i+3], alLeft);  //наим. вида документа
+            Put_Cell(List, 12+i, 5, aResult[RES_SIZE*i+4], alRight); //код шага
+            Put_Cell(List, 12+i, 6, aResult[RES_SIZE*i+5], alLeft);  //наим. шага
+            Put_Cell(List, 12+i, 7, aResult[RES_SIZE*i+6], alLeft);  //символ шага
+            Put_Cell(List, 12+i, 8, aResult[RES_SIZE*i+7], alRight); //кол-во документов
+
+            if (debugMode)
+                for (i, 0, aResult.size/RES_SIZE-1)
+                    Put_Cell(List, 12+i, 9, aResult[RES_SIZE*i+8], alRight); //id документов
+                end;
+            end;
+        end;
+    end;
+    // <-- заполнение блока результатов
+
+    List.Cells(12+aResult.size/RES_SIZE+1, 1).Value = strDayExists;
+
+end; /*End Of ExcelRep*/
+
+
+Macro OpenExcel()
+    var ExObj,
+        ComObj;
+      
+    ExObj  = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+    ComObj = ExObj.CreateComObject ("Excel.Application", False);
+    ComObj.Application.DisplayAlerts = True;
+    ComObj.Workbooks.Add();
+
+    ExcelRep(ComObj);
+    
+    ComObj.Visible = True;
+
+End; /* End Of OpenExcel */
+
+
+
+macro main();
+    var form: TRsbPanel = RslPanel(REP_NAME);
+    form.run();
+    if (formRun)
+        Message("Обработка результатов запроса...");
+        core();
+        Message("Формирование Excel-файла...");
+        OpenExcel();
+    end;
+end;
+                               
+main();
+exit(1);

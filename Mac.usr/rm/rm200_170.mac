@@ -1,0 +1,437 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank v6.0                     */
+/****************************************************************************/
+/*                      Подсистема "АРМ-Позиционера"                        */
+/*                      Обработка транзитного платежа                       */
+/*                                                                          */
+/*  Имя файла: rm200_170.mac                                                */
+/*  Создан:    26.01.05                                Фомченкова Л.Н.      */
+/*                                                                          */
+/*  KS 16.07.2012 C-11882                                                   */
+/*  Jushmanov 2014-02-25 С-19151 Логгирование массово выполненных шагов     */
+/****************************************************************************/
+
+import InsCarryDoc, PaymInter, PTInter, OprInter, BankInter, RMInter, WldInter,
+      "rmtools.mac", "pmtlscom.mac", "cbsttls.mac", "pmprops.mac";
+import "fg_Life_parm.mac"; // SDA 13.06.2012 - особенности обработки валютных транзитных в ПРББ
+import oralib; //Jushmanov 2014-02-25 C-19151
+
+private var fgBank = fg_life_subject({OurBank});
+
+var PaymentObj:RsbPayment;
+
+
+macro Наименование(Имя, Счет, Банк);
+    return string( Substr(Имя, 1, 160), " р/сч. ",
+                   Substr(Счет,1, 20), " в ",
+                   Substr(Банк,1, 160) );
+end;
+
+
+private macro FindBankID( StartDepartment );
+
+    var select:string = " select t_PartyID "
+                        " from ddp_dep_dbt "
+                        " where t_Code = :StartDepartment ";
+
+    var params:TArray = makeArray(SQLParam( "StartDepartment", StartDepartment ));
+
+    var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+    if( rset and rset.moveNext() )
+        return rset.value(0);
+    end;
+
+    return 0;
+end;
+
+//TAM 18.12.2013 C-22504
+private macro НеВыгружать();
+   var sql, cmd, rs;
+   sql = " select T_USERFIELD1 from dcorschem_dbt where T_FIID = ? and t_number = ?";
+   cmd = RSDCommand( sql );
+   cmd.AddParam( "dp", RSDBP_IN, PaymentObj.OutCorschemFIID );
+   cmd.AddParam( "nu", RSDBP_IN, PaymentObj.OutCorschem );
+   rs = RSDRecordSet( cmd );
+   if ( rs.MoveNext )
+      return ( Trim(rs.value(0)) == "to_close");
+   end;
+   return false;
+end;
+
+macro ExecuteStep( doc, first, KindDoc )
+    var DKFlag = "", FlagTrans = 0, stat = 0, БанкДляИсходящего = -1;
+    var PaymentID, pp, Транспорт, ТпСхема, Форма, Релиз;
+    var IPIDs, PPIDs, IPtype, PPtype, BankID:integer = 0;
+    private var error; // KS 16.07.2012 C-11882
+
+    RECORD PaymOut( pmpaym );
+    RECORD memorder( memorder );
+    RECORD bbcpord( bbcpord );
+    RECORD pmrmprop_Out( pmrmprop );
+    RECORD NoteText( notetext );
+    RECORD objatcor( objatcor );
+    RECORD ppdOut( pmprop );
+    RECORD ppkOut( pmprop );
+    RECORD propIn( pmprop );
+    RECORD propOut( pmprop );
+    RECORD CorsIn(corschem);
+    RECORD CorsOut(corschem);
+    FILE   pmcoOut(pmco) key 0;
+
+    ClearRecord(memorder);
+    ClearRecord(bbcpord);
+    ClearRecord(PaymOut);
+    ClearRecord(pmcoOut);
+
+    /* Найти свойства платежа */
+    /* Нужно только для предворительного заполнения буферов вставляемого платежа */
+    stat = FindPayment( PaymentObj.PaymentID, /* Индентификатор */
+                        0,                 /* Purpose    */
+                        0,                 /* SubPurpose */
+                        0,                 /* DocKind    */
+                        0,                 /* DocId      */
+                        true,
+                        PaymOut,           /* буфер платежа            */
+                        ppdOut,               /* буфер дебетовых свойств  */
+                        ppkOut,               /* буфер кредитовых свойств */
+                        pmrmprop_Out        /* свойства R-макета */
+                      );
+
+    if( stat == 0 )
+        if( PaymentObj.IsCredit() )
+            DKFlag = FL_KREDIT;
+        else
+            DKFlag = FL_DEBET;
+        end;
+
+        FlagTrans = PaymentObj.IsTransit();
+        if( DKFlag == FL_KREDIT ) /* флаг уже заполнен - это транзитный документ */
+            copy(propIn, ppdOut);
+            copy(propOut, ppkOut);
+        else
+            copy(propIn, ppkOut);
+            copy(propOut, ppdOut);
+        end;
+
+        if( DKFlag == "" ) /* документ не внешний */
+            msgbox("Документ не является внешним");
+            return 1;
+        end;
+        if( FlagTrans == 0 ) /* документ не транзитный */
+            msgbox("Документ не является транзитным");
+            return 1;
+        end;
+    else
+        MsgBox( "Ошибка при поиске платежа" );
+        return 1;
+    end;
+
+    if( НайтиКорсхему(PaymentObj.InCorschem, PaymentObj.ReceiverFIID, CorsIn))
+        msgbox("Не найдена входящая корсхема платежа");
+        return 1;
+    end;
+
+    if( НайтиКорсхему(PaymentObj.OutCorschem, PaymentObj.ReceiverFIID, CorsOut))
+        msgbox("Не найдена исходящая корсхема платежа");
+        return 1;
+    end;
+
+    /*SDA - генерация сообщения по введенному вручную валютному платежу*/
+    private var ID_Kind, MesID;
+    // SDA 13.06.2012 - особенности обработки валютных транзитных в ПРББ
+    if ((fgBank.is_PRBB) and (PaymentObj.IsTransit) and (PaymentObj.BaseFIID != 0))
+    // генерация сообщений для транзитных из Пайментса не требуется
+   elif (((PaymentObj.DocKind == 322) and ( PaymentObj.ReceiverFIID != 0 )) or
+        // TAM 09.12.2013 C-22504 - для ЭВ необходимо по сообщеним SWIFT создавать сообщения на выгрузке в исходящих
+        ((fgBank.is_EXV) and (PaymentObj.DocKind == 320) and (PaymentObj.BaseFIID != 0) and (not НеВыгружать())))
+        stat = InsertPaymentMessage( PaymentObj.PaymentID, ID_Kind, MesID );
+        if( stat )
+            РасширенноеСообщениеОбОшибке( "Ошибка при генерации сообщения по платежу" );
+            return 1;
+        end;
+    end;
+    /*SDA end*/
+
+    // KS 16.07.2012 C-11882
+    if (( fgBank.is_EXV )              // Только для ЭВ
+    and ( PaymentObj.InCorschem > 2 )  // Не "Основная: РКЦ" и не "ПРББ (НОСТРО)" - плательщик - Филиал ЭВ
+    and ( FlagTrans != 0 )             // Документ транзитный - получателем не является ЭВ
+    and ( PaymentObj.BaseFIID == 0 )   // Рублёвый
+       )
+        stat = PaymentObj.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                                      {OurBank},    // Меняем банк плательщика на наш
+                                      PTCK_BIC,
+                                      {MFO_Bank},  // Меняем банк плательщика на наш
+                                      {Name_Bank}, // Меняем банк плательщика на наш
+                                      "",
+                                      PaymentObj.FuturePayerFIID, 
+                                      1, //CHAPT1 
+                                      PaymentObj.FuturePayerAccount,  // Меняем счёт плательщика
+                                      0,//PaymentObj.Payer,
+                                      Наименование(PaymentObj.PayerName, PaymentObj.PayerAccount, ПолучитьИмяСубъекта(PaymentObj.PayerBankID)), // Меняем наименование плательщика
+                                      PaymentObj.PayerINN,
+                                      PTCK_CONTR,
+                                      ПолучитьКодСубъекта({OurBank}, PTCK_CONTR, error) // Меняем банк плательщика на наш
+                                    );
+    end;
+    // KS 16.07.2012 End
+
+    if( not УстановитьСтатусыПлатежа(OPR_PAYM_DO, OPR_PM_ST_ENTER))
+        PaymentObj.EndDepartment = PaymentObj.Department;
+        PaymentObj.PaymStatus = PM_IS_SENDING;
+        PaymentObj.PropStatus=PM_PROP_READY;
+        return УстановитьСтатусыПлатежа(OPR_PAYM_DIRECT, OPR_PM_ST_DIR_OUT);
+    else
+        return 1;
+    end;
+
+    /****************************************************************************************/
+    PaymOut.PaymentID         = 0;
+    PaymOut.PaymStatus        = 0;
+    PaymOut.Purpose           = PM_PURP_BANKPAYMENT;
+    PaymOut.SubPurpose        = 0;
+    PaymOut.ValueDate         = {CurDate};
+    PaymOut.KindOperation     = 0;
+
+    /*Устанавливаем основной актив по получателю*/
+    PaymOut.BaseAmount        = PaymentObj.ReceiverAmount;
+    PaymOut.BaseFIID          = PaymentObj.ReceiverFIID;
+
+    /*Создаем исходящий платеж банка*/
+    pmrmprop_Out.PaymentID = 0;
+
+    /*Создаем исходящий платеж банка*/
+    propOut.PaymentID    = 0;
+    propOut.PropStatus   = 0;
+    propOut.IsSender     = "";
+    propOut.TransferDate = {CurDate};
+    propOut.SettlementSystemCode = ""; /* Код документа в системе расчетов не копируем, должен заново рассчитываться */
+    propOut.CorrPosType  = 1;          /* Позиционирование пользовательское */
+    propOut.CorrID       = -1;
+    propOut.OurCorrID    = -1;
+    propOut.Corschem     = CorsOut.Number;
+    propOut.PayFIID      = CorsOut.FIID;
+
+    /****************************************************************************************/
+
+    if (DKFlag == FL_KREDIT)
+        /********************************************************************/
+        PaymOut.PayerAccount      = CorsIn.Account;
+        PaymOut.FIID           = CorsIn.FIID;
+        PaymOut.PayerBankID    = FindBankID( PaymentObj.StartDepartment );
+        PaymOut.PayerMesBankID = PaymOut.PayerBankID;
+        PaymOut.Payer          = PaymOut.PayerBankID;
+
+        if (PaymentObj.ReceiverBankID != PaymOut.ReceiverBankID)
+            PaymOut.ReceiverMesBankID = PaymOut.ReceiverBankID;
+            PaymOut.ReceiverBankID = PaymentObj.ReceiverBankID;
+        end;
+
+        pmrmprop_Out.PayerName = Наименование(PaymentObj.PayerName, PaymentObj.PayerAccount, ПолучитьИмяСубъекта(PaymentObj.PayerBankID));
+        pmrmprop_Out.PayerCorrAccNostro = "";
+        pmrmprop_Out.PayerBankName = ПолучитьИмяСубъекта( PaymOut.PayerBankID );
+        /********************************************************************/
+
+        copy(ppkOut, propOut);
+        initpm_paymprop(ppdOut); /*ClearRecord(ppdOut);*/
+
+        ppdOut.CodeKind = propOut.CodeKind;
+
+        if( GetPartyCodeEx( PaymOut.PayerBankID, ppdOut.CodeKind, @ppdOut.BankCode, @BankID ))
+            msgbox("Не найден код банка плательщика");
+            return 1;
+        else
+            if (PaymOut.PayerBankID != BankID)
+                PaymOut.PayerMesBankID = BankID;
+            end;
+        end;
+
+        memorder.DocKind          = DLDOC_BANKPAYMENT;
+    else
+        /********************************************************************/
+        PaymOut.ReceiverAccount   = CorsIn.Account;
+        PaymOut.PayFIID           = CorsIn.FIID;
+        PaymOut.ReceiverBankID    = FindBankID( PaymentObj.StartDepartment );
+        PaymOut.ReceiverMesBankID = PaymOut.ReceiverBankID;
+        PaymOut.Receiver          = PaymOut.ReceiverBankID;
+
+        if( ПолучитьОсновнойТипКодаДляТранспорта( Транспорт, propOut.CodeKind )
+        or  GetPartyCodeEx( PaymentObj.PayerBankID, propOut.CodeKind, @propOut.BankCode, @PaymOut.PayerBankID ) )
+            msgbox("Не найден код банка плательщика");
+            return 1;
+        else
+            if (PaymentObj.PayerBankID != PaymOut.PayerBankID)
+                PaymOut.PayerMesBankID = PaymOut.PayerBankID;
+                PaymOut.PayerBankID = PaymentObj.PayerBankID;
+            end;
+        end;
+
+        pmrmprop_Out.ReceiverName = Наименование(PaymentObj.ReceiverName, PaymentObj.ReceiverAccount, ПолучитьИмяСубъекта(PaymentObj.ReceiverBankID));
+        pmrmprop_Out.ReceiverCorrAccNostro = "";
+        pmrmprop_Out.ReceiverBankName = ПолучитьИмяСубъекта( PaymOut.ReceiverBankID );
+        /********************************************************************/
+
+        copy(ppdOut, propOut);
+        initpm_paymprop(ppkOut); /*ClearRecord(ppkOut);*/
+
+        ppkOut.CodeKind = propOut.CodeKind;
+
+        if( GetPartyCodeEx( PaymOut.ReceiverBankID, ppkOut.CodeKind, @ppkOut.BankCode, @BankID ))
+            msgbox("Не найден код банка получателя");
+            return 1;
+        else
+            if( PaymOut.ReceiverBankID != BankID )
+                PaymOut.ReceiverMesBankID = BankID;
+            end;
+        end;
+
+        memorder.DocKind = DLDOC_BANKCLAIM;
+    end;
+
+    /****************************************************************************************/
+    if ( (DKFlag == FL_DEBET) Or (PaymentObj.ReceiverFIID == 0) )
+        memorder.OrderID        = 0;
+        memorder.Kind_Operation = 0;
+        memorder.Status         = 0;
+        /*Параметры заголовка платежа банка*/
+        memorder.Origin         = MEMORDER_FDOC_TRANZIT;
+        memorder.Oper           = {oper};
+        PaymOut.DocKind         = memorder.DocKind;
+    else
+        bbcpord.OrderID         = 0;
+        bbcpord.Kind_Operation  = 0;
+        bbcpord.CurrentState    = 0;
+        bbcpord.PayerAccount    = PaymOut.PayerAccount;
+        /*Параметры заголовка платежа банка*/
+        bbcpord.Origin          = CP_OR_TRANZIT;
+        bbcpord.Oper            = {oper};
+        PaymOut.DocKind         = memorder.DocKind;
+    end;
+    /****************************************************************************************/
+
+    pmcoOut.PaymentID = PaymentObj.PaymentID;
+    if( GetEQ( pmcoOut ) )
+        pmcoOut.PaymentID = 0;
+    else
+        ClearRecord( pmcoOut );
+    end;
+
+    /*Добавляем созданный платеж банка*/
+    if( PaymentObj.ReceiverFIID == 0 )
+        if( not InsertBankPayment( PaymOut,
+                                   pmrmprop_Out, /* Свойства R-макета для PaymOut */
+                                   ppdOut,       /* Дебетовые свойства PaymOut */
+                                   ppkOut,       /* Кредитовые свойства PaymOut */
+                                   memorder,     /* Заголовок платежа банка */
+                                   PaymentID,    /* Идентификатор записи PaymOut во врем. файле */
+                                   "",           /* ContextID */
+                                   null,         /* SignParm */
+                                   false,        /* LaunchOper */
+                                   null,         /* demand */
+                                   null,         /* pmakkr */
+                                   pmcoOut       /* pmco */
+                                 ) )
+            РасширенноеСообщениеОбОшибке( "Ошибка при вставке платежа");
+            return 1;
+        end;
+    else
+        if( not InsertCPBankPayment( PaymOut,
+                                     pmrmprop_Out, /* Свойства R-макета для PaymOut */
+                                     ppkOut,       /* Кредитовые свойства PaymOut */
+                                     bbcpord,      /* Заголовок платежа банка */
+                                     PaymentID,    /* Идентификатор записи PaymOut во врем. файле */
+                                     "",           /* ContextID */
+                                     null,         /* SignParm */
+                                     false,        /* LaunchOper */
+                                     pmcoOut       /* pmco */
+                                   ) )
+            РасширенноеСообщениеОбОшибке( "Ошибка при вставке платежа" );
+            return 1;
+        end;
+    end;
+
+    /*Копируем из исходного платежа примечания*/
+    if( PaymentObj.GetFirstNotePayment(NoteText) )
+        if( not ДобавитьПримечаниеПлатежа(Notetext, PaymentID))
+            РасширенноеСообщениеОбОшибке("Ошибка при копировании примечания");
+            return 1;
+        end;
+        while( PaymentObj.GetNextNotePayment(NoteText) )
+            ДобавитьПримечаниеПлатежа(Notetext, PaymentID);
+        end;
+    end;
+
+    /*Копируем из исходного платежа категории*/
+    if( PaymentObj.GetFirstObjAtCor(ObjAtCor) )
+        if( not ConnectCategory( ObjAtCor.ObjectType,
+                                 ObjAtCor.GroupID,
+                                 PaymentID,
+                                 true,
+                                 ObjAtCor.AttrID,
+                                 "",
+                                 "" ) )
+            РасширенноеСообщениеОбОшибке( "Ошибка при привязывании категории");
+            return 1;
+        end;
+        while(PaymentObj.GetNextObjAtCor(ObjAtCor))
+            ConnectCategory( ObjAtCor.ObjectType,
+                             ObjAtCor.GroupID,
+                             PaymentID,
+                             true,
+                             ObjAtCor.AttrID,
+                             "",
+                             "" );
+        end;
+    end;
+
+    /* Массивы с информацией о платежах */
+    IPIDs     = TArray;
+    PPIDs     = TArray;
+    IPtype    = TArray;
+    PPtype    = TArray;
+
+    IPIDs(0)  = PaymentObj.PaymentID;
+    PPIDs(0)  = PaymentID;
+    IPtype(0) = OPR_ID_REAL;
+    PPtype(0) = OPR_ID_TMPFILE;
+
+    if( not PaymentsKvit( IPIDs,
+                          IPtype,
+                          PPIDs,
+                          PPtype,
+                          NULL, PMLINK_KIND_RETREDIR) )
+        РасширенноеСообщениеОбОшибке( "Ошибка при установке связи между платежами" );
+        return 1;
+    end;
+
+    /* Закрываем платеж PaymIn*/
+    PaymentObj.PaymStatus = PM_FINISHED;
+    PaymentObj.PropStatus = PM_PROP_CLOSED;
+    return УстановитьСтатусыПлатежа(OPR_PAYM_STATE, OPR_PM_ST_CLOSE);
+end;
+
+
+//Jushmanov 2014-02-25 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

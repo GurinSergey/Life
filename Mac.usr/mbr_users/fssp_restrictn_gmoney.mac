@@ -1,0 +1,1137 @@
+//--------------------------------------------------------------------------------
+//                                                     _                       
+// @filename: fssp_restrictn_gmoney.mac                 \`*-.                   
+// @author  : Golovkin                                   )  _`-.                
+// @desc    : Обработка постановлений о взыскании       .  : `. .               
+// @changes :                                           : _   '  \              
+//                                                      ; *` _.   `*-._         
+//                                                      `-.-'          `-.      
+//                                                        ;       `       `.    
+//                                                        :.       .        \   
+//                                                        . \  .   :   .-'   .  
+//                                                        '  `+.;  ;  '      :  
+//                                                        :  '  |    ;       ;-.
+//                                                        ; '   : :`-:     _.`* ;
+//                                                     .*' /  .*' ; .*`- +'  `*'
+//                                                     `*-*   `*-*  `*-*'        
+//--------------------------------------------------------------------------------
+import rsd,Reporting,PTInter,RsbDataSet,FIInter,RsExts,CurrInter;
+import "globals.mac","likepy.mac","keycodes.mac","fssp_xml_lib.mac","lib_registry.mac","fssp_paymentProc.mac","acs_func.mac";
+import "fssp_lib.mac";
+
+private var fssp_dir_export = RSL_GetRegistryValue( "PRBB/FSSPPATH/OUT" );
+
+private const ACTION_MODE_SINGLE = 1;
+private const ACTION_MODE_MULTI  = 2;
+
+private const UNKNOWN_CLIENT = -1;
+private const UNKNOWN        = -1;
+private const NO_ERROR       =  0;
+
+// статусы ответов для постановления
+private const AQ_EXISTS_DATA        = 1;
+private const AQ_NO_EXISTS_DATA     = 2;
+private const AQ_FULL_PENALTY       = 3;
+private const AQ_PARTLY_PENALTY     = 4;
+private const AQ_NO_MANDATORY_FIELD = 5;
+
+// статусы ответов для конкретного счета
+private const ACC_NO_ERROR        = 0;
+private const ACC_NOT_THE_CLIENT  = 1;
+private const ACC_NOT_FOUND       = 2;
+private const ACC_PARTLY_PENALTY  = 6;
+private const ACC_FULL_PENALTY    = 8;
+private const ACC_PENALTY_NOMONEY = 8;
+private const ACC_IS_CLOSED       = 12;
+
+class fssp_penalty_acc
+    var InternalKey         =  0,
+        ActDate             = "",
+        KindData            = "", 
+        account             = "",
+        fiid                =  0,
+        summa               = $0, // изначальная сумма постановления
+        restrictedAmount    = $0, // сумма, на которую исполнено постановление в валюте 
+        restrictedAmountRub = $0, // сумма, на которую исполнено постановление в рублях 
+        i2Amount            = $0, // сумма, помещенная в Картотеку №2 в валюте
+        i2AmountRub         = $0, // сумма, помещенная в Картотеку №2 в рублях
+        error               = ACC_FULL_PENALTY;
+
+    // просто, для отладчика
+    macro toString
+        return account;
+    end;
+end;
+
+class TFSSP_PENALTY( mes_id )
+
+    var id        = UNKNOWN,
+        clientId  = UNKNOWN_CLIENT,
+        answerKey = UNKNOWN,  
+        error     = NO_ERROR,
+        errorText = TArray,
+        state     = 0,
+        mass_mode = false, 
+        doNotProcess = false,
+        priority  = UNKNOWN,
+        answer    = getTxtFileName ( "RestrReport" );
+
+    var InternalKey    = nullVal,
+        DocNum         = nullVal,
+        DocDate        = nullVal,
+        SPI            = nullVal,
+        SPIFio         = nullVal,
+        Amount         = nullVal,
+        DocCode        = nullVal,
+        RestrDocId     = nullVal,
+        RestrDocNumber = nullVal,
+        RestrDocDate   = nullVal,
+        IPNum          = nullVal,
+        IPDate         = nullVal,
+        IpInternalKey  = nullVal,
+        DebtorINN      = nullVal,
+        DebtorKPP      = nullVal,
+        DebtorName     = nullVal,
+        OSPName        = nullVal,
+        IDDate         = nullVal,
+        IDSubj         = nullVal, 
+        IDSubjName     = nullVal,
+        RecpName       = nullVal,
+        RecpCnt        = nullVal,
+        RecpINN        = nullVal,
+        RecpKPP        = nullVal,
+        RecpBIK        = nullVal;
+    var accounts = TArray();
+
+    // сравнение наименований клиентов
+    private macro compareName( name, namersb )
+        const OOO = "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ";
+        const ZAO = "ЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+        const OAO = "ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+
+        namersb = strupr( namersb ); 
+        namersb = strsubst( namersb, "ООО", OOO );
+        namersb = strsubst( namersb, "ЗАО", ZAO );
+        namersb = strsubst( namersb, "ОАО", OAO );
+        namersb = strsubst( namersb, "Ё"  , "Е" );
+        namersb = strsubst( namersb, "\"" , ""  );
+        namersb = strsubst( namersb, "  " , " " );
+
+        name = strupr( name ); 
+        name = strsubst( name, "ООО", OOO );
+        name = strsubst( name, "ЗАО", ZAO );
+        name = strsubst( name, "ОАО", OAO );
+        name = strsubst( name, "Ё"  , "Е" );
+        name = strsubst( name, "\"" , ""  );
+        name = strsubst( name, "  " , " " );
+
+        return ( name == namersb );
+    end;  
+
+    // генерация ExternalKey
+    private macro getAnswerKey
+        var rs;
+        rs = RsdRecordSet( " SELECT   USR_FSSP_ANSWER_MES_SEQ.NEXTVAL FROM DUAL " );
+
+        if( rs.movenext )
+            return rs.value(0);
+        end;
+
+        return -1;
+    end;
+
+    // объединение ИНН и КПП
+    private macro inn_kpp( inn, kpp )
+        if( kpp == null ) 
+            return inn;
+        else
+            return inn + "/" + kpp;
+        end;
+    end;
+
+    // представление даты в формате ФССП
+    private macro fsspDate( doc_date:date )
+        private var yyyy,mm,dd;
+        DateSplit( date( doc_date ), dd, mm, yyyy );
+        if( strLen( string( mm ) ) == 1 ) mm = "0" + mm; end;
+        if( strLen( string( dd ) ) == 1 ) dd = "0" + dd; end;
+        return yyyy + "-" + mm + "-" + dd;
+    end;
+
+    // перемещает файл отчета из txtfile в директорию выгрузки
+    private macro move_file( in, out )
+        if( copyfile( in, out ) and removefile( in ) ) 
+            return true;
+        end;
+        return false;
+    end;
+
+    // получить имя файла отчета
+    macro getReportFileName
+//        return fssp_dir_export + "/" + answerKey + "_Report.xml";
+        return fssp_dir_export + "/" + getMesName( int( id ) );
+    end;
+
+    // установить статус сообщению
+    private macro setMessageStatus( _state )
+        private var cmd = RsdCommand( " UPDATE   USR_FSSP_MES SET T_MES_STATE = :state WHERE T_ID = :mes_id " );
+        cmd.addparam( "state" , RSDBP_IN, _state );
+        cmd.addparam( "mes_id", RSDBP_IN, id     );
+        cmd.execute;
+        
+        state = _state;
+    end;
+
+    // залочить сообщение
+    private macro lockMessage
+        private var cmd, rs;
+        // ставлю блокировку
+        cmd = RsdCommand( " SELECT * FROM USR_FSSP_MES WHERE T_ID = :MES_ID FOR UPDATE NOWAIT " );
+        cmd.addparam( "MES_ID", RSDBP_IN, id );
+        cmd.execute;
+    onerror
+        runError( "Сообщение заблокировано другим пользователем" );
+    end;
+
+    // проверка полей сообщения
+    // ваще надо переписать нафик
+    // но пока не буду этого делать
+    private macro checkFields
+        var i;
+
+        if(    ( InternalKey   == nullVal )
+            or ( DocNum        == nullVal ) 
+            or ( DocDate       == nullVal )
+            or ( Amount        == nullVal )
+            or ( DocCode       == nullVal )
+            or ( IpInternalKey == nullVal )
+            or ( DebtorINN     == nullVal )
+            or ( DebtorName    == nullVal )
+            or ( IDDate        == nullVal )
+            or ( IDSubj        == nullVal ) 
+            or ( IDSubjName    == nullVal )
+            or ( OSPName       == nullVal ) )
+            error = AQ_NO_MANDATORY_FIELD;
+            errorText[errorText.size] = "Нет обязательных реквизитов"; 
+            return;
+        end;
+
+        if( accounts.size > 0 )
+            for( i, 0, accounts.size - 1 )
+                if(    ( accounts[i].account             == nullVal )
+                    or ( accounts[i].restrictedAmountRub == nullVal ) )
+                    error = AQ_NO_MANDATORY_FIELD;    
+                    errorText[errorText.size] = "Нет обязательных реквизитов"; 
+                    return;
+                end;
+            end;
+        end;
+
+        if(    ( DocCode == "O_IP_ACT_ENDARR_GMONEY"  ) 
+            or ( DocCode == "O_IP_ACT_GACCOUNT_MONEY" ) )
+            if(    ( RecpName == nullVal )
+                or ( RecpCnt  == nullVal )
+                or ( RecpINN  == nullVal ) 
+                or ( RecpBIK  == nullVal ) )
+                error = AQ_NO_MANDATORY_FIELD;
+                errorText[errorText.size] = "Нет обязательных реквизитов"; 
+                return;
+            end;
+        end;
+
+        if(    ( DocCode == "O_IP_ACT_ENDARR_GMONEY"     ) 
+            or ( DocCode == "O_IP_ACT_ENDGACCOUNT_MONEY" ) )
+            if(    ( RestrDocId     == nullVal )
+                or ( RestrDocNumber == nullVal )
+                or ( RestrDocDate   == nullVal ) )
+                error = AQ_NO_MANDATORY_FIELD;
+                errorText[errorText.size] = "Нет обязательных реквизитов"; 
+                return;
+            end;
+        end;
+
+        if( DebtorKPP == nullVal )
+            DebtorKPP = null;
+        end;
+
+        if( RestrDocNumber == nullVal )
+            RestrDocNumber = null;
+        end;
+
+        if( RestrDocDate == nullVal )
+            RestrDocDate = fsspDate( date );
+        end;
+
+    end;
+
+    // сохранение ошибки в таблицу
+    macro save_mes_error
+        private var cmd,i;  
+        for( i, 0, errorText.size - 1 )
+            cmd = RsdCommand( " INSERT INTO USR_FSSP_ERR_TMP   VALUES   (:mes_id, :err_text) " );
+
+            cmd.addparam( "mes_id"  , RSDBP_IN, id           );
+            cmd.addparam( "err_text", RSDBP_IN, errorText[i] );
+
+            cmd.execute;
+        end;
+    end;
+
+    // запись информации о сформированном платеже по документу
+    private macro regPayment( _paymentid, _i2paymentid, _account )
+        var cmd = RsdCommand( " INSERT INTO USR_FSSP_PAYMENTS "
+                              "   VALUES   (0,                "
+                              "             :MES_ID,          "
+                              "             :PAYMENTID,       "
+                              "             :ANSWERKEY,       "
+                              "             :ACCOUNT,         "
+                              "             :INTERNALKEY,     "
+                              "             :DOCNUM,          "
+                              "             :DOCDATE,         "
+                              "             :ACTDATE,         "
+                              "             :KINDDATA,        "
+                              "             :AMOUNT,          "
+                              "             :AMOUNTRUB,       "
+                              "             :I2PAYMENTID,     "
+                              "             :I2AMOUNT,        "
+                              "             :I2AMOUNTRUB,     "
+                              "             :STATE);          " );
+
+        cmd.addparam( "MES_ID"      , RSDBP_IN, id                           ); 
+        cmd.addparam( "PAYMENTID"   , RSDBP_IN, _paymentid                   ); 
+        cmd.addparam( "ANSWERKEY"   , RSDBP_IN, answerKey                    ); 
+        cmd.addparam( "ACCOUNT"     , RSDBP_IN, _account.account             ); 
+        cmd.addparam( "INTERNALKEY" , RSDBP_IN, InternalKey                  ); 
+        cmd.addparam( "DOCNUM"      , RSDBP_IN, DocNum                       ); 
+        cmd.addparam( "DOCDATE"     , RSDBP_IN, DocDate                      ); 
+        cmd.addparam( "ACTDATE"     , RSDBP_IN, _account.ActDate             ); 
+        cmd.addparam( "KINDDATA"    , RSDBP_IN, _account.KindData            ); 
+        cmd.addparam( "AMOUNT"      , RSDBP_IN, _account.restrictedAmount    ); 
+        cmd.addparam( "AMOUNTRUB"   , RSDBP_IN, _account.restrictedAmountRub ); 
+        cmd.addparam( "I2PAYMENTID" , RSDBP_IN, _i2paymentid                 ); 
+        cmd.addparam( "I2AMOUNT"    , RSDBP_IN, _account.i2Amount            ); 
+        cmd.addparam( "I2AMOUNTRUB" , RSDBP_IN, _account.i2AmountRub         ); 
+        cmd.addparam( "STATE"       , RSDBP_IN, _account.error               ); 
+        cmd.execute;
+    end;
+
+    // определение очередности
+    private macro getPriority
+        var cmd,rs,result;
+
+        cmd = RsdCommand( " SELECT   T_PRIORITY             "
+                          "   FROM   USR_FSSP_PRIORITY      "
+                          "  WHERE   T_IDSUBJTYPE = :IDSUBJ " );
+        cmd.addparam( "IDSUBJ", RSDBP_IN, IDSubj ); 
+
+        rs = RsdRecordset( cmd );
+
+        if( rs.movenext ) 
+            result = rs.value( "T_PRIORITY" ); 
+
+            if( result == nullVal ) return null;
+            else                    return int( result );
+            end;
+        end;
+
+        return null;
+    onerror
+        return null;
+    end;
+
+    // получение номера документа по референсу
+    private macro NumDoc
+        var ref;
+        GenerateReference( 1000046, ref );
+        return ref;
+    end;
+
+    // получить имя файла сообщения 
+    private macro getMesName
+        private var cmd, rs;
+        private var sessFileName = "";
+
+        cmd = RsdCommand( " SELECT   sess.t_sess_file "
+                          "   FROM   usr_fssp_sess sess, usr_fssp_mes mes "
+                          "  WHERE   sess.t_id = mes.t_sess_id AND mes.t_id = :mes_id " );
+        cmd.addparam( "mes_id", RSDBP_IN, id );
+
+        rs = RsdRecordset( cmd );
+
+        if( rs.movenext )
+            splitfile( rs.value( "t_sess_file" ), sessFileName );
+        end;
+
+        return sessFileName;
+    end;
+
+    // получить системную ошибку
+    private macro getSystemError( errorNum )
+        initError;
+        memoryError( errorNum );
+        return getErrMsg();
+    end;
+
+    // конвертация валюты
+    private macro convAmount( amount, infiid, outFiid )
+        private var cAmount;
+        if ( ConvSum( cAmount, money( amount ), {curdate}, infiid, outFiid, 7 ) == 0 ) 
+            return cAmount;
+        else  
+            return money( amount );
+        end;       
+    end;
+
+    // проверка счета
+    private macro checkClientAccount( acc:fssp_penalty_acc )
+        private var cmd, rs;
+        private var accRest, accLimRest, cAmount;
+
+        cmd = RsdCommand( " SELECT   ACC.* "
+                          "   FROM   DACCOUNTS_VIEW ACC, DPARTY_DBT PARTY "
+                          "  WHERE   ACC.T_ACCOUNT = :ACCOUNT AND INSTR (ACC.T_TYPE_ACCOUNT, 'П') = 0 AND ACC.T_CLIENT = PARTY.T_PARTYID " );
+        cmd.addparam( "account", RSDBP_IN, acc.account );
+
+        rs = RsdRecordset( cmd );
+
+        if( rs.movenext )
+           if( rs.value( "t_client" ) != clientId )
+               acc.error = ACC_NOT_THE_CLIENT;
+           end;
+
+           if( rs.value( "t_open_close" ) == "З" )
+               acc.error = ACC_IS_CLOSED;
+           end;
+
+           acc.fiid = rs.value( "t_code_currency" );
+           cAmount  = convAmount( acc.restrictedAmountRub, 0, acc.fiid );
+
+           AccGetFreeAmount( accRest, accLimRest, acc.account, 1, acc.fiid, {curdate}, priority );
+
+           if  ( accRest < cAmount )
+               acc.i2Amount            = cAmount;
+               acc.i2AmountRub         = acc.restrictedAmountRub;
+               acc.restrictedAmount    = accRest;
+               acc.restrictedAmountRub = convAmount( acc.restrictedAmount, acc.fiid, 0 );
+               acc.error               = ACC_PARTLY_PENALTY;
+           elif( accRest == 0 )
+               acc.i2Amount            = cAmount;
+               acc.i2AmountRub         = acc.restrictedAmountRub;
+               acc.restrictedAmountRub = $0;
+               acc.error               = $0;
+               acc.error               = ACC_PENALTY_NOMONEY
+           else
+               acc.restrictedAmount = cAmount;
+           end;
+        else
+            acc.error = ACC_NOT_FOUND;
+        end;
+    end;
+
+    // определение клиента
+    private macro get_client_id
+        var cmd, rs, col = TArray();
+
+        macro EvProc ( rs, cmd, id, key )
+            if( cmd == DLG_KEY ) 
+                if( key == KEY_ENTER ) return CM_SELECT; end;
+            end;
+        end;
+
+        cmd = Rsdcommand( " WITH inn_kpp AS (SELECT   :inn inn, :kpp kpp, :name name FROM DUAL) "
+                          " SELECT   party.t_partyid, party.t_name, obj.t_code, COUNT (*) OVER (PARTITION BY NULL) cnt, "
+                          "          NVL2(inn_kpp.kpp,inn_kpp.inn || '/' || inn_kpp.kpp,inn_kpp.inn) mes_inn, "
+                          "          inn_kpp.name mes_name "
+                          "   FROM   dobjcode_dbt obj, dparty_dbt party, inn_kpp "
+                          "  WHERE   obj.t_code like "
+                          "             NVL2 (inn_kpp.kpp, "
+                          "                   inn_kpp.inn || '/' || inn_kpp.kpp, "
+                          "                   inn_kpp.inn || '%') "
+                          "          AND obj.t_codekind = 16 "
+                          "          AND obj.t_state = 0 "
+                          "          AND obj.t_objecttype = 3 "
+                          "          AND obj.t_objectid = party.t_partyid " );
+
+        cmd.addparam( "inn" , RSDBP_IN, DebtorINN  );
+        cmd.addparam( "kpp" , RSDBP_IN, DebtorKPP  );
+        cmd.addparam( "name", RSDBP_IN, DebtorName );
+
+        rs = RsdRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+
+        if( rs.movenext )
+            if( rs.value( "cnt" ) > 1 ) 
+
+                col = makeArray( "t_code"   , "Код"                     , 22, 0, 0, 0, 
+                                 "t_name"   , "Наименование"            , 40, 0, 0, 0, 
+                                 "t_partyid", "ИД субъекта"             , 10, 0, 0, 0,
+                                 "mes_inn"  , "Код в сообщении"         , 22, 0, 0, 0,
+                                 "mes_name" , "Наименование в сообщении", 40, 0, 0, 0 );
+
+                if( RunScroll ( rs, col.size/6, col, null, "EvProc", "Выберите клиента", "~Enter~ выбор" ) )
+                    return int( rs.value( "t_partyid" ) );
+                else
+                    errorText[errorText.size] = "Клиент не выбран";
+                    doNotProcess = true;
+                end;
+            elif( rs.value( "cnt" ) == 1 ) 
+                if( compareName( rs.value( "mes_name" ), rs.value( "t_name" ) ) ) 
+                    return int( rs.value( "t_partyid" ) );
+                else
+                    if( mass_mode )
+                        errorText[errorText.size] = "Не совпадает наименование должника в сообщении и в базе данных||в сообщении:" + DebtorName + "||в БД:" + rs.value( "t_name" );
+                        doNotProcess = true;
+                    else
+                        if( getTrue( true, "Наименование должника в запросе:" + DebtorName + "|| наименование в БД:" + rs.value( "t_name" ) + "||Обрабатывать постановление?" ) )
+                            return int( rs.value( "t_partyid" ) );
+                        end;
+                    end;
+                end;
+            end
+        end;
+        
+        return UNKNOWN_CLIENT;
+    end;
+
+    // получаем список счетов
+    private macro getMessageAccounts
+        private var cmd,rs;
+
+        accounts = TArray();
+
+        cmd = RsdCommand( " WITH FSSP_MES AS (SELECT   xmltype (T_MES_DATA) MES_DATA "
+                          "                     FROM   USR_FSSP_MES  "
+                          "                    WHERE   T_ID = :MES_ID) "
+                          " SELECT   EXTRACTVALUE(ACCDATA.COLUMN_VALUE,'//Acc/text()'        ) Account,     "
+                          "          EXTRACTVALUE(ACCDATA.COLUMN_VALUE,'//Summa/text()'      ) Amount,      "
+                          "          EXTRACTVALUE(ACCDATA.COLUMN_VALUE,'//InternalKey/text()') InternalKey, "  
+                          "          EXTRACTVALUE(ACCDATA.COLUMN_VALUE,'//ActDate/text()'    ) ActDate,     "  
+                          "          EXTRACTVALUE(ACCDATA.COLUMN_VALUE,'//KindData/text()'   ) KindData     "  
+                          "   FROM   FSSP_MES M, TABLE(XMLSEQUENCE(M.MES_DATA.EXTRACT ( '//AvailabilityAccData' ))) ACCDATA  " );
+        cmd.addparam( "mes_id", RSDBP_IN, id );
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            var acc = fssp_penalty_acc;
+            acc.account             = rs.value( "Account"     );
+            acc.summa               = money( rs.value( "Amount" ) );
+            acc.restrictedAmountRub = money( rs.value( "Amount" ) );
+            acc.InternalKey         = rs.value( "InternalKey" );
+            acc.ActDate             = rs.value( "ActDate"     ); 
+            acc.KindData            = rs.value( "KindData"    );
+
+            accounts[accounts.size] = acc;
+        end;
+    end;
+
+    // инициализация объекта
+    macro init( mes_id )
+        private var cmd,rs;
+debugbreak;
+        cmd = RsdCommand(          " SELECT   EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/InternalKey/text()'    ) INTERNAL_KEY,    "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/DocNum/text()'         ) DOC_NUM,         "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/SPI/text()'            ) SPI,             "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/SPIFio/text()'         ) SPIFIO,          "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/Amount/text()'         ) AMOUNT,          "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/DocCode/text()'        ) DOC_CODE,        "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/RestrDocId/text()'     ) RESTR_DOC_ID,    "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/RestrDocNumber/text()' ) RESTR_DOC_NUMBER,"
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IPNum/text()'       ) IP_NUM,          "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IPDate/text()'      ) IP_DATE,         "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/InternalKey/text()' ) IP_INTERNAL_KEY, "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorINN/text()'   ) INN,             "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorKPP/text()'   ) KPP,             "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/DebtorName/text()'  ) NAME,            "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IDSubj/text()'      ) IDSUBJ,          "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IDSubjName/text()'  ) IDSUBJ_NAME,     "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/OSPName/text()'     ) OSPName,         "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/OspProperty/RecpName/text()' ) RECP_NAME, "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/OspProperty/RecpCnt/text()'  ) RECP_CNT,  "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/OspProperty/RecpINN/text()'  ) RECP_INN,  "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/OspProperty/RecpKPP/text()'  ) RECP_KPP,  "
+                          + "\n" + "          EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/OspProperty/RecpBIK/text()'  ) RECP_BIK,  "
+                          + "\n" + "          to_date(EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/IP/IDDate/text()'    ), 'yyyy-mm-dd') IDDATE,   "
+                          + "\n" + "          to_date(EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/DocDate/text()'      ), 'yyyy-mm-dd') DOC_DATE, "
+                          + "\n" + "          to_date(EXTRACTVALUE(XMLTYPE(MES.T_MES_DATA), '/*/*/RestrDocDate/text()' ), 'yyyy-mm-dd') RESTR_DOC_DATE, "
+                          + "\n" + "          MES.T_MES_STATE MES_STATE, "
+                          + "\n" + "          MES.T_PARTY_ID CLIENT      "
+                          + "\n" + "   FROM   USR_FSSP_MES MES   "
+                          + "\n" + "  WHERE   MES.T_ID = :mes_id " );
+        cmd.addparam( "mes_id", RSDBP_IN, mes_id );
+
+        rs = RsdRecordset( cmd );
+
+        if( rs.movenext )
+            InternalKey   = rs.value( "INTERNAL_KEY"     );
+            DocNum        = rs.value( "DOC_NUM"          );
+            DocDate       = rs.value( "DOC_DATE"         );
+            SPI           = rs.value( "SPI"              );
+            SPIFio        = rs.value( "SPIFIO"           );
+            Amount        = rs.value( "AMOUNT"           );
+            DocCode       = rs.value( "DOC_CODE"         );
+            RestrDocId    = rs.value( "RESTR_DOC_ID"     );
+            RestrDocNumber= rs.value( "RESTR_DOC_NUMBER" );
+            RestrDocDate  = rs.value( "RESTR_DOC_DATE"   );
+            IPNum         = rs.value( "IP_NUM"           );
+            IPDate        = rs.value( "IP_DATE"          );
+            IpInternalKey = rs.value( "IP_INTERNAL_KEY"  );
+            DebtorINN     = rs.value( "INN"              );
+            DebtorKPP     = rs.value( "KPP"              );
+            DebtorName    = rs.value( "NAME"             );
+            IDDate        = rs.value( "IDDATE"           );
+            IDSubj        = rs.value( "IDSUBJ"           ); 
+            IDSubjName    = rs.value( "IDSUBJ_NAME"      );
+            OSPName       = rs.value( "OSPName"          );
+            RecpName      = rs.value( "RECP_NAME"        );
+            RecpCnt       = rs.value( "RECP_CNT"         );
+            RecpINN       = rs.value( "RECP_INN"         );
+            RecpKPP       = rs.value( "RECP_KPP"         );
+            RecpBIK       = rs.value( "RECP_BIK"         );
+            state         = int( rs.value( "MES_STATE" ) );
+            clientId      = int( rs.value( "CLIENT" )    );
+
+            id        = mes_id;
+            answerKey = int( getAnswerKey );
+            priority  = getPriority;
+            getMessageAccounts;
+        end;
+    end;
+
+    // удаление платежа по id
+    private macro deletePayment( _paymentid )
+        private var cmd,stat = 0;
+
+        stat = CheckDeletePayment( _paymentid );
+
+        if( stat == 0 )
+//          PM_RollbackAndDeletePmDocument( int( rs.value( "t_paymentid" ) ) ); // нет у нас такой функции, но надеюсь что появится :(
+            PM_RollbackOperation( _paymentid ); // откат операции
+
+            cmd = RSDCommand( " DECLARE "
+                              "    v_stat        NUMBER; "
+                              "    v_paymentid   NUMBER; "
+                              " BEGIN "
+                              "    v_paymentid := :paymentid; "
+                              "    v_stat      := pm_common.DeletePayment (v_paymentid); "                  // удаление платежа
+                              "    IF v_stat = 0 "
+                              "    THEN  DELETE FROM   DPSINRQ_DBT     WHERE   T_PAYMENTID = v_paymentid; " // удаление первичек
+                              "          DELETE FROM   DPSPAYORD_DBT   WHERE   T_ORDERID   = v_paymentid; "
+                              "    END IF; "
+                              "    :retval := v_stat; "
+                              " END; " );
+
+            cmd.addParam( "paymentid", RSDBP_IN , _paymentid );
+            cmd.addparam( "retval"   , RSDBP_OUT, V_INTEGER );
+            cmd.Execute();            
+
+            stat = cmd.param(1).value;
+        end;
+
+        return stat;
+    end;
+
+    // откат( удаление ) платежей по взысканию 
+    private macro rollbackPayments
+        private var cmd,cmdDel,rs,paymentid = 0,i2paymentid = 0,stat = 0;
+
+        cmd = RsdCommand( " SELECT * FROM USR_FSSP_PAYMENTS WHERE T_MES_ID = :MES_ID FOR UPDATE NOWAIT" );
+        cmd.addparam( "MES_ID", RSDBP_IN, id );
+
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            paymentid = int( rs.value( "t_paymentid" ) );
+
+            if( paymentid != 0 )
+                stat = deletePayment( paymentid );
+                if( stat != 0 ) runError( "Не удалось удалить платеж с id " + paymentid + "||" + getSystemError( stat ) ); end;
+            end;
+
+            cmdDel = RsdCommand( " DELETE FROM USR_FSSP_PAYMENTS WHERE T_MES_ID = :MES_ID AND T_PAYMENTID = :PAYMENTID " );
+            cmdDel.addparam( "MES_ID"   , RSDBP_IN, id        );
+            cmdDel.addparam( "PAYMENTID", RSDBP_IN, paymentid );
+            cmdDel.execute();
+        end;
+    end;
+
+    macro rollBackCanselPenalty
+        private var cmd,cmdDel,rs,i2paymentid = 0,execStat = true;
+
+        cmd = RsdCommand( " SELECT * FROM USR_FSSP_PAYMENTS WHERE T_MES_ID = :MES_ID FOR UPDATE NOWAIT" );
+        cmd.addparam( "MES_ID", RSDBP_IN, id );
+
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            i2paymentid = int( rs.value( "t_i2paymentid" ) );
+
+            execStat = PM_RollbackOperation( i2paymentid ); // откат операции
+
+            if( not execStat ) runError( "Не удалось откатить отмену взыскания с id " + i2paymentid + "||" + getErrMsg ); end;
+
+            cmdDel = RsdCommand( " DELETE FROM USR_FSSP_PAYMENTS WHERE T_MES_ID = :MES_ID AND t_i2paymentid = :PAYMENTID " );
+            cmdDel.addparam( "MES_ID"   , RSDBP_IN, id          );
+            cmdDel.addparam( "PAYMENTID", RSDBP_IN, i2paymentid );
+            cmdDel.execute();
+        end;
+    end;
+    // спёрто
+    // отмена отмены претензии
+    private macro rollbackClaims
+        var sql, stat;
+
+        sql = execSQLSelect( " select * from usr_fssp_claim where mesid = :m_mesid ", makeArray( SQLParam( "m_mesid", id ) ) );
+
+        while( sql.moveNext )
+           if( sql.value( "changeDocId" ) != 0 )        
+
+               stat = execStoredFunc( "rsi_rsb_acclaim.CancelAcClmCng" 
+                                       ,v_integer 
+                                       ,makeArray(  SQLParam( "changeDocId", sql.value( "changeDocId" ) ) 
+                                                   ,SQLParam( ""           , {curdate}                  )
+                                                   ,SQLParam( ""           , ""                         ) ) );
+               if( stat == 0 )
+                   execSQL( " delete FROM dacclmcngstate_dbt a WHERE a.t_changedocid = :changeDocId "
+                            ,makeArray( SQLParam( "changeDocId", sql.value( "changeDocId" ) ) ) );
+
+                   execSQL( " delete FROM dacclmcng_dbt      t WHERE t.t_changedocid = :changeDocId "
+                            ,makeArray( SQLParam( "changeDocId", sql.value( "changeDocId" ) ) ) );
+                else
+                    runError( "Не удалось откатить отмену претензии с changeDocId " + sql.value( "changeDocId" ) + "||" + getSystemError( stat ) );
+                end;    
+             end; 
+
+             КорректировкаСуммПр( sql.value( "account" ) );
+        end;     
+
+        execSQL( " delete from usr_fssp_claim where mesid = :m_mesid ", makeArray( SQLParam( "m_mesid", ID ) ) );
+    end;
+
+    // откат сообщения
+    macro rollback( actionMode )
+        private var cmdDel;
+
+        if( id == UNKNOWN ) return UNKNOWN; end;
+
+        rsldefcon.BeginTrans;
+
+        if( actionMode == ACTION_MODE_SINGLE )
+            mass_mode = false;
+        else
+            mass_mode = true;
+        end;
+
+        if( state == 0 ) runError( "Сообщение ещё не обработано" ); end;
+
+        lockMessage;
+
+        if   ( DocCode == "O_IP_ACT_GACCOUNT_MONEY"    ) // постановление о взыскании
+            rollbackPayments;
+        elif ( DocCode == "O_IP_ACT_ENDARR_GMONEY"     ) // постановление о снятии ареста и взыскании
+            rollbackClaims;
+            rollbackPayments;
+        elif ( DocCode == "O_IP_ACT_ENDGACCOUNT_MONEY" ) // постановление об отмене взыскания
+            rollBackCanselPenalty;
+//            runError( "Невозможно откатить отмену взыскания" );
+        end;      
+
+        cmdDel = RsdCommand( " UPDATE USR_FSSP_MES SET T_MES_STATE = 0, T_PARTY_ID = -1 WHERE T_ID = :MES_ID " );
+        cmdDel.addparam( "MES_ID", RSDBP_IN, id );
+        cmdDel.Execute();
+
+        cmdDel = RsdCommand( "DELETE FROM USR_FSSP_ANSWER WHERE T_MES_ID = :MES_ID" );
+        cmdDel.addparam( "MES_ID", RSDBP_IN, id ); 
+        cmdDel.execute;
+
+        rsldefcon.CommitTrans;
+
+        return NO_ERROR;
+    onerror( x )
+        if ( RSLDefCon.IsinTrans )
+            RSLDefCon.RollbackTrans;
+        end;
+
+        errorText[errorText.size] = x.message; 
+        if( not mass_mode ) msgBoxEx( errorText[errorText.size - 1], MB_ERROR ); end;
+        save_mes_error;
+
+        return 1;
+    end;
+
+    // спёр
+    // регистрируем отмену претензии
+    private macro regClaim( account, claimID, changeClaimID, amount )
+        var sql = " INSERT INTO USR_FSSP_CLAIM             "
+                  " VALUES  (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?) ";
+
+        execSQL( sql, makeArray( SQLParam( "", ID            )
+                                ,SQLParam( "", Account       )
+                                ,SQLParam( "", ClientID      )
+                                ,SQLParam( "", ClaimID       )
+                                ,SQLParam( "", ChangeClaimID )
+                                ,SQLParam( "", Docdate       )
+                                ,SQLParam( "", InternalKey   )
+                                ,SQLParam( "", Docnum        ) 
+                                ,SQLParam( "", amount        ) ) );
+    end;
+
+    // отменяем претензию
+    private macro cancelClaim( claimID )
+        private var cmd;
+        private var Reason = getMesName + "_" + InternalKey + "_" + SPIFio + "_" + OSPName;
+
+        cmd = RsdCommand("{ ? = call rsi_rsb_acclaim.insertacclmcng(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ) } ");   
+        cmd.NullConversion = true;
+        cmd.AddParam( "error"        , RSDBP_OUT   , V_INTEGER                          );
+        cmd.AddParam( "claimid"      , RSDBP_IN    , claimId                            );
+        cmd.AddParam( "DocNumber"    , RSDBP_IN    , DocNum                             );
+        cmd.AddParam( "Initiator"    , RSDBP_IN    , 3                                  );
+        cmd.AddParam( "ChangeKind"   , RSDBP_IN    , 3                                  );
+        cmd.AddParam( "Delta"        , RSDBP_IN    , 0                                  );
+        cmd.AddParam( "Priority"     , RSDBP_IN    , 0                                  );
+        cmd.AddParam( "Comment"      , RSDBP_IN    , substr( string( Reason ), 1, 140 ) );
+        cmd.AddParam( "DocDate"      , RSDBP_IN    , DocDate                            );
+        cmd.AddParam( "SysDate"      , RSDBP_IN    , {curdate}                          );
+        cmd.AddParam( "StartDate"    , RSDBP_IN    , {Curdate}                          );
+        cmd.AddParam( "FinishDate"   , RSDBP_IN    , date(0,0,0)                        );
+        cmd.AddParam( "BackoutRecall", RSDBP_IN    , 0                                  );
+        cmd.AddParam( "ChangeDocID"  , RSDBP_IN_OUT, 0                                  );
+        cmd.AddParam( "Auto"         , RSDBP_IN    , strfor(0)                          );
+        cmd.AddParam( "FiscOrgCode"  , RSDBP_IN    , strfor(1)                          );     
+        cmd.execute;
+
+        setParm( 1, cmd.Param( "ChangeDocID" ).value );
+
+        return cmd.Param( "error" ).value;
+    end;
+
+    // поиск и отмена претензий
+    private macro findAndCanselClaims
+        private var cmd, rs, claimID, stat, account, amount, ChangeDocID; 
+
+        cmd = RsdCommand( " select * from usr_fssp_claim where InternalKey = :doc_id and docnum = :doc_num and docdate = :doc_date for update nowait" );
+        cmd.AddParam( "doc_id"  , RSDBP_IN, RestrDocId     );
+        cmd.AddParam( "doc_num" , RSDBP_IN, RestrDocNumber );
+        cmd.AddParam( "doc_date", RSDBP_IN, RestrDocDate   );
+
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            claimID = rs.value( "claimid" );
+            account = rs.value( "account" );
+            amount  = rs.value( "amount"  );
+
+            stat = cancelClaim( claimID, changeDocID );
+
+            if( stat == 0 )
+                regClaim( account, claimID, changeDocID, amount );
+            else
+                errorText[errorText.size] = " Не удалось отменить претензию с id " + claimID + "||" + getSystemError( stat );
+                doNotProcess = true;
+            end;
+        end;
+    end;
+
+    private macro getPayment( account:fssp_penalty_acc )
+        private var stat,numberDoc = NumDoc;
+        private var _ground = "";
+        private var _payment;
+        private var amount,
+                    amountRub;        
+
+        _ground = "Взыскание по Постановлению N " + DocNum + " от " + DocDate + " г. к И/П N " + IPNum + " от " + IPDate + " г. Судебный пристав-исполнитель " + SPIFio;
+
+        if( error == ACC_FULL_PENALTY)
+            amount    = account.restrictedAmount;
+            amountRub = account.restrictedAmountRub;                
+        else
+            amount    = account.i2Amount;
+            amountRub = account.i2AmountRub;                
+        end;
+
+        if( account.fiid == 0 )
+            _payment = FSSP_Order;
+        else
+            _payment = FSSP_RequestOrder;
+            _payment.amountRUR = amountRub;
+            _payment.fiid      = account.fiid;
+        end;
+
+        _payment.payerAcc     = account.account;
+        _payment.receiverAcc  = RecpCnt;
+        _payment.receiverBIC  = RecpBIK; 
+        _payment.receiverName = RecpName;
+        _payment.receiverINN  = inn_kpp( RecpINN, RecpKPP );
+        _payment.amount       = amount;
+        _payment.number       = numberDoc;
+        _payment.iddate       = date( IDDate );
+        _payment.ground       = _ground;
+        _payment.origin       = 3500;
+        _payment.priority     = priority;
+
+        return _payment;
+    end;
+
+    // обработка постановления о взыскании. создание инкассовых поручений
+    private macro createRequestOrders
+        private var i,stat = 0,execStat = true,paymentid = 0,i2paymentid = 0,docKind,imode,numberDoc;
+        private var fssp_payment,fssp_i2payment;
+
+        rsldefcon.BeginTrans;
+
+        for( i, 0, accounts.size - 1 )
+            checkClientAccount ( accounts[i] );
+
+            if(    ( accounts[i].error == ACC_FULL_PENALTY    )
+                or ( accounts[i].error == ACC_PARTLY_PENALTY  ) 
+                or ( accounts[i].error == ACC_PENALTY_NOMONEY ) )
+
+                fssp_payment = getPayment( accounts[i] );
+                stat         = fssp_payment.insert;
+                paymentid    = fssp_payment.payment.paymentId;
+                       
+                if( stat != NO_ERROR )
+                    errorText[errorText.size] = "При вставке платежа произошла ошибка №" + stat + ": \"" + getErrMsg + "\"";
+                    if( not mass_mode ) msgBoxEx( errorText[errorText.size - 1], MB_ERROR ); end;
+                    doNotProcess = true;
+                end;
+
+                if( stat == NO_ERROR ) regPayment( paymentid, 0, accounts[i] ); end;
+
+            end;
+        end;
+
+        if( doNotProcess )
+            RSLDefCon.RollbackTrans;
+        else
+            rsldefcon.CommitTrans;
+        end;
+    onerror( x )
+        if ( RSLDefCon.IsinTrans )
+            RSLDefCon.RollbackTrans;
+        end;
+    end;
+
+    private macro execRequestOrders
+        private var cmd,
+                    rs,
+                    PaymObj,
+                    fiid        = 0,
+                    paymentid   = 0,
+                    i2paymentid = 0,
+                    stat        = 0,
+                    execStat    = true;
+
+        cmd = RsdCommand( " SELECT FSSPPM.*, PM.T_BASEFIID FIID FROM USR_FSSP_PAYMENTS FSSPPM, DPMPAYM_DBT PM WHERE FSSPPM.T_MES_ID = :MES_ID AND FSSPPM.T_PAYMENTID = PM.T_PAYMENTID; " );
+        cmd.addparam( "MES_ID", RSDBP_IN, id );
+
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            paymentid = int( rs.value( "t_paymentid" ) );
+            fiid      = int( rs.value( "fiid"        ) );
+
+            if( fiid == 0 ) paymObj = RsbPSPayOrder  ( paymentid );
+            else            paymObj = RsbRequestOrder( paymentid );
+            end;
+
+            execStat = execOperation( paymObj );
+
+            if( not execStat )
+                errorText[errorText.size] = "При обработке платежа произошла ошибка: \"" + getErrMsg + "\"";
+                if( not mass_mode ) msgBoxEx( errorText[errorText.size - 1], MB_ERROR ); end;
+            end;
+        end;
+    end;
+
+    // обработка отмены взыскания
+    private macro canselPenalty
+        private var cmd,rs,i,paymentid,i2paymentid,acc,accState,i2Exists,stat;
+
+        cmd = RsdCommand( " SELECT   pmf.*, DECODE (pm.t_paymstatus, 2000, 'X', '') I2 "
+                          "   FROM   usr_fssp_payments pmf, dpmpaym_dbt pm "
+                          "  WHERE       pmf.t_i2paymentid = pm.t_paymentid " 
+                          "          AND pmf.T_INTERNALKEY = :INTERNALKEY "
+                          "          AND pmf.T_DOCNUM      = :DOCNUM "
+                          "          AND pmf.T_DOCDATE     = :DOCDATE "
+                          " FOR UPDATE NOWAIT " );
+        cmd.addparam( "INTERNALKEY", RSDBP_IN, RestrDocId     ); 
+        cmd.addparam( "DOCNUM"     , RSDBP_IN, RestrDocNumber ); 
+        cmd.addparam( "DOCDATE"    , RSDBP_IN, RestrDocDate   ); 
+
+        rs = RsdRecordset( cmd );
+
+        while( rs.movenext )
+            acc = fssp_penalty_acc;
+
+            acc.account             = rs.value( "t_account"     );
+            acc.restrictedAmountRub = rs.value( "t_i2amountrub" );
+            acc.restrictedAmount    = rs.value( "t_i2amount"    );
+            acc.InternalKey         = rs.value( "t_internalKey" );
+            acc.ActDate             = rs.value( "t_actdate"     ); 
+            acc.KindData            = rs.value( "t_kinddata"    );
+
+            paymentid               = int( rs.value( "t_paymentid"   ) );
+            i2paymentid             = int( rs.value( "t_i2paymentid" ) );
+            accState                = rs.value( "t_state"       );
+
+            if( accState == ACC_FULL_PENALTY ) // взыскание исполнено полностью
+                acc.error = 21;
+            else
+//                acc.restrictedAmountRub = rs.value( "t_i2amountrub" );
+//                acc.restrictedAmount    = rs.value( "t_i2amount"    );
+debugbreak;
+//                stat = deletePayment( i2paymentid ); 
+                insertBranch( getOperationId( i2paymentid ), BLOCK_ID_RECALL_I2, 10 );
+
+                PM_ExecuteOperation ( i2paymentid, 201 );
+
+                acc.error = 3;
+
+                regPayment( 0, i2paymentid, acc );
+//              cmd = RsdCommand( "UPDATE usr_fssp_payments" )
+            end;
+
+            accounts[accounts.size] = acc;
+        end;
+
+        if( accounts.size == 0 ) error = 6; end;
+
+    end;
+
+    macro create( actionMode )
+        var cmd,rs,i,stat,report,
+            restrictedData           = XMLElement(),
+            nonRestrictedData        = XMLElement(),
+            ArrestRecoveryAmountData = XMLElement(),
+            rDataCount,nRDataCount,restrictedAmount = $0;
+
+        getMessageAccounts;
+
+        if( id == UNKNOWN ) return UNKNOWN; end;
+
+        if( actionMode == ACTION_MODE_SINGLE )
+            mass_mode = false;
+        else
+            mass_mode = true;
+        end;
+
+        if( state == 1 ) runError( "Сообщение уже обработано" ); end;
+
+//      lockMessage;
+
+        checkFields;
+
+        if( ( ClientId == UNKNOWN_CLIENT ) and ( error == NO_ERROR ) ) 
+            ClientId = get_client_id( DebtorINN, DebtorKPP ); 
+
+            if( ClientId == UNKNOWN_CLIENT ) 
+                error = AQ_NO_EXISTS_DATA;
+            else
+                cmd = RsdCommand( " UPDATE   USR_FSSP_MES "
+                                  "    SET   T_PARTY_ID = :CLIENT_ID "
+                                  "  WHERE   T_ID = :MES_ID " );
+                cmd.addparam( "CLIENT_ID", RSDBP_IN, ClientId );
+                cmd.addparam( "MES_ID"   , RSDBP_IN, id       );
+                cmd.execute();
+            end;
+        end;
+
+        if( error == NO_ERROR )
+            if   ( DocCode == "O_IP_ACT_GACCOUNT_MONEY"    ) // постановление о взыскании
+                createRequestOrders;
+                execRequestOrders;
+            elif ( DocCode == "O_IP_ACT_ENDARR_GMONEY"     ) // постановление о снятии ареста и взыскании
+                findAndCanselClaims;
+                createRequestOrders;
+                execRequestOrders;
+            elif ( DocCode == "O_IP_ACT_ENDGACCOUNT_MONEY" ) // постановление об отмене взыскания
+                canselPenalty;
+            end;
+        end;
+
+        if( not doNotProcess )
+            // формирование ответа
+            report = XMLElement( "Report" );
+            report.addChild( XMLElement( "ExternalKey"         , answerKey        ) );
+            report.addChild( XMLElement( "RestrictnInternalKey", InternalKey      ) );
+            report.addChild( XMLElement( "IpInternalKey"       , IpInternalKey    ) );
+            report.addChild( XMLElement( "DocDate"             , fsspDate( date ) ) );
+            report.addChild( XMLElement( "DocNumber"           , answerKey        ) ); // ??
+            report.addChild( XMLElement( "RestrDocDate"        , RestrDocDate     ) ); // ??
+            report.addChild( XMLElement( "RestrDocNumber"      , RestrDocNumber   ) ); // ??
+
+            if( error == NO_ERROR )
+                restrictedData    = XMLElement( "RestrictedData"    );
+                nonRestrictedData = XMLElement( "NonRestrictedData" );
+
+                for( i, 0, accounts.size - 1 )
+                    arrestRecoveryAmountData = XMLElement( "ArrestRecoveryAmountData" );
+                    arrestRecoveryAmountData.addChild( XMLElement( "InternalKey"        , accounts[i].InternalKey         ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "ActDate"            , accounts[i].ActDate             ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "KindData"           , accounts[i].KindData            ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "Acc"                , accounts[i].account             ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "RecoveryAmount"     , accounts[i].restrictedAmount    ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "RecoveryAmountRub"  , accounts[i].restrictedAmountRub ) );
+                    arrestRecoveryAmountData.addChild( XMLElement( "ArrestRecoveryState", accounts[i].error               ) );                  
+
+                    if(    ( accounts[i].error == ACC_FULL_PENALTY   )
+                        or ( accounts[i].error == ACC_PARTLY_PENALTY ) )
+                         restrictedAmount = restrictedAmount + money( accounts[i].restrictedAmountRub );
+                         restrictedData   .addChild( arrestRecoveryAmountData );
+                    else nonRestrictedData.addChild( arrestRecoveryAmountData );
+                    end;
+                end;
+            end; 
+
+            rDataCount  = restrictedData   .childs.size;
+            nRDataCount = nonRestrictedData.childs.size;
+            
+            if   ( ( rDataCount != 0 ) and ( nRDataCount != 0 ) and ( error == NO_ERROR ) ) error = AQ_PARTLY_PENALTY; // постановление исполнено частично
+            elif ( ( rDataCount == 0 ) and ( nRDataCount != 0 ) and ( error == NO_ERROR ) ) error = AQ_NO_EXISTS_DATA; // постановление не исполнено вообще
+            elif ( ( rDataCount != 0 ) and ( nRDataCount == 0 ) and ( error == NO_ERROR ) ) error = AQ_FULL_PENALTY;   // постановление исполнено в полном объеме
+            end;
+
+            report.addChild( XMLElement( "RestrictionAnswerType", error            ) );
+            report.addChild( XMLElement( "RestrictedAmount"     , ""               ) );
+            report.addChild( XMLElement( "RestrictedAmountRub"  , restrictedAmount ) );
+
+            if( nRDataCount != 0 ) report.addChild( nonRestrictedData ); end;
+            if( rDataCount  != 0 ) report.addChild( RestrictedData    ); end;
+
+            setOutput( answer, false );
+            println( report );
+            setOutput( null, true );
+
+            if( not move_file( answer, getReportFileName ) )
+                runError( "Неудалось создать файл " + getReportFileName );
+            else
+                setMessageStatus( 1 );
+                regAnswer( id, answerKey );
+                if( not mass_mode ) viewFile( getReportFileName ); end; 
+            end;
+        else
+            save_mes_error;
+            return 1;
+        end;
+
+        return NO_ERROR;
+    onerror( x )
+        errorText[errorText.size] = x.message; 
+        if( not mass_mode ) msgBoxEx( errorText[errorText.size - 1], MB_ERROR ); end;
+        save_mes_error;
+
+        return 1;
+    end;
+
+    init( mes_id );
+
+end;
+
+/*
+var mes = TFSSP_PENALTY(6233);
+
+//    mes.create(1);
+    mes.rollback;
+//    viewFile(mes.getReportFileName);
+    exit(1);
+*/

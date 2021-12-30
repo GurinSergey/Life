@@ -1,0 +1,616 @@
+// ------------------------------------------------------------------------------------------------
+// @filename: Agent_CheckScroll
+// @author  : Gurin S. N
+// @desc    : Автоматизация процессов обработки платежей в АРМ Позиционера, скроллинги проверок
+// @request : C-30151-7
+// -------------------------------------------------------------------------------------------------
+import BankInter, PaymInter, SbCrdInter, RCW;                     
+import OraLib, LikePy, Globals, lib_agents, lib_const;                  
+
+private var ObjAttr = TRecHandler( "objattr.dbt" );
+private var sql_add, cmd_add, rs_add, col_add, msg_add = "", sql_global, isMultiDel = False, isMultiPrint = False, i;
+
+private macro FastUpdateCheckScroll(rs : RsdRecordset)
+   rs.refreshcommand = RSDCommand(sql_global + " AND usr.paymid = " + rs.value("paymid") + " AND usr.reason = '" + rs.value("reason") + "' AND usr.stopfrase = '" + rs.value("stop") + "'");
+   rs.refreshrecord;
+   UpdateScroll(rs);
+end;
+
+private macro FastDeleteScroll(rs:RsdRecordset, check_kind)
+    var tmp_sql;
+    debugbreak;
+    tmp_sql = "begin "+
+              "   delete from USR_ROBOT_CHECKS where paymid = " + rs.value("paymid") + ";";
+              if (check_kind != 4)
+                  tmp_sql = tmp_sql + "   delete from dobjatcor_dbt where t_objecttype = 501 and t_groupid = " + PT_USR_CAT_CHECK_BEFORE_UNLOAD + 
+                                      "                                   and t_object = lpad(" + rs.value("paymid") + ", 10, 0);";
+              end;
+              if (check_kind == 1)
+                  tmp_sql = tmp_sql + "   update doprstep_dbt SET t_isexecute = 'R' WHERE  t_id_operation = " + PM_Opr_GetIdOperation(rs.value("paymid"),rs.value("dockind")) +
+                                      "           and t_blockid = 10000145 and t_number_step = 190 and t_isexecute = 'W';";
+              elif (check_kind == 4)
+                  tmp_sql = tmp_sql + "   insert into USR_ROBOT_PAYMENT_TMP values (" + rs.value("paymid") + ",null,CHR (0),null,CHR (1),CHR (0),CHR (0),null,CHR (88));";
+              end;
+              tmp_sql = tmp_sql + "commit; end;";
+    rs.deletecommand = RSDCommand(tmp_sql);
+    rs.refreshrecord;
+    rs.Update();
+    UpdateScroll(rs); 
+end;
+
+class  TCheckScroll_1 ()
+    var rs            :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning     :bool         = true;        // флаг "скроллинг запущен"
+    var cr            :TCheckCurrentRecord;        // параметры текущей записи скроллинга
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+    
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+
+        if (cmd == DLG_INIT)
+            if (not cr.IsNull ())
+                var flag = false;
+                if (rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            if (not AddMultiAction (rs, 322)) 
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end;
+
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            elif ((key == 13) or (key == 323))//Enter или F9
+                ret = CM_IGNORE;
+            elif (key == 281) //(Alt + P) (просмотреть платёж)
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                PM_ProcessPanel (RSBPayment (rs.value ("paymid")));
+            elif (key == 322) //F8 - снять признак ручная обработка
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                FastDeleteScroll(rs, 1);
+            elif (key == 319) //F5 - сменить значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (ListObjAttr(OBJTYPE_PAYMENT, PT_USR_CAT_CHECK_STATE, ObjAttr))
+                   if (not setCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, ObjAttr.rec.AttrID, {curdate})) 
+                      msgbox("Ошибка при изменении значения категории \"Состояние проверок\"");
+                   end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 1)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (key == 320) //F6 - снять значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if(GetTrue(true, "Снять значение категории \"Состояние проверок\"?"))
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, 1/*Предварительная выгрузка*/)) end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 1)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (isMultiDel)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                for (i, 0, CheckArr.Size - 1 )
+                   if(rs.move(CheckArr[i][1], BOOKMARK))
+                      FastDeleteScroll(rs, 1);
+                   end;
+                end;
+                CheckArr = TArray();
+                isMultiDel = False;
+                ret = CM_SELECT;
+            end;
+
+        elif (cmd == DLG_MSEL)
+           if (key == 322) //F8 - снять признак ручная обработка
+              CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.bookmark);
+              ret = CM_MSEL_CONT_CLEAR;
+           end;
+
+        elif (cmd == DLG_MSELEND)
+           if (key == 322) //F8 - снять признак ручная обработка
+              isMultiDel = true;
+              ret = CM_CANCEL;
+           end;
+        end;
+        
+        return ret;
+    
+    onError (e)
+      debugbreak ();       
+    end;
+    
+    macro init (_title)
+         var scrollCaption = string (_title);
+         var msg = "(Alt + P) - платеж | (Ecs) - выйти | (F8) - Снять признак ручной обработки | (F5) - Изменить состояние проверок | (F6) - Снять признак всех проверок";
+        
+         var scrollResult = false;
+         var cmd;
+                                     
+         var sql = " SELECT   dpm.t_paymentid paymid, dpm.t_dockind dockind, rm.t_number numdoc, dpm.t_payeraccount payacc, " +
+                   "          dpm.t_receiveraccount recacc, dpm.t_amount amount, dpm.t_oper oper, usr.reason reason"+
+                   "   FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm, dpmrmprop_dbt rm " +
+                   "  WHERE   usr.paymid = dpm.t_paymentid AND dpm.t_paymentid = rm.t_paymentid AND usr.check_kind = 1 AND dpm.t_paymstatus not in (32000) ";
+         sql_global = sql;
+                                                                                                                                                   
+         // вот так мы формируем массив колонок для скроллинга
+         var col;
+            col = makeArray ("NumDoc"       ,"Номер документа"                     ,15,  0, -1, 0,
+                             "PayAcc"       ,"Счет плательщика"                    ,20,  0, -1, 0,
+                             "RecAcc"       ,"Счет получателя"                     ,20,  0, -1, 0,
+                             "Amount"       ,"Сумма"                               ,15,  0, -1, 0,
+                             "Oper"         ,"Операционист"                        ,10,  0, -1, 0, 
+                             "Reason"       ,"Причина непрохождения контроля"      ,100, 0, -1, 0
+                             );                   
+
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            //rs.autorefresh = True;
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, false);
+        end;
+        rs.Close();
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+end;
+
+class  TCheckScroll_2 ()
+    var rs            :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning     :bool         = true;        // флаг "скроллинг запущен"
+    var cr            :TCheckCurrentRecord;        // параметры текущей записи скроллинга
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+    
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+
+        if (cmd == DLG_INIT)
+            if (not cr.IsNull ())
+                var flag = false;
+                if (rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            if (not AddMultiAction (rs, 322)) 
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end;
+
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            elif ((key == 13) or (key == 323))//Enter или F9
+                ret = CM_IGNORE;
+            elif (key == 281) //Alt + P (просмотреть платёж)
+                PM_ProcessPanel (RSBPayment (rs.value ("paymid")));
+            elif (key == 322) //F8 - снять признак ручная обработка
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                FastDeleteScroll(rs);
+            elif (key == 319) //F5 - сменить значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+               if (ListObjAttr(OBJTYPE_PAYMENT, PT_USR_CAT_CHECK_STATE, ObjAttr))
+                  if (not setCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, ObjAttr.rec.AttrID, {curdate})) 
+                     msgbox("Ошибка при изменении значения категории \"Состояние проверок\"");
+                  end;
+                  if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                  if (not DelFromLog(rs.value ("paymid"), 2)) end;
+                  ret = CM_SELECT;
+                end;
+            elif (key == 320) //F6 - снять значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if(GetTrue(true, "Снять значение категории \"Состояние проверок\"?"))
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, 2/*Проверка на дубль*/)) end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 2)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (isMultiDel)        
+               cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+               for (i, 0, CheckArr.Size - 1 )
+                  if(rs.move(CheckArr[i][1], BOOKMARK))
+                     FastDeleteScroll(rs);
+                  end;
+               end;
+               CheckArr = TArray();
+               isMultiDel = False;
+               ret = CM_SELECT;
+            end;
+
+        elif (cmd == DLG_MSEL)
+           if (key == 322) //F8 - снять признак ручная обработка
+              CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.bookmark);
+              ret = CM_MSEL_CONT_CLEAR;
+           end;
+
+        elif (cmd == DLG_MSELEND)
+           if (key == 322) //F8 - снять признак ручная обработка
+              isMultiDel = true;
+              ret = CM_CANCEL;
+           end;
+        end;
+        
+        return ret;
+    
+    onError (e)
+      debugbreak ();       
+    end;
+    
+    macro init (_title)
+         var scrollCaption = string (_title);
+         var msg = "(Alt + P) - платеж | (Ecs) - выйти | (F8) - Снять признак ручной обработки | (F5) - Изменить состояние проверок | (F6) - Снять признак всех проверок";
+        
+         var scrollResult = false;
+         var cmd;
+                                     
+         var sql = "   SELECT CASE "+
+                   "             WHEN (ROW_NUMBER () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount) "+
+                   "                   - RANK () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount)) = 0 "+
+                   "             THEN to_char(DENSE_RANK () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount)) "+
+                   "             ELSE ' ' "+
+                   "          END n, "+
+                   "          usr.reason locate, dpm.t_paymentid paymid, rm.t_number numdoc, dpm.t_amount amount, dpm.t_payeraccount payacc, " +
+                   "          prop.t_bankcode bnkcode, dpm.t_receiveraccount recacc, usr_get_inn (rm.t_receiverinn) recinn, rm.t_receivername recname, " +
+                   "          rm.t_ground ground" +
+                   "     FROM USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm, dpmprop_dbt prop, dpmrmprop_dbt rm " +
+                   "    WHERE     usr.paymid = dpm.t_paymentid AND dpm.t_paymentid = prop.t_paymentid AND usr.check_kind = 2 " +
+                   "          AND prop.t_debetcredit = 1 AND dpm.t_paymentid = rm.t_paymentid AND dpm.t_paymstatus not in (32000) "+
+                   " ORDER BY   4, 5, 6, 8 "; //numdoc, amount, payacc, recacc
+         sql_global = sql;
+                                                                                                                                                   
+         // вот так мы формируем массив колонок для скроллинга
+         var col;
+             col = makeArray ("N"            ,"Номер п/п"                           ,10,  0,  0, 0,
+                              "Locate"       ,"Местонахождение"                     ,25,  0, -1, 0,
+                              "NumDoc"       ,"Номер документа"                     ,15,  0, -1, 0,
+                              "Amount"       ,"Сумма"                               ,15,  0, -1, 0,
+                              "PayAcc"       ,"Счет плательщика"                    ,20,  0, -1, 0,
+                              "BnkCode"      ,"БИК банка получ."                    ,15,  0, -1, 0,
+                              "RecAcc"       ,"Счет получателя"                     ,20,  0, -1, 0,
+                              "RecINN"       ,"ИНН получателя"                      ,15,  0, -1, 0,
+                              "RecName"      ,"Получатель"                          ,50,  0, -1, 0, 
+                              "Ground"       ,"Назначание платежа"                  ,100, 0, -1, 0
+                              );                   
+
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, false);
+        end;
+        rs.Close();
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+end;
+
+class  TCheckScroll_3 ()
+    var rs            :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning     :bool         = true;        // флаг "скроллинг запущен"
+    var cr            :TCheckCurrentRecord;        // параметры текущей записи скроллинга
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+    
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+
+        if (cmd == DLG_INIT)
+            if (not cr.IsNull ())
+                var flag = false;
+                if (rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            if (not AddMultiAction (rs, 322)) 
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end;
+
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            elif ((key == 13) or (key == 323))//Enter или F9
+                ret = CM_IGNORE;
+            elif (key == 281) //Alt + P (просмотреть платёж)
+                PM_ProcessPanel (RSBPayment (rs.value ("paymid")));
+            elif (key == 322) //F8 - снять признак ручная обработка
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                FastDeleteScroll(rs);
+            elif (key == 319) //F5 - сменить значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (ListObjAttr(OBJTYPE_PAYMENT, PT_USR_CAT_CHECK_STATE, ObjAttr))
+                   if (not setCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, ObjAttr.rec.AttrID, {curdate})) 
+                      msgbox("Ошибка при изменении значения категории \"Состояние проверок\"");
+                   end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 3)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (key == 320) //F6 - снять значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if(GetTrue(true, "Снять значение категории \"Состояние проверок\"?"))
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, 3/*Проверка на задвоенность*/)) end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 3)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (isMultiDel)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                for (i, 0, CheckArr.Size - 1 )
+                   if(rs.move(CheckArr[i][1], BOOKMARK))
+                      FastDeleteScroll(rs);
+                   end;
+                end;
+                CheckArr = TArray();
+                isMultiDel = False;
+                ret = CM_SELECT;
+            end;
+
+        elif (cmd == DLG_MSEL)
+           if (key == 322) //F8 - снять признак ручная обработка
+              CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.bookmark);
+              ret = CM_MSEL_CONT_CLEAR;
+           end;
+
+        elif (cmd == DLG_MSELEND)
+           if (key == 322) //F8 - снять признак ручная обработка
+              isMultiDel = true;
+              ret = CM_CANCEL;
+           end;
+        end; 
+       
+        return ret;
+    
+    onError (e)
+      debugbreak ();       
+    end;
+    
+    macro init (_title)
+         var scrollCaption = string (_title);
+         var msg = "(Alt + P) - платеж | (Ecs) - выйти | (F8) - Снять признак ручной обработки | (F5) - Изменить состояние проверок | (F6) - Снять признак всех проверок";
+        
+         var scrollResult = false;
+         var cmd;
+                                     
+         var sql = "   SELECT CASE "+
+                   "             WHEN (ROW_NUMBER () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount) "+
+                   "                   - RANK () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount)) = 0 "+
+                   "             THEN to_char(DENSE_RANK () OVER (ORDER BY rm.t_number, dpm.t_amount, dpm.t_payeraccount, dpm.t_receiveraccount)) "+
+                   "             ELSE ' ' "+
+                   "          END n, "+
+                   "          dpm.t_paymentid paymid, rm.t_number numdoc, DECODE (sess.t_bankdate, NULL, ' ', to_char(sess.t_bankdate,'dd.mm.yyyy')) dispdate, "+
+                   "          dpm.t_amount amount, dpm.t_payeraccount payacc, "+
+                   "          dpm.t_receiveraccount recacc, usr_get_inn (rm.t_receiverinn) recinn, rm.t_receivername recname, "+
+                   "          prop.t_bankcode bnkcode, rm.t_ground ground "+
+                   "     FROM USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm, dpmprop_dbt prop, dpmrmprop_dbt rm, dwlpm_dbt wlpm, "+
+                   "          dwlmeslnk_dbt lnk, dwlmes_dbt mes, dwlsess_dbt sess "+
+                   "    WHERE     usr.paymid = dpm.t_paymentid AND dpm.t_paymentid = prop.t_paymentid "+
+                   "          AND dpm.t_paymentid = wlpm.t_paymentid(+) AND wlpm.t_wlpmid = lnk.t_objid(+) "+
+                   "          AND lnk.t_mesid = mes.t_mesid(+) AND mes.t_sessionid = sess.t_sessionid(+) "+
+                   "          AND usr.check_kind = 3 AND prop.t_debetcredit = 1 AND dpm.t_paymentid = rm.t_paymentid AND dpm.t_paymstatus not in (32000) "+
+                   " ORDER BY 3, 5, 6, 7, 1 desc"; //numdoc, amount, payacc, recacc, n
+         sql_global = sql;
+                                                                                                                                                   
+         // вот так мы формируем массив колонок для скроллинга
+         var col;
+             col = makeArray ("N"            ,"Номер п/п"                           ,10,  0,  0, 0,
+                              "NumDoc"       ,"Номер документа"                     ,15,  0, -1, 0,
+                              "DispDate"     ,"Дата отправки"                       ,15,  0, -1, 0,
+                              "Amount"       ,"Сумма"                               ,15,  0, -1, 0,
+                              "PayAcc"       ,"Счет плательщика"                    ,20,  0, -1, 0,
+                              "RecAcc"       ,"Счет получателя"                     ,20,  0, -1, 0,
+                              "RecINN"       ,"ИНН получателя"                      ,15,  0, -1, 0,
+                              "RecName"      ,"Получатель"                          ,50,  0, -1, 0, 
+                              "BnkCode"      ,"БИК банка получ."                    ,15,  0, -1, 0,
+                              "Ground"       ,"Назначание платежа"                  ,100, 0, -1, 0
+                              );                   
+
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, false);
+        end;
+        rs.Close();
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+end;
+
+class  TCheckScroll_4 ()
+    var rs            :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning     :bool         = true;        // флаг "скроллинг запущен"
+    var cr            :TCheckCurrentRecord;        // параметры текущей записи скроллинга
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+
+
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+
+        if (cmd == DLG_INIT)
+            if (not cr.IsNull ())
+                var flag = false;
+                if (rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            if ((not AddMultiAction (rs, 321)) or (not AddMultiAction (rs, 322)))
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end;
+
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            elif ((key == 13) or (key == 323))//Enter или F9
+                ret = CM_IGNORE;
+            elif (key == 281) //Alt + P - просмотреть платёж
+                PM_ProcessPanel (RSBPayment (rs.value ("paymid")));
+            elif (key == 322) //F8 - снять признак ручная обработка
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                FastDeleteScroll(rs, 4);
+            elif (key == 321) //F7 - печать
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.value ("reason"), rs, rs.bookmark);
+                PrintReportCheck4(rs);//rs.value ("paymid"), rs.value ("reason"), rs);
+                isPrint(rs.value ("paymid"), rs.value ("stop"), rs.value ("reason"), 4);
+                FastUpdateCheckScroll(rs);
+                CheckArr = TArray();
+            elif (key == 319) //F5 - сменить значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if (ListObjAttr(OBJTYPE_PAYMENT, PT_USR_CAT_CHECK_STATE, ObjAttr))
+                   if (not setCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, ObjAttr.rec.AttrID, {curdate})) 
+                      msgbox("Ошибка при изменении значения категории \"Состояние проверок\"");
+                   end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 4)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (key == 320) //F6 - снять значение категории 1017 "Состояние проверок"
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                if(GetTrue(true, "Снять значение категории \"Состояние проверок\"?"))
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_STATE, 4/*Нечеткий поиск*/)) end;
+                   if (not unsetCtgVal(rs.value ("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/)) end;
+                   if (not DelFromLog(rs.value ("paymid"), 4)) end;
+                   ret = CM_SELECT;
+                end;
+            elif (isMultiPrint)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                PrintReportCheck4(rs);
+                for (i, 0, CheckArr.Size - 1 )
+                   if (rs.move(CheckArr[i][3], BOOKMARK))
+                      FastUpdateCheckScroll(rs);
+                   end;
+                end;
+                CheckArr = TArray();
+                isMultiPrint = False;
+            elif (isMultiDel)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                for (i, 0, CheckArr.Size - 1 )
+                   if (rs.move(CheckArr[i][1], BOOKMARK))
+                      FastDeleteScroll(rs, 4);
+                   end;
+                end;
+                CheckArr = TArray();
+                isMultiDel = False;
+            end;
+
+        elif (cmd == DLG_MSEL)
+            if (key == 321) //F7 - печать
+               CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.value ("reason"), rs, rs.bookmark);
+               //isPrint(rs.value ("paymid"), rs.value ("stop"), rs.value ("reason"), 4);
+               //FastUpdateCheckScroll(rs);
+               ret = CM_MSEL_CONT_CLEAR;
+            elif (key == 322) //F8 - снять признак ручная обработка
+               CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.bookmark);
+               ret = CM_MSEL_CONT_CLEAR;
+            end;
+
+        elif (cmd == DLG_MSELEND)
+            if (key == 321) //F7 - печать
+               isMultiPrint = true;
+               ret = CM_CANCEL;
+            elif (key == 322) //F8 - снять признак ручная обработка
+               isMultiDel = true;
+               ret = CM_CANCEL;
+            end;
+        end;
+        
+        return ret;
+    
+    onError (e)
+      debugbreak ();       
+    end;
+    
+    macro init (_title)
+         var scrollCaption = string (_title);
+         var msg = "(Alt + P) - платеж | (Ecs) - выйти | (F8) - Снять признак ручной обработки | (F7) - печать | (F5) - Изменить состояние проверок | (F6) - Снять признак всех проверок";
+        
+         var scrollResult = false;
+         var cmd;
+                                     
+         var sql = " SELECT   usr.isprint p, rownum n, dpm.t_paymentid paymid,"+
+                   "          DECODE (dpm.t_payer, -1, ' ', dpm.t_payer) payer,"+
+                   "          DECODE (dpm.t_receiver, -1, ' ', dpm.t_receiver) receiver, "+
+                   "          rm.t_number numdoc, rm.t_date dat, dpm.t_amount amount, usr.stopfrase stop, "+
+                   "          usr.koef_sovp koef, usr.reason reason, dpm.t_dockind dockind, "+
+                   "          rm.t_payername payname, rm.t_receivername recname, rm.t_ground ground"+
+                   "   FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm, dpmrmprop_dbt rm "+
+                   "  WHERE       usr.paymid = dpm.t_paymentid AND dpm.t_paymentid = rm.t_paymentid "+
+                   "          AND usr.check_kind = 4 AND dpm.t_paymstatus not in (32000) ";
+        sql_global = sql;
+                                                                                                                                                   
+         // вот так мы формируем массив колонок для скроллинга
+         var col;
+             col = makeArray ("P"              ,"Печать"                            , 2,  0, -1, 0,
+                              "Payer"          ,"Код клиента плат-ка"               ,15,  0, -1, 0,
+                              "Receiver"       ,"Код клиента плат-ка"               ,15,  0, -1, 0,
+                              "NumDoc"         ,"№ док."                            ,15,  0, -1, 0,
+                              "Dat"            ,"Дата"                              ,15,  0, -1, 0,
+                              "Amount"         ,"Сумма"                             ,15,  0, -1, 0,
+                              "Stop"           ,"Стоп фаза"                         ,20,  0, -1, 0,
+                              "Koef"           ,"Коэф."                             ,20,  0, -1, 0,
+                              "Reason"         ,"Имя поля документа"                ,20,  0, -1, 0,
+                              "DocKind"        ,"Вид документа"                     ,15,  0, -1, 0
+                              );                   
+
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, false);
+        end;
+        rs.Close();
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+end;
+
+//TCheckScroll_4.init ("Список документов не прошедших контроль \"Нечеткий поиск\"");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

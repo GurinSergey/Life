@@ -1,0 +1,461 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29035 - "Возврат невыясненного"
+// Шаг       : 165   - "Возврат невыясненного платежа"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+// Изменения:
+// KS 13.06.2012 I-00207560
+// TAM 21.08.2013 R-234377
+// KS 09.12.2013 Перенос пользовательских доработок в 31ю сборку
+// Jushmanov 2014-02-25 C-19151 Логгирование массово выполненных шагов
+//-----------------------------------------------------------------------------
+import InsCarryDoc, PaymInter, PTInter, OprInter, BankInter, RMInter, MesInter, WldInter;
+import "rmtools.mac", "cbsttls.mac", "pm_common.mac";
+import oralib, likepy;
+import "frontcommon.mac";
+
+var PaymentObj:RsbPayment;
+
+record cors( corschem ); // Для поиска входящей корсхемы
+record CorAcc(account);
+
+const ПутьКНастройкеПроводитьТекущимДнем = "АРМ ПОЗИЦИОНЕРА\\ПЕРЕМЕННЫЕ\\CARRYINUNKNOWNCURRENTDAY";
+private  var NumberPack = 605,usrNumberPack,errCode; 
+GetRegistryValue("PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\НОМЕР_ПАЧКИ_ДЛЯ_ВОЗВРАТОВ", v_integer, usrNumberPack, errCode); 
+if (not errCode)
+    NumberPack = usrNumberPack;
+end;
+
+
+private macro ЗаполнитьСортировку( InData, Sum )
+    var str, day, month, year;
+    DateSplit(InData, day, month, year );
+    str = String( year:4:o, month:2:o, day:2:o, Sum:18:o );
+    /* Точку удаляем */
+    str = substr( str, 1, Index(str, ".")-1 ) + substr( str, Index(str, ".")+1 );
+    return str;
+end;
+
+
+//-----------------------------------------------------------------------------
+// КорСчет является активным счетом МФР?
+//-----------------------------------------------------------------------------
+private macro CorAccountIsMFRActive( CorNumber:integer, CorAccFIID:integer ):bool
+
+    var rs:object;
+  
+    var select:string = 
+      "select /*+FIRST_ROWS */ 1 " + 
+        "from dobjlink_dbt t, daccount_dbt acc " +
+       "where t.t_objecttype = :OBJTYPE_ACCOUNT " + 
+         "and t.t_groupid = 47 " + 
+         "and t.t_objectid = :OBID " + 
+         "and acc.t_Account = :ACCOUNT " +  
+         "and acc.t_Chapter = 1 " + 
+         "and acc.t_Code_Currency = :FIID    " +
+         "and acc.t_Kind_Account  = 'А' ";
+ 
+    CorAcc.Chapter = 1;
+    CorAcc.Account = GetCorAcc( CorAccFIID, CorNumber, CORS_ACC_ACCOUNT );
+    CorAcc.Code_Currency = CorAccFIID;
+
+    var params = makeArray( SQLParam("OBJTYPE_ACCOUNT", OBJTYPE_ACCOUNT),
+                            SQLParam("OBID", UniID(CorAcc, OBJTYPE_ACCOUNT)),
+                            SQLParam("ACCOUNT", CorAcc.Account),
+                            SQLParam("FIID", CorAccFIID) );
+
+    rs = execSQLselect( select, params, FALSE );
+    if( rs and rs.MoveNext() )
+        return true;
+    else
+        return false;
+    end;
+
+end;
+
+
+//-----------------------------------------------------------------------------
+// Убрать из назначения платежа строку {VOxxxxx}
+//-----------------------------------------------------------------------------
+private macro DeleteVOFromGround( Ground:string ):string
+    var NewGround:string  = Ground;
+    var Part1    :string  = "";
+    var Part2    :string  = "";
+    var indVO    :integer = Index( Ground, "{VO" );
+    var indEndVO :integer = Index( Ground, "}" );
+    // Если кода VO нет в основании, или если он введен некорректно
+    if( ( indVO    == 0 ) or
+        ( indEndVO == 0 ) or
+        ( indVO > indEndVO ) )
+        return NewGround;
+    end;
+    Part1 = SubStr( NewGround, 1, indVO-1 );
+    Part2 = SubStr( NewGround, indEndVO+1 );
+    NewGround = Part1 + Part2;
+    return NewGround;
+end;
+
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first, DocKind:integer, ID_Operation:integer, ID_Step:integer  ) 
+    if(CheckDateStartOpr(ID_Operation))
+        return 1;
+    end;
+
+    // Очистить  значение категории $(Подлежит возврату) платежа
+    if(PaymentObj.Categories.DisconnectAttr(15, 0))
+        msgbox("Ошибка при удалении значения категории \"Подлежит возврату\" платежа");
+        return 1;
+    end;
+
+    var paymtr:RsbPaymTransaction = PaymentObj.MakeTransaction();
+    var err = 0, stat = 0, sort = "";
+    var error:string;
+    var note_text:string = "";
+    var Payment:RsbPayment = null; // платеж 
+    var BankPayment:object = null; // первичный документ
+    array aInput;
+    var oConnection;
+    var oConnection_lib = ActiveX("ADODB.Connection");
+    var ruleid, state, connstring, procname, rset, note, waitstat, ask;
+    var frate:RsbCrossRate;
+
+    if (IsFrontPayment(PaymentObj))
+        if ( (getTrue(true, "Платёж был выгружен во Фронт.\nУдалить операцию во Фронте?")))
+            GetFrontParm(PaymentObj, @ruleid, @state, @connstring, @procname, @waitstat, @note, @ask);
+            oConnection = oConnection_lib;
+            conn2front(oConnection, connstring, note);
+            aInput( 0) = 3;                                 //iud                int // 1=Вставка, 3=Удаление
+            aInput( 1) = {MFO_BANK};                        //bankbic            varchar(10)           ,
+            aInput( 2) = PaymentObj.PaymentID;              //paymentid          int                   ,
+            aInput( 3) = PaymentObj.PayerAccount;           //payeraccount       varchar(25)     = NULL,
+            if ((waitstat == 0) and ((PaymentObj.Dockind == 320) or (PaymentObj.Dockind == 322))) 
+                aInput( 4) = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.ReceiverFIID);
+            else
+                aInput( 4) = PaymentObj.FuturePayerAccount; //realpayer          varchar(25)     = NULL,
+            end;
+            aInput( 9) = PaymentObj.ReceiverAccount;        //receiveraccount    varchar(25)     = NULL,
+            aInput(10) = PaymentObj.FutureReceiverAccount;  //realreceiver       varchar(25)     = NULL,
+            aInput(22) = PaymentObj.PayerAmount;            //debetsum           decimal(18,6)   = NULL,
+            aInput(23) = PaymentObj.ReceiverAmount;         //kreditsum          decimal(18,6)   = NULL,
+            aInput(26) = PaymentObj.Department;             //department         int             = NULL,
+            aInput(29) = {curdate};                         //valuedate          datetime        = NULL,
+            aInput(30) = PaymentObj.ClientDate;             //docdate            datetime        = NULL,
+            aInput(31) = PaymentObj.Dockind;                //dockind            int             = NULL,
+            aInput(39) = PaymentObj.DemandAcceptDate;       //acceptdate         datetime        = NULL,
+            aInput(55) = ruleid;                            //rsbroute           varchar(255)    = NULL,
+            rset = RSADORecordset(ExecuteFrontProcEx(procname, aInput, oConnection,ruleid));
+
+            if (not(rset))
+                return 1;
+            end;
+            if (rset.movenext)
+                if ((rset.m_value[0] < 0) and (rset.m_value[0] != -3))//-3 - операции во Фронт нет
+                    msgbox("Ошибка удаления операции из Фронт:|"+rset.m_value[8]);
+                    stat = 1;
+                end;
+            else
+                msgbox("Не определен статус платежа во Фронте");
+                stat = 1;
+            end;
+            if (oConnection and (oConnection.State == 1) )
+                oConnection.Close();
+            end;
+        end;
+    end;
+    //TAM 01.12.2014 HF_103
+    //if(PaymentObj.BaseFiid == 0)
+    if(PaymentObj.ReceiverFIID == 0)
+        BankPayment            = GenObject( "RsbBankPayment", 0 );
+        Payment                = BankPayment.Payment();
+        BankPayment.Origin     = MEMORDER_FDOC_RETURN; // Возврат невыясненного
+        BankPayment.Oper       = {oper}; 
+        BankPayment.Status     = 1; //MEMORDER_STATUS_POST
+        Payment.DocKind        = Payment.PrimDocKind = DLDOC_BANKPAYMENT;
+        Payment.Purpose        = PM_PURP_BANKPAYMENT;
+        Payment.ShifrOper      = "01";
+        Payment.OrderFIID      =
+        Payment.BaseFIID       =
+        Payment.PayerFIID      = 
+        Payment.ReceiverFIID   = PaymentObj.PayerFIID;
+        Payment.OrderAmount    = PaymentObj.OrderAmount;
+        Payment.BaseAmount     = 
+        Payment.ReceiverAmount = 
+        Payment.PayerAmount    = PaymentObj.PayerAmount;
+    else
+        BankPayment            = GenObject( "RsbBbCpOrder", 0 );
+        Payment                = BankPayment.Payment();
+        BankPayment.Origin     = CP_OR_RMRETURN; // Возврат невыясненного
+        BankPayment.Oper       = {oper}; 
+        BankPayment.CurrentState = 0; //CP_ST_DEFERRED
+        Payment.DocKind        = Payment.PrimDocKind = BBANK_CPORDER;
+        Payment.Purpose        = PM_PURP_BANKPAYMENT;
+        Payment.ComissCharges  = PM_CHRG_SHA;
+        Payment.OrderFIID      = PaymentObj.OrderFIID;
+        Payment.BaseFIID       = PaymentObj.BaseFIID;
+        Payment.PayerFIID      = PaymentObj.PayerFIID;
+        Payment.ReceiverFIID   = PaymentObj.ReceiverFIID;
+        Payment.OrderAmount    = PaymentObj.OrderAmount;
+        Payment.BaseAmount     = 
+        Payment.PayerAmount    = 
+        Payment.ReceiverAmount = PaymentObj.PayerAmount;  
+    end;
+
+    // Запросить у пользователя причину возврата
+    if( not GetMultNoteReject( note_text ) )
+        if( not SetNoteReject( note_text ) )
+            msgbox( "Выполнение процедуры прервано пользователем" );
+            return 1;
+        elif( not strlen( note_text ) )
+            note_text = "Возврат платежа";
+        end;
+     end;
+     // Заполнить примечание
+     if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, note_text ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+     end;
+
+    var IsCarryCurDay = false;
+    // Если не помещался в невыясненные
+    if ( not PaymentObj.IsPlacedToUnknown )
+        GetRegistryValue( ПутьКНастройкеПроводитьТекущимДнем, V_BOOL, IsCarryCurDay, err );
+        if( err != 0 )
+            // По умолчанию считаем, что флаг "Проводить в невыясненные текущим днем" установлен
+            IsCarryCurDay = TRUE;
+        end;
+        // Проверяем ДПП и предлагаем его сменить в случае неверного значения
+        if ( PaymentObj.CorrectInDpp(false) )
+            msgbox("Неверное значение ДПП");
+            return 1;
+        end; 
+
+        if ( PaymentObj.InTransferDate>{curdate} )
+            msgBox("Этот платеж можно проводить только " + string(PaymentObj.InTransferDate));
+            return 1;
+        end;
+
+        if ( PaymentObj.IsTransit() )
+            if ( PaymentObj.IsCredit() )
+                if ( (PaymentObj.InTransferDate!={curdate}) )
+                    msgBox("Входящая ДПП кредитового транзитного платежа|должна быть равна текущей дате");
+                    return 1;
+                end;
+            else
+                if ( (PaymentObj.OutTransferDate!={curdate}) OR 
+                     (PaymentObj.InTransferDate!={curdate}) )
+                    msgBox("Транзитное требование необходимо проводить текущим днем");
+                    return 1;
+                end;
+                if ( НайтиКорсхему(PaymentObj.InCorschem, PaymentObj.ReceiverFIID, cors) )
+                    msgBox("Не найдена входящая корсхема");
+                    return 1;
+                else
+                    if (cors.IsNostro=="")
+                        msgBox("Транзитные требования от лоро-корреспондентов не обрабатываются");
+                        return 1; 
+                    end;
+                end;
+            end;
+        end;
+
+        //Заполняем поля документа
+        paymtr.Chapter = 1;
+        paymtr.FIIDPayer = PaymentObj.PayerFIID;
+        paymtr.Sum = PaymentObj.PayerAmount;
+        paymtr.Number_Pack = PaymentObj.NumberPack;
+        paymtr.ResultCarry = AVIZOCARRY;
+        paymtr.Kind_Oper  = " 1";
+        if (PaymentObj.ShifrOper != "")
+            paymtr.Shifr_Oper  = PaymentObj.ShifrOper;
+        else
+            paymtr.Shifr_Oper = "09";
+        end;
+
+        // Реальные счета и коды банков
+        if( PaymentObj.IsCredit() )
+            paymtr.AccountPayer      = PaymentObj.FuturePayerAccount;
+            paymtr.AccountReceiver   = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.BaseFIID); //TAM 01.12.2014 HF_103
+        else
+            paymtr.AccountPayer      = Unkn_GetAccountActive( PaymentObj.Department, PaymentObj.BaseFIID); //TAM 01.12.2014 HF_103
+            paymtr.AccountReceiver   = PaymentObj.FutureReceiverAccount;
+        end;
+
+        if ( IsCarryCurDay )
+            paymtr.Date_Carry    = {curdate};
+        else
+            paymtr.Date_Carry    = PaymentObj.ValueDate;
+        end;
+
+        paymtr.Department    = PaymentObj.Department;
+        paymtr.Ground        = PaymentObj.Ground;
+        paymtr.Numb_Document = PaymentObj.Number;     
+        if(GetOprStatus(OPR_PAYM_IN_KVIT) != OPR_PM_ST_KVIT) //статус платежа Квитовка несквитован
+            paymtr.Status_After  = ACCTRN_STATUS_PLAN;
+        end;
+
+        if( not paymtr.Carry() )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+
+        // Заполним сортировку - дата помещения + сумма
+        if ( IsCarryCurDay )
+            Sort = ЗаполнитьСортировку( {curdate}, PaymentObj.ReceiverAmount );
+        else
+            Sort = ЗаполнитьСортировку( PaymentObj.ValueDate, PaymentObj.ReceiverAmount );
+        end;
+
+        //Платеж делаем невыясненным
+        PaymentObj.PropStatus = PM_PROP_UNKNOWN;
+        if(PaymentObj.PlaceToUnknown(sort))   
+            MsgBox("Ошибка при помещении платежа в невыясненные");
+            return 1;
+        end;
+    end;
+
+    // Провести запланированные проводки
+    if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+        РасширенноеСообщениеОбОшибке("Ошибка при помещении планируемых проводок в проведенные");
+        return 1;
+    end;
+
+    if( PaymentObj.PayerGroup == PAYMENTS_GROUP_EXTERNAL )
+        // Найти входящую корсхему
+        if( НайтиКорсхему( PaymentObj.InCorschem, PaymentObj.PayerFIID, cors ) )
+            msgBox("Не найдена входящая корсхема");
+            return 1;
+        end;
+        // Если корсчет входящей схемы является активным счетом МФР, то сбросить корсхему у исходящего документа
+        // Схема у исходящего должна быть с пассивным счетом МФР    
+        if( CorAccountIsMFRActive( cors.Number, cors.FIID  ) )
+            Payment.InCorschem = -1;
+        end;
+    end;
+
+    Payment.ReceiverMesBankID = PaymentObj.PayerMesBankID;
+    Payment.PayerMesBankID    = PaymentObj.ReceiverMesBankID;
+    Payment.PaymentKind       = "Н"; //TAM 08.08.2013 R-229444-2 должно быть тип платежа "не задан" вместо "электронно"
+
+    stat = Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                               {OurBank}, 
+                               PTCK_BIC,
+                               "", 
+                               "",
+                               "",
+                               PaymentObj.FuturePayerFIID, 
+                               1, //CHAPT1 
+                               PaymentObj.FuturePayerAccount,
+                               -1,
+                               "",
+                               "",
+                               PTCK_CONTR,
+                               ПолучитьКодСубъекта({OurBank}, PTCK_CONTR, error) 
+                              );
+    if( stat ) return 1; end;
+
+    stat = Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                  PaymentObj.PayerBankID, 
+                                  PTCK_BIC, 
+                                  "", 
+                                  "",
+                                  "",
+                                  PaymentObj.PayerFIID, 
+                                  1, //CHAPT1 
+                                  PaymentObj.PayerAccount,
+                                  PaymentObj.Payer,
+                                  PaymentObj.PayerName,
+                                  PaymentObj.PayerINN,
+                                  PTCK_CONTR,
+                                  ПолучитьКодСубъекта(IfThenElse(PaymentObj.Payer==-1,{OurBank},PaymentObj.Payer), PaymentObj.PayerCodeKind, error) 
+                                );
+    if( stat ) return 1; end;
+
+    Payment.ToBackOffice          = "";
+    Payment.SubPurpose            = 0;
+    Payment.ValueDate             = PM_GetDefaultValueDate(Payment.Department, Payment.PrimDocKind);
+    Payment.Number                = PaymentObj.Number;
+    Payment.Priority              = PaymentObj.Priority;
+    Payment.NumberPack            = NumberPack;
+    Payment.FeeType               = PaymentObj.FeeType;
+    Payment.DefComID              = PaymentObj.DefComID;
+    Payment.ReceiverBankMarkDate  = 
+    Payment.PayerBankEnterDate    = date(0,0,0); 
+    Payment.IsFactPaym            = "";
+    Payment.OutTransferDate       = {CurDate};
+    Payment.Ground = substr( "Возврат средств по платежному поручению " + PaymentObj.Number + " от " + PaymentObj.Date + " : " + note_text, 1, 600 );
+    Payment.Ground = substr(Payment.Ground+" //"+PaymentObj.Ground, 1, 210);
+    Payment.Ground = DeleteVOFromGround( Payment.Ground );
+    Payment.Date                  = {CurDate};
+    Payment.PayDate               = Payment.ValueDate;
+    Payment.ClientDate            = {CurDate};
+    Payment.PayerChargeOffDate    = date(0,0,0);
+
+    if(substr(Payment.ReceiverAccount,1,5) == "40101")
+        Payment.TaxAuthorState = ""; //"15" TAM 21.08.2013 R-234377
+        Payment.BttTICode      = PaymentObj.BttTICode;
+        Payment.OKATOCode      = PaymentObj.OKATOCode;
+        Payment.TaxPmGround    = PaymentObj.TaxPmGround;
+        Payment.TaxPmPeriod    = PaymentObj.TaxPmPeriod;
+        Payment.TaxPmNumber    = PaymentObj.TaxPmNumber;
+        Payment.TaxPmDate      = PaymentObj.TaxPmDate;
+        Payment.TaxPmType      = PaymentObj.TaxPmType;  
+    end;
+    // Если возврат со счета 47416 и транспорт СМБР (СБ РФ)
+    if( ( CompareStrWithMasks( "47416*", PaymentObj.FuturePayerAccount ) == 0 )
+    and ( PaymentObj.InTransport == TRANSP_SMBR ) )
+        Payment.MessageType = "192";
+    end;
+    // Копируем из исходного платежа категории
+    CopyPaymentCategories(Payment, PaymentObj);
+    // Копируем из исходного платежа примечания
+    CopyPaymentNotes(Payment, PaymentObj);
+    // Создать связь
+    if( PaymentObj.LinkPayment( Payment, PMLINK_KIND_RETREDIR ) )
+        msgbox( GetErrMsg() );
+        return 1;
+    end;
+    PaymentObj.CloseUnknown();
+    PaymentObj.ToBackOffice  = "";
+    // Удалить все резервы по платежу
+    PaymentObj.FreeReserve( Payment.PayerAccount, Payment.Chapter, Payment.PayerFIID );
+
+    stat = УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE );
+    if (stat) return stat; end;
+    //PaymentObj.StatusInfo = "Возвращен отправителю";
+  return 0;
+
+end;
+
+
+//Jushmanov 2014-02-25 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0))
+     /*SDA 20.03.2014 - Устанавливаем корректную дату откредитовывания платежа для корректного формирования штафеля невыясненных платежей */
+     Rsdcommand("update drminprop_dbt set T_OUTDATE = TO_DATE( '"+{curdate}+"', 'DD.MM.YYYY' ) where T_PAYMENTID = "+PaymentObj.PaymentID).execute;
+    end;
+
+
+    return 0;
+end;

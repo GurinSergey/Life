@@ -1,0 +1,169 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29042 - "Ожидание поступлений"
+// Шаг      : 10    - "Ожидание поступлений"
+// Описание : Макрос шага
+// Changes:
+//          KS 22.05.2012 I-00174219 
+//          KS 24.05.2012 I-00181441
+//          Gurin S. N. 16.07.2012 R-83851-2
+//          VV 18.02.2013 C-17836
+//          Gurin S. 07.05.2013 R-188356-1
+//          KS 22.11.2013 Перенесены доработки из 30й сборки
+//          Jushmanov 2014-02-24 C-19151 ЛО\оггирование массово выполненных шагов
+//          TAM 02.04.2014 R-356440
+//-----------------------------------------------------------------------------
+import PaymInter, cbsttls, OprInter, pm_common, pm_setst;
+import pschkrst, op_lib;
+import FrontRoute, FrontCommon; //SDA 24.01.2012 - не устанавливается статус необходимости выгрузки во фронт 
+import bordchkrst; //SDA - Банковские ордера обрабатываются иначе чем платежные документы клиента
+import "ppp.mac"; // KS 06.02.2012 I-00143999 ПользовательскиеПроверкиПредобработки
+import oralib; //Jushmanov 2014-02-24 C-19151
+
+var PaymentObj:RsbPayment;
+var InsInd2:bool;
+import "FS.mac";
+import "pschkrst.mac";// KS 24.05.2012 I-00181441
+import "lib_const.mac";
+
+// VV 18.02.2013 C-17836 >>>>>
+private var Per_PP_IK, errCode;
+   GetRegistryValue("COMMON\\Period_PP_IK", V_INTEGER, Per_PP_IK, errCode);
+   if (errCode > 0)
+      msgbox("Проверьте значение настройки COMMON\\Period_PP_IK");
+      return false;
+   end;
+//  <<<<<<<< VV 18.02.2013 C-17836
+  
+
+// Выполнение шага
+MACRO ExecuteStep( doc, payorder, DocKind:integer, ID_Operation:integer, ID_Step:integer  )
+   debugbreak;
+   var DO_Segment, INDEX_Segment;
+   var msg;
+   var PrimObj = GetPrimObj(PaymentObj);
+   var stat = 0;
+
+   var StatBank;  // статус банка из ППП в"Согласование" KS 06.02.2012 I-00143999
+
+   PaymentObj.ValueDate = {curdate};
+   if (PaymentObj.OutTransferDate < {curdate} )
+      PaymentObj.OutTransferDate = {curdate};
+   end;
+
+   var  isFCOver = 0;
+
+   if( InsInd2 )
+      if( (PaymentObj.DocKind == PS_INRQ) and IsSetPsBCNumber( PaymentObj ) )
+         DO_Segment = OPR_PM_ST_EXEC_IPVS;
+      else
+         DO_Segment = OPR_PM_ST_ENTER;
+      end;
+
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_2 , 
+                                    OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL,
+                                    OPR_PAYM_DO, DO_Segment) )
+         msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+         return 1;
+      end;
+   else
+      //Gurin S. N. 16.07.2012 R-83851-2
+      debugbreak;
+      // VV 18.02.2013 C-17836 исправлена константа на настройку реестра
+      // TAM 02.04.2014 R-356440 - только для докмуентов происхождения ИК должна быть реализована С-17836
+      if((PaymentObj.Origin == PSPO_OR_CLB) and (PaymentObj.shifroper == "01"))
+         if( ({curdate} - PaymentObj.Date) > (Per_PP_IK-1) ) 
+            msgbox("Дата документа отстает от текущей более чем на"+" "+Per_PP_IK+" "+"дней.");  
+            RejectPayment( PaymentObj, "Дата документа отстает от текущей более чем на"+" "+Per_PP_IK+" "+"дней." );
+            return 0;
+         end;
+      end;
+      // end VV 18.02.2013 C-17836
+      // KS 22.05.2012 I-00174219 При наличии ареста по счету и недостаточности денежных средств для
+      //                          проведения п/п прошу в протоколе "Ожидающие поступления" выдавать сообщение.
+      if (IsGotoIWP(PaymentObj))
+         msgbox("На счете плательщика есть ограничение суммы (арест на дебет или претензии)");
+         return 1; 
+      end;
+      // KS 22.05.2012 End I-00174219
+      // KS 24.05.2012 I-00181441 При проведении документов из ожидающих, программа
+      //                          должна проводить документы учитывая очередность
+      if (CheckPmWaitPlacedAccPr( PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.Priority-1, PaymentObj.ValueDate ))
+         msgbox("К счету плательщика " + PaymentObj.PayerAccount + 
+                ", есть неоплаченные документы, ожидающие поступления средств с более приоритетной очередностью");
+         return 1;
+      end;
+      // KS 24.05.2012 End I-00181441
+      PaymentObj.PlaceToIndex = "";
+      /* EVG 12/12/2011 */
+      if( GenClassName(PrimObj) == "RsbBankOrder" ) // У банк. ордера нет свойства Payment, поэтому надо отдельно иниц-ть класс
+         stat = BOrd_CheckAccRest( RsbPayment(PrimObj.PaymentID), ID_Operation, ID_Step, true );
+      else
+         stat = PS_CheckDebAccRest( PaymentObj, ID_Operation, ID_Step, true  );
+      end;
+      /*SDA - проверки целевого */
+      isFCOver = 0;
+      //Kozina  процедура контроля целевого использования
+      //DAI из ожидающих рассылки в Lotus нет, повторное выставление категории и если 1 или 5 то осставляем в ожидающих
+      КонтрольЦелевогоИспользоваия(PaymentObj, false, isFCOver, stat);
+   end;
+
+   if (stat == 0)
+      stat = isFCOver;
+   end;
+
+   /*SDA 10.04.2012 - маршрутизация во фронт происходит на шаге предобработки */
+   if (IsFrontPayment(PaymentObj))
+      InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_NO);
+   end;
+
+   if  ( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_PREP))
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+   end;
+
+   return stat;
+END;
+
+//Gurin S. 07.05.2013 R-188356-1
+macro CheckStepAction( mes )
+   debugbreak;
+   private var cmd, rs;
+
+   if (mes == OP_REJECT_STEP)
+      debugbreak;
+      var reason = "";
+      if (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC)
+         getstring(reason, "Введите причину отвержения шага:");
+         if (reason == "")
+            return 1;
+         else
+            PaymentObj.notes.addnote(42,reason);
+            PaymentObj.notes.save(true); //SCR #194241
+         end;
+      end;
+   end;
+
+   return 0;
+end;
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+   private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+   if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+      if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+      if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+      logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                 " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+      ExecSQL(logquery, null, false);
+   end;
+   return 0;
+end;

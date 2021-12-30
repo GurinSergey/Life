@@ -1,0 +1,1524 @@
+/*ПРОЦЕДУРА МАССОВОГО КОНТРОЛЯ ДЛЯ ЭЛЕКТРОННОГО АРХИВА  */
+/*Согласно ТЗ 10344                      03.05.2012 LAO */
+//24.07.2012 vihrov I-00225091-2
+/*27.07.2012 Селект оптимизирован LAO(ДЛЯ ПРИЛОЖЕНИЯ №5)*/
+/*08.11.2012 меняем подключение, то почему то отваливается LAO*/
+/*04.02.2014 Гуцу Е. Переход на 2031*/
+/*03.03.2014 Gurin S. I-00468939-2 Адаптация 2031*/
+/*  Изменения:
+     - darhdoc_dbt, darhdoc$_dbt -> dacctrn_dbt
+     - daccount$_dbt             -> daccount_dbt
+     - t_applicationkey          -> t_acctrnid
+     - t_applicationkind         -> удалено
+     - t_iapplicationkind        -> удалено
+     - doc.t_code_currency       -> doc.t_fiid_payer
+     - doc.t_autokey             -> doc.t_acctrnid
+     - doc.t_sum                 -> doc.t_sum_payer
+*/
+
+//16.05.2014 R-374903-2 DPN В 31-м проводки не удаляются, а переходят в статус 4. В отчёт должны попадать проводки только со статусом 1
+
+Import Календарь;
+import RSD, RCW, RsbDataSet;
+import globals;
+import bankinter;
+import oralib;
+import FIinter;
+import PtInter;
+import likepy;
+import treport;
+var  n, i, reportdate, chapter, chap, restvalue, fii, fi, Chaptername, dprt_v, sum = 0.00, und = 0.00;
+
+var maxs:integer, k:integer;
+var               
+      col, 
+      cmd,
+       rs,
+       cn,
+      flag = 1;
+var Balance="";
+
+array m;
+array p;
+array v;   
+   m(0) = "Прил.№5";
+   m(1) = "Док. автомат. выгрузки";
+   m(2) = "Все";
+   p(0) = "Рубли";
+   p(1) = "Валюта";
+   p(2) = "Все";
+   v(0) = "=";
+   v(1) = "!=";
+   v(2) = ">";
+   v(3) = "<";
+   v(4) = ">=";
+   v(5) = "<=";
+var fulloutput = GetTxtFileName("control302p");
+
+private 
+const  KEY_TAB        =9,                        /*Константы для скролинга*/
+       KEY_CTRL_ENTER =10,
+           KEY_ALT_F2     =361,
+       KEY_ENTER      =13,
+       KEY_ESC        =27,
+       KEY_F8         =322,
+       KEY_F9         =323;
+private const  KEY_F1         =315;
+private const  KEY_F2         =316;
+private const  KEY_F3         =317;
+private const  KEY_SPACE      =32;
+
+
+record Chapt ("obchaptr.dbt");
+record Department ("dp_dep.dbt");
+record Account ("account");
+var Fulloutputl, outl, outputl="control302p.lbr";
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+var dlg = TRecHandler("302p", fulloutputl, TRUE); 
+
+var branch, DateBegin,
+    DateEnd,
+    Office:double  = 0,
+    OfficeName = "По всем офисам";
+array fiidcode, rate1, rate2;
+
+
+
+/*ИМЯ Partyid*/
+private Macro OperInGroup(Oper,IdGroup)
+ var str, rs;
+ str = "select count(*) cnt from DACSGROUPOPER_DBT where T_GROUPID = "+ IdGroup +" and T_OPER = " + Oper;
+ rs = trsbdataset(str);
+ if(rs and rs.movenext)
+   if(rs.cnt > 0)
+     return true;
+   else
+     return false;
+   end;    
+ else
+   return false;
+ end;
+end;
+
+
+
+private macro GetClientName(id)
+
+var  sl=string(" select t_name from dparty_dbt t where t.t_PartyID=",id);
+
+var  DataS=TRsbDataSet(sl);
+
+  if( DataS.moveNext())
+    return DataS.name;
+  else
+    if (id !=0)
+       msgbox("не найден в party.dbt");
+       return 0;
+    else
+      return "";
+    end;
+  end;
+
+END;
+
+
+
+private macro opdate(bdat,edat,branch)
+var sq = "select dcur.T_CURDATE,dcur.T_BRANCH,dcur.T_ISCLOSED,dep.T_NAME,dep.t_code from dcurdate_dbt dcur,Ddp_dep_dbt dep where dcur.t_curdate between ? and ? and dcur.T_ISCLOSED!='X' ";
+if (branch!="")
+ sq=sq+" and dep.T_NAME=? "
+end; 
+  var cmd=Rsdcommand(sq);
+  cmd.addparam("begindate",RSDBP_IN,bdat);
+  cmd.addparam("enddate"  ,RSDBP_IN,edat);
+  if (branch!="")
+   cmd.addparam("T_BRANCH"  ,RSDBP_IN,branch);
+  end; 
+  cmd.execute;
+ var drs = rsdrecordset(cmd);
+
+  if ((drs)and(drs.moveNext()))
+   return true;
+  end;
+end;
+
+//zmp 16.08.2012 I-00236827-2 
+macro parseShifr(shifr:string);
+var i = 0, str:string = "";
+var f = split(trim(shifr),",");
+    while(i < f.size(f))
+    str = str + "'"+f[i]+"',";
+    i = i + 1;
+    end;
+return substr(str,1,strlen(str)-1);
+end;
+
+
+private macro MassControl()
+var SQL,from,where;
+var nazvO,nazvorgan="";
+var status="";
+var bdate,edate,cptr,brn,nbpck,nbpckch,shf,AccPayer,AccReciever,summa,opernum,fl3,cd1,cd2,fl4,sel,fl2,fl5,Cdcurr,Curr,DelControl,clearreport,ChShifr;
+var mask,Kfrom,KWhere,KSQL,RSQL,RKSQL,KSQLUPDATE,Kcmdupdate,Whererur,Whereval;
+var cmd,sort,kontrdoc,kdoc;
+ var kcmd,kcmdr,cmdr;
+ var i,flag=0;
+ var Krs;
+ var rs;
+ var SQLUPDATE,cmdupdate,procontr;
+ var NSQL;
+ var userc={OPER};
+ var paramfisc,move=0;
+ var table = CTableReport;
+ var obsumma,koldoc,HINT,auto_key="First";
+const SELECT="Select ";
+const  Pereopredelenie =0;
+        table.addcolumn("ID DOC",10, AL_CENTER); 
+        table.addcolumn("№ док.",8, AL_CENTER); 
+        table.addcolumn("Гл",2, AL_CENTER);
+        table.addcolumn("Счет плательшика",22, AL_CENTER);
+        table.addcolumn("Счет получателя ",22,AL_CENTER);
+        table.addcolumn("Сумма",15, AL_CENTER);
+        table.addcolumn("Вал",6,AL_CENTER);
+        table.addcolumn("Пачка",6,AL_CENTER);
+        table.addcolumn("Шифр",6,AL_CENTER);
+        table.addcolumn("Дата",10,AL_CENTER);
+        table.addcolumn("Название орг.стуктуры",12,AL_CENTER);
+        table.addcolumn("Подразделение",12,AL_CENTER);
+        table.addcolumn("Контролер",8,AL_CENTER);
+        table.addcolumn("Операционист",8,AL_CENTER);
+/*initprogress(-1, "Формируется отчет, ждите...");*/
+/*Вписываем данные из диалогового окна*/
+ bdate=dlg.rec.BeginDate;/*Начало диапазона*/
+ edate=dlg.rec.EndDate;/*Конец  диапазона*/
+ cptr=dlg.rec.Chapter;/*Глава счетов*/
+ brn=dlg.rec.BranchCode;/*Название подразделения*/
+ nbpck=dlg.rec.NumbPack;/*Номер пачки, возможен ввод через запятую*/
+ nbpckch=dlg.rec.Fl1;/*исключающее или включающее ограничение для пачки*/
+ shf=dlg.rec.Shifr;/*шифр операции возможен ввод через запятую*/
+ AccPayer=dlg.rec.AccountPayer;/*Плательшик*/
+ AccReciever=dlg.rec.AccountReciever;/*Получатель*/
+ summa=dlg.rec.Sum;/*Сумма*/
+ opernum=dlg.rec.OperNum;/*Номер опера*/
+ ChShifr=dlg.rec.ChShifr;
+ cd1=dlg.rec.Cd1;
+ cd2=dlg.rec.Cd2;
+ Fl4=dlg.rec.Fl4;
+ fl2=dlg.rec.Fl2;
+ sel=dlg.rec.Selection;
+ fl5=dlg.rec.Fl5;
+ fl3=dlg.rec.Fl3;
+ Cdcurr=dlg.rec.CdCurr;
+ Curr=dlg.rec.Curren;
+ DelControl=dlg.rec.DelControl;
+ kontrdoc=dlg.rec.KontrDoc;
+ kdoc=dlg.rec.Kdoc;
+ paramfisc="";
+ HINT=" /*+ USE_CONCAT leading(doc,docoper,dep,party,acc,pmd,pm,op,step)*/ ";
+ 
+SQL = 
+ " doc.t_acctrnid, decode(doc.t_userfield2,chr(1),1,2) chk,chapter.t_symbol glava,"+" doc.t_account_payer, doc.t_account_receiver,"+
+       "doc.t_sum_payer amount, fininstr.t_ccy, doc.t_number_pack number_pack,"+
+       "doc.t_shifr_oper shifr, doc.t_date_carry,"+ 
+           "doc.t_userfield2 control, doc.t_oper oparh,"+
+       "dep.t_name ||'  '|| party.t_shortname t_shortname,doc.t_numb_document,doc.t_oper";
+  from =" FROM "+
+       "dobchaptr_dbt chapter,"+
+       "dfininstr_dbt fininstr,"+
+       "ddp_dep_dbt dep,"+
+       "dparty_dbt party,"+
+        /*   "daccount_dbt acc,"+
+           "daccount_dbt acc2,"+*/
+           "dperson_dbt oper";
+      
+ where=" WHERE doc.t_date_carry BETWEEN ? "+
+                            "AND ?"+
+   " AND doc.t_oper = oper.t_oper"+
+   " AND doc.t_chapter = chapter.t_chapter"+
+   " AND doc.t_fiid_payer = fininstr.t_fiid"+
+   " AND dep.t_code = doc.t_branch"+
+   " AND party.t_partyid = dep.t_partyid"+
+   " AND acc.t_chapter = doc.t_chapter"+
+   " AND acc2.t_chapter = doc.t_chapter"+
+   " AND acc2.t_account = doc.t_account_receiver"+
+   " AND acc.t_account = doc.t_account_payer"+
+   " AND DOC.T_STATE = 1"; //16.05.2014 R-374903-2 DPN В 31-м проводки не удаляются, а переходят в статус 4. В отчёт должны попадать проводки только со статусом 1
+      
+   /* Покрытие обрабатывается в валюте*/
+   whererur=" and doc.T_RESULT_CARRY not in (14, 18, 83) "+
+            " and acc.t_type_account  not  like '%П%' and acc.t_type_account not like '%Н%'"+ 
+            " and acc.t_type_account not like '%U%'"+
+                        " and acc2.t_type_account  not  like '%П%' and acc2.t_type_account not like '%Н%'"+ 
+            " and acc2.t_type_account not like '%U%'";
+   
+    Whereval=" and (doc.T_RESULT_CARRY  in (14, 18, 83) "+
+            " or acc.t_type_account like '%П%' or acc.t_type_account  like '%Н%'"+ 
+            " or acc.t_type_account  like '%U%'"+
+                        " or acc2.t_type_account like '%П%' or acc2.t_type_account  like '%Н%'"+ 
+            " or acc2.t_type_account  like '%U%')";
+  
+  
+ 
+ /*формируем запрос*/  
+ if (cptr!="")
+  Where=Where + " AND doc.t_chapter = ?";
+   paramfisc=paramfisc+" Глава:("+cptr+")"; 
+ Else
+   paramfisc=paramfisc+" Глава:(По всем)"; 
+ end;
+ if (brn!="")
+  Where=Where + " AND dep.t_name = ?";
+  paramfisc=paramfisc+" Подразделение:("+brn+")"; 
+ else
+   paramfisc=paramfisc+" Подразделение:(По всем)";
+ end; 
+ if  (nbpck!="")
+  if (nbpckch=="=")
+    Where=Where+" And doc.t_number_pack in ("+nbpck+")";
+        paramfisc=paramfisc+" Пачка(включ.):("+nbpck+")"; 
+  else  
+    Where=Where+" And doc.t_number_pack not in ("+nbpck+")";
+    paramfisc=paramfisc+" Пачка(искл.):("+nbpck+")";
+  end;
+  else 
+    paramfisc=paramfisc+" Пачка:(По всем)";
+ end;  
+ if (shf!="")
+   if (ChShifr=="=")
+    Where=Where+" And doc.t_shifr_oper in ("+parseShifr(shf)+")";
+    paramfisc=paramfisc+" Шифр:("+parseShifr(shf)+")";
+   else
+        Where=Where+" And doc.t_shifr_oper not in ("+parseShifr(shf)+")";
+    paramfisc=paramfisc+" Шифр:(кроме "+parseShifr(shf)+")";
+   end;
+ else
+    paramfisc=paramfisc+" Шифр:(По всем)";
+ end;
+
+ /*convertMaskToSQLFormat*/
+ if (AccPayer!="")
+    Where=Where+" And ("+convertMaskToSQLFormat(AccPayer,"doc.t_Account_Payer")+")"; 
+        
+        paramfisc=paramfisc+" Счет плательщика:("+AccPayer+")";
+ end;
+ if (AccReciever!="")
+    Where=Where+" And ("+convertMaskToSQLFormat(AccReciever,"doc.T_ACCOUNT_RECEIVER")+")"; 
+        paramfisc=paramfisc+" Счет получателя:("+AccReciever+")";
+ end; 
+ if ((summa!="") and (CdCurr!="")) 
+    Where=Where+" And doc.t_sum_payer"+CdCurr+" ?";
+        paramfisc=paramfisc+" Сумма:("+summa+")";
+ end; 
+  if (opernum!="")
+  if (fl2=="=")
+    Where=Where+" And doc.T_OPER in ("+opernum+")";
+        paramfisc=paramfisc+" Опер(включ.):("+opernum+")";
+   else
+    Where=Where+" And doc.T_OPER not in ("+opernum+")";
+        paramfisc=paramfisc+" Опер(искл.):("+opernum+")";
+  end;   
+ end;
+ if (KontrDoc!="")
+  if (KDoc=="=")
+    Where=Where+" And trim(doc.t_userfield2) Like '"+KontrDoc+"'";
+        paramfisc=paramfisc+" Контролер(пров-ка)(включ.):("+KontrDoc+")";
+   else
+    Where=Where+" And trim(doc.t_userfield2) not LIKE '"+KontrDoc+"'";
+        paramfisc=paramfisc+" Контролер(пров-ка)(искл.):("+KontrDoc+")";
+  end;   
+ end;
+ /*Если определена орг структура! Проверяем то что счет открыт операционистом из выбранной структуры!*/
+ if ((cd1!="") and (cd2!=""))
+ paramfisc=paramfisc+" Оргструктура:("+cd1+"."+cd2+")";
+    Where=Where+" AND oper.t_oper IN"+
+                   "( SELECT t_oper"+
+                 " FROM dop_otdel_dbt"+
+                  " WHERE t_code1 = ?";
+    if (cd2!=0) 
+     Where=Where+   " AND t_code2 = ?";
+        end;    
+    Where=Where+   " AND   (t_dateend >= ?"+
+                   " OR t_dateend = '01.01.0001')"+
+                   " AND t_datebegin <= ? )";
+    nazvorgan=dlg.rec.OrgName;
+ 
+ else    /*А если нет, то подставляем для опера название орг структ. к которой он относится*/
+  SQL=SQL+",nvl((SELECT otd.t_code1||' '||otd.t_code2||' '||otd.t_name"+
+           " FROM dotdels_dbt otd, dop_otdel_dbt otds"+
+           " WHERE doc.t_oper = otds.t_oper"+
+           " AND otds.t_code1 = otd.t_code1"+
+           " AND otds.t_code2 = otd.t_code2"+
+           " AND (otds.t_dateend >= ? OR otds.t_dateend = '01.01.0001')"+
+           " AND otds.t_datebegin <= ?"+
+           " AND ROWNUM = 1),'не определен') nameorgan ";
+         nazvorgan=""; 
+        
+ end;
+ /*Если выбрано условие в перечне*/
+ /*"Прил.№5";
+   "Док. автомат. выгрузки";
+   "Все";*/
+ var errr;
+ if (sel=="Прил.№5")
+  GetRegistryValue("PRBB\\ОПЕРАЦИИ ОБЯЗАТЕЛЬНОГО КОНТРОЛЯ", V_STRING,mask, errr);
+  
+  if ((mask!="") and (errr==0))
+ 
+  /* where=where+" AND (rsb_mask.comparestringwithmask('"+mask+"',doc.t_account_payer) = 1"+
+               " OR rsb_mask.comparestringwithmask('"+mask+"',doc.t_account_receiver) = 1)";*/
+  
+  
+var tr=false,ands,ind;
+GetRegistryValue("PRBB\\ОПЕРАЦИИ ОБЯЗАТЕЛЬНОГО КОНТРОЛЯ", V_STRING,mask, errr);
+ands=strlen(mask);
+where=where +" and ( ";
+while (not tr)
+if (ands>512)
+    ind=index(mask,"|",450);
+    where=where+" regexp_instr(doc.t_account_receiver,'"+substr(mask,1,ind-1)+"')=1 or regexp_instr(doc.t_account_payer,'"+substr(mask,1,ind-1)+"')=1 or ";
+    mask=substr(mask,ind+1);
+    ands=strlen(mask);
+else
+    tr=true;
+    where=where+" regexp_instr(doc.t_account_receiver,'"+mask+"')=1 or  regexp_instr(doc.t_account_payer,'"+mask+"')=1)";
+end;
+end;
+
+
+
+
+
+
+
+  else   
+   msgbox("Условий в Прилож. 5 нет, заполните пожалуйста ветку реестра");
+  end;
+  elif(sel=="Док. автомат. выгрузки")
+   from=from+",dpmrmprop_dbt prmprop, dpmdocs_dbt pmd, dpmpaym_dbt pm,dobjatcor_dbt dob";
+   where=Where+" And  doc.t_acctrnid = pmd.t_acctrnid"+
+   " AND pm.t_paymentid = pmd.t_paymentid"+
+   " and prmprop.t_paymentid=pm.t_paymentid"+
+   " AND dob.t_object(+) = LPAD (pm.t_paymentid, 10, 0)"+
+   " AND  ( (SELECT storekind"+
+   " FROM TABLE (user_ea.get_dev_prop (pm.t_dockind,"+
+   "pm.t_origin,"+
+   "prmprop.t_paymentkind,"+
+   "doc.t_shifr_oper,"+
+   "doc.t_number_pack,"+
+   "doc.t_chapter,"+
+   "pm.T_USERTYPEDOCUMENT,"+
+   "doc.t_account_payer,"+
+   "doc.t_fiid_payer,"+
+   "doc.t_account_receiver,"+
+   "doc.t_fiid_payer,"+
+   "NULL))) in (1)"+
+   " OR (dob.t_objecttype = 501 AND dob.t_groupid = 1010))";
+ end;
+    if (Fl4=="x")
+     if (sel=="Док. автомат. выгрузки") 
+           Kfrom=from+",doproper_dbt op,doprstep_dbt step"
+         else
+            Kfrom=from+",dpmdocs_dbt pmd,dpmpaym_dbt pm,doproper_dbt op,doprstep_dbt step"
+         end;
+         
+          KWhere=Where+" And doc.t_acctrnid = pmd.t_acctrnid"+
+       " AND pm.t_paymentid = pmd.t_paymentid"+
+       " AND op.t_documentid = LPAD (pm.t_paymentid, 34, 0)"+
+       " and pm.t_dockind=op.t_dockind"+ /* без этого просто жесть*/
+       " AND step.t_id_operation = op.t_id_operation"+
+       " AND step.t_blockid = 10000125"+
+       " AND step.t_number_step = 10";
+      /* " and doc.T_OPER<>step.T_OPER" ;*//*выбираем опер проводки не такой как опер шага*//* Может нарушить логику, закоментировал*/
+           
+                 
+        elif ((Fl3!="x") and (delControl!="x"))
+          if (Fl5!="x")
+            Where=Where+" and doc.T_USERFIELD2 = CHR(1) and doc.T_OPER <> "+userc;
+          else
+            Where=Where+" and doc.T_OPER <> "+userc;
+          end;
+    end;
+ paramfisc=paramfisc+" Перечень:("+sel+")";
+ if (Fl5=="x")
+    Where=Where+" And DOC.T_USERFIELD2 = CHR(1)";
+        paramfisc=paramfisc+" Отчет:(без контроля)";
+ end;
+ if (dlg.rec.KontrOper=="x")
+    //Gurin S. 15.05.2014 I-00486990-2 --2031
+    //Where=Where+" AND doc.t_autokey=docoper.T_AUTOKEY And DOC.T_USERFIELD2 != CHR(1)"+
+    Where=Where+" AND doc.t_acctrnid=docoper.t_acctrnid And DOC.T_USERFIELD2 != CHR(1)"+
+                " and DOC.T_USERFIELD2 = docoper.t_oper ";
+    //KWhere=KWhere+" AND doc.t_autokey=docoper.T_AUTOKEY And DOC.T_USERFIELD2 != CHR(1)"+
+    KWhere=KWhere+" AND doc.t_acctrnid=docoper.t_acctrnid And DOC.T_USERFIELD2 != CHR(1)"+
+                  " and DOC.T_USERFIELD2 = docoper.t_oper ";
+    paramfisc=paramfisc+" Отчет:(Контролер=оперу)";
+ end;
+
+ sort=" order by chk,glava,doc.t_account_payer,doc.t_sum_payer,doc.T_ACCOUNT_RECEIVER,doc.t_acctrnid";
+ var valldoc="dacctrn_dbt";
+ var valch="рублевые проводки";
+ var val=1;
+ var prov=4;
+ /*paramfisc=paramfisc+" отбор:[Рублевые и валютные проводки]";*/
+ /*Выбираем какие запросы будем выполнять*/
+ if (Curr=="Валюта")
+   val=val+1;
+   valch="валютные проводки";  
+   paramfisc=paramfisc+" отбор:[Валютные проводки]";
+ elif (Curr=="Рубли")
+  prov=2;
+  paramfisc=paramfisc+" отбор:[Рублевые проводки]";
+ else
+  paramfisc=paramfisc+" отбор:[Рублевые и валютные проводки]";
+ end;  
+  debugbreak; 
+ clearreport=0; 
+/*Формируем параметры для шапки и фисклога*/
+var header;
+ if (Fl3!="x")
+   if (DelControl!="x")
+    if (fl4!="x")  
+     paramfisc="Тип отчета: Непроконтролированные платежи "+paramfisc;
+         header="Итоговый отчет процедуры заполнения проводок без контроля";
+        else
+         paramfisc="Тип отчета: Переопределение контролера "+paramfisc ; 
+         header="Итоговый отчет процедуры переопределения контролера";
+        end;
+   else
+     paramfisc="Тип отчета: Очистка контролера "+paramfisc ; 
+         header="Итоговый отчет процедуры очистка контролера";
+   end;
+ elif(dlg.rec.KontrOper=="x")
+     paramfisc="Тип отчета: Отчет 'Контр=Опер' "+paramfisc;
+         header="Отчет контролер на проводке = операционисту";
+ elif(fl5=="x")
+     paramfisc="Тип отчета: Отчет 'Только без контроля'"+paramfisc;
+         header="Отчет текущего состояния документов без контроля  ";
+ else
+         paramfisc="Тип отчета: Отчет 'Общий' "+paramfisc;
+         header="Отчет текущего состояния документов  контроля  ";
+ end;   
+ 
+ /*Сверху все понятно, теперь для чего нужен while:
+  1. У нас есть три разных запроса: Валютные проводки, Рублевые Проводки, Курсовая Разница(Руб)+ покрытие
+  2. Для того что бы не переписывать их несколько раз, я собрал цикл. 
+  Например:
+  Если у нас параметры "по всем валютам" и плюс "Перезаписать информацию по контр"  
+  Тогда нам нужно будет собрать три запроса: 
+  Первый запрос по Рублям darhdoc_dbt+ дополнительный запрос по перезаписи контролера в проводке на 
+  контролера в шаге.
+  Второй по валюте + по перезаписи контролера 
+  Третий по курсовой разницы и счетам покрытия(В рублях его нельзя формировать согласно ТЗ)+ по перезаписи контролера
+  Выходит три запроса, значит цикл с 1 до <4 
+  val будет 1 а prov=4; В цикле проверяется значение val и по нему строится запрос далее, если бы мы формировали отчет "Валюта"
+  нам нужно было бы val начинать с 2 и пропустить формирование Рублевого запроса. LAO */
+
+ /*СОБИРАЕМ ЗАПРОС ТУТ! Кроме покрытия так как оно  собирается в цикле*/
+ /*Собираем сразу все запросы даже если флаг не стоит а то  слишком много ифов...*/
+ 
+  var gnsql,grsql,gcmd;/*Фишка для формирования подвала при отчете Контр=Опер*/
+        /*   "daccount_dbt acc,"+
+           "daccount_dbt acc2,"+*/
+ if (dlg.rec.KontrOper!="x")/*проверяем на Параметр Формировать отчет где Контролер=Оперу на проводке*/
+  KSQL=SELECT+HINT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc, daccount_dbt acc, daccount_dbt acc2 "+KWhere;/*контроль шага в валюте*/
+  RKSQL=SELECT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc ,daccount_dbt acc, daccount_dbt acc2 "+KWhere+Whererur;/*контроль шага в рублях*/  
+  NSQL=SELECT+HINT+SQL+From+",dacctrn_dbt doc ,daccount_dbt acc, daccount_dbt acc2 "+Where +" AND fininstr.t_ccy != 'RUR' "+sort;/*валютный запрос*/  //16.05.2014 R-374903-2 DPN В валюту не должны попадать рубли
+  RSQL=SELECT+SQL+From+",dacctrn_dbt doc ,daccount_dbt acc, daccount_dbt acc2 "+Where+Whererur+sort;/*рублевы запрос*/
+ elif (dlg.rec.KontrOper=="x")
+  KSQL=SELECT+HINT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+KWhere;/*контроль шага в валюте*/
+  RKSQL=SELECT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+KWhere+Whererur;/*контроль шага в рублях*/  
+  NSQL=SELECT+HINT+SQL+From+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+Where+" AND fininstr.t_ccy != 'RUR' "+sort;/*валютный запрос*/  //16.05.2014 R-374903-2 DPN В валюту не должны попадать рубли
+  RSQL=SELECT+SQL+From+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+Where+Whererur+sort;/*рублевы запрос*/
+  /*Подвал отчета*/
+  gnsql="Select "+HINT+"  oper.t_name,doc.t_oper,count(*) kolvo "+From+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+Where+" Group by doc.t_oper,oper.t_name";
+  grsql="Select /*+ USE_CONCAT*/ oper.t_name, doc.t_oper,count(*) kolvo "+From+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+Where+Whererur+" Group by doc.t_oper,oper.t_name";
+  
+ end;
+  
+ 
+while (val<prov)
+ i=1;
+ 
+
+  if (val==1) /* если идет построение списка рублевых проводок*/
+   cmd = rsdcommand(RSQL);
+   kcmd = rsdcommand(RKSQL);
+   gcmd = rsdcommand(grsql);
+   valldoc="dacctrn_dbt";
+   valch="рублевые проводки";
+  elif (val==2) /* если идет построение списка валютных проводок */
+   cmd = rsdcommand(NSQL);
+   kcmd = rsdcommand(ksql);
+   gcmd = rsdcommand(gnsql);
+   valldoc="dacctrn_dbt";
+   valch="валютные проводки";
+  elif (val==3) /*отбираем покрытие и курс разницу с рублевых проводок*/
+    if (dlg.rec.KontrOper!="x")
+     RSQL=SELECT+SQL+From+", dacctrn_dbt doc,daccount_dbt acc, daccount_dbt acc2 "+Where+Whereval+sort;/*рублевы запрос*/
+     RKSQL=SELECT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc,daccount_dbt acc, daccount_dbt acc2 "+KWhere+Whereval;
+    elif (dlg.rec.KontrOper=="x")  
+     RSQL=SELECT+SQL+From+", dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+Where+Whereval+sort;/*рублевы запрос*/
+     RKSQL=SELECT+SQL+",step.t_oper stepoper "+KFrom+",dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+KWhere+Whereval;
+         
+         grsql="Select  /*+ USE_CONCAT */ oper.t_name,doc.t_oper,count(*) kolvo "+From+", dacctrn_dbt doc,dacctrn_dbt docoper,daccount_dbt acc, daccount_dbt acc2 "+
+         Where+Whereval+" Group by doc.t_oper,oper.t_name";/*подвал*/
+         
+    End; 
+   cmd = rsdcommand(RSQL);
+   kcmd = rsdcommand(RKSQL);
+   gcmd = rsdcommand(grsql);
+   valldoc="dacctrn_dbt";
+   valch="счета покрытия, курсовая разница "; 
+    
+   
+  end;
+
+  
+  
+ /*поехали...*/
+ /*Добавляем параметры по сформированным запросам*/
+ /*==============================================================================*/
+if ((cd1=="") and (cd2=="")) 
+  cmd.addparam("enddate1"  ,RSDBP_IN,edate);
+  cmd.addparam("enddate2"  ,RSDBP_IN,edate);
+  kcmd.addparam("enddate1"  ,RSDBP_IN,edate);
+  kcmd.addparam("enddate2"  ,RSDBP_IN,edate);
+ /* gcmd.addparam("enddate1"  ,RSDBP_IN,edate);
+  gcmd.addparam("enddate2"  ,RSDBP_IN,edate);*/
+ end; 
+  cmd.addparam("begindate",RSDBP_IN,bdate);
+  cmd.addparam("enddate"  ,RSDBP_IN,edate);
+  kcmd.addparam("begindate",RSDBP_IN,bdate);
+  kcmd.addparam("enddate"  ,RSDBP_IN,edate);
+  gcmd.addparam("begindate",RSDBP_IN,bdate);
+  gcmd.addparam("enddate"  ,RSDBP_IN,edate);
+ 
+ if (cptr!="")
+  cmd.addparam("chapters",RSDBP_IN,cptr);
+  kcmd.addparam("chapters",RSDBP_IN,cptr);
+  gcmd.addparam("chapters",RSDBP_IN,cptr);
+ end;
+ if (brn!="")
+  cmd.addparam("branch",RSDBP_IN,brn);
+  kcmd.addparam("branch",RSDBP_IN,brn);
+  gcmd.addparam("branch",RSDBP_IN,brn);
+ end;
+ if ((summa!="") and (CdCurr!="")) 
+    cmd.addparam("summa",RSDBP_IN,summa);
+        kcmd.addparam("summa",RSDBP_IN,summa);
+        gcmd.addparam("summa",RSDBP_IN,summa);
+ end; 
+ /*if (opernum!="")
+   cmd.addparam("opernum",RSDBP_IN,opernum);
+   kcmd.addparam("opernum",RSDBP_IN,opernum);
+   gcmd.addparam("opernum",RSDBP_IN,opernum);
+ end;*/
+
+ /*Если определена орг структура! Проверяем то что счет открыт операционистом из выбранной структуры!*/
+ if ((cd1!="") and (cd2!=""))
+   cmd.addparam("cd1",RSDBP_IN,cd1);
+ if (cd2!=0)  
+   cmd.addparam("cd2",RSDBP_IN,cd2);
+ end;  
+   cmd.addparam("edate2",RSDBP_IN,edate);
+   cmd.addparam("edate3",RSDBP_IN,edate);
+   kcmd.addparam("cd1",RSDBP_IN,cd1);
+ if (cd2!=0)  
+   kcmd.addparam("cd2",RSDBP_IN,cd2);
+ end;  
+   kcmd.addparam("edate2",RSDBP_IN,edate);
+   kcmd.addparam("edate3",RSDBP_IN,edate);
+   gcmd.addparam("cd1",RSDBP_IN,cd1);
+ if (cd2!=0)  
+   gcmd.addparam("cd2",RSDBP_IN,cd2);
+ end;  
+   gcmd.addparam("edate2",RSDBP_IN,edate);
+   gcmd.addparam("edate3",RSDBP_IN,edate); 
+ end;
+
+ 
+/*==============================================================================================*/
+  
+ /*  */
+ 
+ 
+  
+ 
+ 
+ debugbreak; 
+  if (Fl4=="x")
+  /* kcmd.execute();*/ /*выполняем проверку на шаг контроля*/
+   Krs = rsdrecordset(kcmd);
+/*   rs = rsdrecordset(kcmd,RSDVAL_CLIENT, RSDVAL_STATIC);
+*/
+   InitProgress( -1, " ~Ctrl-Break~ Прервать", "Переопределение контролера..."+valch );
+   while ((Krs)and(Krs.moveNext()))
+    UseProgress( i );
+        //KSQLUPDATE = " UPDATE "+valldoc+" set t_userfield2="+Krs.value("stepoper")+" where t_autokey="+Krs.value("t_autokey");
+        //KSQLUPDATE = " UPDATE "+valldoc+" set t_userfield2='"+Krs.value("stepoper")+"' where t_autokey="+Krs.value("t_autokey"); //24.07.2012 vihrov I-00225091-2
+        KSQLUPDATE = " UPDATE "+valldoc+" set t_userfield2='"+Krs.value("stepoper")+"' where t_acctrnid="+Krs.value("t_acctrnid"); //24.07.2012 vihrov I-00225091-2
+        Kcmdupdate = RSDCommand(KSQLUPDATE);
+        Kcmdupdate.Execute;
+        /* EVG 4/2/2014 Больше не нужно.
+        if (valldoc=="dacctrn_dbt") /* привязка покрытия и установка контролера */
+         //KSQLUPDATE = " UPDATE dacctrn_dbt  set t_userfield2="+Krs.value("stepoper")+" where t_connappkey="+Krs.value( "t_acctrnid")+" and T_CONNAPPKIND="+Krs.value("t_iapplicationkind");
+         KSQLUPDATE = " UPDATE dacctrn_dbt  set t_userfield2='"+Krs.value("stepoper")+"' where t_connappkey='"+Krs.value( "t_acctrnid")+"' and T_CONNAPPKIND="+Krs.value("t_iapplicationkind");//24.07.2012 vihrov I-00225091-2
+         Kcmdupdate = RSDCommand(KSQLUPDATE);
+         Kcmdupdate.Execute;
+        end;*/
+        i=i+1;
+   end;
+    if (i>1) 
+         WriteFiscLog(OLstrproc,"Итоговый отчет процедуры контроля 'Переопределение контролера': Диапазон:("+bdate+"-"+edate+")"+paramfisc);
+        end;
+   RemProgress();
+  end;
+  
+  
+  
+/*    rs = rsdrecordset(cmd,RSDVAL_CLIENT, RSDVAL_STATIC);
+  */
+  /* cmd.execute();*/
+   rs = rsdrecordset(cmd);
+   InitProgress( -1, " ~Ctrl-Break~ Прервать", "Массовый контроль проводок: "+valch  );
+                                                                                                                             
+ i=1;
+ 
+ obsumma=0;
+ koldoc=0;
+ while ((rs)and(rs.moveNext()))
+  move=1;
+  clearreport=1;
+ if (flag!=1)
+   if ((val==1))
+        WriteFiscLog(OLstrproc,"Итоговый отчет процедуры контроля (рубл. платежи): Диапазон:("+bdate+"-"+edate+")"+paramfisc);
+   elif ((val==2))
+        WriteFiscLog(OLstrproc,"Итоговый отчет процедуры контроля (вал. платежи): Диапазон:("+bdate+"-"+edate+")" +paramfisc);
+    auto_key="FIRST";
+  end;  
+  [Начало формирования:###########]( time ());
+[ ]; 
+[ ]; 
+ [###################################################################################################################] (header:c);
+ [                              за период с ############ по ###########   ##############################################] (bdate:l,edate:l,("("+valch+")"):l); 
+ 
+[ ]; 
+[        ########################################################################################################################################################################################################################################################################################] 
+ (paramfisc);
+
+  /* [┌────┬──┬─────────────────────┬─────────────────────┬─────────────────┬───┬─────┬────┬──────────┬───────────────────────────┬────────────────────────────┬─────────┐
+    │ N  │Гл│  Счет плательшика   │   Счет получателя   │    Сумма        │Вал│Пачка│Шифр│   Дата   │   Название орг.стуктуры   │        Подразделение       │Контролер│];*/
+    flag=1;
+        
+            
+        table.printhead(""); 
+
+
+ end;                                                                                                        
+  if (nazvorgan =="")
+   nazvO=rs.value("nameorgan");
+  else
+   nazvO=cd1+" "+cd2+" "+nazvorgan;  
+  end;
+  UseProgress( i );
+  procontr=rs.value("control");
+  /*обновляем поле usrfield2 если оно не заполнено ***/
+  if (Fl3!="x")
+   if (DelControl!="x")
+    if (fl4!="x")  
+     if (rs.value("chk")==1)
+       //Gurin S. 03.03.2014 I-00468939-2 --2031
+       //SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2='"+userc+"' where t_autokey="+rs.value ("t_autokey"); //24.07.2012 vihrov I-00225091-2 юзерфилд в апострофы
+       SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2='"+userc+"' where t_acctrnid="+rs.value ("t_acctrnid"); //24.07.2012 vihrov I-00225091-2 юзерфилд в апострофы
+       cmdupdate = RSDCommand(SQLUPDATE);
+       cmdupdate.Execute;
+           procontr=userc;
+         end; 
+        else
+           //SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2='"+userc+"' where t_autokey="+rs.value("t_autokey");//24.07.2012 vihrov I-00225091-2
+           SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2='"+userc+"' where t_acctrnid="+rs.value("t_acctrnid");//24.07.2012 vihrov I-00225091-2
+       cmdupdate = RSDCommand(SQLUPDATE);
+       cmdupdate.Execute;
+           procontr=userc; 
+        end;
+   else
+        //SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2=chr(1) where t_autokey="+rs.value("t_autokey");
+        SQLUPDATE = " UPDATE "+valldoc+"  set t_userfield2=chr(1) where t_acctrnid="+rs.value("t_acctrnid");
+       cmdupdate = RSDCommand(SQLUPDATE);
+       cmdupdate.Execute;
+           procontr="очищен "+procontr;
+   end;
+  end;
+  /* [├────┼──┼─────────────────────┼─────────────────────┼─────────────────┼───┼─────┼────┼──────────┼───────────────────────────┼────────────────────────────┼─────────┤
+    │####│##│#####################│#####################│#################│###│#####│####│##########│###########################│############################│#########│]
+    (rs.value("t_numb_document"):c,rs.value("glava"):c,rs.value("t_account_payer"):r,rs.value("t_account_receiver"):r,money(rs.value("amount")):r,
+     rs.value("t_ccy"):c,rs.value("number_pack"):c,rs.value("shifr"):c,date(rs.value("t_date_carry")):c,rs.value("nameorgan"):c,rs.value("t_shortname"):c,procontr:c);*/
+   if (auto_key!=rs.value("t_acctrnid"))  
+         table.printstringtransferbyword(rs.value("t_acctrnid"):c,rs.value("t_numb_document"):c,rs.value("glava"),rs.value("t_account_payer"),rs.value("t_account_receiver"),money(rs.value("amount")),
+     rs.value("t_ccy"),rs.value("number_pack"),rs.value("shifr"),date(rs.value("t_date_carry")),nazvO,rs.value("t_shortname"),procontr,rs.value("t_oper"));
+     table.printseparator();  
+     obsumma=obsumma+rs.value("amount");
+     koldoc=i;
+     i=i+1;
+   end;   
+   auto_key=rs.value("t_acctrnid");
+   end;
+   RemProgress();
+   
+ 
+   if (move==1) /*Если отчет был не пустой*/
+    table.printbottom();
+    [];
+   [Итого документов: ############# на сумму: #######################](koldoc:l,money(obsumma):l);
+    if (dlg.rec.KontrOper=="x")
+         debugbreak; 
+        /* gcmd.execute();*/
+         rs = rsdrecordset(gcmd);/*Select doc.t_oper,count(*) kolvo */
+     [ ]; 
+     [ ]; 
+     [ Список Операционистов и количество совпадений Операционист = Контролер в проводках     ];
+     [ ];
+     [┌──────────────┬────────────────────────────┬───────────────┐
+      │    Номер     │    Название операциониста  │   Кол-во док. │]; 
+        
+     while ((rs)and(rs.moveNext()))
+        
+     [├──────────────┼────────────────────────────┼───────────────┤
+      │##############│############################│###############│]
+       (rs.value("t_oper"):c,rs.value("t_name"):c,rs.value("kolvo"):c);
+     end;
+     [└──────────────┴────────────────────────────┴───────────────┘];    
+     end; 
+        [Время окончания формирования:##############]( time ());
+   end;
+
+
+ 
+ 
+   val=val+1;
+  
+   flag=0;
+   move=0;
+   
+ end;
+ if (clearreport==0)
+   return 0;
+  end;
+end;
+
+
+
+/*Скролинги */
+
+macro EvProc (rs, Command, id, key )  
+      if   ((Command == DLG_KEY) and (key == KEY_ENTER))
+           return CM_SELECT;
+      elif ((Command == DLG_KEY) and (key == KEY_ESC))
+       return CM_CANCEL;
+       
+      else
+        CM_IGNORE;
+      end;
+    end;
+        
+macro AddCol (ar,ind, fld, head, width, rdonly)
+    ar.value (ind * 6)     = fld;
+    ar.value (ind * 6 + 1) = head;
+    ar.value (ind * 6 + 2) = width;
+    ar.value (ind * 6 + 3 ) = 1;   // fldType
+    ar.value (ind * 6 + 4 ) = 0;   // decPoint
+    ar.value (ind * 6 + 5 ) = 0;   // reserv
+end;
+        
+/*Для орг. структуры*/
+
+private MACRO GetScroll(focus);  
+  var kod;
+  col = TArray;
+  cmd = RSDCommand (cn,"select dot.t_code1,dot.t_name from dotdels_dbt dot where dot.t_code2=0 order by dot.t_code1");
+  rs = RSDRecordset(cmd , RSDVAL_CLIENT, RSDVAL_Static );
+  AddCol (col, 0, "t_code1", "N" , 5 , false);
+  AddCol (col, 1, "t_code2", "N2" , 5 , false);
+  AddCol (col, 2, "t_name", "Название" , 5 , false);
+ 
+  if (RunScroll(rs,
+                 3,
+               col,
+              null,
+           @EvProc, "Список отделов","'Enter'- Выбор' ESC'- Выход",false,null,null,50,15))
+  kod=rs.Value("t_code1"); // тащим
+
+  cmd = RSDCommand (cn,"select dot.t_code1,dot.t_code2,dot.t_name from dotdels_dbt dot where dot.t_code1="+kod+"  order by dot.t_code1");
+  rs = RSDRecordset(cmd , RSDVAL_CLIENT, RSDVAL_Static );
+  AddCol (col, 0, "t_code1", "N" , 5 , false);
+  AddCol (col, 1, "t_code2", "N2" , 5 , false);
+  AddCol (col, 2, "t_name", "Название" , 5 , false);
+   if (RunScroll(rs,
+                 3,
+               col,
+              null,
+           @EvProc, "Список отделов","'Enter'- Выбор' ESC'- Выход",false,null,null,50,15))
+
+        kod=rs.Value("t_code1")+"||"+rs.Value("t_code2")+"||"+rs.Value("t_name");/*Собираем три части*/
+  return kod;
+  
+  end;
+end;
+ 
+end;
+
+/*Для оперов*/
+
+private MACRO GetOper(opers,cd1,cd2);  
+  var kodop;
+  var stquery;
+ 
+  col = TArray;
+ 
+ if (opers==1)
+    stquery="select t_oper, t_name"
+                        +" from dperson_dbt"
+                        +" where t_oper in "
+                        +"(select t_oper "
+                        +"from dop_otdel_dbt "
+                        +"where t_code1 = " + CD1 ;
+  if (cd2!=0)
+    stquery=stquery    +" and t_code2 ="+ CD2 + " ";
+  end;
+    stquery=stquery    +"and (t_dateend >= to_date('" +{curDate} + "','DD-MM-YYYY') or t_dateend = '01.01.0001') and t_datebegin <= to_date('" + {curDate} + "','DD-MM-YYYY')) "
+                +"order by t_oper";
+    cmd = RSDCommand (cn,stquery);
+ else
+ cmd = RSDCommand (cn,"select t_oper, t_name"
+                 +" from dperson_dbt"
+             +" where t_oper in "
+                +"(select t_oper "
+                +"from dop_otdel_dbt "
+                +"where (t_dateend >= to_date('" +{curDate} + "','DD-MM-YYYY') or t_dateend = '01.01.0001') and t_datebegin <= to_date('" + {curDate} + "','DD-MM-YYYY')) "
+                +"order by t_oper");
+ end;
+  rs = RSDRecordset(cmd , RSDVAL_CLIENT, RSDVAL_Static );
+ 
+  AddCol (col, 0, "t_oper", "N" , 5 , false);
+  AddCol (col, 1, "t_name", "N2" , 5 , false);
+   
+  if (RunScroll(rs,
+                 2,
+               col,
+              null,
+           @EvProc, "Список операционистов","'Enter'- Выбор' ESC'- Выход",false,null,null,50,15))
+  kodop=rs.Value("t_oper"); // тащим
+   return kodop;
+ 
+  
+ end;
+end;
+
+
+private MACRO Getshifr();  
+  var shifrop;
+ 
+  col = TArray;
+ 
+
+    cmd = RSDCommand (cn,"select T_SHIFR_OPER, T_COMMENT"
+                 +" from dcipher_dbt");
+        
+ 
+  rs = RSDRecordset(cmd , RSDVAL_CLIENT, RSDVAL_Static );
+ 
+  AddCol (col, 0, "T_SHIFR_OPER", "N" , 5 , false);
+  AddCol (col, 1, "T_COMMENT", "N2" , 5 , false);
+   
+  if (RunScroll(rs,
+                 2,
+               col,
+              null,
+           @EvProc, "Шифры операций","'Enter'- Выбор' ESC'- Выход",false,null,null,50,15))
+     shifrop=rs.Value("T_SHIFR_OPER"); // тащим
+   return shifrop;
+ 
+  
+ end;
+end;
+/*                  */
+private MACRO Getpack(bdate,edate,val);  
+  var pack;
+ 
+  col = TArray;
+ 
+ if (val=="Рубли")
+  cmd = RSDCommand (cn,"select d.t_number_pack from dacctrn_dbt d"+
+                                             " where d.t_date_carry between to_date('"+bdate+"','DD.MM.YYYY')"+ 
+                                                 " and to_date('"+edate+"','DD.MM.YYYY')"+
+                         " group by d.t_number_pack"+
+                         " order by d.t_number_pack");
+ elif (val=="Валюта")
+  cmd = RSDCommand (cn,"select d.t_number_pack from dacctrn_dbt d"+
+                                             " where d.t_date_carry between to_date('"+bdate+"','DD.MM.YYYY')"+ 
+                                                 " and to_date('"+edate+"','DD.MM.YYYY')"+
+                         " group by d.t_number_pack"+
+                         " order by d.t_number_pack");
+  else
+   cmd = RSDCommand (cn,"select d.t_number_pack from dacctrn_dbt d"+
+                                             " where d.t_date_carry between to_date('"+bdate+"','DD.MM.YYYY')"+ 
+                                                 " and to_date('"+edate+"','DD.MM.YYYY')"+
+                         " group by d.t_number_pack"+
+                         " union "+
+                                                 " select d.t_number_pack from dacctrn_dbt d"+
+                                             " where d.t_date_carry between to_date('"+bdate+"','DD.MM.YYYY')"+ 
+                                                 " and to_date('"+edate+"','DD.MM.YYYY')"+
+                         " group by d.t_number_pack");  
+ end; 
+  debugbreak;
+        
+ 
+  rs = RSDRecordset(cmd , RSDVAL_CLIENT, RSDVAL_Static );
+ 
+  AddCol (col, 0, "t_number_pack", "Номер пачки" , 5, false);
+   
+  if (RunScroll(rs,
+                 1,
+               col,
+              null,
+           @EvProc, "Пачки в заданном диапазоне","'Enter'- Выбор' ESC'- Выход",false,null,null,20,15))
+     pack=rs.Value("t_number_pack"); // тащим
+   return string(pack);
+ 
+  
+ end;
+end;
+
+
+
+
+  //обработка нажатий клавиш, работа с диалоговыми формами...
+  
+macro event (dlg, cmd, id, key)
+ var dd1,dd2,val;
+ var sglupdate,cmdupd;
+     
+ var  slq=string(" select t_oper,NVL (chapter, chr(1)) chapter,CHAPTERNAME,PRIL,to_date(BDATE,'DD.MM.YYYY') BDATE ,to_date(EDATE,'DD.MM.YYYY') EDATE,VAL,NVL (BRANCHCODE, chr(1)) BRANCHCODE ,BRANCHNAME,NVL (CD1, chr(1)) cd1,NVL (CD2, chr(1)) cd2,NAMEORG,FL1,NVL(NAMEPACK, chr(1)) NAMEPACK,NVL (SHIFR, chr(1)) SHIFR,NVL (CHSHIFR, chr(1)) CHSHIFR ,NVL(DT, chr(1)) dt,NVL(KT, chr(1)) kt,NVL(SUMS, chr(1)) sums,NVL(SUMMA, chr(1)) summa,NVL(FL2, chr(1)) fl2,NVL(OPERNAME, chr(1)) OPERNAME ,NVL(FL3, chr(1)) fl3,NVL(FL5, chr(1)) fl5,NVL(FL4, chr(1)) fl4 from usr_interface_ea inter  where  inter.t_oper="+{OPER});
+ var const_mess = "~F2~ Продолжить ~SPACE~ По всем  ~F8~ Сохранить параметры  ~ESC~ Выход ";
+ var const_mess1 = "~F2~ Продолжить ~SPACE~ По всем ~F8~ Сохранить параметры  ~ESC~ Выход ";
+ var const_mess2 = "~F2~ продолжить ~F8~ Сохранить параметры  ~ESC~ Выход ";
+ var  inter;  
+   /*Первоначальное заполнение полей*/
+   
+   if(cmd == DLG_INIT)
+         dlg.rec.Kdoc="="; 
+         inter=TRsbDataSet(slq);
+         if( inter.moveNext())    
+      dlg.rec.chapter =inter.chapter;
+          dlg.rec.chaptername=inter.chaptername;
+          dlg.rec.Selection=inter.pril;
+          dlg.rec.begindate =inter.bdate;
+          dlg.rec.Enddate=inter.edate;
+          dlg.rec.Curren=inter.val;
+          dlg.rec.branchcode =inter.branchcode;
+          dlg.rec.branchname=inter.branchname;
+          dlg.rec.cd1  =inter.cd1;
+          dlg.rec.cd2  =inter.cd2;
+          dlg.rec.OrgName  =inter.nameorg;
+          dlg.rec.fl1=inter.fl1;
+          dlg.rec.NumbPack=inter.namepack;
+          dlg.rec.shifr=inter.shifr;
+          dlg.rec.AccountPayer=inter.dt;
+          dlg.rec.AccountReciever=inter.kt;
+          dlg.rec.ChShifr=inter.ChShifr;
+          dlg.rec.fl2=inter.fl2;         
+      dlg.rec.fl3=inter.fl3;
+          dlg.rec.fl5=inter.fl5;        
+          dlg.rec.fl4=inter.fl4;
+          UpdateFields(dlg);            
+     else
+          dprt_v = 0;
+          dlg.rec.fl1  ="=";
+          dlg.rec.fl2  ="=";
+      dlg.rec.cd1  ="";
+          dlg.rec.cd2  ="";
+          dlg.rec.CdCurr  ="";    
+      dlg.rec.sum  = "";
+          dlg.rec.branchcode = "";
+      dlg.rec.branchname =officename;
+      dlg.rec.begindate = {curDate};
+          dlg.rec.Enddate = {curDate};
+      dlg.rec.chapter = "1";
+      dlg.rec.chaptername="Балансовые счета";
+          dlg.rec.OrgName="По всей Орг. Структуре";
+          dlg.rec.selection="Прил.№5";
+          dlg.rec.Curren="Все";
+          dlg.rec.ChShifr="!=";
+          dlg.rec.Shifr="04,03";
+          dlg.rec.fl3="x";
+          EnableFields(dlg,22);
+          dlg.rec.fl5="x";
+      UpdateFields(dlg); 
+     end;
+    end;
+   
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+     if (FldName(dlg,id)=="Chapter") 
+       message(" ~F3~ Список  "+const_mess);
+     elif (FldName(dlg,id)=="BeginDate")
+       message(" ~F3~ Календарь  "+const_mess2);
+     elif (FldName(dlg,id)=="EndDate")
+       message(" ~F3~ Календарь "+const_mess2);
+          elif (FldName(dlg,id)=="BranchCode")
+       message(" ~F3~ Список "+const_mess);
+          elif (FldName(dlg,id)=="Selection")   
+       message(" ~F3~ Список "+const_mess2);
+      elif (FldName(dlg,id)=="Cd1")
+       message(" ~F3~ Список "+const_mess);
+      elif (FldName(dlg,id)=="Fl1")
+       message(" ~Space~ установка/сброс "+const_mess2);           
+         else
+           message(const_mess2);
+
+     end;
+    end;
+   
+   if (cmd == DLG_REMFOCUS)
+      /*Проверка корректности конечной даты*/
+     if (FldName(dlg,id) == "EndDate")
+       if (( dlg.rec.EndDate - dlg.rec.BeginDate )<0)
+         MsgBox("Введите пожалуйста корректную  дату окончания периода");
+         return CM_CANCEL;
+        end;
+     end;
+      UpdateFields(dlg); 
+   end;
+
+   if (cmd == DLG_KEY)
+     /**/
+     if (KEY == KEY_ESC)
+       return exit(1);//CM_CANCEL;
+     /*Выбор данных из списка*/
+     elif ( KEY == KEY_F3)
+        
+        /*Перечень отбора Selection */
+        if (FldName(dlg,id) == "Selection")
+        var n = menu (m,null,"Перечень отбора",45,6);
+                 if ( n == 0)
+                  dlg.rec.selection="Прил.№5";
+                 elif ( n == 1)
+                  dlg.rec.selection="Док. автомат. выгрузки";
+                  else
+                   dlg.rec.selection="Все";
+             end;
+        end;
+                
+        /*Перечень отбора Валюта */
+        /*"Рубли";
+      "Валюта";
+      "Все";*/
+        if (FldName(dlg,id) == "Curren")
+        var z = menu (p,null,"Валюта",44,10);
+                 if ( z == 0)
+                  dlg.rec.Curren="Рубли";
+                 elif ( z == 1)
+                  dlg.rec.Curren="Валюта";
+                  else
+                   dlg.rec.Curren="Все";
+             end;
+        end;
+                
+        /*код департамента Getshifr*/  
+                /*Shifr operacii*/
+                if (FldName(dlg,id) == "Shifr")
+                
+              if (val=Getshifr())
+                           if (dlg.rec.Shifr=="") 
+                            dlg.rec.Shifr = val;
+                          else
+                            dlg.rec.Shifr = dlg.rec.Shifr+","+val;
+                          end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                          return CM_IGNORE;
+                          end;
+           end;
+                /*v(0) = "=";
+          v(1) = "!=";
+          v(2) = ">";
+          v(3) = "<";
+          v(4) = ">=";
+          v(5) = "<=";*/
+                  
+                   if (FldName(dlg,id) == "CdCurr")
+        var  y= menu (v,null,"Условие",37,15);
+                 if ( y == 0)
+                  dlg.rec.CdCurr="=";
+                 elif ( y == 1)
+                  dlg.rec.CdCurr="!=";
+                  elif ( y == 2)
+                  dlg.rec.CdCurr=">";
+                  elif ( y == 3)
+                  dlg.rec.CdCurr="<";
+                  elif ( y == 4)
+                  dlg.rec.CdCurr=">=";
+                  elif ( y == 5)
+                  dlg.rec.CdCurr="<=";
+                   else
+                  dlg.rec.CdCurr="";
+             end;
+        end;
+                /*********Даже не спрашивайте зачем нам список пачек в диапазоне*/
+                if (FldName(dlg,id) == "NumbPack")
+                
+              if (val=Getpack(dlg.rec.BeginDate,dlg.rec.EndDate,dlg.rec.Curren))
+                           if (dlg.rec.NumbPack=="") 
+                            dlg.rec.NumbPack = val;
+                          else
+                            dlg.rec.NumbPack = dlg.rec.NumbPack+","+val;
+                          end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                          return CM_IGNORE;
+                          end;
+           end;
+                
+                /****************/
+        if (FldName(dlg,id) == "BranchCode")
+           if (ListDepartment (Department))
+              dprt_v = department.name; 
+              dlg.rec.BranchCode = Department.name;
+              dlg.rec.BranchName = GetClientName(Department.PartyID);
+              message(" ~F3~ Выбор подразделения из списка"+const_mess);
+              UpdateFields(dlg);
+           end;
+        end;
+        if (FldName(dlg,id) == "Chapter")
+           if (ListChapter (Chapt))
+              dlg.rec.Chapter = chapt.chapter;
+              dlg.rec.ChapterName = chapt.name;
+              message(" ~F3~ выбор из списка "+const_mess);
+              UpdateFields(dlg);
+           end;
+          end;
+                  /*Account */
+        if (FldName(dlg,id) == "AccountPayer")
+                  if (index(dlg.rec.AccountPayer,"*"))
+                    Balance = dlg.rec.AccountPayer;
+                        else Balance=""; 
+           end;
+                 if (ListAccount(Account,1,ALLFININSTR,"","",Balance))
+              dlg.rec.AccountPayer = Account.Account;
+                           message(" ~F3~ выбор из списка "+const_mess);
+              UpdateFields(dlg);
+           end;
+          end;
+                  if (FldName(dlg,id) == "AccountReciever")
+                  if (index(dlg.rec.AccountReciever,"*"))
+                    Balance = dlg.rec.AccountReciever;
+                        else Balance=""; 
+           end;
+                 if (ListAccount(Account,1,ALLFININSTR,"","",Balance))
+              dlg.rec.AccountReciever = Account.Account;
+                           message(" ~F3~ выбор из списка "+const_mess);
+              UpdateFields(dlg);
+           end;
+          end;
+        /*Даты */
+        if (FldName(dlg,id) == "BeginDate")
+          dlg.rec.BeginDate = GetDateByCalendar ({curDate});
+        end;
+                if (FldName(dlg,id) == "EndDate")
+          dlg.rec.EndDate = GetDateByCalendar ({curDate});
+        end;
+                
+       /*Орг структура*/
+           if (FldName(dlg,id) == "Cd1")
+                
+              if (val=GETSCROLL())
+                          var org=split(val,"||");
+                          dlg.rec.Cd1 = Org(0);
+                          dlg.rec.Cd2 = org(1);
+                          dlg.rec.OrgName = org(2);
+              message(" ~F3~ выбор из списка ");
+              UpdateFields(dlg);
+                          else
+                          return CM_IGNORE;
+                          end;
+           end;
+           /*Оперы по орг. структуре*/
+                   
+              if (FldName(dlg,id) == "OperNum")
+                if ((dlg.rec.Cd1!="") and (dlg.rec.Cd2!=""))
+                          if (val=GetOper(1,dlg.rec.Cd1,dlg.rec.Cd2))
+                           if (dlg.rec.OperNum!="")
+                            dlg.rec.OperNum = dlg.rec.OperNum+","+ val;
+                           else
+                            dlg.rec.OperNum =val;
+                           end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                           return CM_IGNORE;
+                          end;
+                     end;
+                    if ((dlg.rec.Cd1=="") and (dlg.rec.Cd2==""))
+                          if (val=GetOper(2))
+                           if (dlg.rec.OperNum!="")
+                            dlg.rec.OperNum =dlg.rec.OperNum+","+ val;
+                           else
+                            dlg.rec.OperNum = val;
+                           end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                          return CM_IGNORE;
+                         end;
+            end;
+                   end; 
+                   /*Контролер на проводке*/
+                    if (FldName(dlg,id) == "KontrDoc")
+                if ((dlg.rec.Cd1!="") and (dlg.rec.Cd2!=""))
+                          if (val=GetOper(1,dlg.rec.Cd1,dlg.rec.Cd2))
+                           if (dlg.rec.KontrDoc!="")
+                            dlg.rec.KontrDoc = dlg.rec.KontrDoc+","+ val;
+                           else
+                            dlg.rec.KontrDoc =val;
+                           end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                           return CM_IGNORE;
+                          end;
+                     end;
+                    if ((dlg.rec.Cd1=="") and (dlg.rec.Cd2==""))
+                          if (val=GetOper(2))
+                           if (dlg.rec.KontrDoc!="")
+                            dlg.rec.KontrDoc =dlg.rec.KontrDoc+","+ val;
+                           else
+                            dlg.rec.KontrDoc = val;
+                           end;
+               message(" ~F3~ выбор из списка ");
+               UpdateFields(dlg);
+                          else
+                          return CM_IGNORE;
+                         end;
+            end;
+                   end; 
+                   /*                     */
+       elif (KEY == KEY_SPACE)
+          /*По всем главам*/
+                
+                if (FldName(dlg,id) == "Chapter")
+                   
+          if (dlg.rec.chapter!="")
+             dlg.rec.chapter = "";
+                         dlg.rec.chaptername=" По всем главам";
+             UpdateFields(dlg);
+          end;
+                 end;
+                if (FldName(dlg,id) == "BranchCode")
+          if (dlg.rec.BranchCode!="") 
+                    dlg.rec.BranchCode="";
+                        dlg.rec.branchName="По всем подразделениям";
+            message(" ~F3~ Список подразделений "+const_mess1);
+            UpdateFields(dlg);
+                  end;
+         end;
+                 if ((FldName(dlg,id) == "OrgName") or( FldName(dlg,id) == "Cd1"))
+          if (dlg.rec.Cd1!="") 
+                    dlg.rec.Cd1="";
+                        dlg.rec.Cd2="";
+                        dlg.rec.OrgName="По всей Орг. Структуре";
+            message(" ~Проблел~ По всей Орг. Структуре ");
+            UpdateFields(dlg);
+                  end;
+         end;
+                  if (FldName(dlg,id) == "Fl1")
+          if (dlg.rec.Fl1=="!") 
+                    dlg.rec.Fl1="=";
+            message(" ~Space~ Включение/исключение пачки ");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl1="!";
+                        message(" ~Space~ Включение/исключение пачки ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                
+                 if (FldName(dlg,id) == "ChShifr")
+          if (dlg.rec.ChShifr=="!") 
+                    dlg.rec.ChShifr="=";
+            message(" ~Space~ Включение/исключение шифра ");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.ChShifr="!";
+                        message(" ~Space~ Включение/исключение шифра ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "Fl2")
+          if (dlg.rec.Fl2=="!") 
+                    dlg.rec.Fl2="=";
+            message(" ~Space~ Включение/исключение операциониста ");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl2="!";
+                        message(" ~Space~ Включение/исключение операциониста ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "KDoc")
+          if (dlg.rec.Fl2=="!") 
+                    dlg.rec.Fl2="=";
+            message(" ~Space~ Включение/исключение контролера ");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl2="!";
+                        message(" ~Space~ Включение/исключение контролера ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "CdCurr")
+         
+                    dlg.rec.CdCurr="";
+                        dlg.rec.sum="";
+                    UpdateFields(dlg);
+                    UpdateFields(dlg);
+                  end;
+         
+                  if (FldName(dlg,id) == "Fl3")
+          if (dlg.rec.Fl3=="x") 
+                    dlg.rec.Fl3="";
+                        dlg.rec.Fl5="";
+                        /*DisableFields(dlg,22);*/
+            message(" ~Space~ Включить/выключить отчет ");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl3="x";
+                        /*EnableFields(dlg,22);*/
+                        message(" ~Space~ Включить/выключить отчет ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "KontrOper")
+          if (dlg.rec.KontrOper=="x") 
+                        dlg.rec.KontrOper="";
+            message(" ~Space~ Включить/выключить отчет ");
+                        /*DisableFields(dlg,22);*/
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl3="x";
+                        dlg.rec.KontrOper="x";
+                        dlg.rec.fl5="";
+                        message(" ~Space~ Включить/выключить отчет ");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "Fl4")
+          if (dlg.rec.Fl4=="x") 
+                    dlg.rec.Fl4="";
+                        /*DisableFields(dlg,22);*/
+            message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl4="x";
+                        /*EnableFields(dlg,22);*/
+                        message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                  end;
+         end;
+                 if (FldName(dlg,id) == "DelControl")
+                  if (OperInGroup({oper}, 201)) 
+           if (dlg.rec.DelControl=="x") 
+                    dlg.rec.DelControl="";
+            message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                   else
+                        dlg.rec.DelControl="x";
+                        message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                   end;
+                  else
+                   msgbox("Вы не включены в группу 201");
+                  end;
+                 end; 
+                 if (FldName(dlg,id) == "Fl5")
+          if (dlg.rec.Fl5=="x") 
+                    dlg.rec.Fl5="";
+            message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                        else
+                        dlg.rec.Fl5="x";
+                        message(" ~Space~ Включить/выключить");
+                    UpdateFields(dlg);
+                  end;
+         end;
+     elif (( KEY == KEY_F2 ) )         
+           if (opdate(dlg.rec.BeginDate,dlg.rec.EndDate,dlg.rec.BranchCode))
+                    if ( gettrue(true,"В отчет будут включены данные по незакрытому операционному дню.  Продолжить?"))
+                         Return CM_SAVE;
+                        else
+                         return CM_IGNORE;
+                        end;
+                        else
+                      Return CM_SAVE;
+                    end;
+          elif ((KEY == KEY_F8 ) or (KEY == KEY_ALT_F2) )/*Сохранение пользовательского интерфейса*/
+          /*if (opdate(dlg.rec.BeginDate,dlg.rec.EndDate,dlg.rec.BranchCode))
+                    if ( gettrue(true,"В отчет будут включены данные по незакрытому операционному дню.  Продолжить?"))*/
+                         debugbreak; 
+                         sglupdate=("Delete from usr_interface_ea where t_oper="+{oper});
+                     cmdupd = RSDCommand(sglupdate);
+                     cmdupd.Execute;
+                     debugbreak; /*Надо бы параметризированный сделать...*/
+                 sglupdate=" INSERT INTO usr_interface_ea "+
+                                        "(t_oper,CHAPTER,CHAPTERNAME,PRIL,BDATE,EDATE,VAL,BRANCHCODE,BRANCHNAME,"+
+                                        "CD1,CD2,NAMEORG,FL1,NAMEPACK,SHIFR,DT,KT,FL2,OPERNAME,FL3"+
+                                        ",FL5,FL4,ChShifr)"+
+                                        " values ('"+{oper}+"','"+dlg.rec.chapter+"','"+dlg.rec.chaptername+"','"+dlg.rec.Selection+"','"+dlg.rec.begindate+"','"+dlg.rec.Enddate+"','"+dlg.rec.Curren+"','"+dlg.rec.branchcode+"','"+dlg.rec.branchname+"','"+dlg.rec.cd1+"','"+dlg.rec.cd2+"','"+dlg.rec.OrgName+"','"+dlg.rec.fl1+"','"+dlg.rec.NumbPack+"','"+dlg.rec.shifr+"','"+dlg.rec.AccountPayer+"','"+dlg.rec.AccountReciever+"','"+dlg.rec.fl2+"','"+dlg.rec.OperNum+"','"+dlg.rec.fl3+"','"+dlg.rec.fl5+"','"+dlg.rec.fl4+"','"+dlg.rec.ChShifr+"')";
+               
+              cmdupd = RSDCommand(sglupdate);
+              cmdupd.Execute;
+                        /* Return CM_SAVE;
+                        else
+                         return CM_IGNORE;
+                        end;
+           else
+                Return CM_SAVE;
+           end;*/
+                   
+         /*  Return CM_SAVE;
+                   end;
+                end;*/
+     end;
+   end;
+END;
+ 
+
+
+   
+
+ /*СТАРТ МАКРОСА ТУТ!*/
+ if (OperInGroup({oper}, 200)) 
+  if (RunDialog(dlg, "Event"))
+    if (MassControl==0)
+     msgbox("Данные по заданным параметрам отсутствуют");
+
+         exit(1);
+        /* DLG_DESTROY;
+         RunDialog(dlg, "Event");*/
+        end;
+  end;
+  else
+   msgbox("Пользователь не входит в группу 200!");
+  end;
+
+end;
+
+
+
+
+   
+
+
+

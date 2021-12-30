@@ -1,0 +1,147 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   Макрос комиссии 13.1.0
+ 
+       "Комиссия за обслуживание по зарплатному проекту, в месяц"
+
+       Тип комиссии - периодическая.
+   ChangeLog:
+   //RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, cb_sql, fg_Life_parm, globals, CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+
+
+/* ID Категории "Признаки  для комиссий" */
+const GroupID = 210;
+
+/* Номер признака "Признак - З/пл проект ДМСБ" */
+const TarifCatNum = 10;
+
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcal_addr /*  адрес алгоритма (sfcalcal) */, sfcontrStruc /*Cтруктура sfcontr*/, CommNumber_sfacrpay )
+
+    record sfcontr( sfcontr );
+    record calcal (sfcalcal);
+
+    var query, rs, stat, cmd;
+    var CommSum     = $0,
+        CommQuont   = 0,
+        CommNumber, 
+        fgBank;
+    array arrRecAcc;
+    var retVal, Attrid, Code, Num;
+    record party( party );
+
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+    
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+        SetBuff( sfcontr, sfcontr_addr );
+        SetBuff( calcal, sfcalcal_addr );
+        CommNumber = calcal.CommNumber;               
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       CommNumber = CommNumber_sfacrpay;             
+    end;
+
+
+    debugbreak;
+    /* Определим счёт (счета) получателя для фильтра платежей.
+       Так как счёт может быть один, а может быть несколько, каждый из счетов необходимо
+       передавать отдельным параметром, т.к. переданную строчку sql не воспринимает. Отсутствие
+       параметра или значение null - не проблема. 
+       Если будет более 2 счетов, нужно добавить приём ещё одного параметра в in и его передачу
+       в запрос через cmd.AddParam. */
+    fgBank = fg_life_subject( {OurBank} );
+    if( fgBank.is_Exv )
+       arrRecAcc(0) = "40817810200000000706";
+    end;
+    if( fgBank.is_EXV_Volgograd )
+       arrRecAcc(0) = "40817810901000000001";
+       arrRecAcc(1) = "40820810901000000001";
+    end;
+
+
+    ClearRecord( party );
+    party.PartyID = sfcontr.PartyID;
+    
+    /* Получим значение категории "Признаки  для комиссий" */
+    Num = "";
+    GetMainObjAttr (retVal, OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), GroupID, Attrid, Code, Num);
+
+    if( Num == TarifCatNum )
+
+       query = " Select nvl( sum( paym.t_Amount ), 0 ) " +         // Если платежей нет, возвращаем 1 - для того, чтобы взялся минимум по тарифу.
+               "   From dpmpaym_dbt paym, " +
+               "        dacctrn_dbt arh, " +
+               "        dpmdocs_dbt pmd " +
+               "    Where paym.t_Payer = :payer " + 
+               "    and subStr( paym.t_PayerAccount, 1, 3 ) in ( '405', '406', '407', '408' ) " +
+               "    and paym.t_ReceiverAccount in ( :account1, :account2 ) " +
+               "    and paym.t_PaymStatus = 32000 " +
+               "    and paym.t_PayerBankID = paym.t_ReceiverBankID " +     // Банк получателя = наш банк (= банк плательщика)
+               "    and pmd.t_paymentid = paym.t_paymentid " +
+               "    AND ARH.T_ACCTRNID = PMD.T_ACCTRNID" +
+               "    and arh.t_Chapter     = 1 " + // joy Чтобы не задваивались
+               "    and arh.t_state       = 1 " + //     платежи
+               "    and arh.t_date_carry BETWEEN trunc ( :begdate, 'month' ) " + // joy функция округляет дату до месяцев, тем самым получаем 1 число месяца
+               "                             AND last_day (:enddate) " ; //  функция возвращает последнее число месяца. 
+             cmd = rsdcommand(query);
+             cmd.AddParam( "payer",    RSDBP_IN, sfcontr.PartyID );
+             cmd.AddParam( "account1", RSDBP_IN, arrRecAcc(0)    );
+             cmd.AddParam( "account2", RSDBP_IN, arrRecAcc(1)    );
+             cmd.AddParam( "begdate",  RSDBP_IN, EndDate         );
+             cmd.AddParam( "enddate",  RSDBP_IN, EndDate         );
+
+       rs = rsdRecordSet(cmd);
+       
+        //  02.07.2014 joy R-404644 Получаем значение тарифа
+        GetTarifInfo( sfcontr, EndDate, EndDate, 1, CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType );
+       
+       if (rs and rs.moveNext())
+          
+          CommSum = rs.value( 0, null, V_MONEY );
+
+          if (( CommSum == $0 ) and (MinValue != 0) ) // joy Если сумма нашлась нуевая, а тариф задан
+            CommSum = $1;
+          end;
+
+       end;
+
+    end;
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_SUM;
+    sfbassum.baseSum  = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/

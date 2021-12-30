@@ -1,0 +1,776 @@
+/******************************************************************************
+   Имя файла..:       rep_paym_other_bank.mac
+   Назначение.:       Отчет по платежу неРКЦ
+   Заявка.....:       C-14395
+   Дата.......:       24.09.2012
+   Автор......:       Котов Сергей
+   Комментарий:       Реализовано аналогично rep_acc_other_bank.mac
+******************************************************************************/
+// KS 17.10.2012 Исправил ошидку с регистром имени пользователя и дблинка
+// KS 17.10.2012 Исправил ошибку с платежом, ушедшим в РКЦ
+// KS 30.10.2012 C-14395 Массовый отчет
+
+import Globals, cb_sql;
+import oralib, likepy, repforms;
+import "fg_Life_parm.mac";
+
+const db_reg = "PRBB\\\MASS_EXEC\\БД"; // Ветка реестра с именами и паролями
+const db_reg_user = "USERNAME";        // Ветка реестра с именами
+const db_reg_db   = "DBNAME";          // Ветка реестра паролями
+
+var   our_db; // Наша БД
+
+private var nameout = GetTxtFileName("rep_paym_Report");
+
+private macro getName(tablename,USERNAME,DBNAME)
+  if ((DBNAME == our_db)and(strlen(USERNAME) == 0)) // Для нашей БД и Схемы
+    return tablename;
+  elif (DBNAME == our_db) // Для нашей БД
+    return USERNAME+"."+tablename;
+  else// Для не нашей
+    return USERNAME+"."+tablename+"@"+DBNAME;
+  end;
+end;
+
+private macro TestDBLink(USERNAME,DBNAME)
+
+ // KS 17.02.2012 Имя пользователя и имя дблинка - регист не важен
+ var query:string = "select db_link from all_db_links l \n" +
+//                    " where (USERNAME=upper(:USERNAME) and HOST=upper(:DBNAME)) or \n" + // В параметре можно указывать либо ТНС
+//                    "       (USERNAME=upper(:USERNAME) and DB_LINK = upper(:DBNAME))";   // либо имя линка, кому как удобнее
+// KS 17.10.2012 Достаточно проверить сам дблинк, имя пользователя - не надо
+                    " where (HOST=upper(:DBNAME)) or \n" + // В параметре можно указывать либо ТНС
+                    "       (DB_LINK = upper(:DBNAME))";   // либо имя линка, кому как удобнее
+
+ var params:TArray = makeArray( SQLParam( "USERNAME", USERNAME ),
+                                SQLParam( "DBNAME",   DBNAME )); 
+
+ var rs:RsdRecordset = execSQLselect( query, params, true );
+
+ if ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   return rs.value("db_link"); // dblink уже создан
+  end;
+ end;
+
+ return "";
+
+end;
+
+private macro TestPrivs(USERNAME,TABLE);
+
+ var query:string = "select 1 from USER_SYS_PRIVS s where s.privilege='SELECT ANY TABLE'"; // По любой таблице
+
+ var rs:RsdRecordset = execSQLselect( query );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   return 0;
+  end;
+ end;
+
+ query = "select 1 \n" + // По конкретной таблице
+         "  from dba_tab_privs p \n" +
+         " where (p.privilege = 'SELECT' and \n" +
+         "        grantee = user and \n" +
+         "        p.grantor = upper(:USERNAME) and \n" +
+         "        p.table_name = upper(:TABLENAME)) \n" +
+         "       or \n" +
+         "       (user = upper(:USERNAME))"; // Или в нашей схеме
+
+ var params:TArray = makeArray( SQLParam( "USERNAME",  USERNAME ),
+                                SQLParam( "TABLENAME", TABLE )
+                                ); 
+
+ rs = execSQLselect( query, params, true );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   return 0;
+  end;
+ end;
+
+ return 1;
+
+end;
+
+private macro GetDBParmByBIC(BIC)
+
+ var USERNAME="",DBNAME="", parentid = -1;
+
+
+ var query:string = "select reg.t_keyid \n" +
+                    "  from (select t.t_keyid, sys_connect_by_path(t.t_name, '\\') fld, level lv,t.t_description \n" +
+                    "          from dregparm_dbt t \n" +
+                    "         start with t.t_parentid = 0 \n" +
+                    "        connect by prior t.t_keyid = t.t_parentid) reg, \n" +
+                    "       dregval_dbt val \n" +
+                    " where reg.fld     like '\\" + db_reg + "\\%' \n" +
+                    "   and reg.fld not like '\\" + db_reg + "\\%\\%' \n" +
+                    "   and val.t_keyid=reg.t_keyid \n" +
+                    "   and utl_raw.cast_to_varchar2(val.t_fmtblobdata_xxxx) = '" + BIC + "'||chr(0)";
+
+ var rs:RsdRecordSet = execSQLselect( query );
+
+ while ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   parentid = rs.value(0);
+  end;
+ end;
+
+ if (parentid == -1)
+   return -1;
+ end;
+
+ query = "select p.t_name, utl_raw.cast_to_varchar2(v.t_fmtblobdata_xxxx) t_value \n" +
+         "  From dregparm_dbt p, dregval_dbt v \n" +
+         " where p.t_parentid = :parentid \n" +
+         "   and p.t_keyid = v.t_keyid";
+
+ var params:TArray = makeArray( SQLParam( "parentid", parentid ) ); 
+
+ rs = execSQLselect( query, params, true );
+
+ while ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   if (rs.value("t_name") == db_reg_user)
+    USERNAME = rs.value("t_value");
+   elif (rs.value("t_name") == db_reg_db)
+    DBNAME   = rs.value("t_value");
+   end;
+  end;
+ end;
+
+
+ if (DBNAME == "") // Если БД не задана, то считаем, что нужно работать в нашей БД
+  DBNAME=our_db;
+ end;
+
+
+ // 1. Создаем dblink
+ if (DBNAME != our_db) // Для не нашей
+   // Создать dblink
+   DBNAME = TestDBLink(USERNAME,DBNAME);
+   // Проверим есть ли доступ к нужным таблицам
+   if (DBNAME=="")
+    println("Ошибка!!! Недостаточно прав для присоединения к "+USERNAME+". Необходим DBLINK");
+    return -1;
+   end;
+ else
+   // Проверим есть ли доступ к нужным таблицам
+   if ((TestPrivs(USERNAME,"dpmpaym_dbt")>0)or // Тк таблиц и схем будет не так много, то позволим себе несколько раз вызавать один и тот же код
+       (TestPrivs(USERNAME,"dobjcode_dbt")>0)or
+       (TestPrivs(USERNAME,"dpmprop_dbt")>0)or
+       (TestPrivs(USERNAME,"dcorschem_dbt")>0)or
+       (TestPrivs(USERNAME,"doproper_dbt")>0)or
+       (TestPrivs(USERNAME,"doprstep_dbt")>0)or
+       (TestPrivs(USERNAME,"doprostep_dbt")>0)or
+       (TestPrivs(USERNAME,"ddp_dep_dbt")>0)or
+       (TestPrivs(USERNAME,"dparty_dbt")>0)
+       )
+    println("Ошибка!!! Недостаточно прав для присоединения к "+USERNAME+". Необходимо настроить grant'ы");
+    return -1; // grant select on <USERNAME>.<TABLE> to <myuser>;
+              // grant select any table to <myuser>;
+   end;
+ end;
+
+ setparm(1,USERNAME);
+ setparm(2,DBNAME);
+
+end;
+
+private macro getBICbyPaymentID(USERNAME, DBNAME, PaymentID, current_BIC, Direct)
+
+  private var query, params, rs;
+
+  if (Direct == 0)
+
+     query =            "select bic t_bic \n" +
+                        "  from (select substr(t_userfield3, \n" +
+                        "                      instr(t_userfield3, ';ID') + 3, \n" +
+                        "                      instr(t_userfield3, ';DATE') - instr(t_userfield3, ';ID') - 3) PaymentID, \n" +
+                        "               substr(t_userfield3, 4, instr(t_userfield3, ';ID') - 4) bic \n" +
+                        "          from "+getName("dpmpaym_dbt", USERNAME,DBNAME)+" pm \n" +
+                        "         where pm.t_paymentid = ? " + " \n" +
+                        "           and t_userfield3 like 'BIC%;ID%;DATE%') \n" +
+                        " where translate(PaymentID, '1234567890', '0000000000') = \n" +
+                        "       lpad('0', length(PaymentID), '0')";
+
+     params = makeArray( SQLParam( "paymentid", PaymentID ) );
+
+     rs = execSQLselect( query, params, true );
+
+     if ((rs)and(rs.moveNext()))
+      if (rs and (ValType(rs.value(0)) != 26))
+       return rs.value(0);
+      end;
+     end;
+
+
+ else
+
+   if (current_BIC != arPRBB(0)) // Если мы не в ПРББ, то платёж точно пошёл в ПРББ
+     return arPRBB(0);
+   end;
+
+   query = "select c.t_code " + "\n" +
+           "  from "+getName("dobjcode_dbt",  USERNAME,DBNAME)+" c, \n" +
+           "       "+getName("dcorschem_dbt", USERNAME,DBNAME)+" s, \n" +
+           "       "+getName("dpmprop_dbt",   USERNAME,DBNAME)+" p \n" +
+           " where c.t_codekind = 3 " + "\n" +
+           "   and c.t_objecttype = 3 " + "\n" +
+           "   and c.t_objectid = s.t_corrid " + "\n" +
+           "   and s.t_number = p.t_corschem " + "\n" +
+           "   and p.t_debetcredit = 1 " + "\n" +
+           "   and p.t_paymentid = ? " + "\n" +
+           "   and s.t_fiid = 0 " + "\n" +
+           " order by c.t_bankdate"; // По любой таблице
+
+ end;
+
+ params = makeArray( SQLParam( "PaymentID", PaymentID) );
+
+ rs = execSQLselect( query, params, true );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   return rs.value(0);
+  end;
+ end;
+
+ return "-1";
+
+end;
+
+private macro getStepInformation(USERNAME,DBNAME,PaymentID,name_bank)
+
+ private var flag_ok = 1;
+
+ // По t_paymentid можно определить и состояние платежа
+ var query =        "select st.t_id_step, \n" +
+                    "       ost.t_name, \n" +
+                    "       decode(st.t_isexecute,'X','Выполнен','R','Готов к выполнению','W','Отвергнут',st.t_isexecute) t_isexecute, \n" +
+                    "       st.t_blockid, st.t_number_step, \n" +
+                    "       st.t_plan_date, \n" +
+                    "       st.t_fact_date, \n" +
+                    "       st.t_syst_date, \n" +
+                    "       st.t_syst_time, \n" +
+                    "       decode(st.t_isexecute,'X',to_char(st.t_oper),'R',case when st.t_oper>0 then 'Гр'||to_char(st.t_oper) else ' ' end,' ') t_oper, \n" +
+                    "       pm.t_paymstatus \n" +
+                    "  from "+getName("dpmpaym_dbt",  USERNAME,DBNAME)+" pm, \n" +
+                    "       "+getName("doproper_dbt", USERNAME,DBNAME)+" op, \n" +
+                    "       "+getName("doprstep_dbt", USERNAME,DBNAME)+" st, \n" +
+                    "       "+getName("doprostep_dbt",USERNAME,DBNAME)+" ost \n" + 
+                    " where pm.t_dockind in (16, 201, 320, 322) \n" +
+                    "   and op.t_documentid = lpad(pm.t_paymentid, 34, '0') \n" +
+                    "   and op.t_dockind = pm.t_dockind \n" +
+                    "   and op.t_id_operation = st.t_id_operation(+) \n" +
+                    "   and ost.t_blockid(+) = st.t_blockid \n" +
+                    "   and ost.t_number_step(+) = st.t_number_step \n" +
+                    "   and pm.t_paymentid = ? \n" +
+                    " order by st.t_id_step";
+
+
+ var params:TArray = makeArray( SQLParam( "PaymentID", PaymentID ) );
+
+ var rs = execSQLselect( query, params, true );
+
+ [┌───┬─────────────────────────────────────┬─────────────────────────┬─────────┬───┬──────────┬──────────┬──────────┬──────────┬─────┐
+  │ № │Название                             │Состояние                │Блок     │Шаг│Дата план.│Дата факт.│Дата сист.│Время сист│Исп. │
+  ├───┼─────────────────────────────────────┼─────────────────────────┼─────────┼───┼──────────┼──────────┼──────────┼──────────┼─────┤];
+
+ while ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value("t_id_step")) != 26))
+    [│###│#####################################│#########################│#########│###│##########│##########│##########│##########│#####│]
+   (rs.value("t_id_step"),rs.value("t_name"),rs.value("t_isexecute"),rs.value("t_blockid"),rs.value("t_number_step"),
+    date(rs.value("t_plan_date")),date(rs.value("t_fact_date")),date(rs.value("t_syst_date")),time(rs.value("t_syst_time")),rs.value("t_oper"));
+    flag_ok = 0;
+  elif (rs and (ValType(rs.value("t_paymstatus")) != 26) and ((rs.value("t_paymstatus") == 2990) or (rs.value("t_paymstatus") == 0)))
+    flag_ok = 2;   
+  end;
+ end;
+
+ [└───┴─────────────────────────────────────┴─────────────────────────┴─────────┴───┴──────────┴──────────┴──────────┴──────────┴─────┘
+ ];
+
+ if (flag_ok == 1)
+   println("Платёж не найден в \""+{name_bank}+"\".");
+ elif (flag_ok == 2)
+   println("Платёж в отложенных документах.");
+ end;
+
+ return flag_ok;
+
+end;
+
+private macro AnalizeDB(USERNAME, DBNAME, PaymentID, BIC, current_BIC, Direct)
+
+ private var name_bank,
+             PaymentIDnext = 0;
+ private var transferdate,
+             creationdate;
+
+ private var params;
+ private var curUSERNAME = "",
+             curDBNAME   = our_db;
+
+
+ if (strlen(USERNAME) == 0) // Если мы всё ещё в нашем банке, то нужно для начала вывести данные по платежу у нас
+
+   // 1.2. Шапка
+   [ 
+     ########################################################################################
+
+     ########################################################################################
+     ######################################################################################## ]
+   ("Статистика по прохождению "+ternary(Direct==0,"ответного","начального")+" платежа":c,
+    "Анализ платежа в банке(филиале)":c,
+    {name_bank}:c);
+
+   PaymentIDnext = PaymentID;
+
+ else
+
+   // 2.2. Шапка
+   var query:string = "select p.t_name \n" +
+                      "  from "+getName("ddp_dep_dbt",USERNAME,DBNAME)+" t,  \n" +
+                      "       "+getName("dparty_dbt" ,USERNAME,DBNAME)+" p  \n" +
+                      " where t.t_parentcode = 0  \n" +
+                      "   and p.t_partyid = t.t_partyid";
+
+   var rs:RsdRecordset = execSQLselect( query );
+
+   if ((rs)and(rs.moveNext()))
+    if (rs and (ValType(rs.value(0)) != 26))
+     [ 
+       ########################################################################################
+       ######################################################################################## ]
+     ("Анализ платежа в банке(филиале)":c,
+      rs.value("t_name"):c);
+     name_bank = rs.value("t_name");
+    end;
+   end;
+
+   if (current_BIC != {mfo_bank}) // Если мы ушли из нашего банка, то нужно сначала узнать где мы
+     GetDBParmByBIC(current_BIC, curUSERNAME, curDBNAME);
+   end;
+
+   // 2.3. Анализ платежа
+   if (Direct == 1) // в случае, когда мы ищем платёж, который ушёл в другой банк нужно срачала собрать 
+                    // компоненты t_userfield3, а потом поискать такой платёж
+
+     // Узнаем t_transferdate для облегчения поиска
+     // Это запрос в текущий банк
+     query =            "select pmprop.t_transferdate, \n" +
+                        "       to_char(t_creationdate,'DD.MM.YYYY') || ' ' || to_char(t_creationtime,'HH24:MI:SS') t_creationdate \n" +
+                        "  from "+getName("dpmpaym_dbt",curUSERNAME,curDBNAME)+" pm, \n" +
+                        "       "+getName("dpmprop_dbt",curUSERNAME,curDBNAME)+" pmprop \n" +
+                        " where /*pm.t_dockind in (16, 201, 320, 322) \n" +
+                        "   and */pm.t_paymentid = pmprop.t_paymentid \n" +
+                        "   and pmprop.t_debetcredit = 1 \n" +
+                        "   and pm.t_paymentid = ?";
+
+     params = makeArray( SQLParam( "paymentid", PaymentID ) );
+
+     rs = execSQLselect( query, params, true );
+
+     while ((rs)and(rs.moveNext()))
+      if (rs and (ValType(rs.value(0)) != 26))
+       transferdate = date(rs.value("t_transferdate"));
+       creationdate =     (rs.value("t_creationdate"));
+      end;
+     end;
+
+     // Это запрос в следующий банк
+     query =            "select pm.t_paymentid, \n" +
+//                        "       pmprop_kred.t_group \n" +
+// KS 17.10.2012 start Исправил ошибку с платежом, ушедшим в РКЦ
+                        "       case \n" +
+                        "         when pmprop_kred.t_corschem in \n" +
+// KS 24.10.2012 C-15088 start Новое расписание
+//                        "              (select t_number from "+getName("dcorschem_dbt",USERNAME,DBNAME)+" where upper(' '||t_userfield2||' ') like '% STOP %') \n" +
+                        "                (select t_corschem" + "\n" +
+                        "                   from "+getName("usr_me_time_paym_dbt",USERNAME,DBNAME) + "\n" + "\n" +
+                        "                  where t_timebegin_out_our = t_timeend_out_our)" + "\n" + // из раскраски корсхем в расписании
+// KS 24.10.2012 C-15088 end
+                        "              then 0\n" + // Если платёж ушёл на РКЦ, то дальше не следует проверять
+                        "         else pmprop_kred.t_group \n" +
+                        "       end t_group \n" +
+// KS 17.10.2012 end
+                        "  from "+getName("dpmpaym_dbt",USERNAME,DBNAME)+" pm, \n" +
+                        "       "+getName("dpmprop_dbt",USERNAME,DBNAME)+" pmprop_deb, \n" +
+                        "       "+getName("dpmprop_dbt",USERNAME,DBNAME)+" pmprop_kred \n" +
+                        " where /*pm.t_dockind in (16, 201, 320, 322) \n" +
+                        "   and */pm.t_paymentid = pmprop_kred.t_paymentid \n" +
+                        "   and pmprop_kred.t_debetcredit = 1 \n" +
+                        "   and pm.t_paymentid = pmprop_deb.t_paymentid \n" +
+                        "   and pmprop_deb.t_debetcredit = 0 \n" +
+                        "   and pmprop_deb.t_transferdate >= " + GetSQLDate(transferdate)+ " \n"+
+                        "   and pm.t_userfield3 like 'BIC" + current_BIC + ";ID" + PaymentID + ";DATE" + creationdate + "'";
+                        // KS Без параметров работает явно быстрее
+
+     rs = execSQLselect( query );
+
+   elif (Direct == 0) // в случае, когда мы ищем платёж, который пришёл из другого банка нужно срачала собрать 
+                      // компоненты t_userfield3, а потом поискать такой платёж
+
+     // Это запрос в текущий банк
+     query =            "select PaymentID t_paymentid, \n" +
+                        "       ' ' t_group \n" + // для совместимости
+                        "  from (select substr(t_userfield3, \n" +
+                        "                      instr(t_userfield3, ';ID') + 3, \n" +
+                        "                      instr(t_userfield3, ';DATE') - instr(t_userfield3, ';ID') - 3) PaymentID, \n" +
+                        "               substr(t_userfield3, 4, instr(t_userfield3, ';ID') - 4) bic \n" +
+                        "          from "+getName("dpmpaym_dbt",curUSERNAME,curDBNAME)+" pm \n" +
+                        "         where pm.t_paymentid = ? " + " \n" +
+                        "           and t_userfield3 like 'BIC%;ID%;DATE%') \n" +
+                        " where translate(PaymentID, '1234567890', '0000000000') = \n" +
+                        "       lpad('0', length(PaymentID), '0')";
+
+     params = makeArray( SQLParam( "paymentid", PaymentID ) );
+
+     rs = execSQLselect( query, params, true );
+
+   end;
+
+   // Получаем следующий платёж по цепочке
+   while ((rs)and(rs.moveNext()))
+    if (rs and (ValType(rs.value(0)) != 26))
+     PaymentIDnext = int(rs.value("t_paymentid"));
+    end;
+   end;
+
+ end;
+
+ if (PaymentIDnext != 0)
+
+   if (getStepInformation(USERNAME,DBNAME,PaymentIDnext) == 1) // Если платёж не найден - прекращаем поиск
+     return 1;
+   end;
+  
+   if ((strlen(USERNAME) != 0) and ((Direct == 0) or (rs.value("t_group") == 1))) // Если платёж пошёл дальше, то
+
+    // Обределим БИК по корсхеме и проверим этот платёж в следующем банке
+    // Перемещаемся дальше по цепочке current_BIC/BIC
+    // хоп
+    current_BIC = BIC;
+    // и хоп
+    BIC = getBICbyPaymentID(USERNAME, DBNAME, PaymentIDnext, BIC, Direct);
+
+    execmacrofile("rep_paym_other_bank.mac", "GetPayments", PaymentIDnext, Direct, BIC, current_BIC);
+
+   end;
+
+ else
+   println("Платёж не найден в \""+name_bank+"\"");
+   return 1;
+ end;
+
+ return 0;
+
+onError
+ // Допустим, что с запросами всё ок - значит соединение. Линки проверили - значит ТНС
+ println("Ошибка соединения с "+USERNAME+"@"+DBNAME+". Необходимо проверить TNS и DBLink!");
+ return 1;
+end;
+
+
+private macro AnalizeReg(PaymentID, BIC, current_BIC, Direct)
+
+ var USERNAME="",DBNAME="";
+
+
+ if (GetDBParmByBIC(BIC, USERNAME, DBNAME) == -1)
+   println("\nПроверьте настройки "+db_reg+". Не найдены настройки для БИК "+BIC+".");
+   return -1;
+ end;
+
+ AnalizeDB(USERNAME, DBNAME, PaymentID,  BIC, current_BIC, Direct);
+
+ return 0;
+
+end;
+
+
+private macro init
+
+ var query:string = "SELECT GLOBAL_NAME FROM GLOBAL_NAME";
+
+ var rs:RsdRecordSet = execSQLselect( query );
+
+ if ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   our_db = rs.value("GLOBAL_NAME");
+  end;
+ end;
+
+end;
+
+macro GetPayments(PaymentID, Direct, BIC, current_BIC)
+
+ // PaymentID - ид платежа
+
+ // BIC - БИК банка, в котором следует искать этот платёж
+
+ // current_BIC - БИК банка, в котором находится текущий платёж
+
+ // Direct - направление обхода
+ //          0 - смотрим откуда пришёл платёж (аналогия с дебетомкредитом)
+ //          1 - куда ушёл платёж
+
+ SetOutput(nameout,false);
+
+ if (strlen(current_BIC) == 0)
+   current_BIC = {mfo_bank};
+ end;
+
+ if (strlen(BIC) == 0)
+   BIC = getBICbyPaymentID("", our_db, PaymentID, current_BIC, Direct);
+ end;
+
+ init;
+
+ if ((current_BIC == {mfo_bank})) // Если мы всё ещё в нашем банке, то нужно для начала вывести данные по платежу у нас
+   if (AnalizeDB("", our_db, PaymentID, BIC, current_BIC, Direct) == 1) // Если платёж не найден, то заканчиваем отчет
+     return 1;
+   end;
+ end;
+
+ if (BIC != "-1")
+   AnalizeReg(PaymentID, BIC, current_BIC, Direct);
+ end;
+
+ if (current_BIC == {mfo_bank})
+   SetOutput(null,true);
+   ViewFile(nameout);
+ elif (BIC == "-1")
+   return -1;
+ end;
+
+ return 0;
+
+end;
+
+
+// KS 30.10.2012 C-14395 Start Массовый отчет
+private macro AnalizeDBStatus(USERNAME, DBNAME, PaymentID, closetime, BIC, current_BIC)
+
+ private var name_bank,
+             PaymentIDnext = 0;
+ private var transferdate,
+             creationdate,
+             paymstatus = 0,
+             group = 0;
+
+ private var params;
+ private var curUSERNAME = "",
+             curDBNAME   = our_db;
+
+ private var query, rs, cmd;
+
+ if (strlen(USERNAME) == 0) // Если мы всё ещё в нашем банке, то нужно для начала вывести данные по платежу у нас
+
+   PaymentIDnext = PaymentID;
+
+ else
+
+   cmd = rsdcommand("rollback"); // Защита от ORA-02020: too many database links in use
+   cmd.execute();
+
+   if (current_BIC != {mfo_bank}) // Если мы ушли из нашего банка, то нужно сначала узнать где мы
+     GetDBParmByBIC(current_BIC, curUSERNAME, curDBNAME);
+   end;
+
+   // Узнаем t_transferdate для облегчения поиска и узнаём статус документа
+   // Это запрос в текущий банк
+   query =            "select pmprop.t_transferdate, \n" +
+                      "       to_char(t_creationdate,'DD.MM.YYYY') || ' ' || to_char(t_creationtime,'HH24:MI:SS') t_creationdate \n" +
+                      "  from "+getName("dpmpaym_dbt",curUSERNAME,curDBNAME)+" pm, \n" +
+                      "       "+getName("dpmprop_dbt",curUSERNAME,curDBNAME)+" pmprop \n" +
+                      " where /*pm.t_dockind in (16, 201, 320, 322) \n" +
+                      "   and */pm.t_paymentid = pmprop.t_paymentid \n" +
+                      "   and pmprop.t_debetcredit = 1 \n" +
+                      "   and pm.t_paymentid = ?";
+
+   params = makeArray( SQLParam( "paymentid", PaymentID ) );
+
+   rs = execSQLselect( query, params, true );
+
+   while ((rs)and(rs.moveNext()))
+    if (rs and (ValType(rs.value(0)) != 26))
+     transferdate = date(rs.value("t_transferdate"));
+     creationdate =     (rs.value("t_creationdate"));
+    end;
+   end;
+
+   // 2.3. Анализ платежа
+   // Это запрос в следующий банк
+   query =            "select pm.t_paymentid, \n" +
+                      "       case \n" +
+                      "         when pmprop_kred.t_corschem in \n" +
+// KS 24.10.2012 C-15088 start Новое расписание
+//                        "              (select t_number from "+getName("dcorschem_dbt",USERNAME,DBNAME)+" where upper(' '||t_userfield2||' ') like '% STOP %') \n" +
+                      "                (select t_corschem" + "\n" +
+                      "                   from "+getName("usr_me_time_paym_dbt",USERNAME,DBNAME) + "\n" + "\n" +
+                      "                  where t_timebegin_out_our = t_timeend_out_our)" + "\n" + // из раскраски корсхем в расписании
+// KS 24.10.2012 C-15088 end
+                      "              then 0\n" + // Если платёж ушёл на РКЦ, то дальше не следует проверять
+                      "         else pmprop_kred.t_group \n" +
+                      "       end t_group, \n" +
+                      "       pm.t_paymstatus \n" +
+                      "  from "+getName("dpmpaym_dbt",USERNAME,DBNAME)+" pm, \n" +
+                      "       "+getName("dpmprop_dbt",USERNAME,DBNAME)+" pmprop_deb, \n" +
+                      "       "+getName("dpmprop_dbt",USERNAME,DBNAME)+" pmprop_kred \n" +
+                      " where /*pm.t_dockind in (16, 201, 320, 322) \n" +
+                      "   and */pm.t_paymentid = pmprop_kred.t_paymentid \n" +
+                      "   and pmprop_kred.t_debetcredit = 1 \n" +
+                      "   and pm.t_paymentid = pmprop_deb.t_paymentid \n" +
+                      "   and pmprop_deb.t_debetcredit = 0 \n" +
+                      "   and pmprop_deb.t_transferdate >= " + GetSQLDate(transferdate)+ " \n"+
+                      "   and pm.t_userfield3 like 'BIC" + current_BIC + ";ID" + PaymentID + ";DATE" + creationdate + "'";
+
+   rs = execSQLselect( query );
+
+   // Получаем следующий платёж по цепочке
+   while ((rs)and(rs.moveNext()))
+    if (rs and (ValType(rs.value(0)) != 26))
+     PaymentIDnext = int(rs.value("t_paymentid"));
+     group         = rs.value("t_group");
+     paymstatus    = rs.value("t_paymstatus");
+
+     // Ищу время закрытия
+     closetime    = null;
+
+     if (paymstatus == 32000) // Определим время закрытия документа по шагу
+
+       // По t_paymentid можно определить и состояние платежа
+       query =      "select max(to_date(to_char(st.t_syst_date,'DD.MM.YYYY') || ' ' || to_char(st.t_syst_time,'HH24:MI:SS'),'DD.MM.YYYY HH24:MI:SS')) t_closetime \n" +
+                    "  from "+getName("dpmpaym_dbt",  USERNAME,DBNAME)+" pm, \n" +
+                    "       "+getName("doproper_dbt", USERNAME,DBNAME)+" op, \n" +
+                    "       "+getName("doprstep_dbt", USERNAME,DBNAME)+" st \n" +
+                    " where pm.t_dockind in (16, 201, 320, 322) \n" +
+                    "   and op.t_documentid = lpad(pm.t_paymentid, 34, '0') \n" +
+                    "   and op.t_dockind = pm.t_dockind \n" +
+                    "   and op.t_id_operation = st.t_id_operation(+) \n" +
+                    "   and pm.t_paymentid = ?";
+
+       params = makeArray( SQLParam( "PaymentID", PaymentIDnext ) );
+
+       rs = execSQLselect( query, params, true );
+
+       if ((rs)and(rs.moveNext()))
+         closetime = rs.value("t_closetime");
+       end;
+     end;
+
+
+    end;
+   end;
+
+ end;
+
+ if (PaymentIDnext != 0)
+
+   if ((strlen(USERNAME) != 0) and (group == 1)) // Если платёж пошёл дальше, то
+
+    // Обределим БИК по корсхеме и проверим этот платёж в следующем банке
+    // Перемещаемся дальше по цепочке current_BIC/BIC
+    // хоп
+    current_BIC = BIC;
+    // и хоп
+    BIC = getBICbyPaymentID(USERNAME, DBNAME, PaymentIDnext, BIC);
+
+    paymstatus = execmacrofile("rep_paym_other_bank.mac", "GetPaymentStatus", PaymentIDnext, closetime, BIC, current_BIC);
+
+   end;
+
+   setparm(3, closetime);
+   return paymstatus;
+
+ else
+   return 1; // Не найден в банке. Значит, Пэйментс не подгрузил ещё его
+ end;
+
+ return -1002;
+
+onError
+ // Допустим, что с запросами всё ок - значит соединение. Линки проверили - значит ТНС
+ //println("Ошибка соединения с "+USERNAME+"@"+DBNAME+". Необходимо проверить TNS и DBLink!");
+ return -1003;
+end;
+
+
+private macro AnalizeRegStatus(PaymentID, closetime, BIC, current_BIC)
+
+ var USERNAME="",DBNAME="";
+
+ private var stat;
+
+ if (GetDBParmByBIC(BIC, USERNAME, DBNAME) == -1)
+   return 1; // Не найдены настройки для БИК
+ end;
+
+ stat = AnalizeDBStatus(USERNAME, DBNAME, PaymentID, closetime, BIC, current_BIC);
+
+ setparm(1, closetime);
+
+ return stat;
+
+end;
+
+macro GetPaymentStatus(PaymentID, closetime, BIC, current_BIC)
+
+ // PaymentID - ид платежа
+
+ // BIC - БИК банка, в котором следует искать этот платёж
+
+ // current_BIC - БИК банка, в котором находится текущий платёж
+
+ //SetOutput(nameout,false);
+
+ private var stat;
+
+ if (strlen(current_BIC) == 0)
+   current_BIC = {mfo_bank};
+ end;
+
+ if (strlen(BIC) == 0)
+   BIC = getBICbyPaymentID("", our_db, PaymentID, current_BIC);
+ end;
+
+ init;
+
+ if ((current_BIC == {mfo_bank})) // Если мы всё ещё в нашем банке, то нужно для начала вывести данные по платежу у нас
+   if (AnalizeDBStatus("", our_db, PaymentID, closetime, BIC, current_BIC) == 1) // Если платёж не найден, то заканчиваем отчет
+     return -1000; // Платёж не найден
+   end;
+ end;
+
+ if (BIC != "-1")
+   stat = AnalizeRegStatus(PaymentID, closetime, BIC, current_BIC);
+   setparm(1, closetime);
+   return stat;
+ end;
+
+ if (current_BIC == {mfo_bank})
+   //SetOutput(null,true);
+   //ViewFile(nameout);
+ elif (BIC == "-1")
+   return -1;
+ end;
+
+ return 0;
+
+onError
+
+ return -1004;
+
+end;
+// KS 30.10.2012 C-14395 end
+
+//GetPayments(2220893,1);
+
+//GetPayments(2225188,1);
+
+//GetPayments(69180811,0);
+

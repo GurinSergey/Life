@@ -1,0 +1,722 @@
+/**************************************************************************************************/
+/*   RS-Bank 6.0                                                           R-Style Software Lab   */
+/*  File Name   : mnsznousr.mac                                                                   */
+/*  Created     : 30.11.2011                                                                      */
+/*  Programmer  : Lavrenov A.                                                                     */
+/*  Description : Класс работы с сообщениями ZNS, ZNO                                             */
+/*  Заявка      : С-7026                                                                          */
+/*  Mod.        : 23.12.2011 Переименована процедура AccountExists_RUR                            */
+/*              : 12.01.2012 На основании письма Климахиной от 11.01.2012                         */
+/*              : 10.01.2012 Gurin S.N. I-00142411-1                                              */
+/*              : 17.01.2012 Чесноков Д.С. по заявке I-00142993                                   */
+/*              : 18.01.2012 Зленко М.П. по заявке I-00143374-1                                   */
+/*              : 23.01.11 Gurin S. N. I-00145091-1                                               */
+/*              : 25.01.11 Зленко М.П. I-00146042-1 17.02.2012 I-00154714                         */
+/*              : 26.01.11 Зленко М.П. I-00146075-2 29.02.2012 I-00158538                         */
+/*              : 26.01.11 Gurin S. N. I-00148675-1                                               */
+/*              : 03.02.12 Chesnokov D.S. Добавлена обработка даты открытия счета для             */
+/*                                        всех счетов в запросе                                   */
+/*              : 05.03.12 Lavrenov A.A.  Стремимся к единообразию.                               */
+/*              : 15.03.12 Chesnokov D.S. Поддерживаю стремление, перереписал сообщение о         */
+/*                                        ненайденных счетах.                                     */
+/*              : 20.03.12 Chesnokov D.S. Исправлена обработка задублированных счетов             */
+/*              : 27.03.12 Chesnokov D.S. При контроле наименованй, кавычки не проверяются        */
+/*              : 03.04.12 Chesnokov D.S. Заявка I-00175315(дублирование ошибки при запросе       */
+/*                                         периода раньше чем открыт счет. )                      */
+/*              : 04.04.12 Lavrenov A.A.  I-00175517                                              */
+/*              : 17.04.12 Chesnokov D.S. I-00182118                                              */
+/*              : 13.07.12 Chesnokov D.S. I-00173585                                              */
+/*              : 17.07.12 Chesnokov D.S. I-00193935 очень сомнительный запрос                    */
+/*              : 20.07.12 Chesnokov D.S. I-00224504 исправлены недоделки по I-00151765           */
+/*              : 05.09.12 Chesnokov D.S. I-00174689 если в запросе период больше текущего ОД,    */
+/*                                        то конец периода устанавливаем текущий ОД-1             */
+/*              : 02.04.13 Golovkin       C-18653 проверка наличия депозитных счетов              */
+/*              : 17.04.13 Golovkin       C-18326 убрал проверку на соответствие КПП              */
+/*              : 10.02.14 Chesnokov D.S. По запросу C-26943 добавил функцию Is_Ulianovsk_Client  */
+/*              : 14.12.15 RR Is_Ulianovsk_Client заменена на IsTransferedClient                  */
+/**************************************************************************************************/
+import "wlmnstls.mac", "wlgenmes.mac", "fns_lib.mac", "lib_arr.mac", "fg_Life_parm.mac";
+import ptinter, rsbdataset, globals;
+    
+// Клиент, по которому создается сообщение
+private class ZNSParty( ID:integer )
+  var PartyID   :integer;
+  var LegalForm :integer;
+  var FullName  :string;
+  var INN   :string;
+  var KPP   :string;
+
+  macro ZNSParty( ID:integer )
+    private var PartyObj = RsbParty( ID );
+    private var FullInn;
+    PartyID    = ID;
+    LegalForm  = PartyObj.LegalForm;
+    if( LegalForm == PTLEGF_INST )
+      FullName =  PartyObj.FullName;
+    else
+      FullName = string( PartyObj.LastName, ",", PartyObj.FirstName, ",", PartyObj.Patronymic );
+    end;
+    FullINN    = PartyObj.Code(PTCK_INN);
+    splitfullinn(FullInn,INN,KPP);
+  end;
+  ZNSParty(ID);
+end;
+
+class MnsMessageFormZNO(m_reqid)
+
+   var Error;                    // Действие выполнено с ошибкой
+   var ErrorMes = "";            // Сообщение об ошибках
+   var DoNotSend = 0;            // Если не 0 то сообщение не формируем
+   var DoNotProcess = 0;         // Если не 0 то сообщение не обрабатываем, только для массовой обработки
+   var ReqID = m_reqid;          // идентификатор исходного запроса
+   var PartyID = -1;             // идентификатор клиента  
+   var FileName;                 // Имя входящего файла
+   var ПроверенСчета = TArray(); // Массив Счетов, прошедших проверку функцией Chek
+
+   // Поля сообщений ZNS, ZNO
+   var  ИдФайл           = "", /*Идентификатор файла*/
+        ТипИнф           = "", /*Тип информации*/
+        ВерсПрог         = "", /*Версия передающей прошраммы*/
+        ТелОтпр          = "", /*Телефон отправителя*/
+        ДолжнОтпр        = "", /*Должность отправителя*/
+        ФамОтпр          = "", /*Фамилия отправителя*/
+        КолДок           = "", /*Количество документов*/
+        ВерсФорм         = "", /*Версия формата*/
+        ИдДок            = "", /*Идентификатор документа*/
+        НомЗапр          = "", /*Номер запроса*/
+        ДатаЗапр         = "", /*Дата запроса*/
+        КодНО            = "", /*код налогового органа*/
+        НаимНО           = "", /*наименование налогового органа*/
+        АдрНО            = "", /*адрес налогового органа*/
+        ИННКО            = "", /*ИНН Банка или Банка России*/
+        КППКО            = "", /*КПП банка (филиала) или учреждения Банка России*/
+        БИК              = "", /*БИК банка (филиала) или учреждения Банка России*/
+        НаимКО           = "", /*Наименование банка (филиала) или учреждения Банка России*/
+        НомФ             = "", /*номер филиала банка*/
+        ОсновЗапр        = "", /*Основание запроса*/
+        ВидЗапр          = "", /*Вид запроса*/
+        ТипЗапр          = "", /*Тип запроса*/
+        ДатаНач          = "", /*За период с */
+        ДатаКон          = "", /*За период по*/
+        ИНННП            = "", /*ИНН налогоплательщика*/
+        КППНП            = "", /*КПП налогоплательщика*/
+        НаимНП           = "", /*Наименование организации*/
+        ФИОИП            = "", /*ФИО ИП*/
+        КласЧинРук       = "", /*Классный чин руководителя*/
+        ФИОРук           = "", /*ФИО руководителя*/
+        ДолжРук          = "", /*Должность руководителя*/
+        НомСч            = TArray(); // Массив полей "Счет"
+
+   macro GetClientId()
+     PartyID = GetPartyidByINN(ИНННП,КППНП);
+   end;
+
+   // zmp 25.11.2014 R-496387
+   private macro isDepositAccount(acc)
+      var rs = "select 1 from daccount_dbt where t_account = '" + acc + "' and instr(T_TYPE_ACCOUNT, 'J') != 0 ";
+      return RsdRecordset(rs).movenext();
+   onError
+      return false;
+   end;
+
+   // zmp 25.11.2014 C-?????
+   private macro setClientLink()
+      if(PartyID != -1)
+         var rsd = " MERGE INTO usr_365P_client_link l                  " +
+                   "            USING (SELECT 1 FROM DUAL) ON (REQID =  " + ReqID   + ")" +
+                   "            WHEN MATCHED                            " +
+                   "            THEN UPDATE                             " +
+                   "            SET  clientid =                         " + PartyID + 
+                   "            WHEN NOT MATCHED THEN                   " +
+                   "            INSERT VALUES (" + ReqID  + "," + PartyID + ")";
+
+         RsdCommand(rsd).execute;
+      end;
+   onError
+   end;
+
+   //zmp 16.05.2014
+   macro UpdateAccLnkSate(Acc, State)
+      execSQL(" update dwlacclnk_dbt t    " +                                       
+              "    set t_state =    ?     " +                                         
+              "  where T_OBJECTTYPE = 505 " +                                   
+              "    and T_OBJECTID = ?     " + 
+              "    and t_account =  ?     ",
+              makeArray(SQLParam("", State), SQLParam("", reqid), SQLParam("", Acc)));
+   end;
+   
+   macro MnsMessageFormZNO( ) 
+     var  rs, str, rs_acc ; 
+     var field_name, field_value;
+
+     Error = 0;
+     ErrorMes = "";
+
+     if(valtype(reqid)== V_UNDEF)
+       while( СчитатьПоле( field_name, field_value ) )
+          if( field_name == "ИдФайл" )      ИдФайл = field_value;         end;
+          if( field_name == "ТипИнф" )      ТипИнф = field_value;         end;
+          if( field_name == "ВерсПрог" )    ВерсПрог = field_value;       end;
+          if( field_name == "ТелОтпр" )     ТелОтпр = field_value;        end;
+          if( field_name == "ДолжнОтпр" )   ДолжнОтпр = field_value;      end;
+          if( field_name == "ФамОтпр" )     ФамОтпр = field_value;        end;
+          if( field_name == "КолДок" )      КолДок = field_value;         end;
+          if( field_name == "ВерсФорм" )    ВерсФорм = field_value;       end;
+          if( field_name == "ИдДок" )       ИдДок = field_value;          end;
+          if( field_name == "НомЗапр" )     НомЗапр = field_value;        end;
+          if( field_name == "ДатаЗапр" )    ДатаЗапр = field_value;       end;
+          if( field_name == "КодНО" )       КодНО = field_value;          end;
+          if( field_name == "НаимНО" )      НаимНО = field_value;         end;
+          if( field_name == "АдрНО" )       АдрНО = field_value;          end;
+          if( field_name == "ИННКО" )       ИННКО = field_value;          end;
+          if( field_name == "КППКО" )       КППКО = field_value;          end;
+          if( field_name == "БИК" )         БИК = field_value;            end;
+          if( field_name == "НаимКО" )      НаимКО = field_value;         end;
+          if( field_name == "НомФ")         НомФ = field_value;           end;
+          if( field_name == "ОсновЗапр" )   ОсновЗапр = field_value;      end;
+          if( field_name == "ВидЗапр")      ВидЗапр = field_value;        end;
+          if( field_name == "ТипЗапр" )     ТипЗапр = field_value;        end;
+          if( field_name == "ДатаНач")      ДатаНач = field_value;        end;
+          if( field_name == "ДатаКон")      ДатаКон = field_value;        end;
+          if( field_name == "НаимНП" )      НаимНП = field_value;         end;
+          if( field_name == "ФИОИП" )       ФИОИП = field_value;          end;
+          if( field_name == "ИНННП" )       ИНННП = field_value;          end;
+          if( field_name == "КППНП" )       КППНП = field_value;          end;
+          if( field_name == "КласЧинРук" )  КласЧинРук = field_value;     end;
+          if( field_name == "ФИОРук" )      ФИОРук = field_value;         end;
+          if( field_name == "ДолжРук" )     ДолжРук = field_value;        end;
+          
+          if( field_name == "НомСч" )
+            if (ArrFind(НомСч, field_value) == -1)
+              НомСч[НомСч.Size] = field_value;
+            end;
+          end;
+       end;
+     else
+       str =  " SELECT f.t_name, t.t_value, m.t_mandatoryflag " +
+            "  FROM dwlmesval_dbt t, dwlmeslnk_dbt l, dwltpfld_dbt f, dwlmesfld_dbt m " +
+            " WHERE l.t_objkind = 505 " +
+            "   AND l.t_objid = " + reqid +
+            "   AND t.t_mesid = l.t_mesid " +
+            "   AND t.t_tpfieldid = f.t_tpfieldid " +
+            "   AND m.t_fieldid = t.t_fieldid " +
+            " ORDER BY t_index " ;
+      rs = trsbdataset(str);
+      while( rs and rs.movenext )
+        if( rs.t_name == "ИдФайл" )     ИдФайл = rs.t_value;            end;
+        if( rs.t_name == "ТипИнф" )     ТипИнф = rs.t_value;            end;
+        if( rs.t_name == "ВерсПрог" )   ВерсПрог = rs.t_value;          end;
+        if( rs.t_name == "ТелОтпр" )    ТелОтпр = rs.t_value;           end;
+        if( rs.t_name == "ДолжнОтпр" )  ДолжнОтпр = rs.t_value;         end;
+        if( rs.t_name == "ФамОтпр" )    ФамОтпр = rs.t_value;           end;
+        if( rs.t_name == "КолДок" )     КолДок = rs.t_value;            end;
+        if( rs.t_name == "ВерсФорм" )   ВерсФорм = rs.t_value;          end;
+        if( rs.t_name == "ИдДок" )      ИдДок = rs.t_value;             end;
+        if( rs.t_name == "НомЗапр" )    НомЗапр = rs.t_value;           end;
+        if( rs.t_name == "ДатаЗапр" )   ДатаЗапр = rs.t_value;          end;
+        if( rs.t_name == "КодНО" )      КодНО = rs.t_value;             end;
+        if( rs.t_name == "НаимНО" )     НаимНО = rs.t_value;            end;
+        if( rs.t_name == "АдрНО" )      АдрНО = rs.t_value;             end;
+        if( rs.t_name == "ИННКО" )      ИННКО = rs.t_value;             end;
+        if( rs.t_name == "КППКО" )      КППКО = rs.t_value;             end;
+        if( rs.t_name == "БИК" )        БИК = rs.t_value;               end;
+        if( rs.t_name == "НаимКО" )     НаимКО = rs.t_value;            end;
+        if( rs.t_name == "НомФ")        НомФ = rs.t_value;              end;
+        if( rs.t_name == "ОсновЗапр" )  ОсновЗапр = rs.t_value;         end;
+        if( rs.t_name == "ВидЗапр")     ВидЗапр = rs.t_value;           end;
+        if( rs.t_name == "ТипЗапр" )    ТипЗапр = rs.t_value;           end;
+        if( rs.t_name == "ДатаНач")     ДатаНач = rs.t_value;           end;
+        if( rs.t_name == "ДатаКон")     ДатаКон = rs.t_value;           end;
+        if( rs.t_name == "НаимНП" )     НаимНП = rs.t_value;            end;
+        if( rs.t_name == "ФИОИП" )      ФИОИП = rs.t_value;             end;
+        if( rs.t_name == "ИНННП" )      ИНННП = rs.t_value;             end;
+        if( rs.t_name == "КППНП" )      КППНП = rs.t_value;             end;
+        if( rs.t_name == "КласЧинРук" ) КласЧинРук = rs.t_value;        end;
+        if( rs.t_name == "ФИОРук" )     ФИОРук = rs.t_value;            end;
+        if( rs.t_name == "ДолжРук" )    ДолжРук = rs.t_value;           end;
+          if( rs.t_name == "НомСч" )
+            if (ArrFind(НомСч, field_value) == -1)
+              НомСч[НомСч.Size] = rs.t_value;
+            end;
+          end;
+       end;
+       
+       if(ТипЗапр == "1")//Если по всем счетам то НомСч заполняем из связных счетов
+          rs_acc = getRsWlacclnk(reqid, 505);
+          while(rs_acc and rs_acc.MoveNext() )
+             НомСч[НомСч.Size] = rs_acc.value("t_Account")
+          end;
+       end;
+     FileName = ПолучитьИмяВходФайла( reqid );
+   end;
+   end;
+
+   macro compareName(namefns,namersb)
+    
+     //Lavrenov: ну что за криворукость то такая?
+     // Второй параметр кто будет к верхнему регистру приводить?
+     // Е на Ё зачем менять?
+     const OOO = "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ";
+     const ZAO = "ЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+     const OAO = "ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО";
+     
+     namersb = strupr(namersb); 
+     namersb = strsubst(namersb,"ООО",OOO);
+     namersb = strsubst(namersb,"ЗАО",ZAO);
+     namersb = strsubst(namersb,"ОАО",OAO);
+     namersb = strsubst(namersb,"Ё","Е");
+     namersb = strsubst(namersb,"\"","");
+     namersb = strsubst(namersb,"  "," ");
+
+     namefns = strupr(namefns); 
+     namefns = strsubst(namefns,"ООО",OOO);
+     namefns = strsubst(namefns,"ЗАО",ZAO);
+     namefns = strsubst(namefns,"ОАО",OAO);
+     namefns = strsubst(namefns,"Ё","Е");
+     namefns = strsubst(namersb,"\"","");
+     namefns = strsubst(namersb,"  "," ");
+     return (namefns == namersb);
+
+   end;
+
+   macro Check(mode)
+     var КлиентПоСчету, str, cmd;
+     record Acc(account);
+     var СчетаПоЗапросу;
+     var cnt, acc_err, quest,tmpstr;
+     var accnt_err_32 = TArray(), accnt_err_33 = TArray(), accnt_err_35 = TArray();
+     var accnt_err_transit_currency = TArray(); //zmp 16.05.2014
+     var accnt_err_deposit          = TArray(); //zmp 25.11.2014 R-496387
+
+     var mes_in, bnkname;
+     var ДатаПерехода, errCode;
+     private var fgBank = fg_life_subject({OurBank});
+
+     //zmp 25.11.2014 C-?????
+     setClientLink();
+ 
+     // 02.04.2013 Golovkin C-18653 проверка наличия депозитных счетов
+     if( ТипЗапр == 1 )
+         if( ВидЗапр == 3 ) 
+             ПроверитьНаличиеДепозитныхСчетов( PartyID, ОтрезатьПутьОтИмениФайла( FileName ), date( ДатаНач ), date( ДатаКон ) );
+         else
+             ПроверитьНаличиеДепозитныхСчетов( PartyID, ОтрезатьПутьОтИмениФайла( FileName ) );
+         end; 
+     end;
+
+     //1 Не найден клиент по ИНН 35;В банке (филиале банка) не состоит на обслуживании клиент с ИНН <значение ИНН>, указанным в электронном документе налогового органа
+     if( PartyID == -1 ) 
+       Error = 35; 
+       if (ВидЗапр == 3)
+           if (ФИОИП != "")
+             ErrorMes = "В банке с "+ДатаНач+" по "+ДатаКон+" клиент "+ФИОИП+" ИНННП:"+ИНННП+" счетов не имел";
+           else
+             ErrorMes = "В банке с "+ДатаНач+" по "+ДатаКон+" клиент "+НаимНП+" ИНННП:"+ИНННП+" счетов не имел";
+           end;
+       else
+           ErrorMes = "В банке (филиале банка) не состоит на обслуживании клиент с ИНН "+ ИНННП +", указанным в электронном документе налогового органа "; 
+       end;
+       //Lavrenov: тут мы в обрабатываем запрос даже в массовом режиме.
+       DoNotSend = 1;
+       return 1;
+     end;    
+     
+     debugbreak;
+     /*17.01.2012 Чесноков Д.С. По запросу I-00142993*/
+     if( PartyID != -1 )
+       if (fgBank.is_EXV)//10.02.14 Chesnokov D.S. По запросу C-26943 добавил функцию Is_Ulianovsk_Client
+         var ClientSign = IsTransferedClient(PartyID);
+           if (ClientSign != -1)
+             if (ClientSign == 1)
+               bnkname = "Ульяновске";
+             elif (ClientSign == 2)
+               bnkname = "Ставрополе";
+             elif (ClientSign == 3)
+               bnkname = "Воронеже";
+             elif (ClientSign == 4)
+               bnkname = "Волгограде";
+             end;
+             
+             if(mode == 1)
+              ErrorMes = "Клиент обслуживался в "+bnkname+", ПРОВЕРЬТЕ КЛИЕНТА!!!";
+              DoNotProcess = 1;
+             else
+              msgbox("Клиент по запросу " + ОтрезатьПутьОтИмениФайла( FileName ) + " обслуживался в "+bnkname+". | Проверьте счета в "+strupr(bnkname)+"!");
+             end;
+           end;
+       end;
+       КлиентПоСчету = ZNSParty( PartyID );
+         // 17.04.2013 Golovkin C-18326 убрал проверку на соответствие КПП
+         if (КППНП != "")
+             if(( КлиентПоСчету.LegalForm == PTLEGF_INST ) and ( КлиентПоСчету.KPP == "" ))
+                 if(mode == 1)                
+                     Error = 35;  
+                     ErrorMes = "КПП клиента не соответствует ИНН, указанному в электронном документе налогового органа";
+                     DoNotProcess = 1;
+                 else
+                     gettrue(quest, string("Запрос " + ОтрезатьПутьОтИмениФайла( FileName ) + " ||ИНН/КПП в запросе:" + ИНННП + "/" + КППНП + "|| ИНН/КПП в БД:" +КлиентПоСчету.INN + "/" + КлиентПоСчету.KPP + "|| Сформировать справку?" ));
+                     if(quest == false)
+                         Error = 35;
+                         ErrorMes = "КПП " + КППНП + " клиента не соответствует ИНН " + ИНННП + ", указанному в электронном документе налогового органа";
+                     end;
+                 end;
+             end;
+         end;
+     else
+       Error = 35; 
+       //Получаем дату перехода банка
+       GetRegistryValue("PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА", V_STRING, ДатаПерехода, errCode);
+       if ( errCode > 0 )
+         msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА");
+       end;
+       
+       if (ВидЗапр == 3)
+           if (ФИОИП != "")
+             if ((date(ДатаПерехода) > date(ДатаНач)) and (date(ДатаПерехода) < date(ДатаКон)) and (mode != 1))
+               msgbox("Клиент " + ФИОИП + " в RS.Bank v.6 не найден. Проверьте наличие счетов и клиента в Rs-Bank 5.0");
+             end;
+             ErrorMes = "В банке с "+ДатаНач+" по "+ДатаКон+" клиент ИНННП:"+ИНННП+" ФИОИП:"+ФИОИП+" счетов не имел";
+           else
+             if ((date(ДатаПерехода) > date(ДатаНач)) and (date(ДатаПерехода) < date(ДатаКон)) and (mode != 1))
+               msgbox("Клиент " + НаимНП + " в RS.Bank v.6 не найден. Проверьте наличие счетов и клиента в Rs-Bank 5.0");
+             end;
+             ErrorMes = "В банке с "+ДатаНач+" по "+ДатаКон+" клиент ИНННП:"+ИНННП+" НаимНП:"+НаимНП+" счетов не имел";
+           end;
+       else
+           ErrorMes = "В банке (филиале банка) не состоит на обслуживании клиент с ИНН "+ ИНННП +", указанным в электронном документе налогового органа "; 
+       end;
+
+        DoNotSend = 1; 
+        return 1;
+     end;
+
+     if ( ( КлиентПоСчету.LegalForm == PTLEGF_INST  ) and (not compareName(НаимНП,КлиентПоСчету.FullName )))
+       //4	Не совпадает наименование	35;Наименование клиента <<значение наименования>> не соответствует ИНН <значение ИНН>, указанному в электронном документе налогового органа 
+        if(mode == 1)//если массовый режим
+            Error = 35;  
+            ErrorMes = "Наименование клиента не соответствуют ИНН, указанному в электронном документе налогового органа";
+            DoNotProcess = 1;
+        else
+            gettrue(quest, string("Запрос "+ОтрезатьПутьОтИмениФайла(FileName)+" ||Наименование в запросе:" + НаимНП + "|| наименование в БД:" +КлиентПоСчету.FullName +"|| Сформировать справку?" ));
+            if(quest == false)
+              Error = 35;  
+              //Лавренов 15.12.2011 убрал "уродский" комментарий (с) Зам.начальника УОР Карнаухова Е.В. (495)933-37-37 д.13-35
+              //ErrorMes = "Наименование клиента "+ КлиентПоСчету.FullName +" не соответствуют ИНН "+ КлиентПоСчету.INN +", указанному в электронном документе налогового органа";
+              ErrorMes = "Наименование клиента не соответствуют ИНН, указанному в электронном документе налогового органа";
+            end;
+        end;
+     elif ( ( КлиентПоСчету.LegalForm == PTLEGF_PERSN ) and (not compareName(ФИОИП,КлиентПоСчету.FullName )))  
+       //4	Не совпадает наименование	35;Наименование клиента <<значение наименования>> не соответствует ИНН <значение ИНН>, указанному в электронном документе налогового органа 
+        if(mode == 1)//если массовый режим
+            Error = 35;  
+            ErrorMes = "Наименование клиента не соответствуют ИНН, указанному в электронном документе налогового органа";
+            DoNotProcess = 1;
+        else
+            gettrue(quest, string("Запрос "+ОтрезатьПутьОтИмениФайла(FileName)+" ||Наименование в запросе:" + ФИОИП + "|| наименование в БД:" +КлиентПоСчету.FullName +"|| Сформировать справку?" ));
+            if(quest == false)
+              Error = 35;  
+              //Лавренов 15.12.2011 убрал "уродский" комментарий (с) Зам.начальника УОР Карнаухова Е.В. (495)933-37-37 д.13-35
+              //ErrorMes = "Наименование клиента "+ КлиентПоСчету.FullName +" не соответствуют ИНН "+ КлиентПоСчету.INN +", указанному в электронном документе налогового органа";
+              ErrorMes = "Наименование клиента не соответствуют ИНН, указанному в электронном документе налогового органа";
+            end;     
+        end;     
+     end;     
+     
+     if(( Error != 0 ) or ( ErrorMes != "" )) 
+        DoNotSend = 1; 
+        return 1;
+     end;
+
+     if (date(ДатаКон) < date(ДатаНач))
+         ErrorMes = "Дата начала диапазона в запросе " + ДатаНач + " больше даты конца диапазона " + ДатаКон + "  ";
+         error = 35;
+         DoNotSend = 1;
+         if(mode == 1)//если массовый режим
+             DoNotProcess = 1;
+         end;
+     end;
+
+     /*05.09.2012 Chesnokov D.S. По заявке I-00174689*/
+     if (date(ДатаКон) > {curdate})
+       ДатаКон = {curdate} - 1;
+     end;
+
+     //Lavrenov: теперь по всем запросам создаются записи в dwlacclnk_dbt 
+     //if((НомСч.Size > 0) and (ТипЗапр == "2"))
+        СчетаПоЗапросу = getRsWlacclnk(reqid, 505);
+        while(СчетаПоЗапросу and СчетаПоЗапросу.MoveNext() )
+           acc_err = 0;
+           if (AccountExists_RUR(СчетаПоЗапросу.value("t_Account"),СчетаПоЗапросу.value("t_Chapter")))          
+             ПолучитьСчет( СчетаПоЗапросу.value("t_FIID"), СчетаПоЗапросу.value("t_Account"), Acc );
+             if(acc.client != PartyID)
+               //счет не принадлежит клиенту
+               if(mode == 1)//если массовый режим
+                 accnt_err_33[accnt_err_33.size] = СчетаПоЗапросу.value("t_Account");
+                 acc_err = 1;
+                 DoNotProcess = 1;
+               else    
+                 gettrue(quest, string("Запрос "+ОтрезатьПутьОтИмениФайла(FileName)+" ||Счет: " + СчетаПоЗапросу.value("t_Account") + "|| не принадлежит клиенту:" +КлиентПоСчету.FullName +"|| Сформировать справку?" ));
+                 if(quest == false)
+                   str = " update dwlacclnk_dbt t " + 
+                         "    set t_state = 33 " +
+                         "  where T_OBJECTTYPE = 505 " +
+                         "    and T_OBJECTID = " + reqid + 
+                         "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                   cmd = RsdCommand(str);
+                   cmd.execute;
+                   
+                   accnt_err_33[accnt_err_33.size] = СчетаПоЗапросу.value("t_Account");
+                   acc_err = 1;
+                  end;
+               end;
+             //zmp 16.05.2014
+             elif((ВидЗапр == "3") and (ТипЗапр == 2) and (acc.code_currency != 0) and (substr(acc.account, 14, 1) == 1)) 
+                 accnt_err_transit_currency[accnt_err_transit_currency.size()] = acc.account;
+                 UpdateAccLnkSate(acc.account, 40);  
+                 acc_err = 1;                                  
+             elif((ВидЗапр == "3") and (ТипЗапр == 2) and (isDepositAccount(acc.account))) 
+                 accnt_err_deposit[accnt_err_deposit.size()] = acc.account;
+                 UpdateAccLnkSate(acc.account, 41);  
+                 acc_err = 1;                                  
+             else
+               if(acc.open_close == "З" )
+                  //счет закрыт
+                  if(ВидЗапр == "3") 
+                    if(ТипЗапр == 2) // Chesnokov D.S. 17.07.2012 I-00193935 Для запроса по всем счетам формируем пустое BV
+                      if(acc.close_date < date(ДатаНач)) //Lavrenov: I-00151765 Если дата закрытия меньше даты начала периода формируем PB2
+                        if(DoNotProcess != 1)
+                          str = " update dwlacclnk_dbt t " + 
+                                "    set t_state = 35 " +
+                                "  where T_OBJECTTYPE = 505 " +
+                                "    and T_OBJECTID = " + reqid + 
+                                "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                          cmd = RsdCommand(str);
+                          cmd.execute;
+                        end;
+                    
+                        accnt_err_35[accnt_err_35.size] = "Счет "+ СчетаПоЗапросу.value("t_Account") +" закрыт "+ acc.close_date;
+                        acc_err = 1;
+                      elif (acc.open_date > date(ДатаКон))//Chesnokov D.S. I-00224504 доделаем недоделанное по I-00151765
+                        if(DoNotProcess != 1)
+                          str = " update dwlacclnk_dbt t " + 
+                                "    set t_state = 36 " +
+                                "  where T_OBJECTTYPE = 505 " +
+                                "    and T_OBJECTID = " + reqid + 
+                                "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                          cmd = RsdCommand(str);
+                          cmd.execute;
+                        end;
+                    
+                        accnt_err_35[accnt_err_35.size] = "Счет "+ СчетаПоЗапросу.value("t_Account") +" открыт "+ acc.open_date;
+                        acc_err = 1;
+                      end;
+                    end;
+                  elif(ВидЗапр == "2")//Lavrenov: I-00151765++ Для BOS сразу PB2
+                    //gettrue(quest, string("Запрос "+ОтрезатьПутьОтИмениФайла(FileName)+" ||Счет: " + СчетаПоЗапросу.value("t_Account") + "|| закрыт. || Сформировать справку?" ));
+                    if(DoNotProcess != 1)
+                      str = " update dwlacclnk_dbt t " + 
+                            "    set t_state = 35 " +
+                            "  where T_OBJECTTYPE = 505 " +
+                            "    and T_OBJECTID = " + reqid + 
+                            "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                      cmd = RsdCommand(str);
+                      cmd.execute;
+                    end;
+                    
+                    accnt_err_35[accnt_err_35.size] = "Счет "+ СчетаПоЗапросу.value("t_Account") +" закрыт "+ acc.close_date;
+                    acc_err = 1;
+                  end;
+               else
+                 if(ВидЗапр == "3")
+                   if(acc.open_date > date(ДатаКон))//Lavrenov: I-00149338 Счет открыт позднее запрашиваемого периода   
+                     if(DoNotProcess != 1)
+                       str = " update dwlacclnk_dbt t " + 
+                             "    set t_state = 36 " +
+                             "  where T_OBJECTTYPE = 505 " +
+                             "    and T_OBJECTID = " + reqid + 
+                             "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                       cmd = RsdCommand(str);
+                       cmd.execute;
+                     end;
+                    
+                     accnt_err_35[accnt_err_35.size] = "Счет "+ СчетаПоЗапросу.value("t_Account") +" открыт "+ acc.open_date;
+                     acc_err = 1;
+                   end;
+                 end;
+               end;
+             end;
+           else
+              //счет не найден
+              if(DoNotProcess != 1)
+                  str = " update dwlacclnk_dbt t " + 
+                         "    set t_state = 32 " +
+                         "  where T_OBJECTTYPE = 505 " +
+                         "    and T_OBJECTID = " + reqid + 
+                         "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                  cmd = RsdCommand(str);
+                  cmd.execute;
+              end;
+                      
+              accnt_err_32[accnt_err_32.size] = СчетаПоЗапросу.value("t_Account");
+              acc_err = 1;
+           end;      
+           if(acc_err != 1)
+               ПроверенСчета[ПроверенСчета.size] = СчетаПоЗапросу.value("t_Account");
+               if(DoNotProcess != 1)
+                   str = " update dwlacclnk_dbt t " + 
+                         "    set t_state = 100 " +
+                         "  where T_OBJECTTYPE = 505 " +
+                         "    and T_OBJECTID = " + reqid + 
+                         "    and t_account = '" + СчетаПоЗапросу.value("t_Account") + "'";
+
+                   cmd = RsdCommand(str);
+                   cmd.execute;
+               end;
+           end;
+        end;
+
+        //Формируем строку сообщения 
+        if(accnt_err_32.size == НомСч.Size)
+           cnt = 0;
+           error = 32;
+          // В банке отсутствует номер счета 40702810508130002217 ООО "ТД ВОСТОК" ИНН 3128083616@@@
+           ErrorMes = "В банке (филиале банка) отсутствует номер счета (номера счетов) ";
+           while(cnt<accnt_err_32.size)
+              ErrorMes = ErrorMes + accnt_err_32[cnt]+", ";
+              cnt = cnt+1;
+           end;
+           ErrorMes = substr(ErrorMes,1,strlen(ErrorMes)-2);
+           if (ФИОИП != "")
+              ErrorMes = ErrorMes + " " +ФИОИП+ " ИНН "+ИНННП+"  ";
+           else
+              ErrorMes = ErrorMes + " " +НаимНП+ " ИНН "+ИНННП+"  ";
+           end;
+
+         //Получаем дату перехода банка
+           GetRegistryValue("PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА", V_STRING, ДатаПерехода, errCode);
+           if ( errCode > 0 )
+             msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА");
+           end;
+
+           if(date(ДатаНач) < date(ДатаПерехода))
+             msgbox("Дата начала выписки в запросе " + ОтрезатьПутьОтИмениФайла(FileName) +" меньше даты перехода Банка на RS-Bank v.6| Проверьте наличие операций в RS-Bank v.5");
+           end;
+
+        elif(accnt_err_33.size == НомСч.Size)
+           cnt = 0;
+           error = 33;
+           
+           if (ФИОИП != "")//Lavrenov: 04.04.2012 I-00175517
+              ErrorMes = "ФИОИП: "+ ФИОИП +" в запросе не соответствует номеру счета (номерам счетов) ";
+           else
+              ErrorMes = "НаимНП: "+ НаимНП +" в запросе не соответствует номеру счета (номерам счетов) ";
+           end;
+           while(cnt<accnt_err_33.size)
+              ErrorMes = ErrorMes + accnt_err_33[cnt]+", ";
+              cnt = cnt+1;
+           end;
+        else
+           cnt = 0;
+           if(accnt_err_32.size > 0)
+             ErrorMes = "В банке (филиале банка) отсутствует номер счета (номера счетов) ";
+              while(cnt<accnt_err_32.size)
+                ErrorMes = ErrorMes + accnt_err_32[cnt]+", ";
+                 cnt = cnt+1;
+                 error = 35;
+              end;
+              
+              ErrorMes = substr(ErrorMes,1,strlen(ErrorMes)-2);
+              if (ФИОИП != "")
+                 ErrorMes = ErrorMes + " " +ФИОИП+ " ИНН "+ИНННП+"  ";
+              else
+                 ErrorMes = ErrorMes + " " +НаимНП+ " ИНН "+ИНННП+"  ";
+              end;
+           end;
+
+           cnt = 0;
+           while(cnt<accnt_err_33.size)
+              if (ФИОИП != "")//Lavrenov: 04.04.2012 I-00175517
+                 ErrorMes = ErrorMes +"ФИОИП: "+ ФИОИП +" в запросе не соответствует номеру счета "+ accnt_err_33[cnt]+", ";
+              else
+                 ErrorMes = ErrorMes +"НаимНП: "+ НаимНП +" в запросе не соответствует номеру счета "+ accnt_err_33[cnt]+", ";
+              end;
+              cnt = cnt+1;
+              error = 35;
+           end;
+           
+           if (accnt_err_35.size > 0)
+              cnt = 0;
+              tmpstr = "";
+             while(cnt<accnt_err_35.size)
+                tmpstr = tmpstr + accnt_err_35[cnt]+", ";
+                cnt = cnt+1;
+             end;
+             if (ФИОИП != "")
+                 ErrorMes = ErrorMes+" "+ФИОИП+" ИНН "+ИНННП+" "+tmpstr;
+             else
+                 ErrorMes = ErrorMes+" "+НаимНП+" ИНН "+ИНННП+" "+tmpstr;
+             end;
+                error = 35;
+           end;
+           //zmp 16.05.2014
+           if(accnt_err_transit_currency.size() > 0)
+              ErrorMes = ErrorMes + String("Транзитный валютный счет не открывается на основании договора банковского счета и не обладает признаками счета, определенными п. 2 ст.11 НК РФ. В связи с этим п.2 ст.86 Кодекса не применяется относительно транзитных валютных счетов.(письмо Минфина №03-02-07/1-256 от 16.10.2012г.).Т.о. р/счет " , array_to_str(accnt_err_transit_currency, ", ") ," является транзитным валютным счетом и предоставление выписок по таким счетам по запросу налогового органа не предусмотрено действующим законодательством.");            
+              error = 35;                   
+           end;
+           //zmp 25.11.2014 R-496387
+           if(accnt_err_deposit.size() > 0)
+              ErrorMes = ErrorMes + String("Счет ",  array_to_str(accnt_err_deposit, ", "), " является депозитным счетом.Согласно Письма ФНС от 29.12.12 №АС-4-2/22680@ до внесения изменений в Приказы ФНС России от 25.07.12 №№ММВ-7-2/518@,ММВ-7-2/520 документооборот касательно инф-ции о вкладах(депозитах) осуществлять на бумажных носителях.На данный момент изменения в Приказы не внесены. ");         
+              error = 35;                   
+           end;
+
+        end;        
+        
+        if(ПроверенСчета.size == 0)
+           DoNotSend = 1; 
+        end;
+        
+        if ( ErrorMes != "" )
+           ErrorMes = substr(ErrorMes, 1, strlen(ErrorMes)-2);
+        end;
+     //end;
+     return IfThenElse( ( Error != 0 ) or ( ErrorMes != "" ), 1, 0 ); 
+   end;
+
+   macro GetSubKind()
+     if( ВидЗапр == 1 )
+       return 5;
+     elif( ВидЗапр == 2 )
+       return 7;
+     elif( ВидЗапр == 3 )
+       return 6
+     else
+       return 0;
+     end;
+   end;
+
+   macro GetNarrative()
+     private var _ВидЗапр;
+     if( (ВидЗапр == "1") )
+       _ВидЗапр = "о наличии счетов в банке у ";
+     elif( (ВидЗапр == "2") )
+       _ВидЗапр = "об остатках денежных средств на счетах ";
+     elif( (ВидЗапр == "3") )
+       _ВидЗапр = "о предоставлении выписок по операциям на счетах ";
+     else 
+       ErrorMes = "Неверно задан вид справки";
+       Error = 1;
+     end;
+     return   "Запрос № " + НомЗапр + " от " + ДатаЗапр + " из налогового органа " + КодНО + " " + НаимНО + " " + 
+              _ВидЗапр + "клиента " + ИНННП + IfThenElse( КППНП != "", string( "\\" + КППНП ), "" ) + " " +
+              IfThenElse( НаимНП != "", НаимНП , ФИОИП );
+   end;
+   
+   MnsMessageFormZNO();
+
+end;

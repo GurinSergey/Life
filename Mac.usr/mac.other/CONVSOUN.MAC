@@ -1,0 +1,785 @@
+/*-------------------------------------------------------------------------------------------
+RS-Bank V6
+
+  15.09.2010 Котов С.С.
+
+Описание макроса: Импорт справочника Базы данных СОУН - SOUN_DBF.ARJ 
+                  в справочник Налоговых органов RS-6. 
+Основные функции:   Заполнение справочника налоговых из файла SOUN1.dbf
+Входные данные:     SOUN1.DBF
+Выходные данные:    Импорт справочника Базы данных СОУН в справочник Налоговых органов RS-6 
+
+Работоспособность в "трехзвенке": Да
+Изменен: Gurin S. N. 20.10.2012 C-14975
+Изменен: Gurin S. N. 11.07.2013 R-216658-2 Возможность загрузки с локальной машины.
+------------------------------------------------------------------------------------------- */
+import globals, dbf2ora, cb_sql, BankInter, treport;
+import PTInter;
+import oralib, likepy, globals, rsexts;
+import BankInter, rcw, rsd;
+import "lib_registry.mac", WordIntf;
+//Gurin S. N. 20.10.2012 C-14975
+var protocol = TArray ();
+var dat;
+
+var temppath  = RSL_GetRegistryValue ("BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/TEXTDIR");
+var fullPath, directory, fileExtension, NameFile, tmp;
+
+/*13.03.2013 Chesnokov D.S. логгирование запуска для поиска неиспользуемых макросов*/
+ExecmacroFile("lib_log.mac", "LogProcedure", "CONVSOUN.MAC");
+
+// @return: true - файл на СП ,false - файл на машине
+macro StrPath (str)
+    if (substr(trim(str),1,1) == "\\")
+        return true;
+    else 
+        return false;
+    end;
+end;
+
+macro FileCopy () 
+    var retVal = True, copy; 
+    temppath = temppath + "\\" + NameFile + fileExtension;
+       if (not StrPath(fullPath))
+           fullPath ="$" + fullPath;                                   
+           if ( not CopyFile( fullPath, temppath))
+               retVal = False;
+           end;
+       else
+           if (substr(fullPath,1,8) == substr(temppath,1,8))
+               copy = run (GetEnv("COMSPEC"),"/c copy "+ fullPath  +","+ temppath);
+               if (copy == 0)
+                   retVal = True;    
+               end;
+           else
+               fullPath ="$" + fullPath;
+               if ( not CopyFile( fullPath, temppath))
+                   retVal = False;
+               end;
+           end;
+
+       end;
+       directory = splitFile (temppath, NameFile, fileExtension);
+       if (not retVal) return ""; else return temppath; end;
+end;
+
+macro RunImport()
+  var ErrText;
+  var rs, cmd, ret_val, CountIMP, CountDPL, CountDLT;
+
+  /* Проверяем задан ли диапазон ID субъектов для данного филиала SCR 88731*/
+  rs = SQL_ExecuteAndGetRs(" select    count(*) " 
+  "                          from      dpartyidr_dbt i, dptrnglnk_dbt r " +
+  "                          where     r.t_Branch = " + {OperDprt} +
+  "                                and i.t_IDrng = r.t_IDrng" + 
+  "                                and i.t_statrng = CHR(0)");
+  rs.MoveNext;
+
+  if ( rs.value(0) == 0 )
+      msgbox("Нет открытых диапазонов ИД субъектов для данного филиала");
+      exit;
+  end;
+
+  debugbreak;
+  var ob = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+  var ex = ob.CreateComObject ("Excel.Application");
+  if (fullPath = ex.application.GetOpenFileName ("Файлы (*.DBF),*.DBF", null, "Выберите файл для загрузки"));
+      directory = splitFile (fullPath, NameFile, fileExtension);
+  end;    
+  if (fullPath == V_Undef) msgbox("Файл не выбран. Процедура импорта прервана"); exit(); end;
+  tmp = FileCopy();
+
+  if (tmp == "") msgbox("Ошибка копирования файла в ..\txtfile "); exit(); else fullPath = tmp; end;
+ 
+  if (not dbf2ora(string(directory + "SOUN1.DBF"), "SOUN1_DBF", "Загрузка файла SOUN1.DBF в БД",ErrText))
+      msgbox(ErrText);
+      return 1;
+  end;
+
+// sql_execute("delete from SOUN1_DBF where t_kod!='5433'");       // KS Для отладки
+
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private class TRecord (_num, _name, _code, _old_code, _new_code)
+    var m_num      = _num;
+    var m_name     = _name;
+    var m_code     = _code;
+    var m_old_code = _old_code;
+    var m_new_code = _new_code;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro QSortCmp(rec1, rec2):integer
+  if (rec1.m_num < rec2.m_num)
+     return -1;
+  elif (rec1.m_num > rec2.m_num)
+     return +1;
+  end;
+
+  return 0;     
+END;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro viewProtocol ()
+    var table = CTableReport ();
+    var i = 0;
+   [##########################################################################################] ("Протокол загрузки справочникака СОУН":c:40);
+   [                                                                       Пользователь: #####] ({oper});
+   [                                                       Дата: ########### Время: ##########] (date (), time ());
+   [                                                                                          ];
+
+   qsort(protocol, @QSortCmp); //Сортируем массив по возрастанию номерос ФНС (код 28)
+
+    if (protocol.size ())
+        table.addColumn ("Номер ФНС",                   5, AL_CENTER); 
+        table.addColumn ("Наимеонвание ФНС",           25, AL_CENTER);
+        table.addColumn ("Код",                        25, AL_CENTER);
+        table.addColumn ("Значение до обновления",     20, AL_CENTER);
+        table.addColumn ("Значение после обновления",  20, AL_CENTER);
+        table.printHead (string ("Успешно загружены/обновлены ФНС":c:100));
+
+        BegAction(100, "Ждите, идет формирование протокола загрузки..", False);
+        while (i < protocol.size ())
+            table.printStringTransferByWord (protocol[i].m_num, 
+                                             protocol[i].m_name, 
+                                             protocol[i].m_code, 
+                                             protocol[i].m_old_code, 
+                                             protocol[i].m_new_code); 
+            i = i + 1;
+        end;
+        EndAction();
+
+        table.printBottom ();
+        println("ИТОГО: ", i);
+    else
+        println("Ни одной ФНС не было загружено");
+    end;
+
+end;
+
+macro CheckSOUNCountNum()
+var myDS;
+  myDS = SQL_ExecuteAndGetRs(" select abs((select count(*) " + 
+  "                                          from DPARTYOWN_DBT " +
+  "                                         where     T_PARTYKIND = 6 " +
+  "                                               and T_PARTYID in (select q.T_PARTYID " +
+  "                                                                   from dparty_dbt q " +
+  "                                                                  where q.T_LOCKED is null))"+
+  "                                      -(select count(*) " +
+  "                                          from DOBJCODE_DBT " +
+  "                                         where     T_OBJECTTYPE = 3 " +
+  "                                               and T_CODEKIND = 28 " +
+  "                                               and T_STATE = 0 " +
+  "                                               and T_OBJECTID in (select q.T_PARTYID " +
+  "                                                                    from dparty_dbt q " +
+  "                                                                   where q.T_LOCKED is null))) " +
+  "                                      varCheck " +
+  "                              from dual");
+
+ myDS.MoveNext;
+ if ( myDS.varCheck == 0 )
+    return true;
+ else 
+    return false;                                                       
+ end;
+
+end;
+
+macro ClearParty()
+   //удалим налоговые адреса
+   SQL_Execute("delete FROM dadress_dbt where T_PARTYID in (select T_OBJECTID from dobjcode_dbt where T_CODE like 'SOUN_%')");
+
+   //удалим бесхозные адреса
+   SQL_Execute("delete FROM dadress_dbt where T_PARTYID not in (select q.T_PARTYID from dparty_dbt q)");
+
+   //удалим бесхозные привязки для налоговых субектов
+   SQL_Execute("delete from DPARTYOWN_DBT where T_PARTYKIND = 6 and T_PARTYID not in (select q.T_PARTYID from dparty_dbt q)");
+
+   //удалим привязку налоговых субектов к налоговым органам
+   SQL_Execute("delete FROM dpartyown_dbt where T_PARTYID in (select T_OBJECTID from dobjcode_dbt where T_CODE like 'SOUN_%')");
+
+   //удалим налоговых субектов 
+   SQL_Execute("delete FROM DPARTY_DBT where T_PARTYID in (select T_OBJECTID from dobjcode_dbt where T_CODE like 'SOUN_%')");
+
+   //удалим коды налоговых субектов 
+   SQL_Execute("delete FROM DOBJCODE_DBT where T_USERID = '9973'");
+end;
+
+//Gurin S. N. 20.10.2012 C-14975 Запись изменений в историю субъекта
+macro WriteHist(PrtID, kind, oldCODE, newCODE)
+var commandText;
+ commandText =" INSERT INTO dptprmhist_dbt (T_PARTYID, " +
+              "                             T_SYSDATE, " +
+              "                             T_SYSTIME, " +
+              "                             T_OPER, " +
+              "                             T_PARAMKINDID, " +
+              "                             T_VALUEBEFORE, " +
+              "                             T_VALUEAFTER, " +
+              "                             T_BANKDATE) " +
+              "  values     (" + PrtID + ", " +
+              "              SYSDATE, " +
+              "              SYSDATE, " +
+              "              " + {Oper} + ", " +
+              "              " + kind + ", " +
+              "              '" + oldCODE + "', " +
+              "              '" + newCODE + "', " +
+              "              TRUNC (SYSDATE - 100) )";
+ sql_execute(commandText);
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro FNSName(id)
+var query, cmd, rs;
+query =  "select t_name from dparty_dbt where t_partyid = :id";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_name")
+    else
+       return "";
+    end;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro GetAdress(id)
+var query, cmd, rs;
+query =  "select t_adress from dadress_dbt where t_partyid = :id";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_adress")
+    else
+       return "";
+    end;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro GetTel(id)
+var query, cmd, rs;
+query =  "select t_phonenumber from dadress_dbt where t_partyid = :id";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_phonenumber")
+    else
+       return "";
+    end;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro GetMail(id)
+var query, cmd, rs;
+query =  "select t_e_mail from dadress_dbt where t_partyid = :id";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_e_mail")
+    else
+       return "";
+    end;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro GetIndex(id)
+var query, cmd, rs;
+query =  "select t_postindex from dadress_dbt where t_partyid = :id";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_postindex")
+    else
+       return "";
+    end;
+end;
+
+//Gurin S. N. 20.10.2012 C-14975
+private macro GetFNSCode(id)
+var query, cmd, rs;
+query =  "SELECT   t_code " +
+         "  FROM   dobjcode_dbt " +
+         " WHERE   t_objectid = :id AND t_codekind = 28 ";
+    cmd = RsdCommand(query);
+    cmd.AddParam("id", RSDBP_IN, id);
+    cmd.execute();
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+       return rs.value("t_code")
+    else
+       return "";
+    end;
+end;
+
+
+macro PostMakeParty()
+var commandText;
+//debugbreak;
+ /* Перебираем все Налоговые Органы*/
+ var rs = SQL_ExecuteAndGetRs("select count(distinct(T_OBJECTID)) myCount from soun1_DBF q, dobjcode_dbt where T_CODE like 'ФНС%' AND T_CODE = 'ФНС'||T_KOD and trim(q.t_datak) is null");
+ var i = 0;
+ var cmd, querty, cd;
+ //Gurin S. N. 20.10.2012 C-14975
+ var old_adress, new_adress, old_tel, new_tel, old_mail, new_mail, old_index, new_index;
+
+ rs.MoveNext;
+ InitProgress (int(rs.myCount)); 
+
+ rs = SQL_ExecuteAndGetRs("select distinct(T_OBJECTID) from soun1_DBF q, dobjcode_dbt where T_CODE like 'ФНС%' AND T_CODE = 'ФНС'||T_KOD and trim(q.t_datak) is null "); //and t_objectid = 41711
+ debugbreak;
+ while (rs.MoveNext)
+// привязываем к подчиненным вышестоящие организации 
+    commandText = "UPDATE DPARTY_DBT " +
+ "                    SET T_SUPERIOR = " +
+ "                           (SELECT   D.T_OBJECTID " +
+ "                              FROM   DOBJCODE_DBT D " +
+ "                             where     rownum = 1 " +
+ "                                   and D.T_OBJECTTYPE = 3 " +
+ "                                   and D.T_CODEKIND = 28 " +
+ "                                   and D.T_STATE = 0 " +
+ "                                   and D.T_CODE = T_SUPERIOR ) " +
+//      +"\n"+ " where T_PARTYID in (select T_OBJECTID from dobjcode_dbt where T_CODE like 'ФНС%')";
+//      +"\n"+ " where T_PARTYID ="+rs.value(0);
+ "                  where T_PARTYID = ? ";
+    cmd = RsdCommand(commandText); 
+    cmd.AddParam("PARTYID", RSDBP_IN, rs.value(0));
+    cmd.execute(); 
+
+    //Gurin S. N. 20.10.2012 C-14975 для протокола
+    old_adress = GetAdress(rs.value(0));
+    old_tel  = GetTel(rs.value(0));
+    old_mail  = GetMail(rs.value(0));
+    old_index  = GetIndex(rs.value(0));
+
+     commandText = " BEGIN " +
+     "                UPDATE dadress_dbt " +
+     "                   SET T_ADRESS  = " +
+     "                          nvl( " +
+     "                            (select q.T_ADRES " +
+     "                               from soun1_DBF q, dobjcode_dbt " +
+     "                              where     rownum = 1 " +
+     "                                    and trim(T_DATAK) is null " +
+     "                                    and T_CODEKIND= 28 " +
+     "                                    and T_CODE = T_KOD " +
+     "                                    and T_OBJECTID = T_PARTYID), " +
+     "                            chr(1)), " +
+     "                       T_POSTINDEX  = " +
+     "                          nvl( " +
+     "                            (select substr( " +
+     "                                      q.T_ADRES, " +
+     "                                            instr( " +
+     "                                              translate(q.T_ADRES,'1234567890','0000000000'),',000000,')+1,6) " +
+     "                               from soun1_DBF q, dobjcode_dbt " +
+     "                              where     rownum = 1 " +
+     "                                    and trim(T_DATAK) is null " +
+//      +"\n"+ "     T_POSTINDEX  = nvl((select NVL(substr(trim(T_ADRES), instr(trim(T_ADRES),',',2)-6, 6),chr(1)) from soun1_DBF q, dobjcode_dbt where rownum = 1 and trim(T_DATAK) is null " // KS 15.09.2010 Индекс
+     "                                    and T_CODEKIND= 28 " +
+     "                                    and T_CODE = T_KOD " +
+     "                                    and T_OBJECTID = T_PARTYID), " +
+     "                            chr(1)), " +
+     "                       t_phonenumber = " +
+     "                          NVL ( " +
+     "                            (SELECT   substr(trim(q.T_TEL),1,24) " +
+     "                               FROM   soun1_DBF q, dobjcode_dbt " +
+     "                              WHERE       ROWNUM = 1 " +
+     "                                      AND TRIM (t_datan) = " +
+     "                                           (SELECT   MIN (t_datan) " +
+     "                                              FROM   soun1_DBF, dobjcode_dbt do " +
+     "                                             WHERE       TRIM (t_email) IS NOT NULL " +
+     "                                                     AND t_kod = do.t_code " +
+     "                                                     AND do.t_objectid = t_partyid " +
+     "                                                     AND T_CODEKIND = 28) " +
+     "                                      AND T_CODEKIND = 28 " +
+     "                                      AND T_CODE = T_KOD " +
+     "                                      AND T_OBJECTID = T_PARTYID), " +
+     "                          CHR (1) " +
+     "                         ), " +
+     "                       t_e_mail = " +
+     "                          NVL ( " +
+     "                            (SELECT   q.T_email " +
+     "                               FROM   soun1_DBF q, dobjcode_dbt " +
+     "                              WHERE       ROWNUM = 1 " +
+     "                                      AND TRIM (t_datan) = " +
+     "                                            (SELECT   MIN (t_datan) " +
+     "                                               FROM   soun1_DBF, dobjcode_dbt do " +
+     "                                              WHERE       TRIM (t_email) IS NOT NULL " +
+     "                                                      AND t_kod = do.t_code " +
+     "                                                      AND do.t_objectid = t_partyid " +
+     "                                                      AND T_CODEKIND = 28) " +
+     "                                      AND T_CODEKIND = 28 " +
+     "                                      AND T_CODE = T_KOD " +
+     "                                      AND T_OBJECTID = T_PARTYID), " +
+     "                           CHR (1)) " +
+//      +"\n"+ "  WHERE T_PARTYID in (select T_OBJECTID from soun1_DBF q, dobjcode_dbt where T_CODE like 'ФНС%' AND T_CODE = 'ФНС'||T_KOD)"
+//      +"\n"+ "  WHERE T_PARTYID ="+rs.value(0)
+     "                 WHERE T_PARTYID = ? and T_TYPE = 3; " // KS Почтовый адрес
+
+     "                 IF SQL%NOTFOUND " +
+     "                 THEN " +
+     "                   INSERT INTO dadress_dbt (T_PARTYID, " +
+     "                                            T_TYPE, " +
+     "                                            T_ADRESS, " + 
+     "                                            T_COUNTRY, " +
+     "                                            T_POSTINDEX, " +
+     "                                            T_PHONENUMBER, " +
+     "                                            T_PHONENUMBER2, " +
+     "                                            T_E_MAIL, " +
+     "                                            T_BRANCH) " +
+     "                        select distinct " + //Gurin 20.09.2012 I-00242868-2	
+     "                               (T_OBJECTID) T_PARTYID, " +
+     "                               3 T_TYPE," // KS Почтовый адрес 
+     "                               NVL(TRIM(T_ADRES),chr(1)) T_ADRESS, " +
+     "                               'RUS' T_COUNTRY, " +
+//      +"\n"+ " NVL(substr(trim(T_ADRES), instr(trim(T_ADRES),',',2)-6, 6),chr(1)) T_POSTINDEX," 
+     "                               nvl(substr(T_ADRES,instr(translate(T_ADRES,'1234567890','0000000000'),',000000,')+1,6), " +
+     "                               chr(1)) T_POSTINDEX, " +
+     "                               nvl(trim(substr(nvl(substr(trim(T_TEL), 1, instr(trim(T_TEL),',')-1), T_TEL), 1, 24)), " +
+     "                               chr(1)) T_PHONENUMBER,"
+     "                               nvl(trim(substr(substr(trim(T_TEL), instr(trim(T_TEL),',')+1), 1, 24)), " +
+     "                               chr(1)) T_PHONENUMBER2, " + 
+     "                               NVL(TRIM(T_EMAIL),chr(1)) T_E_MAIL, " +
+     "                               0 T_BRANCH " +
+     "                          from soun1_DBF, dobjcode_dbt " +
+     "                         where     T_CODE = 'ФНС'||T_KOD " +
+     "                               and trim(T_DATAK) is null " +
+     "                               and T_OBJECTID = ?; " +
+     "                 END IF;" +
+     "               END;";
+      //    sql_execute(commandText);       
+      cmd = RsdCommand(commandText);                 
+      cmd.AddParam("PARTYID1", RSDBP_IN, rs.value(0));
+      cmd.AddParam("PARTYID2", RSDBP_IN, rs.value(0));
+      cmd.execute();
+
+      //Gurin S. N. 20.10.2012 C-14975 для протокола
+      new_adress = GetAdress(rs.value(0));
+      new_tel  = GetTel(rs.value(0));
+      new_mail  = GetMail(rs.value(0));
+      new_index  = GetIndex(rs.value(0));
+
+      //Gurin S. N. 20.10.2012 C-14975
+      if (trim(old_adress) != trim(new_adress))
+         WriteHist(rs.value(0), 210, old_adress, new_adress);
+            dat =  TRecord(GetFNSCode(rs.value(0)),FNSName(rs.value(0)),"Адрес",old_adress,new_adress);
+            protocol(protocol.size ()) = dat;                                              
+      end;
+      if (trim(old_tel) != trim(new_tel))
+         WriteHist(rs.value(0), 210, old_tel, new_tel);
+            dat =  TRecord(GetFNSCode(rs.value(0)),FNSName(rs.value(0)),"Телефон",old_tel,new_tel);
+            protocol(protocol.size ()) = dat;                                              
+      end;
+      if (trim(old_mail) != trim(new_mail))
+         WriteHist(rs.value(0), 210, old_mail, new_mail);
+            dat =  TRecord(GetFNSCode(rs.value(0)),FNSName(rs.value(0)),"Почта",old_mail,new_mail);
+            protocol(protocol.size ()) = dat;                                              
+      end;
+      if (trim(old_index) != trim(new_index))
+         WriteHist(rs.value(0), 210, old_index, new_index);
+            dat =  TRecord(GetFNSCode(rs.value(0)),FNSName(rs.value(0)),"Индекс",old_index,new_index);
+            protocol(protocol.size ()) = dat;                                              
+      end;
+
+    UseProgress (i); 
+    i = i + 1;
+  end; 
+  RemProgress (i); 
+
+  //Gurin S. N. 20.10.2012 C-14975 закрывает реогранизованые ФНС
+  commandText = " SELECT   do.t_objectid, do.t_code " +
+                "   FROM   SOUN1_DBF s, dobjcode_dbt do, DPARTY_DBT part " +
+                "  WHERE       REGEXP_INSTR (LOWER (S.T_COMENT), 'реорган|закрыт') > 0 " +
+                "          AND s.t_kod NOT IN (SELECT   t_kod " +
+                "                                FROM   SOUN1_DBF " +
+                "                               WHERE   TRIM (T_DATAK) IS NULL) " +
+                "          AND s.t_kod = do.t_code " +
+                "          AND PART.T_PARTYID = DO.T_OBJECTID " +
+                "          AND do.t_codekind = 28 "
+                "          AND PART.T_LOCKED != CHR (88) ";
+  cmd = RsdCommand(commandText);
+  rs =  RsdRecordset(cmd);
+  while (rs and rs.movenext())
+      querty = " UPDATE   dparty_dbt " +
+               "    SET   t_locked = CHR (88) " +
+               "  WHERE   t_partyid = :id ";
+      cd = RsdCommand(querty);
+      cd.AddParam("id",RSDBP_IN,rs.value("t_objectid"));
+      cd.execute();
+      dat =  TRecord(rs.value("t_code"),FNSName(rs.value("t_objectid")),"-","-","ФНС закрыта");
+      protocol(protocol.size ()) = dat; 
+ end; 
+
+  // чистим одинаковые телефоны 
+  commandText = "UPDATE DADRESS_DBT SET T_PHONENUMBER2 = chr(1) WHERE  T_PHONENUMBER = T_PHONENUMBER2";
+  sql_execute(commandText); 
+
+  // удаляем таблицу с данными soun1.DBF которые уже импортировали. 
+  commandText = "Drop table soun1_DBF"; 
+  sql_execute(commandText); 
+
+  OnError(e);
+     println(commandText);
+     println("Error in MakeCommentForCurrPayment: (", e.Code, ") ", e.Message, " Модуль:", e.Module, " строка:", e.Line );
+   RETURN False;
+end;
+
+/*------------------------------------------------------------------------------
+   Функция формирования кодов субъектов
+------------------------------------------------------------------------------*/   
+macro MakePartyCode (rs, PartyID: Integer, var_CODEKIND: Integer, var_CodeValue: String)
+var commandText;
+var var_BRANCH = {OperDprt};
+var var_USERID = {Oper};
+var myDS;
+ if (strlen(trim(var_CodeValue)) > 1)
+  myDS = SQL_ExecuteAndGetRs(" SELECT count(*) myCount " +
+                             "   FROM DOBJCODE_DBT " +
+                             "  where     T_STATE = 0 " +
+                             "        and T_OBJECTTYPE = 3 " +
+                             "        and T_CODEKIND = "+var_CODEKIND+
+                             "        and T_OBJECTID = "+PartyID);
+  myDS.MoveNext;
+  if (int(myDS.myCount) == 0)
+   myDS = SQL_ExecuteAndGetRs(" SELECT count(*) myCount " +
+                              "   FROM DOBJCODE_DBT " +
+                              "  where     T_STATE = 0 " +
+                              "        and T_OBJECTTYPE = 3 " +
+                              "        and T_CODEKIND = "+var_CODEKIND+
+                              "        and T_CODE = '"+var_CodeValue+"'");
+   myDS.MoveNext;
+   if (int(myDS.myCount) == 0)
+     myDS = null;// KS Проверка уже введенного кода
+     myDS = SQL_ExecuteAndGetRs("  SELECT count(*) myCount " +
+                                "    FROM DOBJCODE_DBT " +
+                                "   WHERE    T_OBJECTTYPE = 3 " +
+                                "        AND T_CODEKIND = "+var_CODEKIND+
+                                "        AND (T_CODE = '"+var_CodeValue+"'" +
+                                "             OR (     T_UNIQUE = 'X' " +
+                                "                  AND T_UNIQUE = CHR(88) " +
+                                "                  AND T_OBJECTID = '"+PartyID+"')) " +
+                                "        AND (T_BANKDATE      = TO_DATE('01.01.0001','DD.MM.YYYY')) " +
+                                "        AND (T_BANKCLOSEDATE = TO_DATE('31.12.9999','DD.MM.YYYY')) ");
+     myDS.MoveNext;
+     if (int(myDS.myCount) == 0)
+        myDS = null;
+        myDS = SQL_ExecuteAndGetRs("select DOBJCODE_DBT_SEQ.nextval mySeq from dual");
+        myDS.MoveNext;
+
+        commandText = "Insert into DOBJCODE_DBT (T_AUTOKEY, " +
+                      "                          T_BRANCH, " +
+                      "                          T_OBJECTTYPE, " +
+                      "                          T_CODEKIND, " + 
+                      "                          T_OBJECTID, " +
+                      "                          T_CODE, " +
+                      "                          T_USERID, " +
+                      "                          T_STATE, " +
+                      "                          T_BANKDATE, " +
+                      "                          T_SYSDATE, " +
+                      "                          T_SYSTIME, " +
+                      "                          T_NUMSESSION, " +
+                      "                          T_UNIQUE, " +
+                      "                          T_BANKCLOSEDATE) " +
+                      "  Values    ('"+string(int(myDS.mySeq))+"', " +
+                      "             " +var_BRANCH+ "," +
+                      "             3, " + 
+                      "             " + var_CODEKIND+"," + 
+                      "             '" +PartyID+"'," + 
+                      "             '"+var_CodeValue+"'," + 
+                      "             "+{Oper}+"," +
+                      "             0, " +
+                      "             trunc(sysdate-100), " +
+                      "             trunc(sysdate-100), " +
+                      "             TO_DATE('01.01.0001', 'DD.MM.YYYY'), " +
+                      "             0, " +
+                      "             'X', " +
+                      "             TO_DATE('01.01.0001', 'DD.MM.YYYY')) ";
+        sql_execute(commandText);
+        //println("Добавление субъекта:["+string(trim(rs.T_KOD))+"]["+trim(rs.T_NAIM)+"] " + "Код: [" + var_CODEKIND +"]. Значение: [" + var_CodeValue +"]" );
+        dat =  TRecord(trim(rs.T_KOD),trim(rs.T_NAIM),var_CODEKIND,"код нововведенный",trim(var_CodeValue));
+        protocol(protocol.size ()) = dat;                                                                                     
+     else
+        println("Невозможно добавить параметр. У данного субъекта период действия уже введенного ранее параметра перекрывает вновь вводимый." );
+     end;
+   else 
+     println("Невозможно добавить параметр для ФНС ид: [" + PartyID + "]. У другого субъекта  уже имеется параметр ["+var_CodeValue+"] для кода ["+var_CODEKIND+"]." );
+   end;
+  else 
+   myDS = SQL_ExecuteAndGetRs("  SELECT T_CODE " +
+                              "  FROM DOBJCODE_DBT " + 
+                              " where     T_STATE = 0 " +
+                              "       and T_OBJECTTYPE = 3 " +
+                              "       and T_CODEKIND = "+var_CODEKIND +
+                              "       and T_OBJECTID = "+PartyID);
+   myDS.MoveNext;
+   if ((trim(myDS.T_CODE) != trim(var_CodeValue)) and (var_CODEKIND == 16))
+      //Gurin S. N. 20.10.2012 C-14975
+      commandText =" BEGIN "+
+                   "   UPDATE   dobjcode_dbt " +
+                   "      SET   t_state = 1, "+
+                   "            t_bankclosedate = '" + {CurDate} + "' " +
+                   "    WHERE       T_OBJECTTYPE = 3 " +
+                   "            AND T_CODEKIND =" + var_CODEKIND +
+                   "            AND T_OBJECTID = " + PartyID +
+                   "            AND t_state = 0; "+
+                   "   INSERT INTO dobjcode_dbt (T_OBJECTTYPE," +
+                   "                             T_CODEKIND, " +
+                   "                             T_OBJECTID, " +
+                   "                             T_CODE, " +
+                   "                             T_STATE, " +
+                   "                             T_BANKDATE, " +
+                   "                             T_SYSDATE, " +
+                   "                             T_SYSTIME, " +
+                   "                             T_USERID, " +
+                   "                             T_BRANCH, " +
+                   "                             T_NUMSESSION, " +
+                   "                             T_UNIQUE, " +
+                   "                             T_BANKCLOSEDATE) " +
+                   "      VALUES   (3, " +
+                   "                " + var_CODEKIND + "," +
+                   "                " + PartyID + ", " +
+                   "                '" + trim(var_CodeValue) + "', " +
+                   "                0, " +
+                   "                TRUNC (SYSDATE - 100), " + //"'" + rs.value("t_datan") + "', " +  //
+                   "                TRUNC (SYSDATE - 100), " +
+                   "                TO_DATE ('01.01.0001', 'DD.MM.YYYY'), " +
+                   "                " + {Oper} + ", " +
+                   "                " + var_BRANCH + ", " +
+                   "                0, " +
+                   "                'X', " +
+                   "                TO_DATE ('01.01.0001', 'DD.MM.YYYY'));" +
+                   " END;";
+      //debugbreak;
+      sql_execute(commandText);
+      //println("Обновление субъекта:["+string(trim(rs.T_KOD))+"]["+trim(rs.T_NAIM)+"] " + "Старое значение:" + trim(myDS.T_CODE) + " Новое значение:"+trim(var_CodeValue));
+      //Gurin S. N. 20.10.2012 C-14975
+      dat =  TRecord(trim(rs.T_KOD),trim(rs.T_NAIM),var_CODEKIND,trim(myDS.T_CODE),trim(var_CodeValue));
+      protocol(protocol.size ()) = dat;
+   elif (trim(myDS.T_CODE) != trim(var_CodeValue)) //  Gurin S. N. 20.10.2012 C-14975
+      println("Требуется вручную изменить параметр ["+var_CodeValue+"] с кодом ["+var_CODEKIND+"]." );
+      println("Старое значение:"+trim(myDS.T_CODE));
+      println("Новое значение:"+trim(var_CodeValue));
+   end;
+  end;
+ end;
+
+ OnError(e);
+    println(commandText);
+    println("Error in MakeCommentForCurrPayment: (", e.Code, ") ", e.Message, " Модуль:", e.Module, " строка:", e.Line );
+   RETURN False;
+end;
+
+macro CreateParty(rs)
+  var myParty;
+  var mySQL;
+  var myCodes;
+  var myDS;
+  var myDS_Seq, myAutoKey;
+  myDS = null;
+  myDS = SQL_ExecuteAndGetRs("select count(*) myCount from DOBJCODE_DBT where T_OBJECTTYPE = 3 and T_CODEKIND = 28 and T_CODE = '"+rs.T_KOD+"'");
+  myDS.MoveNext;
+  if (int(myDS.myCount) == 0)
+     //println("Добавление субъекта:["+string(trim(rs.T_KOD))+"]["+trim(rs.T_NAIM)+"]");
+     myParty = RSBParty (true);
+  else
+     myDS = null;
+     myDS = SQL_ExecuteAndGetRs("select T_OBJECTID from DOBJCODE_DBT where T_OBJECTTYPE = 3 and T_CODEKIND = 28 and T_CODE = '"+rs.T_KOD+"'");
+     myDS.MoveNext;
+
+     //println("Обновление субъекта:["+string(trim(rs.T_KOD))+"]["+trim(rs.T_NAIM)+"]");
+     myParty = RSBParty (int(myDS.T_OBJECTID), false);
+  end;
+ 
+  myParty.LegalForm = int(1);
+// myParty.ShortName = string(trim(rs.T_KOD));
+  myParty.ShortName = string(trim(rs.T_NAIMK)); // KS 15.09.2010 Сокращенное наименование = Добавочное наименование
+  myParty.FullName = trim(rs.T_NAIM);
+  myParty.AddName = trim(rs.T_NAIMK);
+// myParty.USERFIELD1 = trim(rs.T_COMENT);     // KS 15.09.2010 Не требуется
+// myParty.OKPO = substr(trim(rs.T_COMENT), 11, 8);
+  myParty.NRCountry = "RUS";
+  if (ValType(rs.T_KODV) != V_UNDEF)
+     myParty.SuperiorID = trim(rs.T_KODV);
+  end;
+  myParty.update();
+
+  MakePartyCode (rs, int(myParty.PartyID), int(1), "ФНС"+trim(rs.T_KOD));
+  MakePartyCode (rs, int(myParty.PartyID), int(28), trim(rs.T_KOD));
+  if (strlen(trim(rs.T_INN)) > 0)
+      MakePartyCode (rs, int(myParty.PartyID), int(16), rs.T_INN+"/"+rs.T_KPP);
+  end;
+
+  myDS = SQL_ExecuteAndGetRs("select count(*) myCount from DPARTYOWN_DBT where T_PARTYKIND = 6 and T_PARTYID  = "+myParty.PartyID);
+  myDS.MoveNext;
+  if (int(myDS.myCount) == 0) // KS 15.09.2010 Если не является налоговым органом, то добавим
+      sql_execute(" BEGIN " +
+                  "    UPDATE DPARTYOWN_DBT " +
+                  "       SET T_PARTYKIND = 6, " +
+                  "           T_BRANCH     = " + {OperDprt} +
+                  "     WHERE T_PARTYID  = " + myParty.PartyID + ";"
+                  
+                  "  IF SQL%NOTFOUND " +
+                  "  THEN " +
+                  "     INSERT INTO DPARTYOWN_DBT(T_PARTYID, " +
+                  "                               T_PARTYKIND, " +
+                  "                               T_SUPERIOR, " + 
+                  "                               T_SUBKIND, " +
+                  "                               T_BRANCH, " +
+                  "                               T_NUMSESSION) " + 
+                  "          VALUES ( " + myParty.PartyID + ", " +
+                  "                  6, " +
+                  "                  0, " +
+                  "                  0, " +
+                  "                  " + {OperDprt} + ", " 
+                  "                  0); " +
+                  "  END IF; " +
+                  " END; ");     
+  end;
+end;
+
+ var i, rs;
+ /*
+ if (not CheckSOUNCountNum()) 
+     msgbox("Не у всех налоговых органов указан уникальный код."); 
+     exit(0); 
+ end;
+ */
+
+//ClearParty(); exit(0);
+//if (RunImport("..\\ImpExp\\SOUN\\") != 1)
+
+ var ПутьК_PATHTORESOURCE,Value_err;
+    GetRegistryValue("PRBB\\SOUN\\PATHTORESOURCE", V_STRING, ПутьК_PATHTORESOURCE, Value_err);
+    //ПутьК_PATHTORESOURCE = "..\\Import";
+    GetRegistryValue("BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/TEXTDIR", V_STRING, temppath, Value_err);
+    RunImport();
+    rs = SQL_ExecuteAndGetRs("select count(*) myCount from SOUN1_DBF where trim(t_datak) is null");
+    rs.MoveNext;
+    InitProgress (int(rs.myCount)); 
+   
+    //базовый запрос выбирающий только действующие налоговые органы
+    rs = SQL_ExecuteAndGetRs("    SELECT T_KOD, T_VID, T_KODP, nvl(trim(T_KODV), trim(T_KODP)) T_KODV, " +
+                             "           T_NAIMK, T_NAIM, T_PSONO, T_PUCH, T_POTCHDOK, T_POTCH, " +
+                             "           T_SPRO_U, T_SPRO_F, T_INN, T_KPP, T_ADRES, T_TEL, T_EMAIL, T_CITE, " +
+                             "           T_DOKUM, T_NOMDOK, T_DATADOK, T_DATAN, T_DATAK, T_COMENT " +
+                             "      FROM SOUN1_DBF " +
+                             "     where trim(T_DATAK) IS NULL" + // and t_kod = 0544 // and t_kod = 1665
+                             "  order by T_KODP");
+    i = 0; 
+    while (rs.MoveNext)
+       debugbreak;
+       CreateParty(rs);
+       i = i + 1; 
+       UseProgress (i); 
+    end; 
+    RemProgress (i);
+  PostMakeParty();
+  viewProtocol ();
+  RemoveFile(temppath);

@@ -1,0 +1,211 @@
+/*
+Макрос check_rec_lib.mac
+Заявка C-12522 контроль за  правильностью наименования получателя средств  в платежных  документах  внутрибанковских
+Котов Сергей 14.08.2012
+
+В  целях  усиления контроля за расчетами Клиентов и улучшения качества обслуживания необходимо
+ввести контроль за  правильностью наименования получателя средств  в платежных  документах  внутрибанковских.
+
+
+Контроль проведения документов в РКО юридич. лица/Рубли, полученных по Интернет-Клиент и
+обработанных ABBY от ИП и ЮЛ в пользу ИП и ЮЛ: балансовый  счет  по  кредиту 405, 407, 40802.
+БИК  банка-плательщика = БИК  банку-получателя ( для ПРББ  044525986 ).
+
+В случае несоответствия наименования р.счета получателя в ПП наименованию в справочнике Банка документы поступают
+в "Ожидающие ручной обработки". Далее документы  анализируются и зачисляются на р.счета получателей, 
+либо в Отказанные с причиной "Ошибка в наименовании получателя". Т.к. документы обработываются вручную необходимо 
+обеспечить  их просмотр по Alt+B  и проведение. просмотр сравнения наименований аналогично документам АРМ позиционера
+"Невыясненные  на ручной обработке"
+
+
+проведение по F2, выбрать ЗАЧИСЛИТЬ ОТКАЗ
+
+Следует учесть специфику отказа от электронных документов для ИнтернетКлиента и документов ABBY на бумажных носителях. 
+
+Начальник УОР        Фоменко О.Л.
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+*/
+
+import BankInter, PayInter, globals, KeyCodes;
+import "rmcmptl.mac";
+import oralib, likepy;
+ 
+private var   check_rec_acc = "405*,407*,40802*";
+        const check_rec_cancel = 0;
+        const check_rec_carry  = 1;
+        const check_rec_reject = 2;
+
+// Проверка документа на необходимость проверки
+macro need_check_recname(PaymentObj)
+
+  if( ( PaymentObj.dockind == PS_PAYORDER     ) and   // Контроль проведения документов в РКО юридич. лица/Рубли
+      (( PaymentObj.origin == 2100             )  or  // 2100 - ABBYY FC
+       ( PaymentObj.origin == 2                )) and // 2    - Клиент-Банк
+      ( PaymentObj.receiverbankid == {OurBank} ) and   // БИК  банка-плательщика = 
+      ( PaymentObj.payerbankid    == {OurBank} ) and   // БИК  банка-получателя
+      ( CompareStrWithMasks (check_rec_acc , PaymentObj.ReceiverAccount) == 0 ) // балансовый счет по кредиту 405, 407, 40802
+    )
+    return 1;
+  end;
+
+  return 0;
+ 
+end;
+
+// Проверка наименования получателя
+macro check_recname(PaymentObj)
+  // PaymentObj.ReceiverName
+  return СравнитьНаименования(PaymentObj.PaymentID);
+end;
+
+// Вызов диалога. Может возвратить 0 - отмена. 1 - зачислить. 2 - отвергнуть
+macro diag_recname(PaymentObj, hidebutton)
+
+//---------------------------
+//Current resource: P_CMPNMS lib: ..\obj\bank.lbr 
+//---------------------------
+  // Вызываю диалоговую панель
+  // Возвращаю ответ. 0 - отмена. 1 - зачислить. 2 - отвергнуть
+
+   var path = "",
+       pathfile = "",
+       filen = "chkrec.lbr";
+
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+   pathfile = FindPath(filen,path);
+	if (not pathfile)
+		msgbox("Не найдена LBR");
+		exit();
+	end;
+   var dlg;
+   if (hidebutton)
+     dlg = TRecHandler("P_CMPSML",pathfile,True);
+   else
+     dlg = TRecHandler("P_CMPNMS",pathfile,True);
+   end;
+   private var ret = check_rec_cancel;
+
+   /*Обработчик диалоговой панели ввода исходных данных для печати*/
+   MACRO Event (dlg, cmd, id, key) 
+      var mess = "Необходимо указать действие ~ESC~ Выход " ;
+      private var rs, cmd_rec, recid, addnames = "";
+
+      if(cmd == DLG_INIT)
+        // Заполняем поля
+        if (not hidebutton)
+          dlg.rec.RejGround = "Наименование получателя в платеже не совпадает с наименованием в системе";
+        end;
+        // В исходном документе - тут всё просто
+        dlg.rec.RecAcc    = PaymentObj.ReceiverAccount;
+        dlg.rec.RecINN    = PaymentObj.ReceiverINN;
+        dlg.rec.RecBIC    = PaymentObj.ReceiverBankCode;
+        dlg.rec.RecBank   = PaymentObj.ReceiverBankName;
+        dlg.rec.RecName   = PaymentObj.ReceiverName;
+        // В системе - через запросы
+        // Счет
+        cmd_rec = RSDCommand("select a.t_account, " +
+                             "       a.t_nameaccount, " +
+                             "       decode(a.t_open_close, 'X', 'Закрыт', 'Открыт') t_open_close, " +
+                             "       d.t_name BranchCode, " +
+                             "       p.t_name BranchName," +
+                             "       a.t_client" +
+                             "  from daccount_dbt a, ddp_dep_dbt d, dparty_dbt p " +
+                             " where a.t_account = ? " +
+                             "   and a.t_branch = d.t_code " +
+                             "   and p.t_partyid = d.t_partyid"
+                             );
+        cmd_rec.addParam("partyid", RSDBP_IN, PaymentObj.ReceiverAccount);
+        rs = RSDRecordset(cmd_rec);
+
+        if (rs.movenext)
+          dlg.rec.SysAcc            = rs.value(0);
+          dlg.rec.SysAccName        = rs.value(1);
+          dlg.rec.SysAccStat        = rs.value(2);
+          dlg.rec.SysAccBranchCode  = rs.value(3);
+          dlg.rec.SysAccBranchName  = rs.value(4);
+          recid = rs.value(5);
+        else
+          dlg.rec.SysAcc            =
+          dlg.rec.SysAccName        =
+          dlg.rec.SysAccStat        =
+          dlg.rec.SysAccBranchCode  =
+          dlg.rec.SysAccBranchName  = "";
+          recid = PaymentObj.Receiver;
+        end;
+        // Получатель
+        cmd_rec = RSDCommand("select p.t_name, p.t_shortname, p.t_addname, c.t_code " +
+                             "  From dparty_dbt p, dobjcode_dbt c " +
+                             " where p.t_partyid = ? " +
+                             "   and c.t_objecttype = 3 " +
+                             "   and c.t_codekind = 16 " +
+                             "   and c.t_objectid = p.t_partyid " +
+                             "   and c.t_state = 0 " +
+                             " order by c.t_bankdate desc"
+                             );
+        cmd_rec.addParam("partyid", RSDBP_IN, recid);
+        rs = RSDRecordset(cmd_rec);
+
+        if (rs.movenext)
+          dlg.rec.SysName           = rs.value(0);
+          dlg.rec.SysShortName      = rs.value(1);
+          dlg.rec.SysAddName        = rs.value(2);
+          dlg.rec.SysINN            = rs.value(3);
+        else
+          dlg.rec.SysName           =
+          dlg.rec.SysShortName      =
+          dlg.rec.SysAddName        =
+          dlg.rec.SysINN            = "";
+        end;
+
+        // Псевдонимы - запрос
+        cmd_rec = RSDCommand("select p.t_name from dpartyname_dbt p where p.t_partyid =  ? and t_nametypeid not in (1,2,3)");
+        cmd_rec.addParam("partyid", RSDBP_IN, recid);
+        rs = RSDRecordset(cmd_rec);
+        // Псевдонимы - собираем
+        while (rs.movenext)
+          addnames = addnames + rs.value(0) + "\n";
+        end;
+        // Псевдонимы - убираем лишний перенос строки
+        if (strlen(addnames)!=0)
+          addnames = substr(addnames,1,strlen(addnames)-1);
+        end;
+
+        dlg.rec.SysAddNames = addnames;
+
+        UpdateFields(dlg); 
+      end;
+      
+      if (cmd==DLG_SETFOCUS)
+        message(mess);        
+      end;
+      
+      if (cmd==DLG_BUTTON)
+        if  (FldName(dlg,id)=="BtCar");
+           ret = check_rec_carry;
+           return CM_CANCEL;
+        elif(FldName(dlg,id)=="BtRej");
+           ret = check_rec_reject;
+           return CM_CANCEL;
+        elif(FldName(dlg,id)=="BtCan");
+           ret = check_rec_cancel;
+           return CM_CANCEL;
+        end;       
+      end;
+
+      if (cmd==DLG_KEY)
+        if (KEY==KEY_ESC)
+           // Отмена
+           return CM_CANCEL;
+        end;
+      end;
+   END;
+
+   RunDialog(dlg, "Event");
+
+   return ret;
+
+end;
+
+
+//var PaymentObj = RSBPayment(48522738);
+//diag_recname(PaymentObj);

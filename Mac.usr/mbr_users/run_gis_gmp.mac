@@ -1,0 +1,527 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : run_gis_gmp.mac                                              */
+/*  Created     : 08.10.2014                                                   */
+/*  Programmer  : Chesnokov D.S.                                               */
+/*  Description : Макрос управления оракловыми планировщиками ГИС ГМП          */
+/*                и выпуск статистики работы данных планировщиков              */
+/*               16.07.2015 Chesnokov D.S. Правки для ГИС ГМП 1.16             */
+/*               09.12.2015 Chesnokov D.S. Дополнение протокола ошибок информа */
+/*                 цией о платеже                                              */
+/*******************************************************************************/
+import RsbFormsInter, RSD, rsexts, "KeyCodes.mac", "globals.mac", "gis_scroll.mac", "Календарь", "lib_sqltools.mac";
+
+private const FT_INT32 = 1, FT_STRING = 7, FT_DATE = 9,
+              FT_NUMSTR = 18, FT_NUMERIC = 25;
+
+macro GetStatJob(Name_Job:string)
+
+  var rs, str;
+  str = " SELECT DECODE (ENABLED, 'TRUE', 'ВКЛЮЧЕН', 'FALSE', 'ВЫКЛЮЧЕН', ENABLED) AS state " +
+        "   FROM user_scheduler_job_dests " +
+        "  WHERE job_name = '" + Name_Job + "'";
+  rs = RsdRecordSet(str);
+  if (rs and rs.MoveNext())
+    return rs.value(0);
+  end;
+  return "НЕ ОПРЕДЕЛЕНО";
+end;
+
+macro StartJob(Name_Job:string)
+  var str, cmd;
+  str = " Begin SYS.DBMS_SCHEDULER.ENABLE (NAME => '" + Name_Job + "'); END;";
+  cmd = RsdCommand(str);
+  cmd.Execute;
+  return true;
+  ONERROR
+    return false;
+end;
+
+macro StopJob(Name_Job:string)
+  var str, cmd;
+  str = " Begin SYS.DBMS_SCHEDULER.DISABLE(NAME  => '" + Name_Job + "', "+
+        "                                  FORCE => TRUE); END;";
+  cmd = RsdCommand(str);
+  cmd.Execute;
+  return true;
+  ONERROR
+    return false;
+end;
+
+Macro GetJobStat(NameJob:string, StarDate:date, Enddate:date, all_cnt, success_cnt, err_cnt)
+  
+  var rs, str;
+
+  //Общее количество запусков
+  str = "select count(0) from user_scheduler_job_run_details where JOB_NAME = '" + NameJob +
+        "' and req_start_date between to_date('" + StarDate + "','dd.mm.yyyy') and to_date('" + EndDate + "','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  if (rs and rs.MoveNext)
+    SetParm(3, int(rs.value(0)));
+  else
+    SetParm(3, 0);
+  end;
+  
+  //Количество успешных запусков
+  str = "select count(0) from user_scheduler_job_run_details where JOB_NAME = '" + NameJob +
+  "' and status = 'SUCCEEDED' and req_start_date between to_date('" + StarDate + "','dd.mm.yyyy') and to_date('" + EndDate + "','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  if (rs and rs.MoveNext)
+    SetParm(4, int(rs.value(0)));
+  else
+    SetParm(4, 0);
+  end;
+  
+  //Количество ошибочных запусков
+  str = "select count(0) from user_scheduler_job_run_details where JOB_NAME = '" + NameJob +
+  "' and status != 'SUCCEEDED' and req_start_date between to_date('" + StarDate + "','dd.mm.yyyy') and to_date('" + EndDate + "','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  if (rs and rs.MoveNext)
+    SetParm(5, int(rs.value(0)));
+  else
+    SetParm(5, 0);
+  end;
+  
+end;
+
+macro GetErrSendCht(StarDate:date, Enddate:date)
+  
+  var rs, str;
+  
+  str = "select count(0) from usr_gis_gmp_errsend_log_dbt where t_sysdate between to_date('"+StarDate+"','dd.mm.yyyy') " +
+                                                                            " and to_date('"+Enddate+"','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  if (rs and rs.MoveNext)
+    return int(rs.value(0));
+  else
+    return 0;
+  end;
+end;
+
+macro GetSendCht(StarDate:date, Enddate:date)
+
+  var rs, str;
+  
+  str = "select count(0) from usr_gis_gmp_sendmes_log_dbt where t_send_req_time between to_date('"+StarDate+"','dd.mm.yyyy') " +
+                                                                                   " and to_date('"+Enddate+"','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  
+  if (rs and rs.MoveNext)
+    return int(rs.value(0));
+  else
+    return 0;
+  end;
+end;
+
+macro GetReqCht(StarDate:date, Enddate:date)
+
+  var rs, str;
+  
+  str = "select count(0) from usr_gis_gmp_sendmes_log_dbt where t_get_resp_time between to_date('"+StarDate+"','dd.mm.yyyy') " +
+                                                                                   " and to_date('"+Enddate+"','dd.mm.yyyy')";
+  rs = RsdRecordSet(str);
+  
+  if (rs and rs.MoveNext)
+    return int(rs.value(0));
+  else
+    return 0;
+  end;
+end;
+
+macro CreateReport(p_StartDate, p_EndDate)
+  debugbreak;
+  var str, rs;
+  var all_cnt = 0, success_cnt = 0, err_cnt = 0;
+  var TxtPath = "", filename, errCode;
+  filename = strsubst(string(date),".","")+strsubst(string(time),":","")+{oper}+".txt";
+  
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TxtPath, errCode);
+  if ( errCode > 0 )
+     msgbox("Ошибка при определении директории TxtFile");
+     return 1;
+  else
+     TxtPath = substr(GetCurDir(false),1,index(StrUpr(GetCurDir(false)),"\\OBJ")) + substr(TxtPath,4)+"\\"+filename;
+  end;
+  
+  setoutput (TxtPath,true);
+  
+  if (p_StartDate == p_EndDate)
+    [                                            ПРОТОКОЛ РАБОТЫ ПЛАНИРОВЩИКОВ ГИС ГМП ЗА ##########](p_StartDate);
+    
+  else
+    [                                            ПРОТОКОЛ РАБОТЫ ПЛАНИРОВЩИКОВ ГИС ГМП ЗА ПЕРИОД С ########## ПО ##########](p_StartDate, p_EndDate);
+  end;
+  
+  //Так как ориентироваться будем через timestamp, то к концу периода прибавим +1 день
+  p_EndDate = p_EndDate + 1;
+  [ 
+
+  ];
+  
+  GetJobStat("GIS_GMP_SENDMES_JOB", p_StartDate, p_EndDate, all_cnt, success_cnt, err_cnt);
+  [  СОСТОЯНИЕ ПЛАНИРОВЩИКА ОТПРАВКИ СООБЩЕНИЙ:  ###############  КОЛ-ВО ЗАПУСКОВ: ######, УСПЕШНЫХ: ######, ОШИБОК: ###### ]
+  (GetStatJob("GIS_GMP_SENDMES_JOB"), all_cnt, success_cnt, err_cnt);
+  
+  GetJobStat("GIS_GMP_STATUS_JOB", p_StartDate, p_EndDate, all_cnt, success_cnt, err_cnt);
+  [  СОСТОЯНИЕ ПЛАНИРОВЩИКА ПОЛУЧЕНИЯ СТАТУСА:   ###############  КОЛ-ВО ЗАПУСКОВ: ######, УСПЕШНЫХ: ######, ОШИБОК: ###### ]
+  (GetStatJob("GIS_GMP_STATUS_JOB"), all_cnt, success_cnt, err_cnt);
+  
+  [ 
+
+  ];
+  
+  err_cnt = GetErrSendCht(p_StartDate, p_EndDate);
+  [  КОЛ-ВО ОШИБОК ОТПРАВКИ СООБЩЕНИЙ:  ########](err_cnt);
+  
+  if (err_cnt != 0)
+    [  ┌────────────────────┬───────────┬─────────────────────────────────────────────────────────────┬──────┬──────────┬────────────┬──────────┬─────┬──────┬─────────────────────────┬────────────────────┬────────────────────┐
+       │     Дата ошибки    │  ID инф.  │                       Текст ошибки                          │ Шлюз │    ID    │    Дата    │   Номер  │ ВСП │ Опер.│      Происхождение      │  Счет плательщика  │   Счет получателя  │
+       │                    │ сообщения │                                                             │ н/д  │  платежа │   платежа  │  платежа │     │      │         платежа         │                    │                    │];
+    
+    startQueryCapture();
+    [
+      WITH err
+             AS (SELECT /*+Materialize*/ TO_CHAR (t_sysdate, 'dd.mm.yyyy hh24:mi:ss') AS t_date,
+                        t_infoid,
+                        usr_gis_gmp_util.parsererrxml (t_response) AS t_err_data,
+                        NVL (t_offline_ug, ' ') AS t_offline_ug
+                 FROM usr_gis_gmp_errsend_log_dbt WHERE t_sysdate between :1 AND :2),
+          err_inf
+             AS (SELECT e.*,
+                        UTL_RAW.cast_to_varchar2(DBMS_LOB.SUBSTR (inf.t_fmtblobdata_xxxx,
+                                                                  200
+                                                 ))
+                           AS t_paymentid
+                 FROM err e, dwlinfo_dbt inf
+                 WHERE inf.t_infoid = e.t_infoid),
+          err_paym
+             AS (SELECT inf.t_date,
+                        inf.t_infoid,
+                        inf.t_err_data,
+                        inf.t_offline_ug,
+                        REGEXP_SUBSTR (SUBSTR (inf.t_paymentid, INSTR (inf.t_paymentid, 'ID платежа:') + 11), '[[:digit:]]{4,}') AS t_paymentid
+                 FROM err_inf inf)
+      SELECT t.t_paymentid, TO_CHAR(pm.t_valuedate, 'dd.mm.yyyy') as t_valuedate , prop.t_number, d.t_name as t_vsp, pm.t_oper, pm.t_payeraccount, pm.t_receiveraccount,
+             CASE pm.t_dockind
+             WHEN 16
+             THEN
+             'ББ-> '||
+             (SELECT t_code
+                FROM dllvalues_dbt ll
+               WHERE t_list = 1665 AND t_element = pm.t_origin)
+             WHEN 201
+             THEN
+             'РКО-> '||(SELECT t_code
+                FROM dllvalues_dbt ll
+               WHERE t_list = 1665 AND t_element = ord.t_origin)   
+             ELSE
+               'РКО'
+             END as t_origin,                               
+             t.t_date, t.t_infoid, t.t_err_data, t.t_offline_ug 
+        FROM err_paym t INNER JOIN dpmpaym_dbt pm ON (t.t_paymentid = pm.t_paymentid)
+                        INNER JOIN dpmrmprop_dbt prop ON (t.t_paymentid = prop.t_paymentid)
+                         LEFT JOIN dpspayord_dbt ord ON (t.t_paymentid = ord.t_orderid)
+                        INNER JOIN ddp_dep_dbt d ON (d.t_code = pm.t_opernode) 
+    ];
+    str = endQueryCapture();
+    rs = RsdCommand(str);
+    rs.addParam(":1", RSDBP_IN, p_StartDate );
+    rs.addParam(":2", RSDBP_IN, p_EndDate   );
+    rs = RsdRecordset(rs);
+    While(rs.MoveNext())
+      [  ├────────────────────┼───────────┼─────────────────────────────────────────────────────────────┼──────┼──────────┼────────────┼──────────┼─────┼──────┼─────────────────────────┼────────────────────┼────────────────────┤
+         │####################│###########│ ########################################################### │ #### │##########│############│##########│#####│ #####│#########################│####################│####################│
+      ](rs.value("t_date"), rs.value("t_infoid"), rs.value("t_err_data"):w, rs.value("t_offline_ug"):c, rs.value("t_paymentid"),
+        rs.value("t_valuedate"), rs.value("t_number"):r, rs.value("t_vsp"):c, rs.value("t_oper"), rs.value("t_origin"):w, rs.value("t_payeraccount"), rs.value("t_receiveraccount")); 
+    end;
+      [  └────────────────────┴───────────┴─────────────────────────────────────────────────────────────┴──────┴──────────┴────────────┴──────────┴─────┴──────┴─────────────────────────┴────────────────────┴────────────────────┘];
+  end;
+  
+  [ 
+
+  ];
+  
+  all_cnt = GetSendCht(p_StartDate, p_EndDate);
+  [  ОТПРАВЛЕНО СООБЩЕНИЙ ВСЕГО:  ##########](all_cnt);
+
+  str = "SELECT COUNT(0) FROM usr_gis_gmp_sendmes_log_dbt WHERE t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+                                  " and to_date('"+p_EndDate+"','dd.mm.yyyy') /*AND t_status_resp = 1*/";
+  rs = RsdRecordSet(str);
+  if (rs and rs.moveNext())
+    all_cnt = int(rs.value(0));
+  else
+    all_cnt = 0;
+  end;
+
+  str = "SELECT COUNT(0) FROM usr_gis_gmp_sendmes_log_dbt WHERE t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+                                  " and to_date('"+p_EndDate+"','dd.mm.yyyy') /*AND t_status_resp = 1*/ AND t_resp_err_code = '0'";
+  rs = RsdRecordSet(str);
+  if (rs and rs.moveNext())
+    success_cnt = int(rs.value(0));
+  else
+    success_cnt = 0;
+  end;
+
+
+  str = "SELECT   COUNT (0) "+
+        "  FROM   usr_gis_gmp_sendmes_log_dbt LOG "+
+        " WHERE    LOG.t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+        "                                  and to_date('"+p_EndDate+"','dd.mm.yyyy') "+
+        "      AND LOG.t_resp_err_code != '0' "+
+        "      AND LOG.t_resp_err_code != CHR (0) "+
+        "      AND LOG.t_send_req_time = (SELECT MAX (t_send_req_time) "+  //Gurin S. 23.05.2016 берем актуальную запись
+        "                           FROM usr_gis_gmp_sendmes_log_dbt "+
+        "                          WHERE t_payment_id = LOG.t_payment_id)";
+
+  rs = RsdRecordSet(str);
+  if (rs and rs.moveNext())
+    err_cnt = int(rs.value(0));
+  else
+    err_cnt = 0;
+  end;
+
+  [            "ОТВЕТ ГОТОВ":     ##########,  ОБРАБОТАНО УСПЕШНО:  ###########,  ОШИБОК:  ##########](all_cnt, success_cnt, err_cnt);
+  
+//  str = "SELECT COUNT(0) FROM usr_gis_gmp_sendmes_log_dbt WHERE t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+//                                  " and to_date('"+p_EndDate+"','dd.mm.yyyy') AND t_status_resp = 2";
+//  rs = RsdRecordSet(str);
+//  if (rs and rs.moveNext())
+//    all_cnt = int(rs.value(0));
+//  else
+//    all_cnt = 0;
+//  end;
+  
+//  [         "ОТВЕТ НЕ ГОТОВ":     ##########](all_cnt);
+  
+
+//  str = "SELECT COUNT(0) FROM usr_gis_gmp_sendmes_log_dbt WHERE t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+//                                  " and to_date('"+p_EndDate+"','dd.mm.yyyy') AND t_status_resp not in (0, 1, 2)";
+//  rs = RsdRecordSet(str);
+//  if (rs and rs.moveNext())
+//    all_cnt = int(rs.value(0));
+//  else
+//    all_cnt = 0;
+//  end;
+  
+//  [         "ПРОЧИЕ СТАТУСЫ":     ##########](all_cnt);
+
+
+  
+  str = "SELECT COUNT(0) FROM usr_gis_gmp_sendmes_log_dbt WHERE t_send_req_time between to_date('"+p_StartDate+"','dd.mm.yyyy') " +
+                                  " and to_date('"+p_EndDate+"','dd.mm.yyyy') AND t_resp_err_code = chr(0)";
+  rs = RsdRecordSet(str);
+  if (rs and rs.moveNext())
+    all_cnt = int(rs.value(0));
+  else
+    all_cnt = 0;
+  end;
+  
+  [  ОЖИДАЕТ В ОЧЕРЕДИ ШЛЮЗА:     ##########](all_cnt);
+  
+  [ 
+
+  ];
+  
+  all_cnt = GetReqCht(p_StartDate, p_EndDate);
+  [  ПОЛУЧЕНО СТАТУСОВ ВСЕГО:     ##########](all_cnt);
+  
+  setoutput (null,true);
+  viewfile(TxtPath);
+end;
+
+class(TRsbPanel) Date_Panel();
+  InitTRsbPanel();
+  setCaption("Укажите период");
+  SetStatus("~F2, F9~ Посмотреть статистику и ошибки, ~F3~ Календарь, ~F5~ Посмотреть скроллинг");
+  
+  setPosition(21,8);//определим положение на экране
+  setSize(33,6);//определяем размеры
+  
+  var StartDate:TRsbLabel = TRsbLabel(3, 2, "Начало периода:");
+  var EndDate:TRsbLabel = TRsbLabel(3, 4, "Конец  периода:");
+  
+  var val_StartDate:date = {curdate};
+  var val_EndDate:date = {curdate};
+
+  var f_StartDate:TRsbEditField = TRsbEditField(FT_DATE);
+  var f_EndDate:TRsbEditField = TRsbEditField(FT_DATE);
+
+  addLabel(StartDate);
+  addLabel(EndDate);
+  
+  f_StartDate.bindValue(this, "val_StartDate");
+  f_StartDate.SetPosition(21, 2);
+  f_StartDate.setSize(10,1);
+  f_StartDate.Editable = true;
+  f_StartDate.Focusable = true;
+  f_StartDate.Name = "StartDate";
+  AddControl(f_StartDate);
+  
+  f_EndDate.bindValue(this, "val_EndDate");
+  f_EndDate.SetPosition(21, 4);
+  f_EndDate.setSize(10,1);
+  f_EndDate.Editable = true;
+  f_EndDate.Focusable = true;
+  f_EndDate.Name = "EndDate";
+  AddControl(f_EndDate);
+  
+  addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "PressKey_Date_Panel"));
+  
+  macro PressKey_Date_Panel(RsbEvent:object)
+    if ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "StartDate"))
+      f_StartDate.Value = GetDateByCalendar(f_StartDate.Value);
+    elif ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "EndDate"))
+      f_EndDate.Value = GetDateByCalendar(f_EndDate.Value);
+    elif ((RsbEvent.KeyCode == KEY_F2) or (RsbEvent.KeyCode == KEY_F9))
+      if(f_StartDate.Value > f_EndDate.Value)
+        msgbox("Дата конца периода больше даты начала");
+      else
+        CreateReport(f_StartDate.Value, f_EndDate.Value);
+        this.hide();
+      end;
+    elif (RsbEvent.KeyCode == KEY_F5)
+      Monitor_Show (f_StartDate.Value, f_EndDate.Value);
+      this.hide();
+    end;
+  end;
+  
+end;
+
+
+class(TRsbPanel) MainPanel();
+
+  InitTRsbPanel();
+  setCaption("Панель управления обработчиками ГИС ГМП");
+  SetStatus("~Esc~ Выход ~F7~ Отчет о параметрах работы");
+  
+  setPosition(14,9);//определим положение на экране
+  setSize(56,9);//определяем размеры
+  
+  Var NameButtonMes, NameButtonStat;
+  
+  var labelSendMes:TRsbLabel = TRsbLabel(3, 3, "Отправка сообщений :");
+  var labelGetStat:TRsbLabel = TRsbLabel(3, 5, "Получение статуса  :");
+  
+  var val_Stat_SendMes:STRING = "";
+  var val_Stat_GetStat:STRING = "";
+  
+  var Stat_SendMes:TRsbEditField = TRsbEditField(FT_STRING);
+  var Stat_GetStat:TRsbEditField = TRsbEditField(FT_STRING);
+
+  var Start_Mes:TRsbPushButton  = TRsbPushButton("Включить");
+  var Stop_Mes:TRsbPushButton   = TRsbPushButton("Выключить");
+  var Start_Stat:TRsbPushButton = TRsbPushButton("Включить");
+  var Stop_Stat:TRsbPushButton  = TRsbPushButton("Выключить");
+  
+  addLabel(labelSendMes);
+  addLabel(labelGetStat);
+  
+  Stat_SendMes.bindValue(this, "val_Stat_SendMes", 10);
+  Stat_SendMes.SetPosition(18, 3);
+  Stat_SendMes.setSize(10,1);
+  Stat_SendMes.Editable = false;
+  Stat_SendMes.Focusable = false;
+  Stat_SendMes.Name = "Stat_SendMes";
+  Stat_SendMes.Value = GetStatJob("GIS_GMP_SENDMES_JOB");
+  AddControl(Stat_SendMes);
+  
+  Stat_GetStat.bindValue(this, "val_Stat_GetStat", 10);
+  Stat_GetStat.SetPosition(18, 5);
+  Stat_GetStat.setSize(10,1);
+  Stat_GetStat.Editable = false;
+  Stat_GetStat.Focusable = false;
+  Stat_GetStat.Name = "Stat_GetStat";
+  Stat_GetStat.Value = GetStatJob("GIS_GMP_STATUS_JOB");
+  AddControl(Stat_GetStat);
+  
+  Start_Mes.SetPosition(31, 3);
+  Start_Mes.setSize(10);
+  Start_Mes.Name = "Start_Mes";
+  Start_Mes.OnClicked(R2M(this, "Start_Click_Mes"));
+  AddControl(Start_Mes);
+  
+  Stop_Mes.SetPosition(43, 3);
+  Stop_Mes.setSize(10);
+  Stop_Mes.Name = "Start_Mes";
+  Stop_Mes.OnClicked(R2M(this, "Stop_Click_Mes"));
+  AddControl(Stop_Mes);
+  
+  Start_Stat.SetPosition(31, 5);
+  Start_Stat.setSize(10);
+  Start_Stat.Name = "Start_Stat";
+  Start_Stat.OnClicked(R2M(this, "Start_Click_Stat"));
+  AddControl(Start_Stat);
+  
+  Stop_Stat.SetPosition(43, 5);
+  Stop_Stat.setSize(10);
+  Stop_Stat.Name = "Start_Stat";
+  Stop_Stat.OnClicked(R2M(this, "Stop_Click_Stat"));
+  AddControl(Stop_Stat);
+  
+  //обработаем кнопку включить отправки сообщения
+  macro Start_Click_Mes(RsbEvent)
+    if (RsbEvent.id == RSB_EV_BUTTON_CLICKED)
+      if (GetStatJob("GIS_GMP_SENDMES_JOB") == "ВЫКЛЮЧЕН")
+        if (StartJob("GIS_GMP_SENDMES_JOB"))
+          Stat_SendMes.Value = GetStatJob("GIS_GMP_SENDMES_JOB");
+        else
+          msgbox("Не могу включить указанное задание");
+        end;
+      end;
+    end;
+  end;
+  //обработаем кнопку выключить отправки сообщения
+  macro Stop_Click_Mes(RsbEvent)
+    if (RsbEvent.id == RSB_EV_BUTTON_CLICKED)
+      if (GetStatJob("GIS_GMP_SENDMES_JOB") == "ВКЛЮЧЕН")
+        if (StopJob("GIS_GMP_SENDMES_JOB"))
+          Stat_SendMes.Value = GetStatJob("GIS_GMP_SENDMES_JOB");
+        else
+          msgbox("Не могу отключить указанное задание");
+        end;
+      end;
+    end;
+  end;
+  //обработаем кнопку включить сборку статуса
+  macro Start_Click_Stat(RsbEvent)
+    if (RsbEvent.id == RSB_EV_BUTTON_CLICKED)
+      if (GetStatJob("GIS_GMP_STATUS_JOB") == "ВЫКЛЮЧЕН")
+        if (StartJob("GIS_GMP_STATUS_JOB"))
+          Stat_GetStat.Value = GetStatJob("GIS_GMP_STATUS_JOB");
+        else
+          msgbox("Не могу включить указанное задание");
+        end;
+      end;
+    end;
+  end;
+  //обработаем кнопку выключить сборку статуса
+  macro Stop_Click_Stat(RsbEvent)
+    if (RsbEvent.id == RSB_EV_BUTTON_CLICKED)
+      if (GetStatJob("GIS_GMP_STATUS_JOB") == "ВКЛЮЧЕН")
+        if (StopJob("GIS_GMP_STATUS_JOB"))
+          Stat_GetStat.Value = GetStatJob("GIS_GMP_STATUS_JOB");
+        else
+          msgbox("Не могу отключить указанное задание");
+        end;
+      end;
+    end;
+  end;
+  
+  addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "PressKey_MainPanel"));
+  
+  /*Обработаем клавишу F7*/
+  macro PressKey_MainPanel(RsbEvent:object)
+    if(RsbEvent.KeyCode == KEY_F7)
+      var dt_pan:TRsbPanel = Date_Panel;
+      dt_pan.run;
+      SetStatus("~Esc~ Выход ~F7~ Отчет о параметрах работы");
+    elif(RsbEvent.KeyCode == KEY_ESC)
+      //this.close();
+    end;
+  end;
+end;
+
+  var panel:TRsbPanel = MainPanel;
+  panel.run;
+  exit(1);

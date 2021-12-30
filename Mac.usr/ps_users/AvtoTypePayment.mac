@@ -1,0 +1,271 @@
+//определение Типа платежа и блокировки банка получателя
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+import PTInter, oralib;
+import "likepy.mac";
+import "fg_Life_parm.mac",globals; // KS 25.01.2011 Для ГЭБ
+import PaymInter;
+
+//SDA 08.06.2012 - "тонкие" правила перечисления платежей требуются только для регионов,
+//работающих через расчетный центр ПРББ
+private var fgBank = fg_life_subject({OurBank});
+
+//SDA  устанавливаем  реквизиты транспорта межбанковского платежа 
+macro DefMessRelForPm(PaymentID, TpSchemID, RlsFormID);
+   private var cmd,SQL,retval = 0;     
+   var params:Tarray;
+   SQL = "UPDATE dpmprop_dbt";
+   SQL = SQL + "\n   SET t_tpid = 0, ";
+   SQL = SQL + "\n       t_tpschemid = 0, "; 
+   SQL = SQL + "\n       t_rlsformid = 0, ";
+   SQL = SQL + "\n       t_SUBKINDMESSAGE  = 1,";
+   SQL = SQL + "\n       t_corrpostype = 0 ";
+   SQL = SQL + "\n  WHERE t_paymentid = "+ PaymentID;
+   SQL = SQL + "\n    AND t_debetcredit = 1";
+   rsdcommand(SQL).execute;
+
+   SQL = "UPDATE dpmpaym_dbt";
+   SQL = SQL + "\n   SET T_RECEIVERMESBANKID = 0 ";
+   SQL = SQL + "\n  WHERE t_paymentid = "+ PaymentID;
+   rsdcommand(SQL).execute;
+
+   params = makeArray( SQLParam("PaymentID"    , PaymentID ),
+                       SQLParam( "TpID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "TpShemID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "FormID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "RlsFormID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "InNoControl", V_STRING, RSDBP_OUT )
+                     );
+   retval = execStoredFunc( "wld_common.DefineMessageReleaseForPm", V_INTEGER, params );
+
+   //Gurin S. 22.12.2014 C-36270-7
+   SetParm(1, params.value(2).value);
+   SetParm(2, params.value(4).value);
+end;
+
+//SDA 29.03. 2012 при установленном системном типе позиционирования, вызов wld_common.DefineMessageReleaseForPm изменяет схему расчетов. Пришлось отказаться от SetReseiverPI     
+macro SetCorshemRCC(PaymentID);
+   private var cmd,SQL,retval = 0;
+   var params:Tarray;
+   SQL = "UPDATE dpmprop_dbt";
+   SQL = SQL + "\n   SET t_tpid = 9, ";
+   SQL = SQL + "\n       T_CORSCHEM = 1, "; 
+   SQL = SQL + "\n       t_tpschemid = 0, "; 
+   SQL = SQL + "\n       t_rlsformid = 0, ";
+   SQL = SQL + "\n       t_SUBKINDMESSAGE  = 1,";
+   SQL = SQL + "\n       t_corrpostype = 1 ";
+   SQL = SQL + "\n  WHERE t_paymentid = "+ PaymentID;
+   SQL = SQL + "\n    AND t_debetcredit = 1";
+   rsdcommand(SQL).execute;
+
+   SQL = "UPDATE dpmpaym_dbt";
+   SQL = SQL + "\n   SET T_RECEIVERMESBANKID = T_RECEIVERBANKID ";
+   SQL = SQL + "\n  WHERE t_paymentid = "+ PaymentID;
+   rsdcommand(SQL).execute;
+
+   params = makeArray( SQLParam("PaymentID"    , PaymentID ),
+                       SQLParam( "TpID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "TpShemID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "FormID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "RlsFormID", V_INTEGER, RSDBP_OUT ),
+                       SQLParam( "InNoControl", V_STRING, RSDBP_OUT )
+                     );
+   retval = execStoredFunc( "wld_common.DefineMessageReleaseForPm", V_INTEGER, params );
+end;
+
+
+//SDA "тонкие" правила перечисления платежей 
+macro SetMFORule(PaymentID);
+   const WL_SCHEME_RCC_810  = 1;
+   const WL_SCHEME_PRBB_810 = 2;
+   private var PaymentObj:object;
+   private var errCode, errCode1=0,errCode2=0;
+   var Dtmask,KtMask,PackMask;
+   //SDA 08.06.2012 - "тонкие" правила перечисления платежей требуются только для регионов, работающих через расчетный центр ПРББ
+   if ( fgBank.is_PRBB )
+      return;
+   end;
+
+   //SDA "тонкие" правила перечисления платежей 
+    if ((ValType(PaymentId) != v_undef) and (PaymentId > 0))// платеж уже сохранен 
+      PaymentObj = RsbPayment(PaymentId);
+      if (PaymentObj.OutCorschem == WL_SCHEME_RCC_810)  //устанавливаем системное позиционирование на 1 схему расчетов 
+         SetCorshemRCC(PaymentID);
+         PaymentObj.FutureReceiverAccount = GetCorAcc( 0, 1 , CORS_ACC_ACCOUNT );
+         PaymentObj.SetReceiverPI( PAYMENTS_GROUP_EXTERNAL, 
+                                   PaymentObj.ReceiverBankID, 
+                                   PaymentObj.ReceiverBankCodeKind, 
+                                   PaymentObj.ReceiverBankCode, 
+                                   PaymentObj.ReceiverBankName,
+                                   PaymentObj.ReceiverBankCorrAcc,
+                                   PaymentObj.ReceiverFIID, 
+                                   PaymentObj.chapter,
+                                   PaymentObj.ReceiverAccount, 
+                                   null, 
+                                   PaymentObj.ReceiverName, 
+                                   PaymentObj.ReceiverINN,
+                                   null,
+                                   null,
+                                   WL_SCHEME_RCC_810, /* Corschem = РКЦ */
+                                   /*PM_CORRPOS_TYPE_USER*/ PM_CORRPOS_TYPE_SYSTEM); 
+      elif  (PaymentObj.OutCorschem == WL_SCHEME_PRBB_810) 
+      /*SDA - проверка только для платежей которые хочут пойти по пайментс на ПРББ */     
+         GetRegistryValue ( "PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\DTMASKRCC", V_STRING, Dtmask, errCode1 );
+         GetRegistryValue ( "PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\KTMASKRCC", V_STRING, KtMask, errCode2 );
+         // 08.06.2012 SDA - перенес доработку из локального макроса ВУЗ-а
+         // 2011-12-07 joy C-7515 Если отправляем на ПРББ - нужно установить позиционирование на payments
+         if ((PaymentObj.ReceiverBankCode == "044525986") and (PaymentObj.ReceiverBankCodeKind == 3))
+            return;
+         end;
+         /* по корреспонденции счетов - перечислене "обналичильщиков" только через РКЦ
+         * Дт   405-407,40802*,40807*  
+         * Кт 423*,426*,40817*,30232*,47422* 
+         */
+         if  ( ((errCode2 == 0) and (CompareStrWithMasks (KtMask, paymentObj.ReceiverAccount) == 0)  )
+            and  ((errCode1 == 0) and (CompareStrWithMasks (Dtmask, paymentObj.PayerAccount   ) == 0)))
+            SetCorshemRCC(PaymentID);
+            PaymentObj.FutureReceiverAccount = GetCorAcc( 0, 1 , CORS_ACC_ACCOUNT );
+            PaymentObj.SetReceiverPI( PAYMENTS_GROUP_EXTERNAL, 
+                                      PaymentObj.ReceiverBankID, 
+                                      PaymentObj.ReceiverBankCodeKind, 
+                                      PaymentObj.ReceiverBankCode, 
+                                      PaymentObj.ReceiverBankName,
+                                      PaymentObj.ReceiverBankCorrAcc,
+                                      PaymentObj.ReceiverFIID, 
+                                      PaymentObj.chapter,
+                                      PaymentObj.ReceiverAccount, 
+                                      null, 
+                                      PaymentObj.ReceiverName, 
+                                      PaymentObj.ReceiverINN,
+                                      null,
+                                      null,
+                                      WL_SCHEME_RCC_810, /* Corschem = РКЦ */
+                                      PM_CORRPOS_TYPE_USER /* PM_CORRPOS_TYPE_SYSTEM*/); 
+         end;
+      end;
+   end;
+end;
+
+
+macro AvtoTypePaymEx(R_BankPartyID, pm_type, bnk_stat,valut, ReceiverBankCode, ShifrOper, PaymentId)
+   var Bank_UER,BIC_RKC,RKC_UER, char;
+   var rs;
+   var cmd = RSDCommand(
+                   " SELECT dprt.t_uer as u1, dprt.t_bic_rcc, dprt1.t_uer as u2, dprt.T_lock, dprt.t_real "+
+                   " FROM dbankdprt_dbt dprt, dobjcode_dbt cod, dbankdprt_dbt dprt1 "+
+                   " WHERE cod.T_OBJECTTYPE = 3 "+                 
+                   " AND cod.t_codekind = 3 "+                 
+                   " AND dprt.t_bic_rcc = cod.t_code "+
+                   " AND cod.t_objectid = dprt1.t_partyid "+
+                   " AND dprt.t_partyid = ?"
+                          );
+   cmd.addParam("rb",RSDBP_IN, R_BankPartyID );
+   rs = RSDRecordset(cmd);
+   if( rs.moveNext() )
+      Bank_UER = rs.value("u1");
+      BIC_RKC = rs.value("t_bic_rcc");
+      RKC_UER = rs.value("u2");
+      If(pm_type == "С")
+         char = "С";
+      ELIf(pm_type == "П")
+         char = "П";
+      ELIf((Bank_UER==2)or(Bank_UER==3)) 
+         //TAM 11.07.2013 R-216001-2
+         char = "Н"; //char = "Э";
+      Elif (((Bank_UER==0)or(Bank_UER==1)or(Bank_UER==4)or(Bank_UER==5))AND((RKC_UER==1)or(RKC_UER==3)or(RKC_UER==4)or(Bank_UER==4)or(Bank_UER==5)))
+         //TAM 11.07.2013 R-216001-2
+         char = "Н"; //char = "Э";
+      Else
+         char = "П";
+      End;
+
+      bnk_stat = "";
+      If (rs.value("T_lock")=="X")
+         bnk_stat="Заблокирован";
+      else
+         if(rs.value("T_real")!=StrFor (1))
+            cmd = RSDCommand(
+                            "select t_note "+ 
+                              "from dllvalues_dbt "+
+                             "where t_list=1900 "+
+                               "and t_code =?");
+
+            cmd.addParam("real",RSDBP_IN, rs.value("T_real") );
+            rs = RSDRecordset(cmd);
+            if (rs.movenext)
+               bnk_stat = rs.value(0);
+            end;
+         end;
+      end;
+
+      setparm(2,bnk_stat);
+      //Если платеж был валютный, то вернуть надо только статус банка
+      if (valut != 0)
+         return true;
+      end;
+   else
+      MsgBox("Не найден банк получателя или его РКЦ");
+      char = "П";
+   end;
+   //доп проверки региона и вида платежа
+   // KS 25.01.2011 Для ГЭБ
+   private var Edoc = false, errCode, errCode1,errCode2;
+   if (char != "С")
+      if ((((
+          (substr({MFO_Bank},1,4) == "0445") and 
+          (substr(ReceiverBankCode,1,4) != "0445") and 
+          (substr(ReceiverBankCode,1,4) != "0424") and 
+          (substr(ReceiverBankCode,1,4) != "0446")
+          )  or //SDA - 13.06.2012 - для региональных
+          ( (substr({MFO_Bank},1,4) != "0445") and
+            (substr(ReceiverBankCode,1,4) != (substr({MFO_Bank},1,4)))
+
+          ) ) 
+         )
+         and (ShifrOper!="01"))
+         GetRegistryValue("PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ДПП_ТЕКУЩИМ_ДНЕМ\\ПОЧТОВЫЕ\\МЕЖРЕГИОН В ЭЛЕКТРОННОМ ВИДЕ", v_bool, Edoc, errCode); 
+         if ((errCode != 0) or (not Edoc))
+            char = "П";
+         else
+            //TAM 11.07.2013 R-216001-2
+            char = "Н"; //char = "Э";
+         end;
+      else
+         //TAM 11.07.2013 R-216001-2
+         char = "Н"; //char = "Э";
+      end;
+   end;
+   setparm(1,char);
+end;
+
+macro AvtoTypePaym(PaymObj, bnk_stat)
+   AvtoTypePaymEx(
+                  PaymObj.ReceiverBankID, 
+                  PaymObj.PaymentKind,
+                  bnk_stat,
+                  PaymObj.BaseFIID,
+                  PaymObj.ReceiverBankCode, 
+                  PaymObj.ShifrOper,
+                  PaymObj.PaymentId
+                  );
+   /*SDA 06.04.2012 - история с обналичивальщиками - продолжается */
+   SetMFORule(PaymObj.PaymentId);
+end;
+
+//!!!Seleznev
+macro GetPmtypeByID(pmid)
+   var pm_type, bnk_stat;
+   var cmd = RSDCommand(
+                         "select   pm.t_receiverbankid, pm.t_basefiid, pr.t_bankcode, pmr.t_shifroper " +
+                         "  from   dpmpaym_dbt pm, dpmrmprop_dbt pmr, dpmprop_dbt pr " +
+                         " where       pm.t_paymentid = ? " +
+                         "         and pmr.t_paymentid = pm.t_paymentid " +
+                         "         and pr.t_paymentid = pm.t_paymentid " +
+                         "         and t_debetcredit = 1 "
+                        );
+   cmd.addparam("pmid", RSDBP_IN, pmid);
+   var rs = RSDRecordset(cmd);
+   if (rs.movenext)//Lavrenov: 29.03.2012 Добавил pmid в вызов процедуры. 
+      AvtoTypePaymEx(rs.value(0) , pm_type, bnk_stat, rs.value(1), rs.value(2), rs.value(3),pmid);
+      return pm_type;
+   end;
+end;

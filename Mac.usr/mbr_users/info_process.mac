@@ -1,0 +1,240 @@
+//Gurin S. 28.03.2014 Загрузка информационных сообщений УФЭБС Альбом v2.6.0
+//                   (очень срочно надо, поэтому взял за шаблон mci_process.mac)
+import BankInter, rsexts, MesInter, WldInter, globals, rsd, oralib, CTInter;
+import "lib_registry.mac";
+
+private var DIR_BASE_MCI, RACE_FILE_MASK, SERVER_TMP_FOLDER, DIR_RACE_INFO, DIR_RACE_INFO_OLD;
+private var racesFound = false;;
+
+private macro LogError(Category, Message)
+   println(Category, ": ", Message);
+end;
+
+private macro normalizePath(path)
+    if (SubStr(path, StrLen(path), 1)!="\\")
+      path = path + "\\";
+    end;
+    return path;
+end;
+
+private macro getSetting(regkey, defaultPath)
+    var regval:string, error;
+
+    GetRegistryValue(regkey, V_STRING, RegVal, error );
+    
+    if(( error != 0) or ((error==0) and (trim(RegVal)=="")))
+        LogError("Предупреждение", "Не найдено значение настройки реестра "+regkey+". Установлено значение: "+defaultPath);
+        RegVal = defaultPath;
+    end;
+
+    return RegVal;
+end;
+
+private macro readSettings()  /* Считать параметры из реестра */
+   
+    DIR_BASE_MCI      = normalizePath(getSetting("PRBB\\MCI\\BASE_PATH")); //, BASE_PATH_MCI
+    DIR_RACE_INFO     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\MCI\\INFO_PATH")); //, INFO_PATH
+    DIR_RACE_INFO_OLD = DIR_RACE_INFO + normalizePath(getSetting("PRBB\\MCI\\INFO_PATH\\OLDMES")); //, INFO_PATH
+
+end;
+
+private var FileNamesArray;
+
+private macro CreateFileList(FileNamesArray:TArray, SourceFilesPath:string);
+    var i = 0, DirList;
+
+    DirList = TDirList(SourceFilesPath);   
+    while (i < DirList.Count)
+        if (StrLen(DirList.Name(i)) > 10)
+            FileNamesArray(FileNamesArray.Size()) = DirList.Name(i);
+        end;
+        i = i + 1;
+    end;   
+end;
+
+/* Проверить наличие файлов в папке рейса */
+private macro isFilesExist(Folder)
+   var filesFound = false; 
+   
+   FileNamesArray = null;
+   FileNamesArray = TArray();
+    
+    CreateFileList(FileNamesArray, Folder);
+    if (FileNamesArray.Size()>0)
+      filesFound = true;
+    end;
+    return filesFound;
+end;
+
+private macro DateToStr(IDate, delim:string)
+    var day, month, year;
+    
+    if (ValType(delim)==V_UNDEF)
+      delim = "";
+    end;
+    if ((ValType (IDate) == V_UNDEF) or (IDate == Date (0,0,0)))
+        return "00000000";
+    end;
+    DateSplit (IDate, day, month, year);
+    if (day < 10)
+        day = String ("0"+day);
+    else
+        day = String (day);
+    end;
+    if (month < 10)
+        month = String ("0"+month);
+    else
+        month = String (month);
+    end;
+    return String (day+delim+month+delim+year);
+end;
+
+
+private macro sqlTime2Time(sqlDate:variant):time
+  var dt:date, tm:time;
+  DtTmSplit( sqlDate, dt, tm );
+  if(tm == NULL)
+    dt = time(12,0,0);
+  end;
+  return tm;
+end;
+
+private var sess_count = 0, sess_sum = $0, race_count = 0, race_sum = $0;
+
+private macro DateFromStr(str)
+   var y, m, d;
+   y = int(SubStr(str, 1, 4));
+   m = int(SubStr(str, 6, 2));
+   d = int(SubStr(str, 9, 2));
+   return Date(d, m, y);
+end;
+
+
+private macro updateSess(SrcFileName, RaceNo)
+    var cmd = RsdCommand("update dwlsess_dbt set t_numberrace = "+RaceNo+" where t_direct = chr(88) and  t_filename Like '%"+SrcFileName+"' ");
+    cmd.execute();
+    return true;
+end;
+
+
+/* передать все файлы рейса из локальной папки во временную папку на сервере */
+private macro copyAllFiles(From, To, RaceNo)
+    var i = 0, SrcFileName, TmpFileName;
+
+    while (i < FileNamesArray.Size())
+        SrcFileName = From + FileNamesArray(i);
+        TmpFileName = To + DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+
+        if (not CopyFile(SrcFileName, TmpFileName, true, FileNamesArray(i)))
+           LogError("!!!ОШИБКА", "Ошибка копирования файла " + SrcFileName + " в " + TmpFileName);
+        end;
+        i = i + 1;
+    end;
+end;
+
+private macro moveFile (src:string, dst:string)
+    debugbreak;
+    var m_copy   = copyFile (src, dst);
+    var m_remove = removeFile (src);
+    return (m_copy and m_remove);
+end;
+
+private macro deleteAllFiles(From)
+    var i = 0, SrcFileName;
+
+    while (i < FileNamesArray.Size())
+        SrcFileName = From + FileNamesArray(i);
+       if (not RemoveFile(SrcFileName))
+         LogError("Предупреждение", "Файл "+SrcFileName+" не удалён!");
+       end;
+       i = i+1;
+    end;
+end;
+
+private macro setRaceNumInSess(RaceNo)
+    var i = 0, SrcFileName;
+
+    while (i < FileNamesArray.Size())
+       SrcFileName = DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+       if (not updateSess(SrcFileName, RaceNo))
+          LogError("Предупреждение", "В сеансе загрузки из файла "+SrcFileName+" не удалось обновить номер рейса!");
+       end;
+       i = i+1;
+    end;
+end;
+
+
+private macro getsessnumbers(RaceNo)
+    var i = 0, SrcFileName;
+    var rs, sess="";
+
+    while (i < FileNamesArray.Size())
+       SrcFileName = DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+       rs = RsdRecordset("select t_number from dwlsess_dbt where   t_filename LIKE '%"+SrcFileName+"' and t_numberrace = "+RaceNo);
+       if (rs.movenext)
+          sess = sess + rs.value(0)+" ";
+       end;
+       i = i + 1;
+    end;
+
+    return sess;
+end;
+
+
+private macro processRace(Folder, RaceNo)
+   var success = true;
+   private var id;
+   /* 1. Если в папке рейса нет файлов - ничего не делать */
+   if (isFilesExist(Folder))
+        /* 2. Иначе */
+      if (GetTrue(true, "Найдены информационные сообщения. Загрузить?"))
+         racesFound = true;
+         /* 2.1. Скопировать файлы на терминал */
+         //message("Передача файлов на сервер...");
+         //В архив
+         copyAllFiles(Folder, DIR_RACE_INFO_OLD, RaceNo); 
+
+         message("Загрузка файлов рейса...");
+         if (not ImportFileDir (DIR_RACE_INFO, TRANSP_UFBS, RaceNo)) 
+            /* Записать номер рейса в сеанс */
+            setRaceNumInSess(RaceNo);
+            success = false;
+            LogError("Рейс "+string(RaceNo), "Ошибка обработки рейса");
+         else
+            setRaceNumInSess(RaceNo);
+
+            //msgbox("Сформированы сеансы: "+getsessnumbers(RaceNo));
+            //deleteAllFiles(Folder);
+         end; 
+
+      end;
+   end;
+   return success;
+end;
+
+private macro processAllRaces()
+    private var log_name;
+    file log() txt;
+    log_name = GetTxtFileName("mciprocess");
+
+    SetOutput(log_name);
+    if (not processRace (DIR_RACE_INFO,0))
+        LogError("Информационные сообщения", "Ошибка обработки рейса");
+    end; 
+    SetOutput(null, true);  /* вернуть вывод в стандартный поток */
+
+    /* Вывести на экран протокол работы процедуры */
+    if (open(log, log_name))
+        ViewFile(log);
+    end;
+    close(log);
+end;
+
+macro process()
+   readSettings();   /* Считать параметры из реестра */
+   processAllRaces();   /* Обработать файлы рейсов */
+end;
+
+/*****START*****/
+process();
+exit(1);

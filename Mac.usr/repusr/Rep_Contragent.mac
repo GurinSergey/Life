@@ -1,0 +1,662 @@
+/*************************************************************************************************/
+/*                      Автоматизированная банковская система RS-Bank v6.0                       */
+/*************************************************************************************************/
+/*  Имя файла        : Rep_Contragent.mac                                                        */
+/*  Описание         : макрос отчета по контрагентам                                             */
+/*************************************************************************************************/
+/*  Программист      : Глушин С.П.                                                               */
+/*  Создан           : 07.10.2013 по заявке C-21346                                              */
+/*  Изменен          : GSP 25.02.2014 Адаптация под 2031                                         */
+/*                   : DPN 12.09.2014 I-00514743-2 Если несколько проводок по платежу,           */
+/*                     то нужно их суммировать                                                   */
+/*                   : Chesnokov D.S. 28.01.2015 По I-00547768 поправим недоделки из I-00514743  */
+/*                     а так же перепишем условие по ВСП для входящих документов, принадлежность */
+/*                     к ВСП теперь определяем по счету.                                         */
+/*                   : EVG 7/7/2015 Скорректирован фильтр ИНН                                    */
+/*************************************************************************************************/
+
+
+import globals;
+import oralib,  BANKINTER;
+import keycodes;
+import rcw,RSD;
+import PTInter,cb_sql;
+import Календарь, VBAConst;
+import "lib_lang.mac",OprInter,treport,payminter,LikePy;
+import "fastexcel.mac";
+   var contragentSelect,recordcount = 1;
+   var ob,ex,obBook,pathfile,path,dataCount;
+   var filen = "RSU_Contr.lbr";
+private var script = "",
+            excludeBankList = "",
+            MenuChoise1,
+            select_ofis,
+            cmd_ofis,
+            ofis_record,
+            select_oper,
+            cmd_oper,
+            oper_record,
+            select_bank,
+            cmd_bank,
+            bank_record,
+            rep_period,
+            param_filtr_exp,
+            param_filtr_imp,
+            param_ofis,     /*|фильтр по офису     |                          */
+            param_oper,     /*|       по оперу     |                          */
+            param_INN,      /*|       по ИНН       |                          */
+            param_bdate,    /*|начало периода      | \   набор параметров     */
+            param_edate,    /*|конец периода       |   - для построения       */
+            param_banks,    /*|банки контраг.      | /   итогового рекордсета */
+            param_excBIC,   /*|исключить БИКи      |                          */
+            flag_life_group,/*|флаг по банкам ФГ   |                          */
+            lifeGroupBIC =  /*|БИКи банков ФГ ЛАЙФ |                          */
+                        "'044525986',"+  /*Пробизнесбанк*/
+                        "'046577781',"+  /*ВУЗ          */
+                        "'042406718',"+  /*НБС          */
+                        "'042908701',"+  /*ГЭБ          */
+                        "'044525732',"+  /*Гоу          */
+                        "'046311808',"+  /*ЭВ-Саратов   */
+                        "'040702756',"+  /*ЭВ-Ставрополь*/
+                        "'041806835',"+  /*ЭВ-Волгоград */
+                        "'042007755',"+  /*ЭВ-Воронеж   */
+                        "'047308902' ";  /*ЭВ-Ульяновск */    
+
+array filtrname;
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+
+ pathfile = FindPath(filen,path);
+        if (not pathfile)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+var dlg = TRecHandler("R_Contr",pathfile,true);
+
+private macro cutTextCodeToStr(_str) /*приведеие данных из полей формы к sql строке для оператора IN*/
+          var mas:Tarray=tarray();
+          var i:integer = 0, i1 = 0;
+          var CodeToStr = "",f;
+              mas(mas.size) = ","; mas(mas.size) = ";"; /*список проверяемых символов, можно расширить */
+              i = 0; i1 = 0;
+          while (i1<mas.size)
+             f = split(trim(_str),mas(i1));
+             CodeToStr = "";
+             while (i<f.size(f))
+                CodeToStr = CodeToStr + "','" + trim(f(i)) ;
+                i = i + 1;      
+             end;
+             _str = substr(CodeToStr,4);
+             i = 0; i1 = i1+1;
+          end;
+          return(substr(CodeToStr,3)+"'");
+        end;
+
+private macro GetOperName(NumOper:integer):string  /*поиск имени опера по номеру*/
+           var sl = " SELECT t_name FROM dperson_dbt "+
+                    "  WHERE t_oper = "+NumOper+"";
+           var dataS = TRsbDataSet(sl);
+           if(DataS.moveNext())
+              param_oper = NumOper;
+              return DataS.name;
+           end;
+           return "";  
+        end;
+
+private macro GetOperDept(NumOpDep:integer,kind:integer) /*Ищем инфо по подразделению активного пользователя*/
+           var sl,dataS;
+           if(kind<3)
+              sl = " select DDP.T_NAME num, PART.T_NAME name, PERS.T_CODEDEPART depcode  "+
+                   "   from ddp_dep_dbt ddp, dperson_dbt pers, dparty_dbt part           "+
+                   "  where PERS.T_OPER = "+ NumOpDep +
+                   "    and PERS.T_CODEDEPART = DDP.T_CODE                               "+
+                   "    and DDP.T_PARTYID = PART.T_PARTYID                               ";
+           else
+              sl = " select PART.T_NAME name,DDP.T_CODE depcode                          "+
+                   "   from ddp_dep_dbt ddp, dparty_dbt part                             "+
+                   "  where DDP.T_NAME = " + NumOpDep  +
+                   "    and DDP.T_PARTYID = PART.T_PARTYID                               ";
+           end;
+              dataS = TRsbDataSet(sl);
+           if(DataS.moveNext())
+              param_ofis = DataS.depcode;
+              if(kind == 1)
+                 return DataS.num;
+              else
+                 return DataS.name;
+              end;
+           else
+              msgbox("неверно задан номер подразделения");
+              return "DeptNumbError";
+           end;
+           return "";  
+        end;
+
+MACRO SetTypeColumns(aw:tarray); /*Создаем двумерный массив с форматами столбцов*/
+           var w1=tarray(true); w1(0)=1; w1(1)=2; aw(0)=w1; /* формат столбца - Text     */
+           var w2=tarray(true); w2(0)=2; w2(1)=2; aw(1)=w2; /* формат столбца - Text     */
+           var w3=tarray(true); w3(0)=3; w3(1)=2; aw(2)=w3; /* формат столбца - Text     */
+           var w4=tarray(true); w4(0)=4; w4(1)=1; aw(3)=w4; /* формат столбца - General  */
+           var w5=tarray(true); w5(0)=5; w5(1)=1; aw(4)=w5; /* формат столбца - General  */
+           var w6=tarray(true); w6(0)=6; w6(1)=2; aw(5)=w6; /* формат столбца - Text     */
+           var w7=tarray(true); w7(0)=7; w7(1)=2; aw(6)=w7; /* формат столбца - Text     */
+           var w8=tarray(true); w8(0)=8; w8(1)=2; aw(7)=w8; /* формат столбца - Text     */
+           var w9=tarray(true); w9(0)=9; w9(1)=2; aw(8)=w9; /* формат столбца - Text     */
+END;/*macro*/
+
+MACRO splitTime()  /* перевод времени в формат ЧЧ_ММ_СС для вставки в имя файла */
+ private var timesec = string(Time);
+ private var splittimesec; 
+    splittimesec = Substr(timesec,1,2)+"_"+substr(timesec,4,2)+"_"+substr(timesec,7,2);
+    return splittimesec;
+END;
+
+
+MACRO ContragentsReport() /* Конструктор запроса, создание транспортного файла и открытие его Экселем */
+    message("Построение запроса к БД");
+    initprogress(-1);
+private var dd:date,      /*|                                            */
+            tt:time,      /*|  это переменные для использования FileInfo */
+            ii:integer,   /*|                                            */
+            ss:string;    /*|                                            */
+    var   TimeSecond = splitTime();
+    var   NameTranspFile:string = "ReportContragents_"+TimeSecond;
+    var   SPNameTranspFile = GetTxtFileName(NameTranspFile);
+          NameTranspFile = substr(SPNameTranspFile,12);     /* имя файла без пути */
+    setOutput(SPNameTranspFile);
+
+    if(param_INN != "")
+
+       /* EVG 7/7/2015 Сделал фильтр по подстроке ИНН, т.к. часто в платежах указывается
+          КПП = 0, а также КПП не всегда известен специалистам, формирующим отчёт. Правильнее
+          фильтровать платежи по ИНН без учёта КПП.
+       param_filtr_exp  = "      and prop.T_RECEIVERINN = '" + param_INN + "'"; 
+       param_filtr_imp  = "      and prop.T_PAYERINN = '" + param_INN + "'";
+       */
+       param_filtr_exp  = "      and prop.T_RECEIVERINN like '" + param_INN + "%'"; 
+       param_filtr_imp  = "      and prop.T_PAYERINN    like '" + param_INN + "%'";
+
+    elif(param_ofis != "")
+       param_filtr_exp  = "      and paym.t_opernode = " + param_ofis;
+       /*Chesnokov D.S. 28.01.2015 По I-00547768 для входящих документов, принадлежность */
+       /*                          к ВСП теперь определяем по счету. */
+       param_filtr_imp  = "      and acc.t_branch = " + param_ofis;
+    elif(param_oper != "")
+       param_filtr_exp  = "      and paym.t_oper = " + param_oper;
+       param_filtr_imp  = "      and paym.t_oper = " + param_oper;
+    else
+       param_filtr_exp  = "";
+       param_filtr_imp  = "";
+    end;
+
+    if(param_banks != "")
+       param_banks = "      and PM.T_BANKCODE in ("+ param_banks +")";
+    end;
+
+    if(flag_life_group == "X")
+       lifeGroupBIC = "      and PM.T_BANKCODE not in ("+ lifeGroupBIC;
+       if(param_excBIC != "")
+          lifeGroupBIC = lifeGroupBIC + "," + param_excBIC + ")";
+       else
+          lifeGroupBIC = lifeGroupBIC + ")";
+       end;
+    else
+       if(param_excBIC != "")
+          lifeGroupBIC = "      and PM.T_BANKCODE not in ("+ param_excBIC + ")";
+       else
+          lifeGroupBIC = "";
+       end;
+    end;
+       rep_period = "      and PAYM.T_VALUEDATE between '" + param_bdate + "' and '" + param_edate + "'";
+
+
+/*-------------------------------- main select body -------------------------*/
+    contragentSelect = 
+    " select * from(                                                                        "+ "\n" +
+    "   SELECT   PART.T_NAME ClientNAME,                                                    "+ "\n" +
+    "            nvl(PROP.T_PAYERINN,' ') ClientINN,                                        "+ "\n" +
+    "            PAYM.T_PAYERACCOUNT ClientACC,                                             "+ "\n" +
+    "            SUM(DECODE (paym.T_PAYFIID,0,PAYM.T_AMOUNT,                                "+ "\n" +
+    "                      (SELECT  sum( t_sum_natcur)                                      "+ "\n" +  //12.09.2014 I-00514743-2 DPN
+    "                         FROM   dacctrn_dbt arh, dpmdocs_dbt docs                      "+ "\n" +
+    "                        WHERE   DOCS.T_PAYMENTID = PAYM.T_PAYMENTID                    "+ "\n" +
+    "                                AND ARH.T_ACCTRNID = DOCS.T_ACCTRNID                   "+ "\n" +
+    "                                AND (PAYM.T_AMOUNT = ARH.T_SUM_PAYER                   "+ "\n" +
+    "                                     OR PAYM.T_AMOUNT = ARH.T_SUM_RECEIVER)            "+ "\n" +
+    "                                AND ARH.T_ACCOUNT_PAYER NOT LIKE '%ОВП%'               "+ "\n" +
+    "                                AND ARH.T_ACCOUNT_RECEIVER NOT LIKE '%ОВП%')))exp_sum, "+ "\n" +
+    "            0 imp_sum,                                                                 "+ "\n" +
+    "            PROP.T_RECEIVERNAME ContrNAME,                                             "+ "\n" +
+    "            prop.T_RECEIVERINN ContrINN,                                               "+ "\n" +
+    "            PROP.T_RECEIVERBANKNAME ContrBNAME,                                        "+ "\n" +
+    "            PM.T_BANKCODE ContrBCODE                                                   "+ "\n" +
+    "     FROM   dpmpaym_dbt paym,                                                          "+ "\n" +
+    "            dpmrmprop_dbt prop,                                                        "+ "\n" +
+    "            dparty_dbt part,                                                           "+ "\n" +
+    "            dpmprop_dbt pm,                                                            "+ "\n" +
+    "            daccount_dbt acc                                                           "+ "\n" +
+    "    WHERE       PAYM.T_PAYMENTID = PROP.T_PAYMENTID                                    "+ "\n" +
+    "            AND PAYM.T_PAYER = PART.T_PARTYID                                          "+ "\n" +
+    "            AND PAYM.T_PAYMENTID = PM.T_PAYMENTID                                      "+ "\n" +
+    "            AND PAYM.T_PAYERACCOUNT = ACC.T_ACCOUNT                                    "+ "\n" +
+    "            AND ACC.T_TYPE_ACCOUNT LIKE '%Ч%'                                          "+ "\n" +
+    "            AND SUBSTR (PAYM.T_RECEIVERACCOUNT, 1, 3) NOT IN                           "+ "\n" +
+    "                     ('401','402','403','404','423','426','302','202','301')           "+ "\n" +
+    "            AND SUBSTR (PAYM.T_RECEIVERACCOUNT, 1, 5) NOT IN ('40817', '40911')        "+ "\n" +
+    "            AND PAYM.T_PAYER <> PAYM.T_RECEIVER                                        "+ "\n" +
+    "            AND PM.T_DEBETCREDIT = 1                                                   "+ "\n" +
+    lifeGroupBIC + "\n" + param_banks + "\n" + param_filtr_exp + "\n" + rep_period           + "\n" +
+    "            AND (PART.T_LEGALFORM = 1                                                  "+ "\n" +
+    "                 OR (PART.T_LEGALFORM = 2                                              "+ "\n" +
+    "                     AND EXISTS                                                        "+ "\n" +
+    "                           (SELECT   1                                                 "+ "\n" +
+    "                              FROM   dpersn_dbt pers                                   "+ "\n" +
+    "                             WHERE   PART.T_PARTYID = PERS.T_PERSONID                  "+ "\n" +
+    "                                     AND pers.T_ISEMPLOYER = 'X')))                    "+ "\n" +
+    " GROUP BY   T_NAME,                                                                    "+ "\n" +
+    "            T_PAYERINN,                                                                "+ "\n" +
+    "            T_PAYERACCOUNT,                                                            "+ "\n" +
+    "            T_RECEIVERNAME,                                                            "+ "\n" +
+    "            T_RECEIVERINN,                                                             "+ "\n" +
+    "            T_RECEIVERBANKNAME,                                                        "+ "\n" +
+    "            T_BANKCODE                                                                 "+ "\n" +
+    " UNION ALL                                                                             "+ "\n" +
+    "   SELECT   PART.T_NAME ClientNAME,                                                    "+ "\n" +
+    "            nvl(PROP.T_RECEIVERINN,' ') ClientINN,                                     "+ "\n" +
+    "            PAYM.T_RECEIVERACCOUNT ClientACC,                                          "+ "\n" +
+    "            0 exp_sum,                                                                 "+ "\n" +
+    "            SUM(DECODE (paym.T_PAYFIID,0,PAYM.T_AMOUNT,                                "+ "\n" +
+    "                      (SELECT   sum(t_sum_natcur)                                      "+ "\n" + // Chesnokov D.S. 28.01.2015 I-00547768
+    "                         FROM   dacctrn_dbt arh, dpmdocs_dbt docs                      "+ "\n" +
+    "                        WHERE   DOCS.T_PAYMENTID = PAYM.T_PAYMENTID                    "+ "\n" +
+    "                                AND ARH.T_ACCTRNID = DOCS.T_ACCTRNID                   "+ "\n" +
+    "                                AND (PAYM.T_AMOUNT = ARH.T_SUM_PAYER                   "+ "\n" +
+    "                                     OR PAYM.T_AMOUNT = ARH.T_SUM_RECEIVER)            "+ "\n" +
+    "                                AND ARH.T_ACCOUNT_PAYER NOT LIKE '%ОВП%'               "+ "\n" +
+    "                                AND ARH.T_ACCOUNT_RECEIVER NOT LIKE '%ОВП%')))imp_sum, "+ "\n" +
+    "            PROP.T_PAYERNAME ContrNAME,                                                "+ "\n" +
+    "            prop.T_PAYERINN ContrINN,                                                  "+ "\n" +
+    "            PROP.T_PAYERBANKNAME ContrBNAME,                                           "+ "\n" +
+    "            PM.T_BANKCODE ContrBCODE                                                   "+ "\n" +
+    "     FROM   dpmpaym_dbt paym,                                                          "+ "\n" +
+    "            dpmrmprop_dbt prop,                                                        "+ "\n" +
+    "            dparty_dbt part,                                                           "+ "\n" +
+    "            dpmprop_dbt pm,                                                            "+ "\n" +
+    "            daccount_dbt acc                                                           "+ "\n" +
+    "    WHERE       PAYM.T_PAYMENTID = PROP.T_PAYMENTID                                    "+ "\n" +
+    "            AND PAYM.T_RECEIVER = PART.T_PARTYID                                       "+ "\n" +
+    "            AND PAYM.T_PAYMENTID = PM.T_PAYMENTID                                      "+ "\n" +
+    "            AND PAYM.T_RECEIVERACCOUNT = ACC.T_ACCOUNT                                 "+ "\n" +
+    "            AND ACC.T_TYPE_ACCOUNT LIKE '%Ч%'                                          "+ "\n" +
+    "            AND SUBSTR (PAYM.T_PAYERACCOUNT, 1, 3) NOT IN                              "+ "\n" +
+    "                     ('401','402','403','404','423','426','302','202','301')           "+ "\n" +
+    "            AND SUBSTR (PAYM.T_PAYERACCOUNT, 1, 5) NOT IN ('40817', '40911')           "+ "\n" +
+    "            AND PAYM.T_PAYER <> PAYM.T_RECEIVER                                        "+ "\n" +
+    "            AND PM.T_DEBETCREDIT = 0                                                   "+ "\n" +
+    lifeGroupBIC + "\n" + param_banks + "\n" + param_filtr_imp + "\n" + rep_period           + "\n" +
+    "            AND (PART.T_LEGALFORM = 1                                                  "+ "\n" +
+    "                 OR (PART.T_LEGALFORM = 2                                              "+ "\n" +
+    "                     AND EXISTS                                                        "+ "\n" +
+    "                           (SELECT   1                                                 "+ "\n" +
+    "                              FROM   dpersn_dbt pers                                   "+ "\n" +
+    "                             WHERE   PART.T_PARTYID = PERS.T_PERSONID                  "+ "\n" +
+    "                                     AND pers.T_ISEMPLOYER = 'X')))                    "+ "\n" +
+    " GROUP BY   T_NAME,                                                                    "+ "\n" +
+    "            T_RECEIVERINN,                                                             "+ "\n" +
+    "            T_RECEIVERACCOUNT,                                                         "+ "\n" +
+    "            T_PAYERNAME,                                                               "+ "\n" +
+    "            T_PAYERINN,                                                                "+ "\n" +
+    "            T_PAYERBANKNAME,                                                           "+ "\n" +
+    "            T_BANKCODE                                                                 "+ "\n" +
+    " ) order by clientname,ClientACC,ContrNAME                                             "+ "\n" ;
+    useprogress(2);
+    message("Получение данных");
+debugbreak;
+    var dataContr = TRsbDataSet(contragentSelect);
+
+    message("Формирование транспортного файла");
+    println("Наименование клиента"+"║"+"ИНН клиента"+"║"+"Р/счет клиента"+"║"+"Исходящие платежи"+"║"+"Входящие платежи"+"║"+
+            "Контрагент"+"║"+"ИНН Контрагента"+"║"+"Банк контрагента(Наименование)"+"║"+"Банк контрагента(БИК)");
+    dataCount = 2;
+    while(dataContr.movenext())  /* заполнение транспортного файла */
+       dataCount = dataCount+1;
+       useprogress(dataCount);
+       println(dataContr.ClientNAME  + "║" +  
+               dataContr.ClientINN   + "║" + 
+               dataContr.ClientACC   + "║" + 
+               dataContr.exp_sum     + "║" + 
+               dataContr.imp_sum     + "║" +
+               dataContr.ContrNAME   + "║" +
+               dataContr.ContrINN    + "║" +
+               dataContr.ContrBNAME  + "║" + 
+               dataContr.ContrBCODE  + "║"); 
+       recordcount = recordcount + 1;
+    end;/*while*/
+    setOutput(NULL,TRUE);
+    CopyFile(NameTranspFile,"$c:\\rspar\\"+NameTranspFile, TRUE);                                      /* копирование транспортного файла на терминал */
+    ob = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());                              /* создание объекта для работы с приложениями  */
+    ex = ob.CreateComObject ("Excel.Application", true);                                               /* Active X, запуск Экселя                     */
+                                                                                                       /*                                             */
+    if(not(GetFileInfo("$c:\\rspar\\"+NameTranspFile,@dd,@tt,@ii,@ss)));                               /* проверка успешности копирования и наличия   */
+       println("не мог найти на локальном диске файл "+NameTranspFile+"          \n останавливаюсь");  /* файла на терминале пользователя             */
+       exit(0);
+    end;
+    useprogress(dataCount+1);
+    ss = substr(ss,2);
+    var aw=tarray(true); 
+    SetTypeColumns(aw);
+    obBook = ex.Workbooks.opentext (ss, 866, 1, 1,2,false,false,false,false,false,true,"║",aw,1,"."," ",true,false); /*  открытие транспортного файла       */
+    /*                                                                                                                                                      */
+    /*    (Filename     - Имя файла,                                                                                                                        */
+    /*     Origin       - Кодировка,                                                                                                                        */
+    /*     StartRow     - Номер строки, с которого начинается разбор текста,                                                                                */
+    /*     DataType     - Формат данных в файле. Может быть одним из следующих констант: xlDelimited = 1 (с разделителем) или xlFixedWidth = 2 (по ширине). */
+    /*                     Если этот аргумент не указан, Microsoft Excel пытается определить формат столбца при открытии файла,                             */
+    /*     TextQualifier        - Задает текст классификатора,                                                                                              */
+    /*     ConsecutiveDelimiter - Последовательные разделители считаются одним разделителем (True - считать),                                               */
+    /*     Tab          - Символ табуляции считать разделителем ( True - считать, DataType должен быть xlDelimited ),                                       */
+    /*     Semicolon    - Точку с запятой считать разделителем  ( True - считать, DataType должен быть xlDelimited ),                                       */
+    /*     Comma        - Запятую считать разделителем          ( True - считать, DataType должен быть xlDelimited ),                                       */
+    /*     Space        - Пробел считать разделителем           ( True - считать, DataType должен быть xlDelimited ),                                       */
+    /*     Other        - Заданный символ считать разделителем  ( True - считать, DataType должен быть xlDelimited ),                                       */
+    /*     OtherChar    - Определяет символ-разделитель ( Other дожно быть True ).                                                                          */
+    /*                     Если указан более чем один символ, только первый символ строки используется, а остальные символы игнорируются.,                  */
+    /*     FieldInfo    - Массив, содержащий информацию для разбора отдельных столбцов данных (типы данных по столбцам).                                    */
+    /*                     Интерпретация зависит от значения DataType.                                                                                      */
+    /*                     Когда данные с разделителями, этот аргумент является массивом из двух элементов массива,                                         */
+    /*                     при этом каждый из двух элементов массива указает параметры преобразования для конкретного столбца.                              */
+    /*                     Первый элемент является номером столбца, а второй элемент является одним из значений XlColumnDataType,                           */
+    /*                     определяющей как столбец обрабатывается.                                                                                         */
+    /*                     Перечень возможных значений второго элемента для разных типов данных:                                                            */
+    /*                     Константа            Значение        Тип данных                                                                                  */
+    /*                     xlDMYFormat          4               DMY date format.                                                                            */
+    /*                     xlDYMFormat          7               DYM date format.                                                                            */
+    /*                     xlEMDFormat          10              EMD date format.                                                                            */
+    /*                     xlGeneralFormat      1               General.                                                                                    */
+    /*                     xlMDYFormat          3               MDY date format.                                                                            */
+    /*                     xlMYDFormat          6               MYD date format.                                                                            */
+    /*                     xlSkipColumn         9               Column is not parsed.                                                                       */
+    /*                     xlTextFormat         2               Text.                                                                                       */
+    /*                     xlYDMFormat          8               YDM date format.                                                                            */
+    /*                     xlYMDFormat          5               YMD date format.                                                                            */
+    /*     TextVisualLayout     - Визуальная разметка текста,                                                                                               */
+    /*     DecimalSeparator     - Разделитель, что Microsoft Excel использует при распознавании десятичных чисел. По умолчанию настройки системы,           */
+    /*     ThousandsSeparator   - Разделитель тысяч, что Excel использует при распознавании чисел. По умолчанию настройки системы,                          */
+    /*     TrailingMinusNumbers - Если цифры с минусом в конце, должны рассматриваться как отрицательные числа - True.                                      */
+    /*                            Если False или опущен, цифры с минусом в конце рассматриваются как текст,                                                 */
+    /*     Local                - Если региональные настройки машины должны быть использованы для сепараторов, цифры и форматирования данных - True         */
+
+END;/*macro ContragentsReport()*/
+
+Macro formatExcel()
+    message("Форматирование книги Excel");
+    useprogress(dataCount+2);
+private var i = 1; 
+    var obSheet = ex.Sheets(1);
+    while(recordcount >= i)                                        /* передается число строк в рекордсете           */
+       obSheet.Range("A"+i+":I"+i).Interior.Color = 15395562;      /* в диапазоне с записанными данными заливаем    */
+       i = i + 2;                                                  /* через одну строки светло серым                */
+    end;
+    obSheet.Range("A1:I1").HorizontalAlignment = -4108;//xlCenter; /* горизонтальное выравнивание                   */
+    obSheet.Range("A1:I1").Interior.Color = 1;                     /* заливка ячейки, в данном случае черным цветом */
+    obSheet.Range("A1:I1").Font.Colorindex = 2;                    /* цвет текста                                   */
+    obSheet.Range("A1:I1").WrapText = true;
+    obSheet.Range("A1:I1").Font.Bold = true;                       /* полужирный текст                              */
+    ex.ActiveWindow.Selection.AutoFilter;                          /* установка автофильтра на активный лист        */
+    obSheet.Range("A2").Select;                                    /* выбор ячейки и последующее                    */
+    ex.ActiveWindow.FreezePanes = true;                            /* закрепление области                           */
+    obSheet.Columns("A:A").ColumnWidth = 50.43;                    /* установление шираны колонок                   */
+    obSheet.Columns("B:B").ColumnWidth = 20.14;                    /*                                               */
+    obSheet.Columns("C:C").ColumnWidth = 20.14;                    /*                                               */
+    obSheet.Columns("D:D").ColumnWidth = 19.00;                    /*                                               */
+    obSheet.Columns("E:E").ColumnWidth = 19.00;                    /*                                               */
+    obSheet.Columns("F:F").ColumnWidth = 50.00;                    /*                                               */
+    obSheet.Columns("G:G").ColumnWidth = 20.14;                    /*                                               */
+    obSheet.Columns("H:H").ColumnWidth = 32.00;                    /*                                               */
+    obSheet.Columns("I:I").ColumnWidth = 17.14;                    /*                                               */
+    obSheet.Range("A1:I"+recordcount).Borders.LineStyle = xlContinuous;  /* тип линии границы - сплошной            */
+    obSheet.Range("A1:I"+recordcount).Borders.Weight = xlThin;           /* толщина линии                           */
+    obSheet.Range("A1:I1").Borders.Colorindex = 2;                       /* свет линии рамки - белый                */
+    obSheet.Rows("1:1").RowHeight = 30.00;                               /* установление высоты строки              */
+    ex.visible = true;
+end;/*macro*/
+
+MACRO HandleEvent (dlg, cmd, id, key)
+
+    macro EvProc (ofis_record, cmd_ofis, id, key)
+       if(( cmd == DLG_KEY ) and ( key == 13 ))
+          return CM_SELECT;
+       end;
+    end;
+
+
+    macro EventHandler (rs, cmd, id, key )
+       if (cmd == DLG_INIT)
+           if (not AddMultiAction (rs, 316)) 
+               msgbox ("Не удалось выполнить AddMultiAction ()");
+           end;
+       end;
+    
+       if ((cmd == DLG_MSEL) and (key == 316)) // F2
+           excludeBankList = excludeBankList+ "," + string (rs.value("BIC_BANK"));
+//           msgbox (excludeBankLisk);
+           return CM_MSEL_CONT_CLEAR;
+       end;
+
+       if ((cmd == DLG_KEY) and ((key == 13) or (KEY==KEY_ESC)))
+            return CM_SELECT;
+       end;
+    
+       if (cmd == DLG_MSELEND)// and (key == 316)) // F2
+//           msgbox (excludeBankList);
+           return CM_MSEL_STOP_CLEARALL;
+       end;
+    end;                                 
+
+
+
+
+
+    if(cmd == DLG_INIT)
+       message("~F2~ продолжить,  ~ESC~ выход");
+       dlg.rec.filtr_name = "выберите тип фильтра";
+       dlg.rec.life_banks = "X";
+       dlg.rec.end_date = {curdate};
+       dlg.rec.beg_date = "01." + substr(string({curdate}),4);
+       UpdateFields(dlg); 
+    end;
+
+/*    if(cmd == DLG_SETFOCUS)
+
+    end;
+*/
+    if (cmd == DLG_REMFOCUS)
+       if (FldName(dlg,id)=="beg_date")
+          if ( dlg.rec.beg_date > {curdate} )
+             MsgBox("Дата начала периода больше даты текущего операционного дня"); 
+             return CM_CANCEL;
+          end;
+       end;
+       if (FldName(dlg,id)=="end_date")
+          if ( dlg.rec.end_date > {curdate} )
+             MsgBox("Дата конца периода больше даты текущего операционного дня"); 
+             return CM_CANCEL;
+          end;
+       end;
+       if (FldName(dlg,id)=="filtr_name")
+          if(not( (dlg.rec.filtr_name == "Офис") or (dlg.rec.filtr_name == "Операционист") or (dlg.rec.filtr_name == "По ИНН контрагента")))
+             msgbox("некорректное значение фильтра, выберите один из вариантов по F3");
+             return CM_CANCEL;
+          end;
+       end;
+       if (FldName(dlg,id)=="filtr_value")
+          if(dlg.rec.filtr_name == "Операционист")
+             dlg.rec.filtr_coment = GetOperName(dlg.rec.filtr_value);
+          elif(dlg.rec.filtr_name == "Офис")
+             if(GetOperDept(dlg.rec.filtr_value,3) != "DeptNumbError")
+                dlg.rec.filtr_coment = GetOperDept(dlg.rec.filtr_value,3);
+             else
+                return CM_CANCEL;
+             end;
+          end;
+       end;
+       UpdateFields(dlg); 
+    end;
+
+    if (cmd==DLG_KEY)
+      if (KEY==KEY_ESC)
+        if (GetTrue(TRUE,"Вы действительно хотите выйти?"))
+          exit(1);
+          return  CM_CANCEL;
+        else
+          return  CM_IGNORE;    
+        end;
+      elif (KEY==KEY_ENTER)                                             
+          return CM_Ignore;
+      elif (KEY==KEY_F1)
+       msgbox("HELP YOURSELF");
+        return CM_Ignore;          
+      elif (KEY==KEY_F9)
+        return CM_Ignore;          
+      elif (KEY==KEY_F3)
+         if (FldName(dlg,id) == "filtr_name")
+            filtrname(0) = "Офис";
+            filtrname(1) = "Операционист";
+            filtrname(2) = "По ИНН контрагента";    
+            MenuChoise1 = Menu(filtrname, "Меню","Выберите фильтр",40,10);
+            if (MenuChoise1 >= 0)
+               dlg.rec.filtr_name = filtrname(MenuChoise1);
+               dlg.rec.filtr_value = "";
+               dlg.rec.filtr_coment = "";
+               if (dlg.rec.filtr_name == "Операционист")
+                  dlg.rec.filtr_value = {oper};
+                  dlg.rec.filtr_coment = GetOperName({oper});
+               elif(dlg.rec.filtr_name == "Офис")
+                  dlg.rec.filtr_value = GetOperDept({oper},1);
+                  dlg.rec.filtr_coment = GetOperDept({oper},2);
+               end;
+               UpdateFields(dlg); 
+            end;
+         end;
+
+         if (FldName(dlg,id) == "filtr_value")
+            if (dlg.rec.filtr_name == "Офис")  /* строим скроллинг отделов*/
+               select_ofis = " Select dp.t_code as otdel_ID,dp.t_name as otdel_num, PART.T_NAME as otdel_name  "+
+                             "   from ddp_dep_dbt dp, dparty_dbt part                                 "+
+                             "  where t_status = 2                                                    "+
+                             "    and DP.T_PARTYID = PART.T_PARTYID                                   "+
+                             "  order by dp.t_name                                                    ";
+               cmd_ofis = RSDCommand(select_ofis);
+               ofis_record = RSDRecordset( cmd_ofis, RSDVAL_CLIENT, RSDVAL_STATIC );
+               if (RunScroll(ofis_record, 0, 0, "Отделы", @EvProc, "Список отделов", "~Enter~ выбор отдела ~Esc~ выход", true,30,5,80,40))
+                 dlg.rec.filtr_value = ofis_record.value (1);
+                 dlg.rec.filtr_coment = ofis_record.value (2);
+                 param_ofis = ofis_record.value (0);
+
+                 UpdateFields(dlg);
+               end;
+            elif (dlg.rec.filtr_name == "Операционист") /* строим скроллинг операционистов*/
+               select_oper = "select  PERS.T_OPER, PERS.T_NAME from dperson_dbt pers  order by t_oper ";
+               cmd_oper = RSDCommand(select_oper);
+               oper_record = RSDRecordset( cmd_oper, RSDVAL_CLIENT, RSDVAL_STATIC );
+               if (RunScroll(oper_record, 0, 0, "Отделы", @EvProc, "Список операционистов", "~Enter~ выбор операциониста ~Esc~ выход", true))
+                 dlg.rec.filtr_value = oper_record.value (0);
+                 dlg.rec.filtr_coment = oper_record.value (1);
+                 param_oper = oper_record.value (0);
+                 UpdateFields(dlg);
+               end;
+            end;
+         end;
+
+         if (FldName(dlg,id) == "exclude_bank")
+            excludeBankList = "";
+            select_bank =
+            " select CODE.T_CODE BIC_Bank, PART.T_SHORTNAME Bank_name          "+
+            "   from dparty_dbt part, dpartyown_dbt pown,dobjcode_dbt code     "+
+            "  where POWN.T_PARTYID = PART.T_PARTYID                           "+
+            "    and CODE.T_OBJECTID = PART.T_PARTYID                          "+
+            "    and pown.T_PARTYKIND = 2                                      "+
+            "    and CODE.T_CODEKIND = 3                                       "+
+            "    and CODE.T_STATE <> 1                                         "+
+            " order by CODE.T_CODE                                             ";
+            cmd_bank = RSDCommand(select_bank);
+            bank_record = RSDRecordset( cmd_bank, RSDVAL_CLIENT, RSDVAL_STATIC );
+            if (RunScroll(bank_record, 0, 0, "Отделы", @EventHandler, "Список банков", "~Enter~ выбор банка  |  ~F2~ выбор выделенной группы банков  |  ~Esc~ выход", true))
+               dlg.rec.exclude_bank = substr(excludeBankList,2);
+               UpdateFields(dlg);
+            end;
+         end;
+
+         if(FldName(dlg,id) == "beg_date")
+            dlg.rec.beg_date = GetDateByCalendar();
+            UpdateFields(dlg);
+         end;
+
+         if(FldName(dlg,id) == "end_date")
+            dlg.rec.end_date = GetDateByCalendar();
+            UpdateFields(dlg);
+         end;
+
+         return CM_Ignore;          
+      elif((key == KEY_SPACE) and (trim(fldname(dlg, id)) == "life_banks"))  /* установка флага по банкам группы */   
+         dlg.rec.life_banks = strfor (88 - codefor (dlg.rec.life_banks));              
+         return CM_DEFAULT;                                                 
+
+      elif (KEY==KEY_F2)          /* окончательная инициализация полей и запуск */
+         if(not( (dlg.rec.filtr_name == "Офис") or (dlg.rec.filtr_name == "Операционист") or (dlg.rec.filtr_name == "По ИНН контрагента")))
+            msgbox("некорректное значение фильтра, выберите один из вариантов по F3");
+            return CM_ignore;
+         else
+            flag_life_group = dlg.rec.life_banks;
+            param_bdate  = dlg.rec.beg_date;
+            param_edate  = dlg.rec.end_date;
+            if(dlg.rec.bic_bank != "")
+               param_banks  = cutTextCodeToStr(dlg.rec.bic_bank);
+            else
+               param_banks  = "";
+            end;
+            if(dlg.rec.exclude_bank != "")
+               param_excBIC = cutTextCodeToStr(dlg.rec.exclude_bank);
+            else
+               param_excBIC = "";
+            end;
+            if (dlg.rec.filtr_name == "По ИНН контрагента")
+               param_INN  = dlg.rec.filtr_value;
+               param_oper = "";
+               param_ofis = "";
+            elif (dlg.rec.filtr_name == "Операционист")
+               param_INN  = "";
+               param_ofis = "";
+            elif (dlg.rec.filtr_name == "Офис")
+               param_INN  = "";
+               param_oper = "";
+            end;
+            return CM_Save;                 
+         end;
+      end;
+    end; /* end cmd==DLG_KEY*/
+end;/*macro HandleEvent*/
+
+
+  if (RunDialog(dlg,"HandleEvent"))        
+    ContragentsReport();
+    formatExcel();
+      println("                                                         ");
+      println("                                                         ");
+      println("                                       ОТЧЕТ СФОРМИРОВАН ");
+/*      println(contragentSelect); */
+  end;
+
+
+
+
+
+
+
+
+
+
+
+
+

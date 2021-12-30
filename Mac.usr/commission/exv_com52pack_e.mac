@@ -1,0 +1,213 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Банк ЭВ
+
+       Макрос пользовательского алгоритма расчёта базовых сумм комиссий 5.2.*pack
+       "Выдача наличных с оформлением заявки в течение предыдущего опер. дня:
+          - 5.2.3pack: прочее (до 100 тыс.руб. )
+          - 5.2.4pack: прочее (от 101 тыс. руб до 1 млн. руб. )
+          - 5.2.5pack: прочее (свыше 1 млн. руб )
+
+       Тип комиссии - единовременная.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ptinter, cb_sql;/*InsertSumList*/
+import exvComLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+record sfbassum( "sfbassum.str" );
+
+/* Символ кассы, по которому берётся данная комиссия */
+CONST CommCashSymbol = "('42', '46', '47', '53', '54', '58', '59', '60', '61')";    // прочие и т.п.
+
+/*
+    Расчет для единовременных комиссий
+*/
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record cashDoc(pscshdoc);
+
+    var stat:integer; 
+    var query, rs;
+    var CommSum   = $0,
+        SymbSum   = $0,
+        TotalCashSum;
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+        
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( cashDoc, Doc );
+
+
+    //debugbreak;
+    // Комиссия по чекам
+    if ( docKind == CASH_PS_OUTORDER )
+
+       rs = GetComBank52RecordSet( cashDoc.IsCurrency, cashDoc.DocKind, cashDoc.AutoKey, CommCashSymbol );
+       while( rs and rs.moveNext() )
+          SymbSum = SymbSum + rs.value(0, null, V_MONEY);
+       end;
+
+
+       if( GetTarifInfo( sfcontr, EndDate, EndDate, 3, sfcalcal.CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType ) )
+
+          /* 5 млн. - лимит операций за месяц, по которому взимаются комиссии 5.2.3 - 5.2.6 pack */
+          var MonthLimitSum = $5000000;
+
+          /* Посчитаем сумму платежей с начала месяца */
+          TotalCashSum = Cash_CalcSymbSum_Period( DocKind, cashDoc, CommCashSymbol, true, sfcontr );
+
+          /* Считаем сумму превышения лимита  (с учётом данного чека) */
+          var OverLimitSum = TotalCashSum + SymbSum - MaxValue;
+          if( OverLimitSum > $0 )
+
+             /* Если это не первый документ, превышающий лимит, то нужно брать только сумму этого
+                документа, а не всего превышения. */
+             OverLimitSum = min( OverLimitSum, SymbSum );
+
+             /* На граничные условия комиссии проверяется сумма превышения лимита - так задумано */
+             if( EXV_Cash_IsProperCommission( sfcontr, sfcalcal, OverLimitSum ) )
+
+                debugbreak;
+
+
+                /* Если ранее обналиченная сумма уже превысила месячный лимит, комиссия не берётся */
+                if( TotalCashSum > MonthLimitSum )
+
+                   CommSum = $0;
+
+                /* Если месячный лимит превышен текущим чеком, и этот чек единственный, то комиссия берётся с 5 млн - лимит ТП */
+                elif( ( SymbSum > MonthLimitSum ) and ( TotalCashSum == $0 ) )
+
+                   CommSum = $5000000 - MaxValue;
+
+                /* Если сумма чеков за месяц (с учётом текущей операции) не превысила месячный лимит 5 млн (+лимит ТП), то 
+                   комиссия берётся с суммы превышения лимита ТП (см. выше). */
+                elif( ( TotalCashSum + SymbSum ) <= MonthLimitSum )
+
+                   CommSum = OverLimitSum;
+
+                /* Если месячный лимит превышен, но чек не единственный, то комиссия берётся с суммы, оставшейся до 5 млн. */
+                elif( ( TotalCashSum + SymbSum ) > MonthLimitSum )
+
+                   CommSum = MonthLimitSum - TotalCashSum;
+
+                end;
+
+                //msgbox (CommSum);
+                /* Считаем комиссию */ 
+                CommSum = CommSum * TarifValue / 100;
+
+             end;
+
+          end;
+
+       end;
+
+    end;
+
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType  = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2  = SF_BASETYPE_SUM;
+    sfbassum.baseSum2   = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы: ", GetErrMsg );
+    end;
+
+    
+    
+    /*return integer( 1 ); -- количество*/
+    
+    /*return $1; -- сумма */
+    
+end;/*CalcCommissionSum*/
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

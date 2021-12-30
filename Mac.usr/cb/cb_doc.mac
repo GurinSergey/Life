@@ -1,0 +1,588 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Макрос скроллинга
+// Описание  : Макрос скроллинга мемордеров в ББ
+// Изменен   : 21.11.2011 Жаворонкова Н. (joy) I-00120276-2 Для кассовых проводок  проставляется вид операции " 3" 
+// Изменен   : 06.07.2012 Gurin  I-00217849-2
+// Изменен   : 15.01.2013 Gurin S. I-00312480-2
+// Изменен   : 06.02.2013 Жаворонкова Н. Рефакторинг кода
+// Изменен   : 15.02.2013 Жаворонкова Н. (joy) C-17206 Добавлено изменения вида хранения в ЭА по ctrl+z
+// KS 26.11.2013 АДаптация под 31ю сборку
+//-----------------------------------------------------------------------------
+
+import BankInter, check117, PaymInter, "pm_opr.mac", "pmchoper.mac", "pm_tools.mac", pm_chksave;
+import "cb_FillFactura.mac";
+import lib_access;
+
+/* EVG */
+import "GenNumber.mac", "shifrKind.mac", "cb_sql.mac";
+/*Seleznev*/
+import "outsidecarry.mac";
+/* Коркин И. Н. */
+import "editdatenotice.mac";
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+import "ChangeReason.mac";
+// KS 22.02.2011 I-00008100 Отвязываем документ
+import diver;
+// 06.02.2012 Жаворонкова Н. 
+import "lib_const.mac";
+import pm_common;
+import "FrontCommon.mac", "fg_Life_parm.mac";
+debugbreak;
+RECORD cb_doc      (cb_doc);
+RECORD cb_docOld(cb_doc);
+RECORD pm_paym        ( pmpaym );
+RECORD DbProp         ( pmprop   );
+RECORD CrProp         ( pmprop   );
+RECORD pm_rmprop      ( pmrmprop );
+RECORD CurTr          ( pmcurtr  );
+RECORD pmkz           ( pmkz     );
+RECORD nvpi           ( pmnvpi   );
+RECORD pm_paymOld     ( pmpaym   );
+RECORD pm_rmpropOld   ( pmrmprop );
+RECORD CurTrOld       ( pmcurtr  );
+RECORD pmkzold        ( pmkz     );
+RECORD nvpiold        ( pmnvpi   );
+
+private FILE    acc ("account");       /* рублевые лицевые счета */
+
+private var sql, cmd; //Gurin
+private var Type = "И, К, N, S"; //Gurin 06.07.2012 I-00217849-2
+private var fgBank = fg_life_subject({OurBank});
+debugbreak;
+
+/*номера полей в панели*/
+const fld_PAYERACC     = 8,    /* Счет плательщика */
+      fld_RECEIVERACC  = 10; /* Счет получателя  */
+
+private MACRO Новый_документ()
+
+ /* EVG Ввод документа: автоматическое формирование номера по референсу */
+    if( StrLen( pm_rmprop.Number ) == 0 )
+        pm_rmprop.Number = GenNumberDocument(); 
+    end;
+
+/* 2011-11-21 joy I-00120276-2 Для кассовых проводок  вид операции должен быть " 3" */
+    if (( substr (pm_paym.PayerAccount, 1, 3) == "202" ) or ( substr (pm_paym.ReceiverAccount, 1, 3) == "202" ))
+        cb_doc.Kind_Oper = " 3";
+    else
+        cb_doc.Kind_Oper = " 6"; // EVG Мемордера должны быть с видом операции 6
+    end;
+
+return 0;
+END;
+
+/************************************************************************/
+/*   Функция проверяет наличие лиц. счета                               */
+/************************************************************************/
+private MACRO ЛСчетСуществует(Глава, КодВалюты, ЛСчет)
+  acc.Chapter        = Глава;
+  acc.Account        = ЛСчет;
+  acc.Code_Currency  = КодВалюты;
+  if (GetEQ(acc))
+          Return TRUE;
+  else
+          Return FALSE;   
+  end;
+END;
+
+/* Установка подсказки для скролингов из макроса */
+
+private const Hint_ByStatus   :string = 
+"/*+FIRST_ROWS LEADING(t pmpaym pmrmprop oproper oprcurst) INDEX(t dcb_doc_dbt_idx4) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t pmpaym pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByValueDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dcb_doc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByCloseDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dcb_doc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+private const Hint_ByStep     :string = 
+"/*+FIRST_ROWS LEADING(t oproper cb_doc pmpaym pmrmprop oprcurst) INDEX(t doprstep_dbt_idx10) INDEX(cb_doc dcb_doc_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t oproper cb_doc pmpaym pmrmprop oprcurst)*/";
+
+
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+
+  // Возможные значения ScrolStates:
+  // -2 - Подготовленные
+  // -1 - Все
+  //  0 - Отложен
+  //  1 - Обрабатывается
+  //  2 - Отвергнут
+  // 50 - Закрыт
+  
+  /* Отложенные, открытые, отвергнутые */
+    if( ( ScrolStates == 0 ) or ( ScrolStates == 1 ) or ( ScrolStates == 2 ) )
+  
+    return Hint_ByStatus;
+
+  /* Все, Закрытые */
+    elif( ( ScrolStates == 50 ) or
+        ( ScrolStates == -1 ) )
+    
+        var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+        if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+            return Hint_ByCloseDate;
+        elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+            return Hint_ByValueDate;
+        else
+            return Hint_ByStatus;
+        end;
+
+  /* Подготовленные */
+    elif( ScrolStates == -2 )
+        return Hint_ByStep;
+
+    end;
+ 
+return DefaultHint;
+
+END;
+
+private macro getOperationIDbyPaymentID(PID :integer)
+    var sql  = " SELECT OPR.T_ID_OPERATION                               "
+               " FROM DOPROPER_DBT OPR, DPMPAYM_DBT PM                   "
+               " WHERE OPR.T_DOCUMENTID = LPAD (PM.T_PAYMENTID, 34, 0)   "
+               " AND PM.T_DOCKIND = OPR.T_DOCKIND                        "
+               " AND PM.T_PAYMENTID = :pid                               ";
+    sql = execSQLselect(sql, makeArray(SQLParam(":pid", PID)));
+    if (sql and sql.moveNext())  
+        return int(sql.value(0));
+    end;                                                               
+    return 0;
+end;
+
+MACRO Проверить_документ(Режим)
+    var stat = 0;   
+    var obj:object;
+
+  /* EVG Заполнение данных о валютной операции исходя из
+     паспорта сделки, если он есть в назначении платежа. */
+    var PS_string,
+        Sub_VOcode = "",
+        Sub_DLnumb = "";
+    var vo_query,
+       vo_rs;
+
+    private var cmd,rs;
+    
+    if ((Режим == SCR_SAVE) and (pm_paym.paymentid <= 0))
+        return 1;
+    end;
+    
+    if ( Режим != SCR_DELETE )    
+    end;
+    
+    //zmp 13.03.2014 I-00470982
+    var OperationID = getOperationIDbyPaymentID(pm_paym.paymentid) ;   
+    if ((OperationID != 0) and (pm_paym.PAYMSTATUS == 0))      
+        execSQL("update doprcurst_dbt  set T_NUMVALUE = 1  where T_ID_OPERATION =  :OID  and T_STATUSKINDID = 291", makeArray(SQLParam("OID", OperationID)));
+    end;
+   
+    /* Проверка использования кассовых документов */
+    if( ((Режим == SCR_SAVE ) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT)) and index (cb_doc.Kind_Oper," 4") == 1 )  
+        /* Проверить по 117-И */
+        if( cb_doc.Chapter == 1 )
+            if( CheckOnSave_117( pm_paym, NULL, NULL, cb_doc, pm_rmprop ) )
+                return fld_PAYERACC;
+            end;
+        end;
+        
+        if(PM_CheckCO(pm_paym,pm_rmprop,0,0))
+            return 1;
+        end;
+    end;
+    /* zmp 12.02.2014 R-344406-2  
+    if( (Режим == 2 ) or (Режим == 3) or (Режим == 8) ) // ввод/редактирование
+      /* Общие проверки по списку */
+      stat = BBMO_ScrolMacroCommonChecks( TPanelFields(), pm_paym, DbProp, CrProp, pm_rmprop );
+      if( stat != NOTERROR )
+        return stat;
+      end;
+    end;
+    */
+    if( Режим == SCR_DELETE ) /*УДАЛЕНИЕ ДОКУМЕНТА*/
+        if(not isDLMRuning())
+            if(cb_doc.Origin == CB_DOC_ORIGIN_LOANS)
+                if(not Index( "Ц", StrFor(GetIdentProgram())))
+                    msgbox("Документ порожден п/с \"Кредитование\".|Удаление запрещено.");
+                    stat = 1;
+                end;
+            elif(cb_doc.Origin == CB_DOC_ORIGIN_DEPOSIT)
+              if(not Index( "Д", StrFor(GetIdentProgram())))
+                msgbox("Документ порожден п/с \"Депозиты\".|Удаление запрещено.");
+                stat = 1;
+              end;
+            elif(cb_doc.Origin == CB_DOC_ORIGIN_RETAIL)
+                if(not Index( "ВБD", StrFor(GetIdentProgram())))
+                    msgbox("Документ порожден п/с \"Обслуж.физ.лиц\".|Удаление запрещено.");
+                    stat = 1;
+                end;                
+            elif(cb_doc.Origin == CB_DOC_ORIGIN_INCOUNTING)
+                 msgbox("Документ порожден п/с \"Incounting\".|Удаление запрещено.");
+                 stat = 1;
+            end;
+            
+            if(CheckDeletePayment(pm_paym.PaymentID))
+                return 1;
+            else
+                if (ВходитВГруппу({oper}, ACS_GRP_DUMMY))
+                    cmd = RsdCommand("select count(1) from doprdocs_dbt oprdocs"+
+                                    " where oprdocs.t_DocKind=?"+
+                                    "   and oprdocs.t_DocumentID=LPAD(?,34,'0')"+
+                                    "   and rownum=1");
+                    cmd.AddParam("", RSDBP_IN, Pm_paym.DocKind);
+                    cmd.AddParam("", RSDBP_IN, cb_doc.DocumentID);
+                    rs=RSDRecordset(cmd);
+
+                    if (rs.movenext)
+                        if (rs.value(0)==1)
+                            if ( gettrue(true,"Документ порожден шагом операции.|Удалить привязку к данной операции?"))
+                                // KS 22.02.2011 I-00008100 Отвязываем документ
+                                cmd = RsdCommand("delete from doprdocs_dbt oprdocs"+
+                                                " where oprdocs.t_DocKind=?"+
+                                                " and oprdocs.t_DocumentID=LPAD(?,34,'0')");
+                                cmd.AddParam("", RSDBP_IN, Pm_paym.DocKind);
+                                cmd.AddParam("", RSDBP_IN, cb_doc.DocumentID);
+                                cmd.execute();
+                            end;
+                        end;
+                    end;
+                end;
+            end;
+        end;
+    end;
+  /* EVG */
+    var Status;
+  
+  /* EVG Сохранение документа: автоматическое формирование номера по референсу */
+    if ( Режим != SCR_DELETE )
+        if( StrLen( pm_rmprop.Number ) == 0 )
+            pm_rmprop.Number = GenNumberDocument();
+        end;
+    end;
+
+    if( Режим == SCR_EDIT )  /* РЕДАКТИРОВАНИЕ ДОКУМЕНТА */
+        if( cb_doc.Origin == CB_DOC_ORIGIN_LOANS )
+            if(not Index( "Ц", StrFor(GetIdentProgram())))
+                msgbox("Документ порожден п/с \"Кредитование\".|Корректировка запрещена.");
+                stat = 1;
+            end;
+        elif( cb_doc.Origin == CB_DOC_ORIGIN_DEPOSIT )
+          if(not Index( "Д", StrFor(GetIdentProgram())))
+            msgbox("Документ порожден п/с \"Депозиты\".|Корректировка запрещена.");
+            stat = 1;
+          end;            
+        elif( cb_doc.Origin == CB_DOC_ORIGIN_RETAIL )
+            if(not Index( "ВБD", StrFor(GetIdentProgram())))
+                msgbox("Документ порожден п/с \"Обслуж.физ.лиц\".|Корректировка запрещена.");
+                stat = 1;
+            end;            
+        elif( cb_doc.Origin == CB_DOC_ORIGIN_INCOUNTING)
+            msgbox("Документ порожден п/с \"Incounting\".|Корректировка запрещена.");
+            stat = 1;
+        end;
+
+        obj = GenObject("RsbPayment", pm_paym.paymentid);
+
+        if (IsExternalCarry(obj))
+            if (gettrue(false,"Вы редактируете документ выгруженный из внешнией системы|информация об альтернативной схеме проводок может быть утеряна|продолжить?"))
+                cmd = RSDCommand("delete usr_pmdocs where paymentid = ?");
+                cmd.addparam("pmid", RSDBP_IN, pm_paym.paymentid);
+                cmd.execute;
+            else
+                return CHANG_NOTKEEP;
+            end;
+        end;
+
+        if (cb_doc.State == CB_DOC_STATE_DEFERRED) /// ???
+            return 0;
+        end;
+        /*zmp 25.03.2013 R-139478-2 >>>*/
+        if(cb_doc.State == CB_DOC_STATE_CLOSED)
+            if((cb_doc.USERFIELD1 != cb_docOld.USERFIELD1) or
+               (cb_doc.USERFIELD2 != cb_docOld.USERFIELD2) or
+               (cb_doc.USERFIELD3 != cb_docOld.USERFIELD3) or 
+               (cb_doc.USERFIELD4 != cb_docOld.USERFIELD4)
+              )
+                if(not ACS_CheckGroupOper(ACS_GRP_CHANGE_PAYERNAME, {OPER}, false))
+                    msgBox("Вы не можете изменять пользовательские поля в закрытых мемориальных ордерах. \n "+
+                           "Это право предоставлено только для пользователей "+ ACS_GRP_CHANGE_PAYERNAME + " группы."
+                          );
+                    return CHANG_NOTKEEP
+                end;
+            end;
+        end;
+        /*<<< zmp 25.03.2013 R-139478-2*/        
+        /* EVG В незакрытых мемордерах можно исправлять любые поля. После зачисления они сразу закрываются. */
+        if (cb_doc.State != CB_DOC_STATE_CLOSED)
+            return CHANG_NOTIMPORTANT;
+        end;
+
+        if( stat == 0 )
+       /* При редактировании производим проверку важности внесенных изменений */
+       /* Константы важности внесенных изменений:           */
+       /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+       /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+       /* CHANG_NOTKEEP        - не сохранять изменения */
+       /* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+       /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+          и сохранение изменений можно производить без отката операции      */
+            if  ( 
+                (pm_paym.PayerAccount       != pm_paymOld.PayerAccount      ) or
+                (pm_paym.ReceiverAccount    != pm_paymOld.ReceiverAccount   ) or
+                (cb_doc.Code_Currency       != cb_docOld.Code_Currency      ) or
+                (pm_paym.Amount             != pm_paymOld.Amount            ) or
+//              (pm_paym.NumberPack         != pm_paymOld.NumberPack        ) or
+                (cb_doc.TypeDocument        != cb_docOld.TypeDocument       ) or
+    /*          (cb_doc.UserTypeDocument    != cb_docOld.UserTypeDocument   ) or */
+                (pm_paym.ValueDate          != pm_paymOld.ValueDate         ) or
+                (pm_paym.Department         != pm_paymOld.Department        ) or
+                (pm_rmprop.CashSymbolDebet  != pm_rmpropOld.CashSymbolDebet ) or
+                (pm_rmprop.CashSymbolCredit != pm_rmpropOld.CashSymbolCredit) or
+                (pm_rmprop.SymbNotBalDebet  != pm_rmpropOld.SymbNotBalDebet )
+                ) stat = CHANG_IMPORTANT;
+            end;
+        end;
+
+        if (
+            (Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "К" ) Or 
+            Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "А" ) Or
+            Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "Е" ) Or
+            Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "е" ) ) 
+            And
+            ( /* cb_doc.CurrentState != PSPO_ST_REJECTED*/
+            pm_paym.PaymStatus != PM_REJECTED) 
+            )
+
+            if ( not( 
+                ПроверкаИдентичности(cb_doc   , cb_docOld    ) And
+                ПроверкаИдентичности(pm_paym  , pm_paymOld,  "FUTURERECEIVERACCOUNT","UserTypeDocument") And
+                ПроверкаИдентичности(pm_rmprop, pm_rmpropOld ) 
+                    ) 
+                )stat = CHANG_NOTKEEP;
+            elif(       
+                (Not Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "U", "R") ) 
+                And
+                (Not Opr_IsStepExecuteSymb( pm_paym.DocumentID, pm_paym.DocKind, "З", "R", 29029) )
+                And 
+                (pm_paym.FutureReceiverAccount != pm_paymOld.FutureReceiverAccount )
+                ) stat = CHANG_NOTKEEP;
+            end;
+        end;
+        
+    /* EVG 9/04/2012 Если изменилось назначение платежа, и по документу есть проводка,
+       то скорректируем его в этой проводке. */
+        if ( pm_rmprop.ground != pm_rmpropOld.ground )
+
+            //Gurin S. 07.07.2014 I-00499687-2
+            //cmd = rsdcommand(" UPDATE dArhDoc_dbt s SET s.t_Ground = ? " +
+            //                "   WHERE s.t_ApplicationKey = ( Select t_ApplicationKey FROM dPmDocs_dbt " +
+            //                "                                WHERE t_PaymentId = ? )");
+            cmd = rsdcommand(" UPDATE dacctrn_dbt s SET s.t_Ground = ? " +
+                            "   WHERE s.t_acctrnid = ( Select t_acctrnid FROM dPmDocs_dbt " +
+                            "                                WHERE t_PaymentId = ? )");
+
+            cmd.addparam("grnd", RSDBP_IN, pm_rmprop.ground  );
+            cmd.addparam("pID",  RSDBP_IN, pm_paym.PaymentID );
+            cmd.execute();
+        end;
+    end; 
+
+    if (Режим == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                                // (изменения в буферах не сохраняются)
+        return IsImportantChangeForOperMemorialOrder(pm_paym, pm_paymOld, pm_rmprop, pm_rmpropOld, cb_doc, cb_docOld, nvpi, nvpiold);
+    end;
+
+return stat;
+END;
+
+private MACRO ФункцияПользователя( Режим:integer )
+
+    var PaymentObj:Rsbpayment=Rsbpayment(Pm_paym.paymentId);
+    /* Коркин И.Н. Добавил возможность измененения даты и основания в открытых документах */
+    var promt;
+
+    // KS 23.12.2011 Исправительные обороты I-00128647
+    var stat, val;
+
+    array m_menu;
+    m_menu(asize(m_menu))="Исправление шифра/вида";
+    m_menu(asize(m_menu))="Исправление даты и основания";
+    m_menu(asize(m_menu))="Изменение платежа ФМ";
+    //Gurin S. 15.01.2013 I-00312480-2
+    m_menu(asize(m_menu))="Убрать тип документа";
+
+    if (Index(cb_doc.UserTypeDocument, "И")>0)
+        m_menu(asize(m_menu))="Проставить номер для исправительного ";
+    end;
+    /*15-02-2012 Жаворонкова Н. (joy) C-17206 */
+    m_menu(asize(m_menu)) = "Изменить вид хранения";
+
+    //Gurin S. 28.08.2015 I-00581174-2
+    if (ВходитВГруппу({oper}, ACS_GRP_CLOSE_DOC))
+       m_menu(asize(m_menu)) = "Закрыть документ без проводок";
+    end;
+    
+    promt = menu(m_menu, "Выберите действие","Выберите действие",null,null);
+
+    if (promt>=0)
+        if (m_menu(promt) == "Исправление шифра/вида")
+            if(( Режим == UFN_SCROL ) or (Режим == UFN_PANEL_EDIT))
+                updateSK(cb_doc.documentid, cb_doc.kind_oper, pm_rmprop.shifroper);
+                return UPDTPAGE;    // Обновить страницу записей и область скролинга
+            end;
+        elif (m_menu(promt) == "Исправление даты и основания")
+            if(( Режим == UFN_SCROL ) or ( Режим == UFN_PANEL_EDIT ))
+                if ( (cb_doc.state == CB_DOC_STATE_WORKING) or (cb_doc.state == CB_DOC_STATE_DEFERRED) or
+                     (PaymentObj.ReceiverAccount == "" ) //EVG 31/03/2011 Для того, чтобы было можно редактировать основание МО с разноской плдатежа (комиссия с НДС).
+                   )
+                    editDateNotice(cb_doc.documentid, pm_paym.valuedate, pm_rmprop.ground);
+                    return UPDTPAGE;
+                else
+                    msgBox("Редактировать дату и основание этого документа нельзя");
+                end;
+            end;
+        elif (m_menu(promt) == "Изменение платежа ФМ")
+            ChangeReason(PaymentObj);                                            
+        elif (m_menu(promt) == "Проставить номер для исправительного ") // KS 23.12.2011 Исправительные обороты I-00128647
+            stat = GenerateReference( 61, val,null,null,{curdate});
+            if (stat == 0)
+                pm_rmprop.Number = val;
+                msgbox("Установлен номер "+pm_rmprop.Number+"|для журнала регистрации|исправительных мемордеров");
+                return UPDTPAGE;
+            end;
+        //Gurin S. 15.01.2013 Исправление шифра/вида
+        elif (m_menu(promt)=="Убрать тип документа")
+            cmd = RsdCommand ("update dcb_doc_dbt set T_TYPEDOCUMENT = chr(1) where T_DOCUMENTID =:id");
+            cmd.AddParam("id", RSDBP_IN, PaymentObj.Paymentid);
+            cmd.execute();
+            msgbox("Выполнено успешно");
+        /*15-02-2012 Жаворонкова Н. (joy) C-17206 */
+        elif(m_menu(promt) == "Изменить вид хранения")
+            if (Pm_paym.PaymStatus == PM_FINISHED) // Проверки только для закрытых, если открыт\отложен менять можно без проблем
+                execMacroFile ("ea_checks.mac", "CheckEAGroup", Pm_paym); 
+            else
+                execMacroFile ("ea_checks.mac","SetEAStoreKind", Pm_paym);
+            end;
+        /*---end joy */
+        //Gurin S. 28.08.2015 I-00581174-2
+        elif (m_menu(promt) == "Закрыть документ без проводок")
+           execMacroFile ("lib_menu_common.mac","UsrCloseDoc", PaymentObj);
+           return UPDTPAGE;
+        else
+            return 0;
+        end;
+    end;
+ return 0;
+END;
+
+macro ProcessPanel(mode, key, field, panel)
+   /*VDN C-30595 25.12.2014*/
+   var connString, note;
+   if ((panel.Fields.Item(panel.Fields.Current).Name == "E_CBDOC_ACCOUNT_PAYER") and 
+       (StrLen(panel.Fields.Item(7).Value) == 20) and
+       ((Substr(panel.Fields.Item(7).Value, 1, 8) == "40817810") or 
+        (Substr(panel.Fields.Item(7).Value, 1, 8) == "40820810")) and     
+       inList(true, fgBank.is_PRBB(), fgBank.is_VUZ(), fgBank.is_GEB(), fgBank.is_EXV(), fgBank.is_SLD())
+      )
+
+     var account  = panel.Fields.Item(7).Value; 
+         
+     var cmd = RsdCommand("SELECT * FROM DACCOUNT_DBT WHERE T_ACCOUNT = ?");
+         cmd.AddParam( "acc", RSDBP_IN, account );
+     var rs = RsdRecordSet(cmd);
+     if (not rs.MoveNext) 
+       panel.Fields.Item(7).Value = "";
+       panel.Refresh();       
+
+       if(getTrue(false,"Сделать запрос сводного счета?"))
+         if( not ВходитВГруппу ( {oper}, 68 ) )
+           msgbox("Вы не включены в группу | 68 - Ввод в ДТ аналитического счета физлица");
+           return 1;
+         end;
+         var inParams = TArray(), outParams = TArray();
+
+         GetRegistryValue( "PRBB\\ИНТЕРФЕЙСЫ\\КОД_БАНКА_ФРОНТ", V_INTEGER, inParams[0], note ); 
+         if (note) msgbox("Не удалось прочитать настройку реестра PRBB\\ИНТЕРФЕЙСЫ\\КОД_БАНКА_ФРОНТ | Код ошибки: " + note); return 1; end;
+
+         inParams[1] = account; /*"40817810200001425747"; */          
+  
+         if ((IsFrontRuleByPayment (account, "", 70, 1, connString, note)) and                      
+             (ExecuteFrontFunc("prc_get_account_svod", inParams, connString, outParams, note)))
+           if (outParams(3) == " ")
+             panel.Fields.Item(7).Value = outParams(4);
+             panel.Fields.Item(8).Value = outParams(5);
+             panel.Refresh();
+
+             pm_paym.userfield4 = account;
+           else 
+             msgbox("Ошибка процедуры Фронт:|" + outParams(3));
+           end;             
+         end;          
+       end;  
+     end;     
+   end; /*END C-30595*/
+  /* При входе в панель открыть на редактирование поле "Шифр операции" */
+    if( key == 522 )
+        panel.Fields.Item( 16 ).Enabled = true;
+        panel.Refresh();           
+    elif( key == 317 )
+   // KS 19.10.2011 Исправительные обороты
+        if (field == 19)
+            if ((Index(cb_doc.UserTypeDocument   , "И")>0) and
+                (Index(cb_docOld.UserTypeDocument, "И")==0))
+                cb_docOld.UserTypeDocument = cb_doc.UserTypeDocument;
+                panel.Fields.Item( 0 ).value = pm_rmprop.Number = 0;
+                panel.Refresh();
+            end;
+        end;
+    elif ( key == 26 )
+        panel.Fields.Item( 0 ).value = pm_rmprop.Number;
+        panel.Refresh();
+    /*zmp 11.12.2012 C-16200-5 >>> */
+    elif(key == 323 /*F9*/)
+        if((substr(Pm_paym.payeraccount,1,5) == "40911") and
+          (not CompareStrWithMasks("47423*,70601*",Pm_paym.receiveraccount))
+          )
+          MsgBox("Операция запрещена по бух/учету");
+          return 1;
+       end;
+       debugbreak;
+       if ((Pm_paym.dockind == 70) and 
+           (Pm_paym.userfield4 != ""))
+           if (not IsFrontRuleByPayment (Pm_paym.userfield4, Pm_paym.receiveraccount, 70, 1, connString, note))
+              MsgBox("Не найдено подходящее правило Фронт:\n ДТ " + Pm_paym.userfield4 + "\n КТ " + Pm_paym.receiveraccount);
+              return 1;
+           end;
+       end;  
+
+    /*<<< zmp 11.12.2012 C-16200-5 */
+    end;   
+    //Gurin 06.07.2012 I-00217849-2
+    if (CompareStrWithMasks (Type, cb_doc.typedocument)==0)  
+        sql = " Begin "
+              " UPDATE dcb_doc_dbt "
+              " SET t_kind_oper = ' 6' " 
+              " WHERE t_documentid ='" + pm_paym.paymentid +"';"
+              " COMMIT;"
+              " End;";
+        Cmd = RSDCommand(sql);
+        Cmd.execute; 
+    end;
+
+    // zmp 11.07.2014 R-409742-2
+    if(pm_paym.paymentid < 1) // проверка на новый документ
+       //Gurin S. R-507391-2 04.12.2014
+       if (panel.Fields.Item(18).value < {curdate})
+          panel.Fields.Item(18).value = {curdate};
+          panel.Refresh();
+       end;
+    end;
+
+return key;
+END;
+

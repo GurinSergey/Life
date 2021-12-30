@@ -1,0 +1,723 @@
+/* Проверки при предварительной выгрузке                                    */
+/*                                                                          */
+/*                                                                          */
+/*Тихомиров А.Н. 10.09.2009              Версия 1.0                         */
+/*--------------------------------------------------------------------------*/
+/*Gurin S. C-27301-7 24.02.2014 (изменения в связи с Приказом Минфина №107н)*/
+/*Gurin S. 29.03.2016 148Н                                                  */
+/*--------------------------------------------------------------------------*/
+
+import PaymInter, bankinter, globals, likepy, rsd, rsbdataset;
+import "fg_Life_parm.mac";/*SDA*/
+import "AccountTest.mac";/*Gurin*/
+import "wlmcgm.mac"; //TAM 08.08.2013 R-225499-2
+import lib_compare, lib_const, lib_agents;
+
+private const fgBank = fg_life_subject( {OurBank} ); /*SDA 13.03.2014 - нет больше SelfId проверяйте хотя бы на компиляцию */
+var cmd, rsd, payment, reason, i, inn, kpp, cm, rs, dataset, cmd2, rsd2, cmd3, rsd3, pr, output, cmd4, rsd4, cmd5, rsd6, cmd6, cmdI, rsdI, rsd5;
+array paymentid, reas;
+var ret;
+
+var needCheck148N = RSL_GetRegistryValue ("PRBB/NEED_CHECK_148N");
+needCheck148N = (needCheck148N == true);
+
+//Gurin S. 29.03.2016 проверка налоговых платежей на 148Н
+private macro PM_CheckTaxPropUsr( PaymentID:integer, msg:string):integer
+  
+  execSQL("DELETE FROM dpmtax_tmp");
+
+  execSQL( "INSERT INTO dpmtax_tmp ( t_PaymentID ) values ( :PaymentID ) ",
+           makeArray( SQLParam( "", PaymentID ) ) 
+         );
+
+  var retval = execStoredFunc( "RSI_PM_TAXPROP.MassCheckTaxProp", V_INTEGER );  
+  if( retval > 0 )
+    return retval;
+  end;
+
+  var rs = execSQLselect( "select t_Message from dpmtax_tmp where t_PaymentID = :PaymentID", makeArray( SQLParam( "", PaymentID )), FALSE );
+
+  if( rs.moveNext() )
+
+    if( strlen(rs.value("t_Message")) != 0 )
+//       if (( not (index(rs.value("t_Message"), "В наименовании получателя не указано наименование администратора доходов, выделенное скобками") > 0)) and 
+//           ( not (index(rs.value("t_Message"), "Некорректно задана дата в поле 109 (Дата налогового документа)") > 0)))  //R-644915 DPN Временное решение, пока не будет залит пакет
+       if ( not (index(rs.value("t_Message"), "В наименовании получателя не указано наименование администратора доходов, выделенное скобками") > 0))
+          SetParm(1, rs.value("t_Message"));
+       end;
+    end;
+
+  else
+    msgbox("Ошибка при проверке налоговых реквизитов по 148Н");
+    return 1;
+  end;
+  
+  return 0;
+
+end;
+
+
+private macro reject (id);
+   var c = rsdcommand("update doprstep_dbt set t_isexecute = 'W' where T_ID_OPERATION = "+
+                   "(select T_ID_OPERATION from doproper_dbt opr where opr.t_documentid = lpad (?, 34, '0') and opr.t_dockind in (320, 201, 322, 202, 501, 16, 27)) and t_blockid = 10000145 ");
+   c.addparam("id",RSDBP_IN,id);
+   c.execute();
+end;
+
+private macro GetBicBank(id); //Gurin S. N. 21.08.2012
+   cmd = RsdCommand(" Select t_code from dobjcode_dbt where T_OBJECTID = :obid and t_codekind = 1");
+   cmd.addparam("obid",RSDBP_IN,id);
+   cmd.execute;
+   rsd = RsdRecordset(cmd);
+   if (rsd and rsd.movenext)
+       return rsd.value(0);
+   else
+       return "";
+   end;
+end;
+
+private macro check(payment);
+   var stat = 0;
+   ret = False;
+   //1.Недопустимые  символы  в  полях налоговых платежей -  " №", 
+   if (strlen(payment.TAXAUTHORSTATE)>0)
+      if ((index(payment.BTTTICODE,"№") > 0)  or (index(payment.TAXPMNUMBER,"№") > 0) or (index(payment.TAXPMGROUND,"№") > 0)
+          or (index(payment.ground,"№") > 0))
+         stat = 1 ;
+         reason = "Недопустимые  символы  в  полях налоговых платежей -   №";
+      end;
+   end;
+
+   //2.Длина счета плательщика/получателя д.б. равна 20 символов, либо  не заполнено
+   if (not stat)
+      if ((strlen(payment.payeraccount)!=20) and (strlen(payment.payeraccount)!=0))
+         stat = 1 ;
+         reason = "Длина счета плательщика д.б. равна 20 символов, либо  не заполнено";
+      end;
+      if ((strlen(payment.receiveraccount)!=20) and (strlen(payment.receiveraccount)!=0))
+         stat = 1 ;
+         reason = "Длина счета получателя д.б. равна 20 символов, либо  не заполнено";
+      end;
+   end;
+
+   //3.В счете плательщика/получателя д.б. только цифры, получатель  м.б. не указан, 
+   if (not stat)
+      if(isdigitalNumber(Payment.payeraccount) != 0) 
+         stat = 1;
+      reason = "В счете плательщика д.б. только цифры, получатель  м.б. не указан";
+      end;
+
+      if (isdigitalNumber(Payment.receiveraccount) != 0 and (strlen(Payment.receiveraccount)==0))
+         stat = 1;
+      reason = "В счете получателя д.б. только цифры, получатель  м.б. не указан";
+      end;
+   end;
+
+   //3.1 Проверяем правильность ключа счета получателя Gurin S. N.  21.08.2012 по просьбе Фоменко О. Л.
+   if (not stat)
+
+      /* EVG 22/08/2012 Так не нужно, можно проще.
+      if(GetKey(payment.receiveraccount,GetBicBank(payment.receiverbankid))!= payment.receiveraccount)*/
+      if( ( payment.receiverBankCodeKind == PTCK_BIC )
+            and ( GetKey(payment.receiveraccount, payment.receiverBankCode) != payment.receiveraccount ) )
+        stat = 1;
+        /* EVG 22/08/2012 Ошибка.
+        reason = "В счете получателя "+payment.receiveraccount+" неверный ключ. Должен быть "+substr(GetKey(payment.receiveraccount,GetKey(payment.receiveraccount,getbicbank(payment.receiverbankid)),9,1));*/
+        reason = "В счете получателя "+payment.receiveraccount+" неверный ключ. Должен быть " + substr( GetKey( payment.receiveraccount, payment.receiverBankCode ), 9, 1 ) + ".";
+      end;
+   end;
+
+
+   //4.В счете плательщика/получателя код валюты д.б. 810,  либо "    "
+   if (not stat)
+      if ((substr(payment.payeraccount,6,3)!="810") and (strlen(payment.payeraccount)!=0))
+        reas(asize(reas)) = "В счете плательщика/получателя код валюты д.б. 810, получатель  м.б. не указан";
+        reject (payment.paymentid);
+        stat = 2;
+        paymentid(asize(paymentid)) = payment.paymentid;
+
+      end;
+      
+      if ((substr(payment.receiveraccount,6,3)!="810") and (strlen(payment.receiveraccount)!=0))
+        reas(asize(reas)) = "В счете плательщика/получателя код валюты д.б. 810, получатель  м.б. не указан";
+        reject (payment.paymentid);
+        stat = 2;
+        paymentid(asize(paymentid)) = payment.paymentid;
+
+      end;
+   end;
+
+
+   //5.В номере документа д.б. только цифры
+   if (not stat)
+      if(isdigitalNumber(Payment.number) != 0)
+         stat = 1;
+         reason = "В номере документа д.б. только цифры";
+      end;
+   end;
+   //TAM 08.08.2013 R-225499
+   if(not stat)
+      if ( int(Последние_Символы( Payment.Number, 3 )) == 0 )
+         reas(asize(reas)) = "Номер документа для выгрузки нулевой. Скорректируйте номер документа.";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   //6.Длина БИК банка получателя д.б. равна 9 симв.
+   if (not stat)
+     If (not((Payment.ReceiverBankCodeKind==3)and(strlen(Payment.ReceiverBankCode)==9)))
+         stat = 1;
+         reason = "Длина БИК банка получателя д.б. равна 9 симв";
+      End;
+   end;
+
+   //7.В корсчете получателя д.б. только цифры
+   if (not stat)
+      if(isdigitalNumber(payment.Receivercorraccnostro) != 0)
+         stat = 1;
+         reason = "В корсчете получателя д.б. только цифры";
+      end;   
+   end;
+
+   //8.Сумма не может быть равна 0
+   if (not stat)
+      if (payment.baseamount == 0)
+         stat = 1;
+         reason = "Сумма не может быть равна 0";
+      end;
+   end;
+
+   //9.Проверка очередности платежа,  цифра   1 - 6
+   if (not stat)
+      if ((payment.priority>5) or (payment.paymentkind==0)) //TAM 12.12.13 C-25730
+       stat = 1;
+       reason = "Проверка очередности платежа,  цифра   1 - 5";
+      end;
+   end;
+
+   SplitFullINN (payment.payerinn, INN, KPP);
+   //10.ИНН плательщика/получателя должен быть больше 12 симв или 10 или пусто
+   if (not stat)
+      if (strlen(payment.TAXAUTHORSTATE)>0)
+         if ((strlen (inn)<12) and (strlen (inn)!=10)/* and (strlen (inn)!=0)*/ and (inn != 0))  //Оставлю по ТЗ
+            stat = 1;
+            reason = "ИНН плательщика должен быть больше 12 симв или 10 или пусто";
+         end;
+      end;
+   end;
+
+   //11.ИНН плательщика  только цифры.
+   if (not stat)
+      if(isdigitalNumber(inn) != 0)
+         stat = 1;
+         reason = "ИНН плательщика  только цифры"
+      end;
+   end;
+
+   //12.Наименование получателя не может быть пустым
+   if (not stat)
+      if (strlen (payment.payername) == 0)
+       stat = 1;
+       reason = "Наименование плательщика не может быть пустым";
+      end;
+   end;
+
+   //13.КПП плательщика должен быть  9 симв.
+   if (not stat)
+      if (strlen(payment.TAXAUTHORSTATE)>0)
+      if ((strlen (kpp)!=9) /*and (strlen (kpp)!=0)*/ and (kpp!=0)) //По тз
+       stat = 1;
+       reason = "КПП плательщика должен быть  9 симв";
+      end;
+      end;
+   end;
+
+   //14.КПП плательщика должен только цифры,
+   if (not stat)
+    if(isdigitalNumber(kpp) != 0)
+       stat = 1;
+       reason = "КПП плательщика должен только цифры";
+    end;
+   end;
+
+   //Повторяем для получателя
+   SplitFullINN (payment.receiverinn, INN, KPP);
+   //10.ИНН плательщика/получателя должен быть больше 12 симв или 10 или пусто
+   if (not stat)
+      if (strlen(payment.TAXAUTHORSTATE)>0)
+      if ((strlen (inn)<12) and (strlen (inn)!=10) /*and (strlen (inn)!=0) */and (inn != 0)) //По ТЗ
+       stat = 1;
+       reason = "ИНН получателя должен быть больше 12 симв или 10 или пусто";
+      end;
+      end;
+   end;
+   //11.ИНН плательщика  только цифры.
+   if (not stat)
+      if(isdigitalNumber(inn) != 0)
+         stat = 1;
+         reason = "ИНН получателя  только цифры"
+      end;
+   end;
+
+   //13.КПП плательщика должен быть  9 симв.
+   if (not stat)
+      if (strlen(payment.TAXAUTHORSTATE)>0)
+         if ((strlen (kpp)!=9) /*and (strlen (kpp)!=0) */and (kpp!=0))    //По ТЗ
+            stat = 1;
+            reason = "КПП получателя должен быть  9 симв";
+         end;
+      end;
+   end;
+
+   //14.КПП плательщика должен только цифры,
+   if (not stat)
+    if(isdigitalNumber(kpp) != 0)
+       stat = 1;
+       reason = "КПП получателя должен только цифры";
+    end;
+   end;
+
+   //20. Отсутствует  корр.счет  банка получателя, если  БИК  не  отд. ЦБ РФ, т.е.  окончание БИК = 000
+   if (not stat)
+      if (strlen(payment.Receivercorraccnostro) == 0)
+         cmd4 = rsdcommand("select t_coracc from dbankdprt_dbt where t_partyid = ?");
+         cmd4.addparam ("BIC",RSDBP_IN,Payment.ReceiverBankid);
+         cmd4.execute();
+         rsd4 = rsdrecordset(cmd4);
+         if ((rsd4.movenext())  and (strlen(rsd4.value(0))>1))
+            reas(asize(reas)) = "Отсутствует  корр.счет  банка получателя, если  БИК  не  отд. ЦБ РФ";
+            reject (payment.paymentid);
+            stat = 2;
+            paymentid(asize(paymentid)) = payment.paymentid;
+         end;        
+      end;
+   end;
+
+   //15.  У    ЭДСФ   с шифром    02   вид отправки  должен быть    ЭДСФ, иначе  ошибка.
+   if (payment.shifroper =="02" )
+      cmd3 = rsdcommand("select count(1) as cnt "+
+                       " from dwlpm_dbt, dwlmeslnk_dbt, dwlmes_dbt, dwlmesrls_dbt "+
+                       " where dwlpm_dbt.t_paymentid= ?"+
+                       " and dwlmeslnk_dbt.t_ObjID = dwlpm_dbt.t_WlPmID  "+
+                       " and dwlmes_dbt.t_MesID = dwlmeslnk_dbt.t_MesID  "+
+                       " and dwlmes_dbt.t_rlsformid=dwlmesrls_dbt.t_rlsformid  "+
+                       " and dwlmesrls_dbt.T_FORMID = 124 ");
+      cmd3.addparam("ID", RSDBP_IN, payment.paymentid);
+      cmd3.execute();
+      rsd3 = rsdrecordset(cmd3);
+      if ((rsd3.movenext()) and (rsd.value(0) == 0))
+         reas(asize(reas)) = "C шифром    02   вид отправки  должен быть    ЭДСФ, иначе  ошибка";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   //17. Контроль правильности заполнения налоговых платежей при заполненнм статусе  плательщика - 
+   //поле 101  не пустое. Обязательно  КБК= 20 символов, наличие информации в  ост-х полях, не пробел.
+   if (stat != 2)
+      //Gurin S. C-27301-7 24.02.2014 
+      if (stringEqMask(payment.receiveraccount, "40302*,40501????????2*,40601????????1*,40601????????3*,40701????????1*,40701????????3*," +
+                                                "40503????????4*,40603????????4*,40703????????4*"))
+          var INN_pay, INN_rec;
+          SplitFullINN (payment.payerinn, INN_pay);
+          SplitFullINN (payment.receiverinn, INN_rec);
+          if (strlen(payment.TAXAUTHORSTATE)>0)
+              if (
+                 (strlen(trim(payment.TAXAUTHORSTATE)) != 2) or ((strlen(payment.BTTTICODE) != 20) and (trim(payment.BTTTICODE) != "0")) or 
+                 ((strlen(payment.OKATOCODE) != 8) and (strlen(payment.OKATOCODE) != 11) and (trim(payment.OKATOCODE) != "0"))
+                 )
+                 reas(asize(reas)) = "Контроль правильности заполнения налоговых платежей при заполненном статусе  плательщика";
+                 reject (payment.paymentid);
+                 stat = 2;
+                 paymentid(asize(paymentid)) = payment.paymentid;
+              end;
+
+              if ((strlen(INN_pay) != 10) and (strlen(INN_pay) != 12) and (INN_pay != 0))//TAM 01.04.2014 разрешается ИНН равный 0
+                  reas(asize(reas)) = "ИНН плательщика должен быть 10 или 12 символом";
+                  reject (payment.paymentid);
+                  stat = 2;
+                  paymentid(asize(paymentid)) = payment.paymentid;
+              elif ((strlen(INN_rec) != 10) and (strlen(INN_rec) != 12))
+                  reas(asize(reas)) = "ИНН получателя должен быть 10 или 12 символом";
+                  reject (payment.paymentid);
+                  stat = 2;
+                  paymentid(asize(paymentid)) = payment.paymentid;
+              end;
+          end;
+      else
+      if (strlen(payment.TAXAUTHORSTATE)>0)                                                                                                                   
+         if ((strlen(payment.BTTTICODE) != 20)  or /*(strlen(strsubst(payment.TAXPMTYPE," ",""))==0) or*/ (strlen(strsubst(payment.TAXPMDATE," ",""))==0) // Gurin S. 20.04.2016 I-00592613-2 TAXPMTYPE может быть пустым
+          or (strlen(strsubst(payment.TAXPMNUMBER," ",""))==0) or (strlen(strsubst(payment.TAXPMPERIOD," ",""))==0)
+          or (strlen(strsubst(payment.TAXPMGROUND," ",""))==0) or (strlen(strsubst(payment.OKATOCODE," ",""))==0))
+            if (substr(payment.receiveraccount,1,5) != "40314")
+               reas(asize(reas)) = "Контроль правильности заполнения налоговых платежей при заполненном статусе  плательщика";
+               reject (payment.paymentid);
+               stat = 2;
+               paymentid(asize(paymentid)) = payment.paymentid;
+            else
+               if (string(payment.BTTTICODE) != "0")
+                  reas(asize(reas)) = "Контроль правильности заполнения налоговых платежей при заполненном статусе  плательщика";
+                  reject (payment.paymentid);
+                  stat = 2;
+                  paymentid(asize(paymentid)) = payment.paymentid;
+               end;
+            end;
+         end;
+      end;
+   end;
+
+   //Gurin S. 29.03.2016 148Н
+   if (stat != 2)
+      var pay_INN, rec_INN;
+      SplitFullINN (payment.payerinn, pay_INN, rec_INN);
+
+      if ((strlen(payment.TAXAUTHORSTATE)>0) and (not payment.UIN))
+         reas(asize(reas)) = "Не задан УИН";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+
+      if (inList(payment.TAXAUTHORSTATE,"09","10","11","12","13","14") and (payment.UIN == "0"))
+         if (strlen(pay_INN) != 12)
+            reas(asize(reas)) = "Длина кода ИНН должна быть 12 символов";
+            reject (payment.paymentid);
+            stat = 2;
+            paymentid(asize(paymentid)) = payment.paymentid;
+         end;
+      end;
+
+      if (needCheck148N)
+         var check148 = ""; 
+         PM_CheckTaxPropUsr(payment.paymentid, check148);
+         if (check148 != "")
+            reas(asize(reas)) = check148;
+            reject (payment.paymentid);
+            stat = 2;
+            paymentid(asize(paymentid)) = payment.paymentid;
+         end;
+      end;
+   end;
+end;
+      
+   //18. Дата документа, дата поступления  в Банк   должна быть  <= дате текущего дня
+   if (stat != 2)
+   //TAM 08.08.2013 R-225499-2  контроль дат, которые участвует в ED
+      if ((payment.valuedate > {curdate}) or 
+          (payment.date > {curdate}) or 
+          (payment.clientdate > {curdate}) or
+          (payment.I2PlaceDate > {curdate}) or
+          (payment.PayerChargeOffDate > {curdate}) or
+          (payment.PayerBankEnterDate > {curdate}))
+         reas(asize(reas)) = "Дата документа, дата поступления в Банк должна быть <= дате текущего дня. Проверьте даты документа.";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+   
+   // 19.Шифр платежа должен быть 01, 02, 06, 16, иначе ошибка  в  отвергнутые.
+   if (stat != 2)
+      if ((payment.shifroper!="01") and (payment.shifroper!="02") and (payment.shifroper!="06") and (payment.shifroper!="16"))
+         reas(asize(reas)) = "Шифр платежа должен быть 01, 02, 06, 16, иначе ошибка  в  отвергнутые.";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   // I -001610 Заявка
+   if (stat != 2)
+      var cmdI = rsdcommand("select 1 from dpmpaym_dbt where t_paymentid = ? and T_PAYERBANKENTERDATE = ?");
+      cmdI.addparam("ID",RSDBP_IN, payment.paymentid);
+      cmdI.addparam("date",RSDBP_IN, "01.01.0001");
+      cmdI.execute();
+      var rsdI = rsdrecordset(cmdI);
+      if (rsdI.movenext())
+         reas(asize(reas)) = "Неверная дата поступления в банк плательщика";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+
+   //X1. Проверка на счет получателя. Код валюты должен быть равен 810 
+   if (stat != 2)
+      /*VDN 09.09.2015 R-618505*/
+      var acc_receiver = payment.receiveraccount;
+      if ((payment.IsExternal) and (strLen(acc_receiver) == 0)) acc_receiver = payment.FutureReceiverAccount; end;
+      //if (substr(payment.receiveraccount,6,3) != "810"))
+      if (substr(acc_receiver, 6, 3) != "810")
+         reas(asize(reas)) = " В счете получателя неверно указана валюта";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   //X2. Проверяем банк получателя на присутствие в справочнике 
+   if (stat != 2)
+      cmd6 = rsdcommand("select 1 from dobjcode_dbt where   t_objecttype = 3 and t_codekind = 3 and t_state = 0 and t_code = ?  ");
+      cmd6.addparam("bic", RSDBP_IN, payment.receiverBankCode);
+      cmd6.execute();
+      rsd6 = rsdrecordset(cmd6);
+      if (not rsd6.movenext)
+         reas(asize(reas)) = " БИК отсутствует";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   //X3. Проверяем преемника
+   if (stat != 2)
+      cmd6 = rsdcommand("select 1 from dbankdprt_dbt where t_controldate <= ? and t_controldate <> TO_DATE ('01.01.0001', 'dd.mm.yyyy') and t_partyid = ?  ");
+      cmd6.addparam("date", RSDBP_IN, {curdate});
+      cmd6.addparam("bic", RSDBP_IN, payment.receiverBankID);
+      cmd6.execute();
+      rsd6 = rsdrecordset(cmd6);
+      if (rsd6.movenext)
+         cmd5 = rsdcommand("SELECT 1 "+
+                           "  FROM dobjlink_dbt "+
+                           " WHERE t_objecttype = 3 "+
+                           "   AND t_groupid = 1 "+
+                           "   AND t_objectid = lpad('"+payment.receiverBankID+"',10,'0') "+
+                           "   AND t_validfromdate <= ? "+
+                           "   AND t_validtodate >= ?");
+         cmd5.addparam("date", RSDBP_IN, {curdate});
+         cmd5.addparam("date1", RSDBP_IN, {curdate});
+         rsd5 = rsdrecordset(cmd5);
+            if (rsd5.movenext)
+               reas(asize(reas)) = " Банк имеет преемника, указанный БИК недействителен";
+               reject (payment.paymentid);
+               stat = 2;
+               paymentid(asize(paymentid)) = payment.paymentid;
+            end;
+      end;
+   end;
+
+   //X4. Проверяем отозванную лицензию
+   if (stat != 2)
+      //TAM 09.07.2013 I-00397077
+      var query = " SELECT VAL.T_NAME reason" + 
+                  " FROM   dbankdprt_dbt dprt, dllvalues_dbt val " +
+                  " WHERE  dprt.t_controldate <= ? AND t_partyid = ? AND  t_real <> chr(1) " +
+                         " AND VAL.T_CODE = DPRT.T_REAL";
+      //cmd6 = rsdcommand("select 1 from dbankdprt_dbt where t_controldate <= ? and t_partyid = ? and  t_real <> chr(1)");
+      cmd6 = rsdcommand(query);
+      cmd6.addparam("date", RSDBP_IN, {curdate});
+      cmd6.addparam("bic", RSDBP_IN, payment.receiverBankID);
+      cmd6.execute();
+      rsd6 = rsdrecordset(cmd6);
+      if (rsd6.movenext)
+         reas(asize(reas)) = rsd6.value("reason"); //TAM 09.07.2013 I-00397077
+         //" У Банка отозвана лицензия, указанный БИК недействителен";
+         reject (payment.paymentid);
+         stat = 2;
+         paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+
+   //X5. Проверяем закрытого субъекта
+   if (stat != 2)
+      cmd6 = rsdcommand("select 1 from dparty_dbt where t_partyid = ?  and t_locked = CHR(88) ");
+      cmd6.addparam("party", RSDBP_IN, payment.receiverBankID);
+      cmd6.execute();
+      rsd6 = rsdrecordset(cmd6);
+      if (rsd6.movenext)
+           reas(asize(reas)) = " Банк закрыт, указаный БИК недействителен";
+           reject (payment.paymentid);
+           stat = 2;
+           paymentid(asize(paymentid)) = payment.paymentid;
+      end;
+   end;
+   if (stat == 1)
+      [│######│#####################│#####################│#######################│########│#####################################################################│]
+      (payment.number,payment.payeraccount, payment.receiveraccount, payment.baseamount:f, payment.oper, reason); 
+      pr = 1;
+   end;
+   if (stat == 2/*платеж отвергнут*/)
+      ret = True;
+   end;
+END;
+
+
+
+Macro Run_Check(id) 
+   var flag = True;
+   if (isNull(id)) flag = False; end;
+   //Проверяем сразу и отвергаем задвоенные платежи
+   //21. Контроль  задвоенности платежей в одном сеансе отправки по №№ док-та, сумме,  дебет, кредит 
+   cm = "   SELECT rmprop.t_number, pmpaym.t_amount, pmpaym.t_payeraccount, pmpaym.t_receiveraccount, count(1) as cnt "+
+        "     FROM dpmpaym_dbt pmpaym, "+
+        "          dpmrmprop_dbt rmprop, "+
+        "          doproper_dbt opr, "+
+        "          doprstep_dbt st "+
+        "    WHERE     pmpaym.t_paymentid = rmprop.t_paymentid "+
+        "          AND opr.t_dockind = pmpaym.t_dockind "+
+        "          AND opr.t_documentid = LPAD (pmpaym.t_paymentid, 34, '0') "+
+        "          AND st.t_id_operation = opr.t_id_operation "+
+        "          AND st.t_isexecute = 'R' "+
+        "          AND pmpaym.t_valuedate = ? "+
+        "          AND st.t_symbol = 'Ф' "+
+        "          AND st.t_blockid = 10000145 "+
+        "          AND pmpaym.t_basefiid = 0 "+
+        " GROUP BY rmprop.t_number, pmpaym.t_amount, pmpaym.t_payeraccount, pmpaym.t_receiveraccount "+
+        "   HAVING count(1) > 1  ";
+   
+    cm = RsdCommand(cm);
+    cm.addparam("date",RSDBP_IN,{curdate});
+    cm.execute();
+    rs = RsdRecordSet(cm);
+    while (rs.movenext())
+       cm = "SELECT pmpaym.t_paymentid "+
+            "  FROM dpmpaym_dbt pmpaym, "+
+            "       dpmrmprop_dbt rmprop, "+
+            "       doproper_dbt opr, "+
+            "       doprstep_dbt st "+
+            " WHERE     pmpaym.t_paymentid = rmprop.t_paymentid "+
+            "       AND opr.t_dockind = pmpaym.t_dockind "+
+            "       AND opr.t_documentid = LPAD (pmpaym.t_paymentid, 34, '0') "+
+            "       AND st.t_id_operation = opr.t_id_operation "+
+            "       AND pmpaym.t_basefiid = 0"+
+            "       AND st.t_isexecute = 'R' "+
+            "       AND pmpaym.t_valuedate = to_date('"+{curdate}+"','dd-mm-yyyy')"+
+            "       AND st.t_symbol = 'Ф' "+
+            "       AND st.t_blockid = 10000145 "+
+            "       AND rmprop.t_number = '"+ rs.value(0)+"'"+
+            "       AND pmpaym.t_amount = "+ rs.value(1)+
+            "       AND pmpaym.t_payeraccount = '"+ rs.value(2)+"'"+
+            "       AND pmpaym.t_receiveraccount = '"+rs.value(3)+"'";
+       dataset = trsbdataset(cm);
+       while (dataset.movenext())
+          reject (dataset.paymentid);
+          paymentid(asize(paymentid)) = dataset.paymentid;
+          reas(asize(reas)) = "Контроль  задвоенности платежей в одном сеансе отправки";
+          if (flag)
+             if (not Checks_LogProc(dataset.paymentid, reas(0), 1)) end;
+             if (not setCtgVal(dataset.paymentid, PT_USR_CAT_CHECK_STATE, 1/*Предварительная выгрузка*/, {curdate})) end;
+             if (not setCtgVal(dataset.paymentid, PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/, {curdate})) end;
+          end;
+      end;
+   end;
+
+   cmd2 = "SELECT count(1) "+
+          "  FROM dpmpaym_dbt pmpaym, "+
+          "       doproper_dbt opr, "+
+          "       doprstep_dbt st "+
+          " WHERE     opr.t_dockind = pmpaym.t_dockind "+
+          "       AND opr.t_documentid = LPAD (pmpaym.t_paymentid, 34, '0') "+
+          "       AND st.t_id_operation = opr.t_id_operation "+
+          "       AND pmpaym.t_basefiid = 0"+
+          "       AND pmpaym.t_valuedate = ?"+
+          "       AND st.t_isexecute = 'R' "+
+          "       AND st.t_blockid = 10000145 " +
+          "       AND st.t_symbol = 'Ф' ";
+          if (flag)
+             cmd2 = cmd2 + " AND pmpaym.t_paymentid = ? ";
+          end;
+   cmd2 = RsdCommand(cmd2);
+   cmd2.addparam("date",RSDBP_IN,{curdate});
+   if (flag) cmd2.addparam("id",RSDBP_IN,id); end;
+   cmd2.execute();
+   rsd2 = rsdrecordset(cmd2);
+   if (rsd2.movenext())end;
+      if (not flag)
+         initprogress(int(rsd2.value(0)));
+      end;
+
+      //Остальные проверяем по
+      cmd = "SELECT pmpaym.t_paymentid "+
+            "  FROM dpmpaym_dbt pmpaym, "+
+            "       doproper_dbt opr, "+
+            "       doprstep_dbt st "+
+            " WHERE     opr.t_dockind = pmpaym.t_dockind "+
+            "       AND opr.t_documentid = LPAD (pmpaym.t_paymentid, 34, '0') "+
+            "       AND st.t_id_operation = opr.t_id_operation "+
+            "       AND pmpaym.t_basefiid = 0"+
+            "       AND pmpaym.t_valuedate = ?"+
+            "       AND st.t_isexecute = 'R' "+
+            "       AND st.t_blockid = 10000145 "  +
+            "       AND st.t_symbol = 'Ф' ";
+            if (flag)
+               cmd = cmd + " AND pmpaym.t_paymentid = ? ";
+            end;
+      cmd = RsdCommand(cmd);
+      cmd.addparam("date",RSDBP_IN,{curdate});
+      if (flag) cmd.addparam("id",RSDBP_IN,id); end;
+      cmd.execute();
+      rsd = rsdrecordset(cmd);
+      output = GetTxtFileName("RM_CHECK");
+     
+      [Внешние документы, не прошедшие контроль при предварительной выгрузке
+
+                                выгружены  в  МБР   для  ОТПРАВКИ  в  МЦИ
+      ┌──────┬─────────────────────┬─────────────────────┬───────────────────────┬────────┬─────────────────────────────────────────────────────────────────────┐];
+      i=0;
+      while (rsd.movenext())
+         i =i+1;
+         if (not flag)
+            useprogress(int(i));
+         end;
+         payment = rsbpayment(RSD.value(0));
+         check (payment);
+      end;
+      if (not flag)
+         remprogress();
+      end;
+      i = 0;
+      [└──────┴─────────────────────┴─────────────────────┴───────────────────────┴────────┴─────────────────────────────────────────────────────────────────────┘];
+      
+      if (not pr)
+         [Нет документов не прошедших контроль];
+      end;
+
+      if (asize(paymentid))
+         [Внешние документы, не прошедшие контроль при предварительной выгрузке
+
+                            выгружены  в   ОТВЕРГНУТЫЕ     МБР
+         ┌──────┬─────────────────────┬─────────────────────┬───────────────────────┬────────┬─────────────────────────────────────────────────────────────────────┐
+         ];
+         while (i < asize(paymentid))
+            dataset = trsbdataset("select rm.t_number, pm.t_payeraccount, pm.t_receiveraccount, pm.t_amount, pm.t_oper from dpmpaym_dbt pm, dpmrmprop_dbt rm where pm.t_paymentid = rm.t_paymentid and pm.t_paymentid = "+paymentid(i));
+            if (dataset.movenext())
+               [│######│#####################│#####################│#######################│########│#####################################################################│]
+               (dataset.number,dataset.payeraccount, dataset.receiveraccount, dataset.amount:f, dataset.oper, reas(i));
+
+               if (flag and ret)
+                  if (not Checks_LogProc(id, reas(i), 1)) end;
+                  if (not setCtgVal(id, PT_USR_CAT_CHECK_BEFORE_UNLOAD, 7/*Ручная обработка*/, {curdate})) end;
+               end;
+            else
+               [│#########################################################################################################################################################│]
+               ("Ошибка. Платеж не найден");
+            end;
+
+            i = i + 1;
+         end;
+      
+            [└──────┴─────────────────────┴─────────────────────┴───────────────────────┴────────┴─────────────────────────────────────────────────────────────────────┘];
+      else
+         [
+
+          Нет отвергнутых документов не прошедших контроль];
+      end;
+
+      if (flag)
+         //Проставляем категорию "Состояние проверок" - "Предварительная выгрузка"
+         if (not setCtgVal(id, PT_USR_CAT_CHECK_STATE, 1/*Предварительная выгрузка*/, {curdate})) end;
+         //обнуляем массивы
+         asize(paymentid, 0);
+         asize(reas, 0);
+      end;
+      if (not flag)
+         setoutput(null,true);
+      end;
+END;
+
+
+//Run_Check(25242339);

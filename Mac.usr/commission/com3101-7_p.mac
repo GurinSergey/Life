@@ -1,0 +1,208 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
+joy C-31392 
+Комиссия 3.10.* за прочие платежи в пользу ФЛ на счета в  БАНКАХ ГРУППЫ ЛАЙФ.
+Взимается в зависимости от общей суммы всех платежей в пользу ФЛ (п.3.9.* и 3.10.*)
+
+Тип комиссии: периодическая
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, cb_sql;
+import CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+debugbreak;
+record sfbassum( "sfbassum.str" );
+
+
+ class ComStructure(number_, Code_, minC_, maxC_)
+    var number = number_;
+    var Code = Code_;
+    var minC = minC_;
+    var maxC = maxC_;
+
+ end;
+
+
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcalusr_addr/*Алгоритм расчета*/, sfcontrStruc /*Cтруктура sfcontr*/, numberCom /*при вызове из подлючалки*/ )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+debugbreak;
+
+   
+         /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+        SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       sfCalcal.FeeType = 1;
+       sfCalcal.CommNumber = numberCom;
+       
+    end;
+
+
+    var stat, PaymentsSum = $0, TotalSum = $0, SumOfBases = $0; // сумма платежей, общая сумма с начала месяца, сумма уже посчитанных баз.
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var CommBase = Tarray();
+    var i = 1; // массив начинается с 1
+    var query, rs, sql, cmd, ComCode, Min, Max, yy, mm;
+
+    rs    = null;
+    sql   = null;
+    cmd   = null;
+    
+    // Данные о минимумах и максимумах комиссий. Нулевой объект массива не заполняем для удобства нумерации
+    var ComParam = TArray();
+    ComParam (0) = ComStructure (0, "", 0, 0);
+    ComParam (1) = ComStructure (1, "3.10.1", $0, $100000);
+    ComParam (2) = ComStructure (2, "3.10.2", $100000, $300000);
+    ComParam (3) = ComStructure (3, "3.10.3", $300000, $600000);
+    ComParam (4) = ComStructure (4, "3.10.4", $600000, $1000000);
+    ComParam (5) = ComStructure (5, "3.10.5", $1000000, $3000000);
+    ComParam (6) = ComStructure (6, "3.10.6", $3000000, $5000000);
+    ComParam (7) = ComStructure (7, "3.10.7", $5000000, $0);
+
+    //Получаем значения кода текущей комиссии
+
+   SQL = "SELECT subStr(com.t_code, 1, 6) cod";
+   SQL = SQL + "  FROM dsfcomiss_dbt com ";
+   SQL = SQL + " WHERE com.t_feetype     = " + sfCalcal.FeeType;
+   SQL = SQL + "   AND com.t_number      = " + sfCalcal.CommNumber;
+debugbreak;
+   rs = rsdRecordSet(SQL);
+   if (rs and rs.MoveNext())
+      ComCode = rs.Value("cod", null, V_STRING);
+   end;
+
+debugbreak;
+    
+    rs = GetComToPhisFacesRecordSet_new( sfcontr,  beginDate, EndDate, true, false, false, ComCode); // 4- й параметр true, т.е. отбираем внутренние
+    while (rs and rs.moveNext())    
+        PaymentsSum = PaymentsSum + rs.Value (0, null, V_MONEY); // посчитали сумму платежей, по которым должна списаться комиссия
+    end;
+    
+    if (PaymentsSum > 0)
+        /* Определим дату начала текущего месяца */
+        dateSplit(EndDate, null, mm, yy);
+        var MonthBegDate = date(1, mm, yy);
+        
+        rs = GetComToPhisFacesRecordSet_new( sfcontr,  MonthBegDate, EndDate, true, true, false ); // Это весь "НАКОПЛЕННЫЙ ИТОГ" как понимает его банк...
+                                                                                                                     
+        while (rs and rs.moveNext())
+            TotalSum = TotalSum + rs.Value (0, null, V_MONEY); // посчитали сумму всех остальных (т.е. не с ИП, не зарплатных) платежей с начала месяца.Параметр 4 можно передавать любой.
+        end;
+        // Для комиссий 3.10.*  не учитываем в накопленном итоге те платежи (внешние) за тек. день, с кот. сейчас будем списывать комиссию
+        TotalSum = TotalSum - PaymentsSum;
+        if (TotalSum < 0) // на всякий случай
+            TotalSum = 0;
+        end; 
+
+            if (TotalSum == 0 )
+                while ( ((PaymentsSum - SumOfBases) > 0) and (i < 7)) ;
+                    if ((PaymentsSum - SumOfBases) >= (ComParam(i).maxC - ComParam(i).minC) ) 
+                        CommBase (i) = ComParam(i).maxC - ComParam(i).minC;
+                    else 
+                        CommBase (i)  = PaymentsSum - SumOfBases;
+                    end;
+                SumOfBases = SumOfBases + CommBase (i);
+                i = i + 1;
+                end;
+            Else // Если это не первый платеж за месяц
+                while ( ((PaymentsSum - SumOfBases) > 0) and (i < 7))
+                    If (TotalSum >= ComParam(i).maxC) // Не попадаем в базу комиссии, переходим к следующей
+                        CommBase (i) = 0;
+                        
+                    elif ((TotalSum > ComParam(i).minC) and (TotalSum < ComParam(i).maxC )) // Попали в первую комиссию, которая должна быть удержана 
+                        If ((PaymentsSum  >= ComParam(i).maxC - TotalSum) ) // т.е. всё аналогично первому платежу, но вместо минимума используем накопленную за месяц сумму
+                            CommBase (i) = ComParam(i).maxC -  TotalSum; 
+                        else
+                            CommBase (i) = PaymentsSum; // SumOfBases здесь не нужен, т.к. будет равен нулю 
+                        end;
+                    else // т.е. TotalSum <= min, тогда всё аналогично тому, как для первого чека за месяц. 
+                        If (PaymentsSum - SumOfBases > 0 )
+                            If (  (PaymentsSum - SumOfBases) >= (ComParam(i).maxC - ComParam(i).minC) )  
+                                CommBase (i) = ComParam(i).maxC - ComParam(i).minC;
+                            else
+                                CommBase (i) = PaymentsSum - SumOfBases;
+                            end;
+                        else 
+                            CommBase (i) = 0;
+                        end;
+                    end;
+                    
+                SumOfBases = SumOfBases + CommBase (i);
+                i = i + 1;
+                
+                end;
+            end;
+            // Для последней комисии (сейчас это 3.10.7) нужен немного другой алгоритм из-за отсутствия максимума
+            if (i = 7);
+                if (TotalSum == 0)
+                    if (PaymentsSum > ComParam(i).minC)
+                        CommBase (i) = PaymentsSum - SumOfBases;
+                    else
+                        CommBase (i) = 0;
+                    end;
+                else
+                    if (TotalSum > ComParam(i).minC)
+                        CommBase (i) = PaymentsSum;
+                    else
+                        if ((PaymentsSum - SumOfBases) > 0)
+                            CommBase (i) = PaymentsSum - SumOfBases;
+                        else  
+                            CommBase (i) = 0;
+                        end;
+                    end;
+                end;
+            end;
+        
+        
+        var j = substr (ComCode,6,1);
+        
+        CommSum = CommBase (j);
+        if (ValType(CommSum) == V_UNDEF)
+            CommSum = 0;
+        end;
+    end;
+        
+        
+   /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType    = SF_BASETYPE_SUM;
+    sfbassum.baseSum   = CommSum;
+
+    sfbassum.baseType2   = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+
+
+END;
+      

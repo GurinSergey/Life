@@ -1,0 +1,164 @@
+/************************************************************************/
+/*         Автоматизированная банковская система RS-Bank                */
+/*                 Copyright (c) R-Style Software Lab 2002              */
+/*                                                                      */
+/*  Имя файла      : prpmrqvi.mac                                       */
+/*                                                                      */
+/*  Описание       : Печать платежного поручения (WR)                   */
+/*                                                                      */
+/*  Программист    : Дроздов И.Е.                                       */
+/*                                                                      */
+/*  Создан         : 22.09.04                                           */
+/*                                                                      */
+// KS 04.12.2013 Перенос пользовательских доработок в 31ю сборку
+// EVG 4/03/2014 Реализован условный вывод надписей "Изменение реквизитов"
+// VDN 30.04.2014 I-00484148-2
+/* ********************************************************************** */
+
+import prpm;
+import "BnkTemplReport.mac";
+
+import lib_compare, RsbDataSet;
+import "fg_Life_parm.mac";
+private Const fdBank = fg_life_subject({OurBank});
+
+class (BnkTemplReport) PayOrder0401060Report(PayerP:TPartyProperties, ReceiverP:TPartyProperties)
+debugbreak;
+   var PayerPr = PayerP;
+   var ReceiverPr = ReceiverP;
+   var paym   :TRecHandler = TRecHandler( "pmpaym.dbt",   "bank.def" );
+   var debet  :TRecHandler = TRecHandler( "pmprop.dbt",   "bank.def" );
+   var credit :TRecHandler = TRecHandler( "pmprop.dbt",   "bank.def" );
+   var rmprop :TRecHandler = TRecHandler( "pmrmprop.dbt", "bank.def" );
+   
+   copy( paym   , pr_pmpaym   );
+   copy( debet  , pr_debet    );
+   copy( credit , pr_credit   );
+   copy( rmprop , pr_pmrmprop );
+
+   
+   macro Create()
+
+     var Sum = string(paym.rec.Amount);
+     StrSet(Sum, StrBrk(Sum, ".,"), "-");
+     var pINN, pKPP, rINN, rKPP;
+     splitINN_KPP(PayerPr.INN, pINN, pKPP);
+     splitINN_KPP(ReceiverPr.INN, rINN, rKPP);
+
+     SetSheetName( rmprop.rec.Number );
+
+      //назначение платежа
+     var sql,gr;
+     if ( fdBank.is_EXV )
+          gr = PutDoubleQoute(String(rmprop.rec.Ground));
+
+          sql = "   WITH t AS (SELECT "+
+                   "\n REGEXP_SUBSTR (LOWER ('"+gr+"'),"+
+                   "\n '((в((\\s+т(\\s|\\S)*ч(\\s|\\S)*)|(кл(\\s|\\S)*)*\\s+ндс(\\S|\\s)*))|(ндс((\\s+не(т|(\\s+обл(\\s|\\S)*)))|(\\s(\\s|\\S)*)))|(без\\s(\\s|\\S)*ндс))'"+
+                   "\n ) AS A_  FROM dual)"+
+                   "\n SELECT nvl((t.A_),' ') as nds FROM t";
+     else
+         //TAM 24.10.11 I-00111622-3
+          gr = StrSubst(rmprop.rec.Ground,"'"," "); //избегаем неверной трактовки строк в запросе
+         /*Агеев С. В. Попытался предусмотреть максимум возможных записей про НДС в описании платежа*/
+          sql = "WITH t AS (SELECT "+
+                   "\n REGEXP_SUBSTR (LOWER ('"+gr+"'), '(в\\s+т(\\s|\\S)*ч(\\s|\\S)*\\s+ндс(\\S|\\s)*)' )  AS A_,"+
+                   "\n REGEXP_SUBSTR (LOWER ('"+gr+"'), '(ндс(\\s+не(т|(\\s+)обл(\\w|\\.)*)))' )  AS B_,   "+
+                   "\n REGEXP_SUBSTR (LOWER ('"+gr+"'), '(без\\s(\\s|\\S)*ндс)' )  AS C_  FROM dual)"+
+                   "\n SELECT TRIM(nvl((t.A_||t.B_||t.C_),' ')) as nds FROM t;";
+     end;
+     var data = TRsbDataSet(sql);
+     var ground;
+     if (data.movenext)
+            /*TAM I-00096805-2 Не следует разрывать основание на строки по первому пробелу.*/ 
+            /*sev I-00118595-3 trim убирает все пробелы, строка не разрывается*/
+             var pos = index(strlwr(rmprop.rec.Ground), trim(data.value(0)));
+             if (pos == 0)
+                     ground = rmprop.rec.Ground;
+             else
+                     ground = substr(rmprop.rec.Ground, 1, pos-1) + "\n" + substr(rmprop.rec.Ground,pos);
+             end;
+     end;
+
+     
+     SetValues( //"PayerBankEnterDate", string(paym.rec.PayerBankEnterDate:f),
+                //TAM I-00097078-2
+                //дата поступления в банк
+                "PayerBankEnterDate",
+                   IfThenElse(( fdBank.is_EXV ),
+                              "",
+                              IfThenElse(((paym.rec.PayerBankEnterDate >= rmprop.rec.PayerChargeOffDate) and (string(rmprop.rec.PayerChargeOffDate) != "")), rmprop.rec.PayerChargeOffDate:f, paym.rec.PayerBankEnterDate:f)//TAM 06.06.2012 I-00203428-2 string(paym.rec.PayerBankEnterDate:f)
+                             ),
+                //"PayerChargeOffDate", string(rmprop.rec.PayerChargeOffDate:f),
+                //TAM I-00097078-2
+                //дата списания со счета
+                "PayerChargeOffDate",
+                   //TAM 10.04.12 I-00171975-2 - дата списания заполняется только когда списан весь документ.
+                   IfThenElse((( fdBank.is_EXV ) or (not ((paym.rec.paymstatus == 32000) or (paym.rec.paymstatus == 3000)))),
+                              "",
+                              string(rmprop.rec.PayerChargeOffDate:f)
+                             ),
+                "Data", string(rmprop.rec.Date:f),
+                //"PaymentKind", GetPaymentKind(rmprop.rec.PaymentKind),
+                "PaymentKind", IfThenElse(((rmprop.rec.PaymentKind == "П") and ((rmprop.rec.ShifrOper == "02") or (rmprop.rec.ShifrOper == "06") or (rmprop.rec.ShifrOper == "16"))),
+                                          "",
+                                          GetPaymentKind(rmprop.rec.PaymentKind)
+                                         ),
+                "Number", rmprop.rec.Number,
+                "TaxAuthorState", rmprop.rec.TaxAuthorState,
+                "SumInPrint", RubToStrAlt(paym.rec.Amount),
+                "pINN", pINN,
+                //"pKPP", pKPP,
+                "pKPP", IfThenElse(((pKPP == "") and (rmprop.rec.TaxAuthorState != "")),"0",pKPP),
+                "Summa", Sum, 
+                "PayerName", PayerPr.Name,
+                "PayerAccount", string(PayerPr.Account),
+                "PayerBankName", PayerPr.BankName,
+                "BIC_PB", PayerPr.BankBIC,
+                "PayerBankCorrAccount", string(PayerPr.BankCorrAccount),
+                "ReceiverBankName", ReceiverPr.BankName,
+                "ReceiverBankBIC", ReceiverPr.BankBIC,
+                "ReceiverBankCorrAccount", string(ReceiverPr.BankCorrAccount),
+                "rINN", rINN,
+                "rKPP", rKPP,
+                "ReceiverAccount", ReceiverPr.Account,
+                "ReceiverName", ReceiverPr.Name,
+                "ShifrOper", rmprop.rec.ShifrOper,
+                "ShifrNazn", "",
+                //VDN 30.04.2014 I-00484148-2 - отображение кода в печатной форме
+                "ShifrCode", IfThenElse(rmprop.rec.Date >= date(01,04,2014), rmprop.rec.Uin, ""),
+                "Srok", "",
+                "Priority", rmprop.rec.Priority,
+                "ResultPole", "",  
+                "BttTICode", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.BttTICode,   ""),
+                "OkatoCode", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.OKATOCode,   ""),
+                "TaxPmGround", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.TaxPmGround, ""),
+                "TaxPmPeriod", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.TaxPmPeriod, ""),
+                "TaxPmNumber", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.TaxPmNumber, ""),
+                "TaxPmDate", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.TaxPmDate,   ""),
+                //Gurin S. 26.01.2015 R-534089-2
+                //"TaxPmType", IfThenElse(rmprop.rec.TaxAuthorState, IfThenElse(((rmprop.rec.Date >= date(01,01,2015)) and (rmprop.rec.TaxPmType == "0")),"",rmprop.rec.TaxPmType),   ""),/*zmp 12.01.2015 HF2031_19_25\124*/
+                "TaxPmType", IfThenElse(rmprop.rec.TaxAuthorState, rmprop.rec.TaxPmType,   ""),
+//                "Ground", rmprop.rec.Ground,
+                "Ground", Ground,
+                "OtBankPl", string(paym.rec.PayerBankMarkDate)
+              );
+
+
+     /* EVG 4/03/2014 Надписи "Изменение реквизитов" из шаблонов убрал - они необходимы только для случаев,
+        когда реквизиты платежа, действительно, менялись. В остальных случаях надпись не выводится.
+        Вывод надписи осуществляет процедура ProcessPaymentEditing() из prpm.mac */
+     ProcessPaymentEditing( this, paym );
+
+   end;
+   
+   initBnkTemplReport("PayOrder0401060.xls");
+end;
+
+MACRO PrintPayReqRSF(): bool
+
+  var PayerPr   :TPartyProperties = TPartyProperties("Payer",    pr_pmpaym, pr_debet,  pr_pmrmprop);
+  var ReceiverPr:TPartyProperties = TPartyProperties("Receiver", pr_pmpaym, pr_credit, pr_pmrmprop);
+
+  return PayOrder0401060Report( PayerPr, ReceiverPr ).Print();
+END;

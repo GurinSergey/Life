@@ -1,0 +1,259 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: reqclosa.mac (дистрибутив)
+// @desc    : макрос скроллинга заявлений на закрытие счёта РКО
+// @changes : 2013-05-23 zip_z. C-19478
+//            2013-06-20 TAM R-206012-2
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+//            2014-07-25 LVV R-417349
+//            2014-12-12 VDN R-500926
+// -------------------------------------------------------------------------------------------------
+import BankInter, PSInter, reqinter;                                             // distr
+import AccCloseDoc, CheckDelivery, ps_reqclose_reason, lib_const, fg_life_parm, lib_account;  // user
+
+// заполняется сишно, поэтому должно быть
+RECORD ReqCloseAcc(reqclosa);
+RECORD OldReqCloseAcc(reqclosa);
+
+var accbuf  :TRecHandler = TRecHandler( "account.dbt"  , "bank.def" );
+
+// из них реально используется только Fld_PackNumb
+const Fld_Account = 6, Fld_Series   = 17, Fld_PackNumb = 25;
+
+// @desc: Установка подсказки для скролингов из макроса 
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+    private const HINT_BYDATE      = "/*+FIRST_ROWS LEADING(t oproper accounts partcode) INDEX(t dreqclosa_dbt_idx5) USE_NL(t oproper accounts partcode)*/";
+    private const HINT_BYCLOSEDATE = "/*+FIRST_ROWS LEADING(t oproper accounts partcode) INDEX(t dreqclosa_dbt_idx4) USE_NL(t oproper accounts partcode)*/";
+    private const HINT_BYSTATUS    = "/*+FIRST_ROWS LEADING(t oproper accounts partcode) INDEX(t dreqclosa_dbt_idx3) USE_NL(t oproper accounts partcode)*/";
+    private const HINT_BYSTEP      = "/*+FIRST_ROWS LEADING(t oproper reqclosa accounts partcode) INDEX(t doprstep_dbt_idx10) INDEX(reqclosa dreqclosa_dbt_idx0) USE_NL(t oproper reqclosa accounts partcode)*/";
+
+    if( ScrolStates == SCR_ST_ALL ) 
+        return HINT_BYDATE;
+    elif( ScrolStates == SCR_ST_CLOSED ) 
+        return HINT_BYCLOSEDATE;  
+    elif( inList(ScrolStates, SCR_ST_DEFER, SCR_ST_OPENED, SCR_ST_REJECTED))
+        return HINT_BYSTATUS;    
+    elif( ScrolStates == SCR_ST_READY ) 
+        return HINT_BYSTEP;
+    end;
+    return DefaultHint;
+END;
+
+MACRO Новое_Заявление()
+    return 0;
+END;
+
+private const REQCLOSA_ST_CLOSED = 30;
+
+private macro CheckOther()
+  var select = "select t_CurrentState, t_Date, t_RequestID from dreqclosa_dbt " +
+                      " where t_Code_Currency = " + ReqCloseAcc.Code_Currency +
+                      "   and t_Account = '" + ReqCloseAcc.Account + "'" +
+                      "   and t_RequestID <> " + ReqCloseAcc.RequestID;
+  var rs = execSQLselect( select );
+  if (rs and rs.MoveNext())
+    if (rs.value("t_CurrentState") != REQCLOSA_ST_CLOSED)
+      var res = ConfWin( makeArray("Заявление на закрытие счета " + ReqCloseAcc.Account + " от " + date(rs.value("t_Date")) +
+              " уже существует и находится в стадии обработки. Сохранить заявление?"), 
+              makeArray("Сохранить", "Продолжить редактирование", "Отказаться"));
+      //Gurin S. 21.10.2014 R-477916-2
+      if (res == 0)
+        if (not GetTrue(true, "Это приведет к дублированию заявлений на закрытие счета. Продолжить?"))
+          res = 2; //Отказаться
+        end;
+      end;
+      return res;  
+    else
+      var err:integer = 0;
+      var locale:string = "";
+      GetRegistryValue("CB\\PAYMENTS\\PANEL\\LOCALE", V_STRING, locale, err);
+      var y1, y2: integer;
+      datesplit(ReqCloseAcc.Date, NULL, NULL, y1);
+      datesplit(date(rs.value("t_Date")), NULL, NULL, y2);
+      if ( (locale == "RU") and (y2 >= y1) )
+        var rs2 = execSQLselect( "select wlmes.t_Trn, wlmes.t_Date from dwlmes_dbt wlmes join dwlmeslnk_dbt wlml using(t_MesID) " +
+            "where wlml.t_objKind = 451 " +/*OBJTYPE_REQCLOSA*/
+              "and wlmes.t_State >= 30 " +/*WLD_STATUS_MES_SEND*/
+              "and wlml.t_objID = " + rs.value("t_RequestID"));
+        if (rs2 and rs2.MoveNext())
+          res = ConfWin( makeArray("Заявление на закрытие счета " + ReqCloseAcc.Account + " от " + date(rs.value("t_Date")) +
+              " уже существует. Заявление обработано и по нему отправлено сообщение в ФНС №" + rs2.value("t_Trn") +
+              " от " + date(rs2.value("t_Date")) + ". Сохранить заявление?"), 
+              makeArray("Сохранить", "Продолжить редактирование", "Отказаться"));
+          return res;
+        end;
+      end;
+    end;
+  end;
+end;
+
+MACRO Проверить_Заявление(Режим)
+    /*
+     * При редактировании производим проверку важности внесенных изменений
+     * Константы важности внесенных изменений:           
+     *      CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)
+     *      CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) 
+     *      CHANG_NOTKEEP        - не сохранять изменения 
+     *
+     * Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром
+     * Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+     * и сохранение изменений можно производить без отката операции      
+     */
+   
+    var BuffAccPaym :string  = "";
+    var Certifs     :TArray  = TArray ();
+    var Cert        :TArray  = TArray ();
+    var stat        :integer = RSL_EXIT_SUCCESS;
+  
+    // ввод/редактирование/сохранение в отложенных
+    if ( (Режим == 2 ) or (Режим == 3) or (Режим == 8) ) 
+      if( ReqCloseAcc.Dummy != "X" )
+        // Счет, закрываемый по заявлению, является открытым (account.open_close = UNSET_CHAR)
+        var select = "select 1 from daccount_dbt " +
+                     " where t_Account = '" + ReqCloseAcc.Account + "'" +
+                     "   and t_chapter = 1 " +
+                     "   and t_Code_Currency = " + ReqCloseAcc.Code_Currency +
+                     "   and t_Open_Close <> chr(0) ";
+        var rs = execSQLselect( select );
+        if (rs and rs.MoveNext())
+          // zmp 30.09.2014 костыль для депозитных счетов
+          if(not ReqCloseAcc.KIND_OPERATION == 13040)
+             //Gurin S. 20.01.2015 R-530389-2
+             //MsgBox("Заданный счет уже закрыт");
+             //return Fld_Account;
+          end;
+        end;
+        //Gurin S. 16.04.2015 I-00562504-2
+        var sql = execSqlSelect("select to_char(t_date,'dd.mm.yyyy') d from dreqclosa_dbt where t_account = :acc", makeArray (SQLParam ("acc", ReqCloseAcc.Account)));
+        if (sql.movenext())
+           if ( gettrue(true, "По счету '" + ReqCloseAcc.Account + "' уже есть заявление на закрытие счета за " + sql.value("d") + ". Продолжить?"))
+              var res = CheckOther();
+              if (res == 1)
+                 return -9;//Продолжить редактирование
+              elif(  res == 2)
+                 return -8;//Отказаться
+              end;
+           else
+              return -8;//Отказаться
+           end;
+        end;
+      end;
+    end;
+
+    if(Режим == SCR_EDIT)  
+        if ((ReqCloseAcc.Account != OldReqCloseAcc.Account) or (ReqCloseAcc.Code_Currency != OldReqCloseAcc.Code_Currency)) 
+            stat = CHANG_IMPORTANT;
+        end;
+        
+    elif( Режим == SCR_CARRY)
+      if( ReqCloseAcc.Dummy != "X" ) 
+        // zip_z. C-19478 Пока только для ПРББ !!! >
+        // -----------------------------------------------------------------------------------------
+        // Обнуляем основание закрытия счёта (PSRQ_EMPTY_REASON), выбираем своё из справочника. 
+        // Пока что-нибудь не выбрали (USR_GetCloseReason) - операцию не стартуем.
+        // Если подвид документа - "Закрыто по распоряжению банка" (PSRQ_SUBKIND_ORDER), справочник 
+        // не показывается, пишется основание-константа
+        // -----------------------------------------------------------------------------------------
+        var bank = fg_life_subject ({OURBANK});
+        if (bank.is_prbb or bank.is_vuz or bank.is_geb or bank.is_exv or bank.is_sld) //20.06.2013 TAM R-206012-2   12.12.2014 VDN R-500926
+            ReqCloseAcc.Ground == PSRQ_EMPTY_REASON;
+            if (ReqCloseAcc.SubKind == PSRQ_SUBKIND_ORDER)
+                ReqCloseAcc.Ground = "Закрытие в одностороннем порядке Банком  (п.1.1 ст.859 ГК РФ)"; 
+            elif(ReqCloseAcc.SubKind == PSRQ_SUBKIND_FINMONORDER)                                     //25.07.2014 LVV R-417349	
+                ReqCloseAcc.Ground = "Закрытие в одностороннем порядке Банком  (п.1.2 ст.859 ГК РФ)"; 	
+            else
+                ReqCloseAcc.Ground = USR_GetCloseReason (PSRQ_SCROLL_READ_ONLY, ReqCloseAcc.SubKind);
+            end;
+            
+            if (ReqCloseAcc.Ground == PSRQ_EMPTY_REASON)
+                msgbox ("Не выбрана причина закрытия счёта, старт операции запрещён");
+                return RSL_EXIT_FAILURE;
+            end;
+        end;
+        // -----------------------------------------------------------------------------------------
+        // < zip_z.
+        
+        stat = CheckAllPayments( ReqCloseAcc.Account, ReqCloseAcc.Code_Currency, BuffAccPaym );
+        if( stat )
+            //Gurin S. 29.12.2014 R-522402-2
+            if (ReqCloseAcc.Account == BuffAccPaym)
+                msgbox( "Нельзя закрыть счет ", BuffAccPaym, ", т.к. по нему есть неоплаченные платежи" );
+                OutallDoc(ReqCloseAcc.Account, ReqCloseAcc.Code_Currency); // Тихомиров по заявке 49830
+                return RSL_EXIT_FAILURE;
+            else
+                msgbox( "Нельзя закрыть связанный счет ", BuffAccPaym, ", т.к. по нему есть неоплаченные платежи" );
+                OutallDoc(BuffAccPaym, Acc_GetFiidByAccount (BuffAccPaym));
+                return RSL_EXIT_FAILURE;
+            end;
+        end;
+        
+        // I-003054 SCR#151897 >
+        stat = CheckRestFromAccount( ReqCloseAcc.Account, 0, ReqCloseAcc.Code_Currency );
+        if( stat )
+            if (Gettrue( True, string("На счет ", ReqCloseAcc.Account, " наложен арест. Закрыть счет?" )))
+                stat = RSL_EXIT_SUCCESS;
+            end;
+        end;
+        // <
+        
+        if( stat )
+            msgbox( "На счет ", ReqCloseAcc.Account, " наложен арест. Закрытие счета невозможно" );
+            return RSL_EXIT_FAILURE;
+        end;
+        stat = CheckSertifForAccount( ReqCloseAcc.Account, ReqCloseAcc.Code_Currency, Certifs );
+        if( stat != -1 )
+            if (( ReqCloseAcc.Series == "" ) and  ( ReqCloseAcc.NumberFirst == "" ) and ( ReqCloseAcc.NumberLast == "" ))
+                if( stat > 0) 
+                    msgbox( "К закрываемому счету имеется чековая книжка с неиспользованными бланками" );
+                    return RSL_EXIT_FAILURE;
+                end;
+            else
+                if( stat == RSL_EXIT_SUCCESS )
+                    msgbox( "В заявлении неверно указаны реквизиты бланков чековой книжки" );
+                    return RSL_EXIT_FAILURE;
+                end;
+                Cert = Certifs[0];
+                if (( ReqCloseAcc.Series      != Cert[0] ) or  
+                    ( ReqCloseAcc.NumberFirst != Cert[1] ) or 
+                    ( ReqCloseAcc.NumberLast  != Cert[2] ))
+                    msgbox( "В заявлении неверно указаны реквизиты бланков чековой книжки" );
+                    return RSL_EXIT_FAILURE;
+                end;
+            end;
+            stat = RSL_EXIT_SUCCESS; /* с чековыми книжками к счету все в порядке */
+        else
+            MsgBox( "Не задан финансовый инструмент для бланков" );
+            return RSL_EXIT_FAILURE;
+        end;                              
+      end;
+    elif (Режим == SCR_ROLLBACK) 
+        if(not CheckDelivery(ReqCloseAcc.RequestID, 2))
+            return RSL_EXIT_FAILURE;
+        end;
+    end;
+    if( ReqCloseAcc.NumberPack < 0 )
+        MsgBox("Номер пачки не может быть отрицательным");
+        return Fld_PackNumb;
+    end;
+    return stat;
+END;
+
+/*
+ *      Возможные значения Режим:
+ *        UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+ *        UFN_PANEL_EDIT(2)  - функция вызвана из панели корректировки объекта;
+ *        UFN_SCROL(3)       - функция вызвана из панели скролинга, единичный вызов, 
+ *                             любая корректировка объекта запрещена;
+ *        UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, 
+ *                             вызов до начала обработки, любая корректировка объекта запрещена;
+ * 
+ *      Пример работы: 
+ *          if( Режим == UFN_SCROL )
+ *              return UPDTPAGE;      // Обновить страницу записей и область скролинга
+ *              //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+ *          end;
+ */
+MACRO Функция_Пользователя( Режим:integer )
+    return RSL_EXIT_SUCCESS;
+END;
+
+

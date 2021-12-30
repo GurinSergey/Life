@@ -1,0 +1,305 @@
+//*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : transferFromBranch.mac v.1                                   */
+/*  Created     : 16.11.2015                                                   */
+/*  Programmer  : Ващенко Д.Н.                                                 */
+/*  Description : Макрос переноса документов КОР и К1 с филиала пользователя   */
+/*                (запускается в банке, в который требуется перенести          */
+/*                документы)                                                   */
+/*  Изменен     :                                                              */
+/*******************************************************************************/
+
+import oralib,
+       rcw, 
+       likepy, 
+       globals, 
+       RsbFormsInter, 
+       KeyCodes, 
+       PaymInter,
+       ldmklbr;
+
+private class UtilCardFile()
+    private var newOper ;
+    private var blockId ;
+    private var typeCardFile;
+    private var countAccounts;
+    private var repName = GetTXTFileName( "transferCard" ); 
+    private var branchOfUser;
+    private var link; 
+
+    macro init ( v_newOper, v_blockId, v_branchOfUser, v_test )
+        newOper       = v_newOper;
+        blockId       = v_blockId; 
+        branchOfUser  = v_branchOfUser; 
+
+        if   ( v_branchOfUser == 0 ) link = "rsbank_evsta_02";
+        elif ( v_branchOfUser == 1 ) link = "rsbank_evvor";
+        elif ( v_branchOfUser == 2 ) link = "rsbank_evv";
+        end;
+
+        if( ( v_test ) and ( v_branchOfUser == 0 ) ) link = "rsstavr_test"; end;
+        if( ( v_test ) and ( v_branchOfUser == 1 ) ) link = "RSVOR_TEST"; end;
+
+     end;
+
+    private macro saveLogError( account, type, errmsg )
+        var cmd =  rsdCommand( " BEGIN USR_TRANSFERFROMBRANCH.saveLogError( :account, :type, :errmsg ); END; " );
+        cmd.addparam( "account", RSDBP_IN, account );
+        cmd.addparam( "type",    RSDBP_IN, type    );
+        cmd.addparam( "errmsg",  RSDBP_IN, errmsg  );
+        cmd.execute();
+    end;
+
+    macro printErrors()
+        private var conformityAccTable = execSQLselect( " SELECT * FROM USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = :branch", makeArray( sqlParam( "branch",  branchOfUser ) ) );
+        private var newAcc;
+        private var errorsRSet;
+
+        setOutput( repName + "Errors", false );
+
+      [                                                              Перенос картотеки ##. Ошибки.                                     ]
+      ( ifThenElse( blockId == 10000133, "№1", "ОР" ) );
+      [ ┌─────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
+        │          Счет               │                                    Результат                                                  │
+        ├─────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤ ];
+
+        while( conformityAccTable.movenext )
+            newAcc     = conformityAccTable.value( "T_ACCOUNT" );
+            errorsRSet = execSQLselect( " SELECT * FROM USR_TRANSFERACCDATA_RESULT_TMP WHERE T_ACTIONTYPE IN ( 60, 6 )  AND T_NEWACCOUNT = :ACC", makeArray( sqlParam( "acc", newAcc ) ) ); 
+          
+            while( errorsRSet.moveNext() )
+                [ │ ########################### │ ############################################################################################# │ ]( errorsRSet.value( "t_newAccount" ):c, errorsRSet.value( "t_errorTxt" ):w );
+            end;                
+        end;
+
+        [ └─────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘ ];
+       
+        setOutput( null, false ); 
+        viewFile( repName + "Errors" );
+    end;
+
+    macro printResult()
+        private var rsetPayments = execSQLselect( "  SELECT   nvl(PMPROP.T_NUMBER,       ' ') T_NUMBER,  "
+                                          "           PMPROP.T_DATE                   T_DATE, "
+                                          "           nvl(PAYM.T_PAYERACCOUNT,   ' ') T_PAYERACCOUNT,  "
+                                          "           nvl(PAYM.T_RECEIVERACCOUNT,' ') T_RECEIVERACCOUNT, "
+                                          "           nvl(PAYM.T_AMOUNT,          0 ) T_AMOUNT "
+                                          "    FROM   USR_TRANSFER_TMP TRANSFER,  "
+                                          "           DPMRMPROP_DBT PMPROP,  "
+                                          "           DPMPAYM_DBT PAYM  "
+                                          "   WHERE   TRANSFER.T_PAYMENTID = PMPROP.T_PAYMENTID(+)  "
+                                          "           AND TRANSFER.T_PAYMENTID = PAYM.T_PAYMENTID(+)  "  );
+         setOutput( repName + "Result", false );
+
+            [                                                  Перенос картотеки ##. Документы.                         ] 
+            ( ifThenElse( blockId == 10000133, "№1", "ОР" ) );
+            [ ┌─────────┬──────────────────┬──────────────────────────┬─────────────────────────┬─────────────────────┐
+              │    №    │       Дата       │     Счет плательщика     │     Счет получателя     │    Сумма платежа    │
+              ├─────────┼──────────────────┼──────────────────────────┼─────────────────────────┼─────────────────────┤ ];
+
+        while( rsetPayments.movenext )
+            [ │ ####### │ ################ │ ######################## │ ####################### │ ################### │ ]
+            ( rsetPayments.value( "T_NUMBER" ):c, date( rsetPayments.value( "T_DATE" ) ):c, rsetPayments.value( "T_PAYERACCOUNT" ), rsetPayments.value( "T_RECEIVERACCOUNT" ), rsetPayments.value( "T_AMOUNT" ) );
+        end;
+            [ └─────────┴──────────────────┴──────────────────────────┴─────────────────────────┴─────────────────────┘ ];  
+        setOutput( null, false );
+        viewFile( repName + "Result" );
+    end;    
+
+    private macro transferForAccount( oldAcc, newAcc );
+        var stat = execSQL( "BEGIN USR_TRANSFERFROMBRANCH.maketransfer( :oldAcc, :newAcc); END;", makeArray( sqlParam( "oldAcc",  oldAcc  ), 
+                                                                                                             sqlParam( "newAcc",  newAcc  ) ) );
+    onError(x)
+        saveLogError( newAcc, 6, x.message );
+    end;
+
+    private macro makeCarry( newAcc )
+        private var paymentsRSet = execSQLselect( " SELECT   PM.T_PAYMENTID PAYMENTID, PM.T_DOCKIND DOCKIND "
+                                                  "   FROM   USR_TRANSFER_TMP TMP, DPMPAYM_DBT PM "
+                                                  "  WHERE   PM.T_PAYMENTID = TMP.T_PAYMENTID " );
+        private var countRSet    = execSQLselect( " SELECT   COUNT(*) \"COUNT\""
+                                                  "   FROM   USR_TRANSFER_TMP TMP, DPMPAYM_DBT PM "
+                                                  "  WHERE   PM.T_PAYMENTID = TMP.T_PAYMENTID " );
+        private var ORPaymentId;
+        private var ORPaymentDocKind;
+        private var imode;
+        private var execStat;
+
+        countRSet.movenext();
+
+        private var paymentsCount = int( countRSet.value( "COUNT" ) ); 
+        private var j = 0;
+
+        initProgress( paymentsCount, "Постановка на картотеку", "Счет " + newAcc );
+        while( paymentsRSet.movenext() )
+            ORPaymentId      = paymentsRSet.value( "PAYMENTID" );
+            ORPaymentDocKind = paymentsRSet.value( "DOCKIND" );
+
+            imode = setDialogFlag( 0 );
+            execStat = PM_ExecuteOperation( ORPaymentId, ORPaymentDocKind );
+            setDialogFlag( imode );
+ 
+            if( not execStat ) saveLogError( newAcc, 6, ORPaymentId + " :: " + getErrMsg ); end;
+            j = j + 1;
+            useProgress( j );
+        end;
+        remProgress();
+    end;
+
+    macro makeTransfer()                               
+        private var conformityAccTable = execSQLselect( " SELECT COUNT(*) T_CNT FROM USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = :branch", makeArray( sqlParam( "branch",  branchOfUser ) ) );
+        conformityAccTable.moveNext();
+        countAccounts = int(conformityAccTable.value( "T_CNT" ) );
+
+        conformityAccTable = execSQLselect( " SELECT * FROM USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = :branch", makeArray( sqlParam( "branch",  branchOfUser ) ) );
+        private var oldAcc;
+        private var newAcc; 
+        private var stat;
+        private var i = 0;
+        private var cmd;
+
+        execSQL( " DELETE FROM USR_TRANSFERACCDATA_RESULT_TMP " );
+
+        initProgress( countAccounts, "Перенос картотеки", "Перенос картотеки" );
+
+        cmd =  rsdCommand( " BEGIN USR_TRANSFERFROMBRANCH.init( :schema, :newoper, :curdate, :blockid ); END; " );
+        cmd.addparam( "schema",   RSDBP_IN, link      );
+        cmd.addparam( "newoper",  RSDBP_IN, newOper   );
+        cmd.addparam( "curdate",  RSDBP_IN, {curdate} );
+        cmd.addparam( "blockid",  RSDBP_IN, blockId   ); 
+        cmd.execute();
+
+        while( conformityAccTable.moveNext() )
+            execSQL( " DELETE FROM USR_TRANSFER_TMP " );
+ 
+            oldAcc  = conformityAccTable.value( "T_ACCOUNT_BRANCH" );
+            newAcc  = conformityAccTable.value( "T_ACCOUNT"        );
+ 
+            begAction( 0 );
+            transferForAccount( oldAcc, newAcc );
+            endAction;
+ 
+            makeCarry( newAcc );
+
+            i = i + 1;
+            useProgress( i );
+        end;
+        remProgress;
+    end; 
+end;
+
+private class( TRecHandler ) Form( lbrName )    
+  InitTRecHandler( "reject", ( lbrName ), true ); 
+  
+  var typeCardFile = 0;
+  var branch;
+  var test;
+  var thisName = lbrName;
+
+  macro handler(  dlg, cmd, id, key ) 
+     Array menuItem; 
+
+     if( ( cmd == DLG_KEY ) and ( KEY == KEY_F2 ) )
+        if( inList("", dlg.( "documents" ), dlg.( "oper" ), dlg.( "branch" ) ) ) 
+           msgBox( "Заданы не все параметры!" ); 
+           return;
+        end;
+
+        if( not execMacroFile( "loadConformityTable.mac", "conformityTableEditor", branch ) ) return; end;
+
+        var cardFile = UtilCardFile();
+
+        if( typeCardFile )
+            cardFile.init( ifThenElse( trim( dlg.rec.oper ) == "", {oper}, trim( dlg.rec.oper ) ), 10000133, branch, test ); 
+        else
+            cardFile.init( ifThenElse( trim( dlg.rec.oper ) == "", {oper}, trim( dlg.rec.oper ) ), 10000165, branch, test );
+        end;
+
+        cardFile.makeTransfer();
+        cardFile.printErrors ();
+        cardFile.printResult ();        
+
+     elif( ( cmd == DLG_KEY ) and ( KEY == KEY_F3 ) )
+ 
+        if( id == FldIndex( "documents" ) )        
+           menuItem( 0 ) = string( "Картотека ОР" : 20 );
+           menuItem( 1 ) = string( "Картотека №1" : 20 );
+
+           typeCardFile = menu( menuItem, "Документы", "Документы" );
+           typeCardFile = ifThenElse( typeCardFile == -2, 0, typeCardFile );
+           dlg.( "documents" ) = menuItem( typeCardFile );                      
+        end;
+
+        if( id == FldIndex( "branch" ) )        
+           menuItem( 0 ) = string( "ЭВ-Ставрополь" : 20 );
+           menuItem( 1 ) = string( "ЭВ-Воронеж"    : 20 );
+           menuItem( 2 ) = string( "ЭВ-Волгоград"  : 20 );
+
+           branch = menu( menuItem, "Выберите филиал", "Филиал" );
+           branch = ifThenElse( branch == -2, 0, branch );
+           dlg.( "branch" ) = menuItem( branch );                      
+        end;
+
+     elif( ( cmd == DLG_KEY ) and ( KEY == KEY_SPACE ) )
+        if( id == FldIndex( "test" ) )        
+           menuItem( 0 ) = string( "Нет" : 15 );
+           menuItem( 1 ) = string( "Да"  : 15 ); 
+
+           test = menu( menuItem, "Тестирование", "Тестирование" );
+           test = ifThenElse( test == -2, 0, test );
+           dlg.( "test" ) = menuItem( test );
+        end;
+     end;
+  end;         
+
+  macro run()
+    return runDialog( this, R2M( this, "Handler" ) );
+  onError
+    delFile( thisName );
+  end;
+End; 
+
+private macro createForm()
+    private var fullOutputLbr, 
+                outPutLbr = "reject.lbr", 
+                outLbr, 
+                lbr, 
+                rc,                                                                                                	
+                elem;
+
+    GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",V_STRING, outLbr );
+    fullOutputLbr = outLbr + "\\" + outPutLbr;
+    lbr = TLbrFile( fullOutputLbr, "C" );
+
+    rc = lbr.AddPanel( "reject", 40, 14, 29, 5, lbr.EColour.SHLP, lbr.EFRame.UNARY );
+    rc.title = "Перенос документов из филиала"; 
+    
+    elem = rc.addFrame(  0, 0, 29, 7, 4 );
+    elem = rc.addLabel(  1, 1, "Документы: " );
+    elem = rc.addField( 12, 1, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "documents", 15, 1, 15 );
+
+    elem = rc.addLabel(  1, 2, "Операционист: " );
+    elem = rc.addField( 18, 2, lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_STRING, "oper", 9, 1, 6 );
+
+    elem = rc.addLabel(  1, 3, "Филиал: " ); 
+    elem = rc.addField( 12, 3, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "branch", 15, 1, 20 );
+
+    elem = rc.addLabel(  1, 5, "Тестирование: " ); 
+    elem = rc.addField( 22, 5, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "test", 5, 1, 5 );
+
+    lbr.save(); 
+    lbr = null;
+
+    return fullOutputLbr;
+end;
+
+/***************************************************************************/
+
+private var parm = Form( createForm() );  
+parm.run();
+exit( 1 );
+
+ 
+
+ 

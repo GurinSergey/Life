@@ -1,0 +1,1178 @@
+import "or_rep_h.mac", globals, "CbReport_h.mac";
+Import oralib, rsexts, PTInter, BilFacturaInter;
+import BankInter;
+/*LVV C-33821 Адаптировал новый дистрибутивный макрос (изменения в законе с 1.10.14) под запрос ФГ Лайф на пользовательскую сортировку записей по возрастанию сумм.
+LVV C-34189 Перенес из старого макроса biljprn1.mac в новый подсчет итогов по журналу.
+ */
+
+Import likepy, rcw, "fg_Life_parm.mac";
+/* -- EVG -- */
+
+private var ssql_ = "";
+private var rs_ssql_;
+private Var Direction;
+private Var JournalID;
+private Var Dolz_1;
+private Var FIO_1;
+private Var PrnDepartment = 0;
+private Var BeginDate     : DATE;
+private Var EndDate       : DATE;
+private Var NumStr        = 1;
+private Var FPrintHead     = true;
+private Var FPrintBottom   = true;
+
+/* EVG To 2030 25/10/2011 Перенесено из локального макроса ЭВ */
+private Var UnionJournal = 0;
+private Var fgBank = fg_life_subject({OurBank});
+/* -- EVG -- */
+                                               
+private FILE BILSFJOURNAL ("bilsfjournal.dbt");
+private FILE FININSER     ("fininstr.dbt") KEY 0;
+private VAR  SfJournal = BILSFJOURNAL;
+private VAR  acssql_query:string= "" ;
+private VAR  acssql_from:string = "";
+
+
+private MACRO GetPeriod(dt1:date, dt2:date, year: integer)
+  var day1, mon1, year1;
+  var day2, mon2, year2;
+  datesplit(dt1, day1, mon1, year1);  
+  datesplit(dt2, day2, mon2, year2);  
+
+  if(year1 != year2)
+    return "";
+  end;
+
+  SetParm(2, year1);
+
+  if(mon1 == mon2)
+    return MonName(mon1);
+  end;
+   
+  if((mon1<=3) AND (mon2<=3))
+    return "I - квартал";
+  end; 
+
+  if((mon1>=4) AND (mon2>=4) AND (mon1<=6) AND (mon2<=6))
+    return "II - квартал";
+  end; 
+
+  if((mon1>=7) AND (mon2>=7) AND (mon1<=9) AND (mon2<=9) )
+    return "III - квартал";
+  end; 
+
+  if((mon1>=10) AND (mon2>=10) AND (mon1<=12) AND (mon2<=12) )
+    return "IV - квартал";
+  end; 
+
+  return "";
+END;
+
+private MACRO GetNoNDSSign( FacturaID )
+  var rs;
+  var sqlString = "SELECT DISTINCT(T_NDSRATE) FROM DBILFACTURALINE_DBT WHERE T_FACTURAID = " + string(FacturaID) +" ORDER BY T_NDSRATE";
+  var NDSRate = 0;
+  var RetVal = false;
+
+  rs = RsdRecordset( sqlString );
+
+  while(rs.moveNext())
+    NDSRate = rs.value(0);
+    if(NDSRate == -1)
+      RetVal = true;
+    else
+      RetVal = false;
+    end;
+  end;
+
+  return RetVal;
+END;
+
+private MACRO GetCompresNameCurrency( iCode )
+  FININSER.FIID = iCode;
+  if( getEQ( FININSER ) )    return  FININSER.Ccy;
+  else                          return  string(iCode);
+  end;
+end;
+
+PRIVATE MACRO AskPrintQ()
+  var RetV = 0;
+  Array Msg;
+
+  Msg(0) = "Выберите режим печати:";
+
+  Array Box;
+  Box(0) = "Печатать шапку и подписи";
+  Box(1) = "Печатать только шапку";
+  Box(2) = "Печатать только подписи";
+  Box(3) = "Печатать без шапки и подписей";
+
+  RetV = ConfWin( Msg, Box );
+
+  if(RetV == 0)
+    FPrintHead     = true;
+    FPrintBottom   = true;
+  elif(RetV == 1)
+    FPrintHead     = true;
+    FPrintBottom   = false;
+  elif(RetV == 2)
+    FPrintHead     = false;
+    FPrintBottom   = true;
+  elif(RetV == 3)
+    FPrintHead     = false;
+    FPrintBottom   = false;
+  end;
+END;
+
+/* EVG To 2030 25/10/2011 Перенесено из локального макроса ЭВ */
+
+// класс для ссылок к схемам
+private CLASS TSchemaReferences(StrFromReg :string, RootNodeName :string)
+	Var
+	NodeName = TArray,
+	UserName = TArray,
+	DBName = TArray,
+	Sort_ = TArray,
+	CheckGrant = TArray,
+	RegStr :string;
+
+	private var ArrOfTablesUsed = TArray;
+	ArrOfTablesUsed = makeArray("dbilbookentry_dbt",
+	"dbilfactura_dbt",
+	"dfininstr_dbt",
+	"dbilsftype_dbt");
+
+	//конструктор по умолчанию
+	NodeName(NodeName.Size()) = RootNodeName;
+	UserName(UserName.Size()) = "";
+	DBName(DBName.Size()) = "";
+	Sort_(Sort_.Size()) = "1";
+	CheckGrant(CheckGrant.Size()) = "1";
+	RegStr = StrFromReg;
+	//конструктор по умолчанию
+
+
+	private macro CheckGrantToTable(UserName_, ArrOfTablesUsed_) :integer
+		var Query = "", 
+			i = 0,
+			DataSet :RsdRecordset,
+			Params :TArray;
+		while( i < ArrOfTablesUsed_.Size())
+			Query =" SELECT 1 FROM dba_tab_privs P " +                           
+			"  WHERE P.PRIVILEGE = 'SELECT' " +
+			"   AND GRANTEE = USER " +
+			"   AND P.GRANTOR = UPPER(:USERNAME_1) " +
+			"   AND P.TABLE_NAME = UPPER(:TABLENAME) " +
+			"   OR USER = UPPER(:USERNAME_2) ";
+			Params = makeArray( SQLParam( "USERNAME_1" , UserName_),
+			SQLParam( "TABLENAME" , ArrOfTablesUsed_[i]),
+			SQLParam( "USERNAME_2" , UserName_));
+			DataSet = execSQLselect( Query, Params, true );
+			if ( (not DataSet ) or ( not DataSet.moveNext()))
+				return 0;
+			end;
+			i = i + 1;
+		end;
+		return 1;
+	end;
+
+
+	macro AddAllRef; //заполняем свойства из реестра
+		//запрос в реестре головного узла
+		var Query = "",
+		DataSet, DataSet1 :RsdRecordset,
+		Params :TArray;
+
+
+		Query = " SELECT REG.T_KEYID " +
+		" FROM (SELECT T.T_KEYID, SYS_CONNECT_BY_PATH(T.T_NAME, '\\') FLD, LEVEL LV, T.T_DESCRIPTION " +
+		"       FROM dregparm_dbt T " +
+		"            START WITH T.T_PARENTID = 0 " +
+		"            CONNECT BY PRIOR T.T_KEYID = T.T_PARENTID) REG, " +
+		"      dregval_dbt VAL " +
+		" WHERE REG.FLD LIKE :PARM_1 " +
+		"  AND REG.FLD NOT LIKE :PARM_2 " +
+		"  AND VAL.T_KEYID=REG.T_KEYID ";
+		
+		Params = makeArray( SQLParam( "Parm_1" , "\\" + RegStr + "\\%" ),
+		SQLParam( "Parm_2" , "\\" + RegStr + "\\%\\%" ));
+		DataSet = execSQLselect( Query, Params , true  );
+		
+
+		while ( ( DataSet ) and ( DataSet.moveNext())) //идем по найденным ключам, заполняем свойства
+			if (DataSet and (ValType(DataSet.value(0)) != 26))
+				// запрос данных по ключам
+				Query = " SELECT P.T_NAME, UTL_RAW.CAST_TO_VARCHAR2(V.T_FMTBLOBDATA_XXXX) T_VALUE,Q.T_NAME " +
+				" FROM dregparm_dbt P, dregval_dbt V, dregparm_dbt Q " +
+				" WHERE P.T_PARENTID = :Parm_1 " +
+				"  AND P.T_KEYID = V.T_KEYID " +
+				"  AND Q.T_KEYID = P.T_PARENTID ";
+				Params = makeArray( SQLParam( "Parm_1" , DataSet.value(0) ));
+				DataSet1 = execSQLselect( Query, Params , true  );
+
+				while ( ( DataSet1 ) and ( DataSet1.moveNext())) // заполняем свойства
+					if(DataSet1.value(0) == "SORT")
+						if ((ValType(DataSet1.value(1)) != 26))
+							Sort_(Sort_.Size()) = DataSet1.value(1);
+						else
+							Sort_(Sort_.Size()) = "1";
+						end;
+					elif(DataSet1.value(0) == "USERNAME")
+						if ((ValType(DataSet1.value(1)) != 26))
+							UserName(UserName.Size()) = DataSet1.value(1);
+						else
+							UserName(UserName.Size()) = "-1";
+						end;
+						NodeName(NodeName.Size()) = DataSet1.value(2);
+						DBName(DBName.Size()) = "";
+						if ( not CheckGrantToTable(UserName(UserName.Size()-1),ArrOfTablesUsed)) //проверка доступа по ссылкам к таблицам
+							println("Нет доступа к данным узла " + NodeName(NodeName.Size()-1));
+							CheckGrant(CheckGrant.Size()) = 0;
+						else
+							CheckGrant(CheckGrant.Size()) = 1;
+						end;
+					end;
+				end;
+
+			end;
+		end;
+	//запрос в реестре головного узла
+	end;
+
+
+END; // класс для ссылок к схемам
+
+private Var ArrOfRegParam = TSchemaReferences("PRBB\\БД", {Name_Bank});
+/* -- EVG -- */
+
+PRIVATE CLASS (CB_CReportTemplate) Sf_DistrReport
+
+  var NumTableStr = 0; 
+
+  var BeginHeadNum =1; // начало шапки
+  var EndHeadNum   =8; // конец шапки
+  
+  var BeginBottomNum =16; // начало подписей
+  var EndBottomNum   =25; // конец подписей 
+
+
+
+  MACRO PrintMode():INTEGER
+     return DL_OUTREPORT_EXCEL;
+  END;
+
+   PRIVATE MACRO PrintHead( IsNotEmpty : bool)
+    var date1, date2, sqlString, rs, count, i, period = "", strPeriod = "", year = 0;
+    record Party(party);
+    var tmpr;
+//debugbreak;
+    if(IsNotEmpty == true)
+
+      date1 = SfJournal.OpenDate;
+      if(SfJournal.CloseDate == date(0,0,0))
+        date2 = {CurDate};
+      else     
+        date2 = SfJournal.CloseDate;
+      end;
+
+			/* EVG To 2030 25/10/2011 Перенесено из локального макроса ЭВ */
+			//переносим в свойство класса ссылки на удаленные схемы
+			if ( UnionJournal )
+				ArrOfRegParam.AddAllRef;
+			end;
+			//переносим в свойство класса ссылки на удаленные схемы
+			/* -- EVG -- */
+
+			/* Если не правильно подтягиваются даты в шапку - курить здесь.*/
+			date1 = BeginDate;
+			date2 = EndDate;
+			/* ===========================================================*/
+
+      ПолучитьСубъекта ({OurBank}, Party ); 
+
+      //period = GetPeriod(date1, date2, year );
+
+      if((period == NULL) OR (period == ""))
+        strPeriod = "за период с " + string(date1) + " по " + string(date2);
+      else
+        strPeriod = "за "+ period + " " + year + " года";
+      end;
+
+      PrintFormatString( NULL,
+                       "JNum"        , "ЖУРНАЛ УЧЕТА ПОЛУЧЕННЫХ И ВЫСТАВЛЕННЫХ СЧЕТОВ-ФАКТУР",
+                       "RecNameTitle", "Наименование налогоплательщика",
+                       "ReceiverName", Party.Name,
+                       "ReceINNTitle", "ИНН/КПП налогоплательщика",
+                       "ReceiverINN" , ПолучитьКодСубъекта( {OurBank}, PTCK_INN ), 
+                       "DateP"       , strPeriod
+                     );
+   else
+      PrintFormatString( NULL,
+                       "JNum"        , "",
+                       "RecNameTitle", "",
+                       "ReceiverName", "",
+                       "ReceINNTitle", "",
+                       "ReceiverINN" , "", 
+                       "DateP"       , ""
+                     );
+
+
+      DeleteRow(BeginHeadNum, EndHeadNum);
+   end;
+
+ END;
+
+  PRIVATE MACRO BeginReport( NumCopy:INTEGER )
+   NumTableStr = 0; 
+   SetActiveSheet( "jrd" );
+  
+   SetNumberPage("Страница ", NumStr);
+
+   PrintHead(FPrintHead);
+
+   RegisterTable( "N1_MainTable", NULL,
+                  "NN"                ,
+                  "CDate"             ,
+                  "Oper_Code"         ,
+                  "CNumber_Date_Src"      ,
+                  "Cnumber_Date_Corr"     ,
+                  "CNumber_Date_Fc"       , 
+                  "CNumber_Date_Isp_Corr" ,  
+                  "CReceiverName"     ,
+                  "CReceiverINN"      ,
+                  "InitSupplierName"      ,
+                  "InitSupplierINN"       ,
+                  "InitSupplierCNum_Date" ,
+                  "Valuta_NC"         ,
+                  "TotalWithNDS"      ,
+                  "TotalNDS"          ,
+                  "MSumma_All"        ,
+                  "PSumma_All"        ,
+                  "MSumma_NDS"        ,
+                  "PSumma_NDS"      
+                );
+
+  END;
+
+  PRIVATE MACRO EndReport()
+    var RowFrom = 0, RowTo = 0;  
+    EndTable();
+// debugbreak;
+    if(FPrintBottom == true)
+      PrintFormatString( NULL,
+                        "Dolz" , Dolz_1,  
+                        "FIO" , FIO_1
+                         );
+    else
+      RowFrom = BeginBottomNum + NumTableStr;
+      RowTo   = EndBottomNum + NumTableStr;
+
+      if(FPrintHead == false)
+        RowFrom = RowFrom - (EndHeadNum - BeginHeadNum + 1);
+        RowTo   = RowTo   - (EndHeadNum - BeginHeadNum + 1);
+      end;
+
+      DeleteRow(RowFrom, RowTo);
+    end;
+   
+  END;
+
+                                                                  
+  PRIVATE MACRO PrintLine( NN, CDate, Oper_Code, CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, CReceiverName, CReceiverINN, InitSupplierName, InitSupplierINN, InitSupplierCNum_Date, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS )
+//     debugbreak;
+
+     PrintTableLine( "NN"           ,  NN           ,  null,
+                     "CDate"        ,  CDate        ,  null,
+                     "Oper_Code"    ,  Oper_Code    ,  null,
+                     "CNumber_Date_Src"      ,  CNumber_Date_Src      ,  null,
+                     "Cnumber_Date_Corr"     ,  Cnumber_Date_Corr     ,  null,
+                     "CNumber_Date_Fc"       ,  CNumber_Date_Fc       ,  null,
+                     "CNumber_Date_Isp_Corr" ,  CNumber_Date_Isp_Corr ,  null,
+                     "CReceiverName",  CReceiverName,  null,
+                     "CReceiverINN" ,  CReceiverINN ,  null,
+                     "InitSupplierName"      ,  InitSupplierName      ,  null,
+                     "InitSupplierINN"       ,  InitSupplierINN       ,  null,
+                     "InitSupplierCNum_Date" ,  InitSupplierCNum_Date ,  null,
+                     "Valuta_NC"    ,  Valuta_NC    ,  null,
+                     "TotalWithNDS" ,  TotalWithNDS ,  null,
+                     "TotalNDS"     ,  TotalNDS     ,  null,
+                     "MSumma_All"   ,  MSumma_All   ,  null,
+                     "PSumma_All"   ,  PSumma_All   ,  null,
+                     "MSumma_NDS"   ,  MSumma_NDS   ,  null,
+                     "PSumma_NDS"   ,  PSumma_NDS   ,  null
+                   );                                       
+
+  END;
+
+
+  
+  
+  
+  PRIVATE MACRO PrintFacturaDistrWR( rs : RsdRecordset, NN : @integer )
+    FILE bilfactura("bilfactura.dbt") key 4;
+    FILE bilfacturaSecond("bilfactura.dbt") key 4;
+
+    var CDate, Mode_Code, Oper_Code,  CReceiverName, CReceiverINN, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS;
+    var CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, SfTypeID, IsSupplierAgent, SupplierFacturaID, InitSupplierName, InitSupplierINN, InitSupplierCNum_Date;
+    var IsNoDistrib = "", Assignment = 0, FacturaID = 0; 
+    var SrcFacturaNumber : string;
+    var SrcCDate         : date;
+    var num, IsAmountNULL, IsSrcFacturaNumberNULL, IsSrcCDateNULL;
+    var modifyRecord:bool = false; 
+    // BILFACTURA
+
+    var TotalAmount ;
+    var InBook      ;
+    var FIC         ;
+    var FIID        ; 
+//debugbreak;
+    rs.value("T_AMOUNT", IsAmountNULL );
+    rs.value("SrcFacturaNumber", IsSrcFacturaNumberNULL);
+    rs.value("SrcCreationDate" , IsSrcCDateNULL        );
+
+
+    Mode_Code = "1";
+    Oper_Code = "";
+    Cnumber_Date_Corr = ""; 
+
+
+    IsNoDistrib  = rs.value("T_ISNODISTRIB");
+    Assignment   = rs.value("T_ASSIGNMENT" );
+
+    FacturaID    = rs.value("T_FACTURAID" );
+    SfTypeID     = rs.value("SFTYPEID" ); 
+
+    IsSupplierAgent = rs.value("t_IsSupplierAgent" ); 
+    SupplierFacturaID = rs.value("t_SupplierFacturaID");
+
+    if(IsNoDistrib == "X")
+      CDate        = "";
+    else
+      CDate        = date(rs.value("T_CREATIONDATE"));
+    end;
+
+    //Для остальных
+    CNumber_Date_Src    = rs.value("t_FacturaNumber") +" "+ string(date(rs.value("t_CreationDate")));  
+                                    
+    CNumber_Date_Isp_Corr = ""; 
+    CNumber_Date_Fc = "";
+
+    var SFacturaID = 0;                                
+    if(Assignment == OBJSFASSIGNMENT_MODIFY) // Исправление 
+      bilfactura.facturaID = rs.value("srcFacturaID");
+      if(getEQ(bilfactura))
+        if(bilfactura.Assignment == OBJSFASSIGNMENT_RECALC)
+          modifyRecord = true;    
+          SFacturaID = bilfactura.facturaID;
+
+          CNumber_Date_Isp_Corr = bilfactura.FacturaNumber +" "+ string(date(bilfactura.CreationDate));  
+        end;  
+      end;                                     
+    end; 
+
+    if((Assignment == OBJSFASSIGNMENT_RECALC) AND (modifyRecord))
+      bilfacturaSecond.facturaID = bilfactura.SourcefacturaID;
+      if(getEQ(bilfacturaSecond))
+        CNumber_Date_Src  = bilfacturaSecond.facturaNumber +" "+ string(date(bilfacturaSecond.creationDate));  
+      end;
+    elif(Assignment == OBJSFASSIGNMENT_RECALC) // Пересчет
+      CNumber_Date_Src  = rs.value("srcfacturanumber") + " " + string(date(rs.value("srcCreationDate")));
+
+      CNumber_Date_Fc = rs.value("t_FacturaNumber") +" "+ string(date(rs.value("t_CreationDate")));  
+    end;
+
+    if(rs.value("SrcCorrectionNum"))
+      Cnumber_Date_Corr = rs.value("SrcCorrectionNum") + " " + date(rs.value("SrcCreationDate"));
+    elif(rs.value("CorrectionNum"))
+      Cnumber_Date_Corr = rs.value("CorrectionNum") +" "+ date(rs.value("t_CreationDate"));
+    else
+      Cnumber_Date_Corr = "";
+    end;
+
+    CReceiverName = rs.value("T_RECEIVERNAME");
+    CReceiverINN  = rs.value("T_RECEIVERINN" );
+
+    if(Assignment == 5) // Пересчет
+      TotalWithNDS = "";
+      TotalNDS     = "";
+
+      if(rs.value("T_TOTALWITHNDS") > $0 )
+        PSumma_All = string(rs.value("T_TOTALWITHNDS"));
+        MSumma_All = "";
+      else
+        PSumma_All = "";
+        MSumma_All = string(-rs.value("T_TOTALWITHNDS"));
+      end;   
+
+      if(rs.value("T_TOTALNDS") > $0 )  
+        if(rs.value("t_IsNoNds") == "X")
+          PSumma_NDS = "без НДС";
+        else
+          PSumma_NDS = string(rs.value("T_TOTALNDS"));
+        end;
+
+        MSumma_NDS = "";
+      else
+        PSumma_NDS = "";
+
+        if(rs.value("t_IsNoNds") == "X")
+          MSumma_NDS = "без НДС";
+        else
+          MSumma_NDS = string(-rs.value("T_TOTALNDS"));
+        end;
+      end;     
+    else
+      TotalWithNDS = string(rs.value("T_TOTALWITHNDS"));
+      if(rs.value("t_IsNoNds") == "X")
+        TotalNDS     = "без НДС";
+      else
+        TotalNDS     = string(rs.value("T_TOTALNDS"));
+      end;
+    end;
+
+    Valuta_NC = rs.value("FiName");
+/* LVV R-488410-2 6.11.2014 заблокировал дистрибутивную печать кода операций, теперь код операций берем из категорий СФ*/ 
+/* var sqlString = "SELECT DISTINCT BILOPRCODE.T_CODE FROM DBILOPRCODE_DBT BILOPRCODE, DBILFACTURALINE_DBT BILFACTURALINE WHERE BILFACTURALINE.T_FACTURAID = " + FacturaId;
+    sqlString = sqlString + " AND BILOPRCODE.T_ID = BILFACTURALINE.T_OPRCODEID ORDER BY BILOPRCODE.T_CODE ASC";
+
+    var coders = RsdRecordset(sqlString);
+
+    Oper_Code = "";
+
+    while(coders.moveNext())
+        if(Oper_Code == "")
+                Oper_Code = coders.value("T_CODE");
+        else
+                Oper_Code = Oper_Code + ", " + coders.value("T_CODE");
+        end;
+    end;
+*/
+		Oper_Code = "";
+		Mode_Code = "";
+//		msgbox("!!!!");
+if (FacturaID == 525930) debugbreak; end; 
+		ssql_ = "SELECT   ATTR.t_groupid, decode(attr.t_name, chr(1), '-', attr.t_name) t_name " 
++"\n				FROM   dobjatcor_dbt ATCOR, dobjattr_dbt attr " 
++"\n							WHERE       ATCOR.T_OBJECT = LPAD ('"+FacturaID+"', 10, 0) " 
++"\n								 AND ATCOR.T_OBJECTTYPE = 720 " 
++"\n								 AND ATCOR.T_GROUPID IN (102, 103) " 
++"\n								 AND ATTR.T_ATTRID = ATCOR.T_ATTRID " 
++"\n								 AND ATTR.T_OBJECTTYPE = ATCOR.T_OBJECTTYPE " 
++"\n								 AND ATTR.T_GROUPID = ATCOR.T_GROUPID " ;
+		
+//msgbox(ssql_);
+	   rs_ssql_ = RsdRecordset( ssql_ );
+	   while( rs_ssql_.moveNext() )
+		if (rs_ssql_.value(0) == 102)
+			if (rs_ssql_.value(1) == "-")
+				//Oper_Code = Oper_Code + "";
+			else
+				if ( Oper_Code == "" ) Oper_Code = rs_ssql_.value(1);
+				else Oper_Code = Oper_Code + ";" + rs_ssql_.value(1); 
+				end;
+			end;
+		elif (rs_ssql_.value(0) == 103)
+			if (rs_ssql_.value(1) == "-")
+				Mode_Code = "";
+			else
+				Mode_Code = rs_ssql_.value(1);
+			end;
+		end;
+	   end;
+    InitSupplierName      = "";
+    InitSupplierINN       = "";  
+    InitSupplierCNum_Date = "";
+    
+    if((SfTypeID == BILTYPE_SF_POSR) AND (IsSupplierAgent == "X") AND (SupplierFacturaID > 0))
+       var iString = " SELECT t_SupplierName, t_SupplierINN, t_FacturaNumber, t_CreationDate  FROM  DBILFACTURA_DBT   " +
+                   "  WHERE T_FACTURAID = "+ SupplierFacturaID;
+
+
+       var icmd = RsdCommand( iString );
+       icmd.NullConversion = true;
+       var irs = RsdRecordset( icmd );
+
+       if( irs.moveNext() )
+          InitSupplierName = irs.value("t_SupplierName");
+          InitSupplierINN  = irs.value("t_SupplierINN");
+          InitSupplierCNum_Date = irs.value("t_FacturaNumber") +" "+ string(date(irs.value("t_CreationDate")));  
+       end;
+    end;
+
+    PrintLine( NN, CDate, Oper_Code, CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, CReceiverName, CReceiverINN, InitSupplierName, InitSupplierINN, InitSupplierCNum_Date, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS );
+  END;
+
+	PRIVATE MACRO PrintFTableDistrWR(NumFIID, AmountByFIID, NDSAmountByFIID,AmountWithNDSByFIID, AllInBook)
+		var i = 0;
+		debugbreak;
+
+		var NumRow = asize(NumFIID) -1; 
+
+		MergeRow( "H8_IncludeInbook", "H8_IncludeInbook", getCurrentRow(), getCurrentRow() + NumRow);
+		MergeRow( "A1_Date", "C_3_SFName", getCurrentRow(), getCurrentRow() + NumRow);
+
+		while(i<asize(NumFIID))
+			PrintTableLine( "A1_Date"         , "Всего ",                            null,
+			"D4_AllSum"       ,  AmountByFIID[i],                      null,
+			"E5_TaxSum"         ,  NDSAmountByFIID[i],                   null,
+			"F6_AllSumWithTax"  ,  AmountWithNDSByFIID[i],               null,
+			"G7_FIID"           ,  GetCompresNameCurrency(NumFIID[i]),   null,
+			"H8_IncludeInbook"  ,  AllInBook,                            null
+			);                           
+			i = i +1;
+		end;
+	END;
+
+  PRIVATE MACRO Create()
+    debugbreak;
+    var date1, date2, sqlString, rs, count, i,delim;
+    record Party(party);
+    Array NumFIID;
+    Array AmountByFIID, NDSAmountByFIID, AmountWithNDSByFIID ;
+    var AllInBook : money;
+    var EmptyStr = "                                                                                                   ";
+    AllInBook = $0;  
+    date1 = BeginDate;
+    date2 = EndDate  ;
+    debugbreak;
+    sqlString = "SELECT COUNT(1) FROM DBILFACTURA_DBT BILFACTURA "+acssql_from+ " WHERE BILFACTURA.T_REGDATE BETWEEN to_date('" + date1 +
+     "', 'dd.mm.yyyy') AND to_date( '"+ date2 +"', 'dd.mm.yyyy') AND BILFACTURA.T_DIRECTION = "+ Direction + " AND BILFACTURA.t_JournalID = " + JournalID +
+     " AND " + acssql_query ;
+
+    if(PrnDepartment != 0)
+        sqlString = sqlString + " AND BILFACTURA.T_DEPARTMENT = " + PrnDepartment;
+    end;
+
+    rs = RsdRecordset( sqlString );
+
+    rs.moveNext();
+
+    count = rs.value(0);
+
+    if( count == 0 )
+
+    else
+   	           /* LVV 16.10.14 перенес код EVG для печати сводного журнала в макрос печати с 1.10.2014 */
+		i = 0;
+          
+		if ( UnionJournal )
+		sqlString = "SELECT * FROM (";
+			while( i < (ArrOfRegParam.UserName.Size())) //цикл по собранным в свойстве класса ссылкам
+				if ( ArrOfRegParam.CheckGrant[i] ) //добавляем строки запроса если проверен доступ к таблицам
+					if ( i > 0 )
+						sqlString = sqlString + " UNION ";
+						delim = ".";
+					else
+						delim = "";
+					end;
+					sqlString = sqlString +    
+                                       " SELECT BILFACTURA.T_FACTURAID, BILFACTURA.T_SFTYPEID As SFTYPEID, BILFACTURA.T_ISNONDS, BILFACTURA.T_CREATIONDATE, BILFACTURA.T_FACTURANUMBER, BILFACTURA.T_RECEIVERNAME, BILFACTURA.T_RECEIVERINN, BILFACTURA.T_TOTALAMOUNT, BILFACTURA.T_TOTALNDS, BILFACTURA.T_TOTALWITHNDS, BILFACTURA.T_ISNODISTRIB, BILFACTURA.T_ASSIGNMENT, BILFACTURA.T_TOTALWITHNDS t_amount /*BE.T_AMOUNT*/, FI.T_NAME || ', ' || FI.T_ISO_NUMBER AS FiName, BILFACTURA.T_FIID, "
+                                       " BILFACTURA.t_correctionnum as CorrectionNum, NVL(BFSRC.t_assignment, 0) as SrcFacturaAssignment, NVL(BFSRC.t_CorrectionNum, 0) as srcCorrectionNum, NVL(BFSRC.t_FacturaNumber, '') AS SrcFacturaNumber, NVL(BFSRC.t_CreationDate, TO_DATE('01.01.0001', 'dd.mm.yyyy')) AS SrcCreationDate, NVL(BFSRC.t_FacturaID, 0) as SrcFacturaID, "
+                                       " BILFACTURA.t_IsSupplierAgent, BILFACTURA.t_SupplierFacturaID, "+
+                                        ArrOfRegParam.Sort_[i] + "1 AS QUERY_ID" +  
+                                       " FROM " + ArrOfRegParam.UserName[i] + delim + " DBILFACTURA_DBT BILFACTURA, " + ArrOfRegParam.UserName[i] + delim + "DBILFACTURA_DBT BFSRC, " + ArrOfRegParam.UserName[i] + delim + /*" DBILBOOKENTRY_DBT BE, " + ArrOfRegParam.UserName[i] + delim +*/ "DFININSTR_DBT FI, " + ArrOfRegParam.UserName[i] + delim + "DBILSFTYPE_DBT FT  ";
+                                        sqlString = sqlString + acssql_from + 
+                                       " WHERE BILFACTURA.T_REGDATE BETWEEN to_date( '"+date1+"', 'dd.mm.yyyy') AND to_date( '"+date2+"', 'dd.mm.yyyy')" +
+                                       " AND BILFACTURA.T_DIRECTION = "+ Direction +
+                                       " AND BILFACTURA.T_SOURCEFACTURAID = BFSRC.T_FACTURAID(+) "+
+                                      // " AND BILFACTURA.T_FACTURAID = BE.T_FACTURAID(+) " +   
+                                       " AND BILFACTURA.T_FIID = FI.T_FIID(+) "
+                                       " AND BILFACTURA.T_SFTYPEID = FT.T_SFTYPEID "
+                                       " AND FT.T_POSTTOJOURNAL = 'X' " +
+                                       " AND " + acssql_query ;         
+                                       if(PrnDepartment != 0)
+                                            sqlString = sqlString + " AND BILFACTURA.T_DEPARTMENT = " + PrnDepartment;
+                                       end;
+				end;
+				i = i + 1;
+			end; //конец цикла
+                       sqlString = sqlString + ")  ORDER BY T_CREATIONDATE, QUERY_ID, T_TOTALNDS ";
+                else
+                    sqlString = " SELECT BILFACTURA.T_FACTURAID, BILFACTURA.T_SFTYPEID As SFTYPEID, BILFACTURA.T_ISNONDS, BILFACTURA.T_CREATIONDATE, BILFACTURA.T_FACTURANUMBER, BILFACTURA.T_RECEIVERNAME, BILFACTURA.T_RECEIVERINN, BILFACTURA.T_TOTALAMOUNT, BILFACTURA.T_TOTALNDS, BILFACTURA.T_TOTALWITHNDS, BILFACTURA.T_ISNODISTRIB, BILFACTURA.T_ASSIGNMENT, BILFACTURA.T_TOTALWITHNDS t_amount /*BE.T_AMOUNT*/, FI.T_NAME || ', ' || FI.T_ISO_NUMBER AS FiName, BILFACTURA.T_FIID, "
+                               " BILFACTURA.t_correctionnum as CorrectionNum, NVL(BFSRC.t_assignment, 0) as SrcFacturaAssignment, NVL(BFSRC.t_CorrectionNum, 0) as srcCorrectionNum, NVL(BFSRC.t_FacturaNumber, '') AS SrcFacturaNumber, NVL(BFSRC.t_CreationDate, TO_DATE('01.01.0001', 'dd.mm.yyyy')) AS SrcCreationDate, NVL(BFSRC.t_FacturaID, 0) as SrcFacturaID, "
+                               " BILFACTURA.t_IsSupplierAgent, BILFACTURA.t_SupplierFacturaID "
+                               " FROM DBILFACTURA_DBT BILFACTURA, DBILFACTURA_DBT BFSRC,  /*DBILBOOKENTRY_DBT BE,*/ DFININSTR_DBT FI, DBILSFTYPE_DBT FT  ";
+                    sqlString = sqlString + acssql_from + 
+                               " WHERE BILFACTURA.T_REGDATE BETWEEN to_date( '"+date1+"', 'dd.mm.yyyy') AND to_date( '"+date2+"', 'dd.mm.yyyy')" +
+                               " AND BILFACTURA.T_DIRECTION = "+ Direction +
+                               " AND BILFACTURA.T_SOURCEFACTURAID = BFSRC.T_FACTURAID(+) "+
+                               //" AND BILFACTURA.T_FACTURAID = BE.T_FACTURAID(+) " + TAM R-476930-2 20.10.2014
+                               " AND BILFACTURA.T_FIID = FI.T_FIID(+) "
+                               " AND BILFACTURA.T_SFTYPEID = FT.T_SFTYPEID "
+                               " AND FT.T_POSTTOJOURNAL = 'X' " +
+                               " AND BILFACTURA.t_JournalID = " + JournalID +
+                               " AND " + acssql_query ;         
+                   if(PrnDepartment != 0)
+                      sqlString = sqlString + " AND BILFACTURA.T_DEPARTMENT = " + PrnDepartment;
+                   end;
+
+                   sqlString = sqlString + " ORDER BY T_CREATIONDATE, T_TOTALNDS ";
+                end;
+
+       var cmd = RsdCommand( sqlString );
+       cmd.NullConversion = true;
+       var total_amount:money = $0.0;
+       var total_nds:money = $0.0;
+       var corr_amount_plus:money = $0.0;   
+	   var corr_amount_minus:money = $0.0;   
+	   var corr_nds_plus:money = $0.0;   
+	   var corr_nds_minus:money = $0.0;   
+       rs = RsdRecordset( cmd ); 
+
+       i = 1;
+       while( rs.moveNext() )
+         PrintFacturaDistrWR( rs, i );
+         i = i + 1;
+	     total_amount = total_amount + money(rs.value("T_TOTALAMOUNT")) + money(rs.value("T_TOTALNDS"));
+	     total_nds = total_nds + money(rs.value("T_TOTALNDS"));
+         if(rs.value("T_ASSIGNMENT" ) == 5 ) 
+		    if(rs.value("T_TOTALNDS") > $0 )
+		       corr_amount_plus = corr_amount_plus + rs.value("T_TOTALWITHNDS");
+			   corr_nds_plus = corr_nds_plus + rs.value("T_TOTALNDS");
+		    else 
+		       corr_amount_minus = corr_amount_minus + rs.value("T_TOTALWITHNDS");
+			   corr_nds_minus = corr_nds_minus  + rs.value("T_TOTALNDS");
+		    end;		 
+		 end; 
+       end;
+       PrintLine( "", "", "", "", "", "", "", "", "", "", "", "", "Итого: ",string(total_amount),string(total_nds), string (corr_amount_minus), string(corr_amount_plus), string (corr_nds_minus), string(corr_nds_plus));
+       NumTableStr = i-1; 
+     end;
+//    PrintFTableDistrWR(NumFIID, AmountByFIID, NDSAmountByFIID,AmountWithNDSByFIID, AllInBook);
+  END;
+  initCB_CReportTemplate( null, "biljrddot.xls" );
+END;
+
+/*-----------------------------------------------------------------------------------*/
+PRIVATE CLASS (CB_CReportTemplate) Sf_ObtReport
+
+  var NumTableStr = 0; 
+
+  var BeginHeadNum =1; // начало шапки
+  var EndHeadNum   =8; // конец шапки
+  
+  var BeginBottomNum =16; // начало подписей
+  var EndBottomNum   =25; // конец подписей 
+
+
+
+  MACRO PrintMode():INTEGER
+     return DL_OUTREPORT_EXCEL;
+  END;
+
+   PRIVATE MACRO PrintHead( IsNotEmpty : bool)
+    var date1, date2, sqlString, rs, count, i, period = "", strPeriod = "", year = 0;
+    record Party(party);
+    var tmpr;
+//debugbreak;
+    if(IsNotEmpty == true)
+
+      date1 = SfJournal.OpenDate;
+      if(SfJournal.CloseDate == date(0,0,0))
+        date2 = {CurDate};
+      else     
+        date2 = SfJournal.CloseDate;
+      end;
+
+      ПолучитьСубъекта ({OurBank}, Party ); 
+
+      period = GetPeriod(date1, date2, year );
+
+      if((period == NULL) OR (period == ""))
+        strPeriod = "за период с "+string(date1) + " по "+string(date2);
+      else
+        strPeriod = "за "+ period + " " + year + " года";
+      end;
+
+      PrintFormatString( NULL,
+                       "JNum"        , "ЖУРНАЛ УЧЕТА ПОЛУЧЕННЫХ И ВЫСТАВЛЕННЫХ СЧЕТОВ-ФАКТУР",
+                       "RecNameTitle", "Наименование налогоплательщика",
+                       "ReceiverName", Party.Name,
+                       "ReceINNTitle", "ИНН/КПП налогоплательщика",
+                       "ReceiverINN" , ПолучитьКодСубъекта( {OurBank}, PTCK_INN ), 
+                       "DateP"       , strPeriod
+                     );
+   else
+      PrintFormatString( NULL,
+                       "JNum"        , "",
+                       "RecNameTitle", "",
+                       "ReceiverName", "",
+                       "ReceINNTitle", "",
+                       "ReceiverINN" , "", 
+                       "DateP"       , ""
+                     );
+
+
+      DeleteRow(BeginHeadNum, EndHeadNum);
+   end;
+
+ END;
+
+  PRIVATE MACRO BeginReport( NumCopy:INTEGER )
+    NumTableStr = 0; 
+    SetActiveSheet( "jro" );
+   
+    SetNumberPage("Страница ", NumStr);
+
+    PrintHead(FPrintHead);
+
+    RegisterTable( "N1_MainTable", NULL,
+                   "NN"                ,
+                   "CDate"             ,
+                   "Oper_Code"         ,
+                   "CNumber_Date_Src"      ,
+                   "Cnumber_Date_Corr"     ,
+                   "CNumber_Date_Fc"       , 
+                   "CNumber_Date_Isp_Corr" ,  
+                   "CReceiverName"     ,
+                   "CReceiverINN"      ,
+                   "SubAgentName"          ,
+                   "SubAgentINN"           ,
+                   "DealKCode"             ,
+                   "Valuta_NC"         ,
+                   "TotalWithNDS"      ,
+                   "TotalNDS"          ,
+                   "MSumma_All"        ,
+                   "PSumma_All"        ,
+                   "MSumma_NDS"        ,
+                   "PSumma_NDS"      
+                 );
+
+  END;
+
+  PRIVATE MACRO EndReport()
+    var RowFrom = 0, RowTo = 0;  
+    EndTable();
+// debugbreak;
+    if(FPrintBottom == true)
+      PrintFormatString( NULL,
+                        "Dolz" , Dolz_1,  
+                        "FIO" , FIO_1
+                         );
+    else
+      RowFrom = BeginBottomNum + NumTableStr;
+      RowTo   = EndBottomNum + NumTableStr;
+
+      if(FPrintHead == false)
+        RowFrom = RowFrom - (EndHeadNum - BeginHeadNum + 1);
+        RowTo   = RowTo   - (EndHeadNum - BeginHeadNum + 1);
+      end;
+
+      DeleteRow(RowFrom, RowTo);
+    end;
+   
+  END;
+
+                                                                  
+  PRIVATE MACRO PrintLine( NN, CDate, Oper_Code, CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, CReceiverName, CReceiverINN, SubAgentName, SubAgentINN, DealKCode, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS )
+
+     PrintTableLine( "NN"           ,  NN           ,  null,
+                     "CDate"        ,  CDate        ,  null,
+                     "Oper_Code"    ,  Oper_Code    ,  null,
+                     "CNumber_Date_Src"     ,  CNumber_Date_Src     ,  null,
+                     "Cnumber_Date_Corr"    ,  Cnumber_Date_Corr    ,  null,
+                     "CNumber_Date_Fc"      ,  CNumber_Date_Fc      ,  null,
+                     "CNumber_Date_Isp_Corr",  CNumber_Date_Isp_Corr,  null,
+                     "CReceiverName",  CReceiverName,  null,
+                     "CReceiverINN" ,  CReceiverINN ,  null,
+                     "SubAgentName"         ,  SubAgentName         ,  null,
+                     "SubAgentINN"          ,  SubAgentINN          ,  null,
+                     "DealKCode"            ,  DealKCode            ,  null,
+                     "Valuta_NC"    ,  Valuta_NC    ,  null,
+                     "TotalWithNDS" ,  TotalWithNDS ,  null,
+                     "TotalNDS"     ,  TotalNDS     ,  null,
+                     "MSumma_All"   ,  MSumma_All   ,  null,
+                     "PSumma_All"   ,  PSumma_All   ,  null,
+                     "MSumma_NDS"   ,  MSumma_NDS   ,  null,
+                     "PSumma_NDS"   ,  PSumma_NDS   ,  null
+                   );                                       
+
+  END;
+
+
+  PRIVATE MACRO PrintFacturaObtWR( rs : RsdRecordset, NN : @integer )
+
+    FILE bilfactura("bilfactura.dbt") key 4;
+    FILE bilfacturaSecond("bilfactura.dbt") key 4;
+    FILE bilfagentpt("bilfagentpt.dbt") key 0;
+    FILE llval(llvalues) key 0;                                
+                                
+    var CDate, Mode_Code, Oper_Code, Cnumber_Corr, Cdate_Corr, CReceiverName, CReceiverINN, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS;
+    var IsNoDistrib = "", Assignment = 0, FacturaID = 0; 
+    var CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, SfTypeID, SubAgentName, SubAgentINN, DealKCode, DealKind;
+    var SrcFacturaNumber : string;
+    var SrcCDate         : date;
+    var num, i, IsAmountNULL, IsSrcFacturaNumberNULL, IsSrcCDateNULL; 
+    var modifyRecord:bool = false; 
+    // BILFACTURA
+
+    var TotalAmount ;
+    var InBook      ;
+    var FIC         ;
+    var FIID        ; 
+//debugbreak;
+    rs.value("T_AMOUNT", IsAmountNULL );
+    rs.value("SrcFacturaNumber", IsSrcFacturaNumberNULL);
+    rs.value("SrcCreationDate" , IsSrcCDateNULL        );
+
+
+    Mode_Code = "1";
+    Oper_Code = "";
+    Cnumber_Corr = ""; 
+    Cdate_Corr   = date(0,0,0);
+
+
+    IsNoDistrib  = rs.value("T_ISNODISTRIB");
+    Assignment   = rs.value("T_ASSIGNMENT" );
+    FacturaID    = rs.value("T_FACTURAID" );
+    SfTypeID     = rs.value("SFTYPEID" ); 
+    DealKind     = rs.value("t_DealKind");
+
+    if(IsNoDistrib == "X")
+      CDate        = "";
+    else
+      CDate        = date(rs.value("T_ACQUISITIONDATE"));
+    end;
+
+    CNumber_Date_Src    = rs.value("t_FacturaNumber") +" "+ string(date(rs.value("t_CreationDate")));  
+    CNumber_Date_Isp_Corr = ""; 
+    CNumber_Date_Fc = "";
+
+                                    
+    var SFacturaID = 0;                                
+    if(Assignment == OBJSFASSIGNMENT_MODIFY) // Исправление 
+      bilfactura.facturaID = rs.value("srcFacturaID");
+      if(getEQ(bilfactura))
+        if(bilfactura.Assignment == OBJSFASSIGNMENT_RECALC)
+          modifyRecord = true;    
+          SFacturaID = bilfactura.facturaID;
+
+          CNumber_Date_Isp_Corr = bilfactura.FacturaNumber +" "+ string(date(bilfactura.CreationDate));  
+        end;  
+      end;                                     
+    end;
+
+    if((Assignment == OBJSFASSIGNMENT_RECALC) AND (modifyRecord))
+      bilfacturaSecond.facturaID = bilfactura.SourcefacturaID;
+      if(getEQ(bilfacturaSecond))
+        CNumber_Date_Src  = bilfacturaSecond.facturaNumber +" "+ string(date(bilfacturaSecond.creationDate));  
+      end;
+    elif(Assignment == OBJSFASSIGNMENT_RECALC) // Пересчет
+      CNumber_Date_Src  = rs.value("srcfacturanumber") + " " + string(date(rs.value("srcCreationDate")));
+
+      CNumber_Date_Fc = rs.value("t_FacturaNumber") +" "+ string(date(rs.value("t_CreationDate")));  
+    end;
+
+
+    if(rs.value("SrcCorrectionNum"))
+      Cnumber_Date_Corr = rs.value("SrcCorrectionNum") + " " + date(rs.value("SrcCreationDate"));
+    elif(rs.value("CorrectionNum"))
+      Cnumber_Date_Corr = rs.value("CorrectionNum") +" "+ date(rs.value("t_CreationDate"));
+    else
+      Cnumber_Date_Corr = "";
+    end;
+
+    CReceiverName = rs.value("T_SUPPLIERNAME"  );
+    CReceiverINN  = rs.value("T_SUPPLIERINN"   );
+
+    if(Assignment == 5) // Пересчет для НДС(еще один if, что б не путаться)
+      TotalWithNDS = "";
+      TotalNDS     = "";
+
+      if(rs.value("T_TOTALWITHNDS") > $0 )
+        PSumma_All = string(rs.value("T_TOTALWITHNDS"));
+        MSumma_All = "";
+      else
+        PSumma_All = "";
+        MSumma_All = string(-rs.value("T_TOTALWITHNDS"));
+      end;   
+
+      if(rs.value("T_TOTALNDS") > $0 )  
+        if(rs.value("t_IsNoNds") == "X")
+          PSumma_NDS = "без НДС";
+        else
+          PSumma_NDS = string(rs.value("T_TOTALNDS"));
+        end;
+
+        MSumma_NDS = "";
+      else
+        PSumma_NDS = "";
+
+        if(rs.value("t_IsNoNds") == "X")
+          MSumma_NDS = "без НДС";
+        else
+          MSumma_NDS = string(-rs.value("T_TOTALNDS"));
+        end;
+      end;   
+    else      
+      TotalWithNDS = string(rs.value("T_TOTALWITHNDS"));
+      if(rs.value("t_IsNoNds") == "X")
+        TotalNDS     = "без НДС";
+      else
+        TotalNDS     = string(rs.value("T_TOTALNDS"));
+      end;
+    end;
+
+var sqlString = "SELECT DISTINCT BILOPRCODE.T_CODE FROM DBILOPRCODE_DBT BILOPRCODE, DBILFACTURALINE_DBT BILFACTURALINE WHERE BILFACTURALINE.T_FACTURAID = " + FacturaId;
+    sqlString = sqlString + " AND BILOPRCODE.T_ID = BILFACTURALINE.T_OPRCODEID ORDER BY BILOPRCODE.T_CODE ASC";
+
+    var coders = RsdRecordset(sqlString);
+
+    Oper_Code = "";
+
+
+    while(coders.moveNext())
+        if(Oper_Code == "")
+                Oper_Code = coders.value("T_CODE");
+        else
+                Oper_Code = Oper_Code + ", " + coders.value("T_CODE");
+        end;
+    end;
+
+    Valuta_NC = rs.value("FiName");
+
+    if(SfTypeID == BILTYPE_SF_POSR)
+      bilfagentpt.facturaID = FacturaID;
+      bilfagentpt.PtKind    = 1;
+      if(getEQ(bilfagentpt))
+        SubAgentName = bilfagentpt.Name;
+        SubAgentINN  = bilfagentpt.INN ;
+      end;
+    end;                               
+
+    DealKCode = "";
+    if(DealKind > 0)
+      var Code = "";
+      llval.List = 2760;
+      llval.Element = DealKind;
+      if( getEQ(llval) )
+         DealKCode = llval.Code;
+      end;
+    end;
+
+  //PrintLine( NN, CDate, Mode_Code, Oper_Code, CNumberSrc, CDateSrc, CNumber, CDateFc, Cnumber_Corr, Cdate_Corr, CReceiverName, CReceiverINN, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS  );
+    PrintLine( NN, CDate, Oper_Code, CNumber_Date_Src, Cnumber_Date_Corr, CNumber_Date_Fc, CNumber_Date_Isp_Corr, CReceiverName, CReceiverINN, SubAgentName, SubAgentINN, DealKCode, Valuta_NC, TotalWithNDS, TotalNDS, MSumma_All, PSumma_All, MSumma_NDS, PSumma_NDS )
+  END;
+
+
+
+  PRIVATE MACRO Create()
+    var date1, date2, sqlString, rs, count, i;
+    record Party(party);
+
+    var EmptyStr = "                                                                                                   ";
+
+    date1 = BeginDate;
+    date2 = EndDate  ;
+
+    sqlString = "SELECT COUNT(1) FROM DBILFACTURA_DBT BILFACTURA "+acssql_from+ " WHERE BILFACTURA.T_REGDATE BETWEEN to_date('" + date1 +
+     "', 'dd.mm.yyyy') AND to_date( '"+ date2 +"', 'dd.mm.yyyy') AND BILFACTURA.T_DIRECTION = "+ Direction + " AND BILFACTURA.t_JournalID = " + JournalID +
+     " AND " + acssql_query ;
+
+    if(PrnDepartment != 0)
+        sqlString = sqlString + " AND BILFACTURA.T_DEPARTMENT = " + PrnDepartment;
+    end;
+
+    rs = RsdRecordset( sqlString );
+
+    rs.moveNext();
+
+    count = rs.value(0);
+
+    if( count == 0 )
+
+    else
+    
+       sqlString = " SELECT BILFACTURA.T_FACTURAID, BILFACTURA.T_SFTYPEID As SFTYPEID, BILFACTURA.T_ISNONDS, BILFACTURA.T_CREATIONDATE, BILFACTURA.T_ACQUISITIONDATE,  BILFACTURA.T_FACTURANUMBER, BILFACTURA.T_SUPPLIERNAME, BILFACTURA.T_SUPPLIERINN, BILFACTURA.T_TOTALAMOUNT, BILFACTURA.T_TOTALNDS, BILFACTURA.T_TOTALWITHNDS, BILFACTURA.T_ISNODISTRIB, BILFACTURA.T_ASSIGNMENT, BE.T_AMOUNT, FI.T_NAME || ', ' || FI.T_ISO_NUMBER AS FiName, BILFACTURA.T_FIID, "
+                   " NVL(BFSRC.t_facturanumber, '') as SrcFacturaNumber, NVL(BILFACTURA.t_correctionNum, 0) as CORRECTIONNUM, NVL(BFSRC.t_CorrectionNum, 0) as srcCorrectionNum, NVL(BFSRC.t_CreationDate, TO_DATE('01.01.0001', 'dd.mm.yyyy')) AS SrcCreationDate, NVL(BFSRC.t_FacturaID, 0) as SrcFacturaID, "
+                   " BILFACTURA.t_DealKind  "
+                   " FROM dbilfactura_dbt bilfactura, DBILFACTURA_DBT BFSRC, DBILBOOKENTRY_DBT BE, DFININSTR_DBT FI, DBILSFTYPE_DBT FT  ";
+       sqlString = sqlString + acssql_from + 
+                   " WHERE BILFACTURA.T_REGDATE BETWEEN to_date( '"+date1+"', 'dd.mm.yyyy') AND to_date( '"+date2+"', 'dd.mm.yyyy')" +
+                   " AND BILFACTURA.T_DIRECTION = "+ Direction +
+                   " AND BILFACTURA.T_SOURCEFACTURAID = BFSRC.T_FACTURAID(+) "+
+                   " AND BILFACTURA.T_FACTURAID = BE.T_FACTURAID(+) " +
+                   " AND BILFACTURA.T_FIID = FI.T_FIID(+) "
+                   " AND BILFACTURA.T_SFTYPEID = FT.T_SFTYPEID "
+                   " AND FT.T_POSTTOJOURNAL = 'X' " +
+                   " AND BILFACTURA.t_JournalID = " + JournalID +
+                   " AND " + acssql_query ;         
+       if(PrnDepartment != 0)
+           sqlString = sqlString + " AND BILFACTURA.T_DEPARTMENT = " + PrnDepartment;
+       end;
+
+       sqlString = sqlString + " ORDER BY BILFACTURA.T_REGDATE, BILFACTURA.T_FACTURANUMBER ";
+
+       rs = RsdRecordset( sqlString );
+
+       i = 1;
+       while( rs.moveNext() )
+         PrintFacturaObtWR( rs, i );
+         i = i + 1;
+       end;
+
+       NumTableStr = i-1; 
+     end;
+
+
+  END;
+
+  initCB_CReportTemplate( null, "biljrodot.xls" );
+END;
+
+
+/*-----------------------------------------------------------------------------------*/
+MACRO PrintDocument3( ncopy, pJournalID, pDirection, pDolz_1, pFIO_1, pPrnDepartment, pBeginDate, pEndDate, pNumStr):bool
+
+  Var stat = 0;
+  Var NumPage  = 1 ;
+  var TempFile;
+  JournalID      =  pJournalID;      
+  Direction      =  pDirection;   
+  Dolz_1         =  pDolz_1;      
+  FIO_1          =  pFIO_1;       
+  PrnDepartment  =  pPrnDepartment;
+  BeginDate      =  pBeginDate;    
+  EndDate        =  pEndDate;      
+  NumStr         =  pNumStr;   
+        /* LVV 16.10.14 перенес код EVG в макрос печати с 1.10.2014 */
+	/* EVG To 2030 25/10/2011 Перенесено из локального макроса ЭВ. Попробуем применить для всех банков. */
+	
+	if ( ( fgBank.is_EXV ) or (fgBank.is_VUZ) or (fgBank.is_GEB) or (fgBank.is_NBS) )
+		if (MsgBoxEx ( "Выпустить сводный ЖУСФ?", MB_YES+MB_NO, IND_NO, "Режим выпуска ЖУСФ" ) == IND_YES )
+			UnionJournal = 1;
+		else
+			UnionJournal = 0;
+		end;
+	end;
+	/* -- EVG -- */
+	
+   //	AskPrintQ();  //LVV хрень не нужная.
+
+  ClearRecord(BILSFJOURNAL);
+  BILSFJOURNAL.JournalID = JournalID;
+  if(not GetEQ(BILSFJOURNAL))
+    return false;
+  end;
+
+  if(GetObjectRestriction(acssql_query, 111, {oper}, "BILFACTURA", CNTX_BilFactura,"BILFACTURA.DBT", acssql_from, true ))
+    if(acssql_from != "")
+      acssql_from = " , " +acssql_from;
+    end;
+  
+    if(Direction == 1)
+        Sf_DistrReport().Run();
+    else if(Direction == 2)
+        Sf_ObtReport().Run();
+    end;
+    end;
+  end;
+
+  return true;
+END;
+
+//Direction=1;
+//JournalID=13;
+//BeginDate     = DATE (1,10,2014);
+//EndDate       = DATE(1,10,2014);
+//PrintDocument3();

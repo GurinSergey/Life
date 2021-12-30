@@ -1,0 +1,340 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: FSSP_AnswerQuery.mac 
+// @desc    : Справка о наличии счетов ФССП
+// @changes : 08.07.2013 Golovkin добавил namespace к элементу Answer, поля DebtorName и SignDateTime 
+//            09.07.2013 Golovkin AnswerDate -> answerDate
+//            10.07.2013 Golovkin QueryInternalKey == InternalKey
+//            15.07.2013 Golovkin добавил запись ответа в таблицу (regAnswer)
+//            18.07.2013 Golovkin AnswerType сделал двухзначным
+// -------------------------------------------------------------------------------------------------
+import Globals, CurrInter, FIInter, Rsexts;
+import FNS_LIB, FSSP_lib, fssp_xml_lib, lib_fg;  
+
+class TFSSP_QUERY(MesID, kindAction) // 1 - не заполнять объект по айди сообщения             
+     
+     CONST 
+
+     NOTICE_DATA_EXISTS        = 1,
+     NOTICE_NO_DATA_EXISTS     = 2,
+     NOTICE_NO_MANDATORY_FIELD = 5,     
+     MULTI_ACTION_MODE         = 2;
+
+     VAR   
+
+     ID             = int(MesID),
+     ClientID       = Tarray(),     
+     OutFileName    = getTxtFileName ("answer_file_tmp"),
+     InternalKey    = NULL, 
+     IPInternalKey  = NULL,
+     ExternalKey    = NULL,
+     DebtorName     = NULL,  
+     DebtorINN      = NULL,
+     DEBTORKPP      = NULL;  
+
+     macro RSL_getRestAcc(pAccount, pFIID, pRestDate):money
+       var RestDate = {curdate};
+      
+       var sql = " SELECT   r.t_rest                                                        "+
+                 " FROM   drestdate_dbt r, daccount_dbt a                                   "+
+                 " WHERE  A.T_ACCOUNT = :account AND A.T_ACCOUNTID = R.T_ACCOUNTID          "+
+                 "        AND R.T_RESTDATE = (SELECT   MAX (T_RESTDATE)                     "+
+                 "                             FROM   drestdate_dbt                         "+
+                 "                             WHERE     T_RESTDATE <= :restdate            "+
+                 "                                   AND R.T_ACCOUNTID = T_ACCOUNTID        "+
+                 "                                   AND R.T_RESTCURRENCY = T_RESTCURRENCY) ";
+
+       var cond =  " AND R.T_RESTCURRENCY = A.T_CODE_CURRENCY ";
+
+       if(valtype(pFIID    ) != V_UNDEF) cond = " AND R.T_RESTCURRENCY = " + pFIID ; end; 
+       if(valtype(pRestDate) != V_UNDEF) RestDate = pRestDate; end;
+
+       sql = execSqlSelect (sql + cond, makeArray (SqlParam ("account"     , pAccount),
+                                               SqlParam ("restdate"    , RestDate)));
+                           
+       if (sql.moveNext ()) return sql.value (0, null, V_MONEY); end;
+       return $0;
+     end;
+
+
+
+     private macro set_field(mes_field, class_field, mes_type)              
+       if(mes_field != NullVal) 
+            if (valtype(mes_type) == v_date  ) class_field = toRSLdate(mes_field);
+          elif (valtype(mes_type) == v_money ) class_field = money(mes_field);
+          elif (valtype(mes_type) == v_string) class_field = ReplaceSpecialChars(mes_field);
+          else                                 class_field = mes_field;  
+          end;
+          setParm(2, class_field);  
+       else   
+          setParm(2, null);  
+       end; 
+     end;
+     
+     private macro check_filds()
+        return inList(NULL, IPInternalKey, InternalKey, DebtorINN, DebtorName);
+     end;
+
+     private macro isTransitAccount(fiid, account)
+        if(fiid != 0)
+           if(_bank.is_SLD)
+              if(substr(account, 14, 1) == "9")  return true; end;
+           else
+              if(substr(account, 14, 1) == "1")  return true; end;
+           end;        
+        end;
+     return false;
+     end;
+     
+     macro FSSP_QUERY()
+         var sql;
+         sql = " SELECT XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/InternalKey/text()')   .getStringVal() InternalKey,  "+
+               "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/InternalKey/text()').getStringVal() IPInternalKey,"+
+               "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorName/text()') .getStringVal() DebtorName,   "+
+               "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorINN/text()')  .getStringVal() DebtorINN,    "+
+               "        XMLTYPE (MES.T_MES_DATA).EXTRACT ('/*/*/IP/DebtorKPP/text()')  .getStringVal() DebtorKPP     "+ 
+               " FROM   usr_fssp_mes mes                                                                             "+
+               " WHERE   MES.T_ID = ?                                                                                ";
+         sql = execSQLSelect(sql, makeArray(SQLParam("", ID)));
+         
+         if(sql.movenext )             
+            ExternalKey     = getExternalKey();                 
+            set_field(sql.value("INTERNALKEY"   ), InternalKey    );            
+            set_field(sql.value("DEBTORNAME"    ), DEBTORNAME     , v_string);
+            set_field(sql.value("DEBTORINN"     ), DEBTORINN      );
+            set_field(sql.value("DEBTORKPP"     ), DEBTORKPP      );
+            set_field(sql.value("IPINTERNALKEY" ), IPINTERNALKEY  );           
+         end;          
+   end;        
+
+   
+
+   private macro save_error( DescError )
+        var sql = " INSERT INTO USR_FSSP_ERR_TMP VALUES  (:mesID, :DescError)" ;
+        execSQL(sql, makeArray(SQLParam("mesID", ID), SQLParam("DescError", DescError)));         
+   end;  
+
+   private macro catchUserError (e)
+      if (RSLDefCon.IsinTrans) RSLDefCon.RollbackTrans; end;
+        save_error(e.message);             
+        return 1;
+   end;               
+   
+        
+   macro RollBack()
+       var cmd;
+       rsldefcon.BeginTrans;                            
+       cmd = RsdCommand( "DELETE FROM USR_FSSP_ANSWER WHERE T_MES_ID = :MES_ID" );
+       cmd.addparam( "MES_ID", RSDBP_IN, id ); 
+       cmd.execute;
+       execSQL("delete from USR_FSSP_ACCOUNTS_LINK where T_MES_ID = ?", makeArray(SQLParam("", ID)));
+       RollBackDataScroll(ID);
+       rsldefcon.CommitTrans;
+
+       return 0;
+    onError(e)      
+       catchUserError(e)
+    end;
+    
+    macro getSfContrInfo(Account, CodeCurrency, SfNumber :@STRING , SfDateBegin :@DATE)
+    DEBUGBREAK;
+       var sql = " SELECT  t_number SfNumber, T_DATEBEGIN SfDateBegin        "
+                 " FROM    dsfcontr_dbt t                                    "  
+                 " WHERE   t_object = ? AND t_objecttype = 1 AND t_fiid = ?  ";
+       sql = execSQLSelect(sql, makeArray(SQLParam("", Account), SQLParam("", CodeCurrency)));
+       if (sql.moveNext())
+          SetParm(3, sql.value("SfNumber"   , NULL, V_STRING));
+          SetParm(4, sql.value("SfDateBegin", NULL, V_DATE  ));          
+       else
+          SetParm(3, "");
+          SetParm(4, date(0,0,0));
+       end;   
+    end;
+
+
+    private macro getParyName(id)        
+        var sql = execSqlSelect("select t_name from dparty_dbt where t_partyid = " + id);
+        if(sql.moveNext()) return  strsubst(sql.value(0), "&", "&amp;");  end;
+    return DebtorName;
+    end;
+    
+    macro getAccountsRSD(ClientID)
+         var cmd, rs;         
+         cmd = " SELECT   acc.t_account account, "
+               "          acc.t_code_currency fiid, "
+               "          acc.t_chapter chapter, "
+               "          acc.T_TYPE_ACCOUNT type_account, "
+               "          DEP.T_NAME NameBranch, "
+               "          ACC.T_OPEN_CLOSE OPEN_CLOSE "
+               "   FROM   ddp_dep_dbt dep, daccount_dbt acc"
+               "  WHERE       acc.t_client in ( " + ClientID + " )"
+               "          AND acc.t_chapter = 1 "
+               "          AND REGEXP_LIKE (acc.T_TYPE_ACCOUNT, 'Ч|Х|Я|Q|K|Y') "
+               "          AND DEP.T_CODE = ACC.T_BRANCH "+         
+               "          AND acc.t_open_close != 'З'   ";
+          if (ClientID == "")  return null;
+          else                 return RsdRecordset(cmd);     
+          end;   
+     end;
+     
+    macro moveFile (src:string, dst:string)
+        return (copyFile (src, dst) and removeFile (src));        
+    end;        
+    
+    macro Create(ActionMode)        
+        record rate (ratedef);
+        var
+        SummaRest = $0,
+        SfNumber, SfDateBegin,
+        rs,
+        FSSPParams :TFSSP_Settings = TFSSP_Settings(),
+        answer                        = XMLElement("ns:Answer", null, makeArray(XMLAttribute( "xmlns:ns", "http://www.red-soft.biz/schemas/fssp/common/2011/0.5"))),
+        Data                          = XMLElement("Data"), 
+        AvailabilityAccData           = XMLElement("AvailabilityAccData"),
+        buffer                        = XMLElement("Buffer"),
+        AnswerType                    = 0,
+        isAccDataExists               = false;        
+        
+        ClientID = IdentityClient(@this, ActionMode); 
+                
+        answer.addchild(XMLElement("ExternalKey"     , ExternalKey          ));
+        answer.addchild(XMLElement("QueryInternalKey", InternalKey          ));
+        answer.addchild(XMLElement("IpInternalKey"   , IpInternalKey        ));
+        answer.addchild(XMLElement("answerDate"      , toFSSPdate({Curdate})));    
+         
+          if(check_filds()       ) AnswerType = NOTICE_NO_MANDATORY_FIELD;       
+        elif(ClientID.Size   == 0) AnswerType = NOTICE_NO_DATA_EXISTS;          
+        end;
+        if(AnswerType == 0)   
+            var clientCounter = 0;          
+            rsldefcon.BeginTrans;  
+            while(clientCounter < ClientID.size())
+                rs = getAccountsRSD(ClientID[clientCounter]);
+                while(rs and rs.moveNext()) 
+
+                   if(isTransitAccount(rs.value("fiid", null, v_integer), rs.value("account", null, v_string)))
+                      continue;
+                   end;
+
+                   isAccDataExists  = true;                                       
+                   insertAccLinks(ID, rs.value("account", null, v_string),       ClientID[clientCounter]); 
+                   Data                       = XMLElement("Data");
+                   AvailabilityAccData        = XMLElement("AvailabilityAccData");                 
+
+                   AvailabilityAccData.addchild(XMLElement("ExternalKey"       , getExternalKey()     ));
+                   AvailabilityAccData.addchild(XMLElement("ActDate"           , toFSSPdate({curdate})));
+                   AvailabilityAccData.addchild(XMLElement("KindData"          , "09"                 ));
+                   AvailabilityAccData.addchild(XMLElement("DebtorName"        , getParyName(ClientID[clientCounter])));
+                   AvailabilityAccData.addchild(XMLElement("Acc"               , rs.value("account")  ));
+                   AvailabilityAccData.addchild(XMLElement("BicBank"           , {MFO_BANK}           ));                                           
+                   
+                   getSfContrInfo(rs.value("account", null, v_string),rs.value("fiid", null, v_integer), SfNumber, SfDateBegin);
+                        
+                   if((SfNumber != "") and (SfDateBegin != date(0,0,0)))
+                      AvailabilityAccData.addchild(XMLElement("contractNumber"    , SfNumber                       ));                      
+                      AvailabilityAccData.addchild(XMLElement("contractStartDate" , toFSSPdate(SfDateBegin)        ));                                                
+                   end;
+                        
+                   AvailabilityAccData.addchild(XMLElement("accountKindCode"    ,  "01"               ));                                           
+                   AvailabilityAccData.addchild(XMLElement("accountKindName"    ,  "расчетный счет"   ));                                                            
+
+                   if(rs.value ("fiid") == 0) SummaRest = RestA (rs.value("account"), {curdate}, rs.value("chapter"));
+                   else                       SummaRest = RestAC(rs.value("account"), rs.value("fiid"), {curdate}, rs.value("chapter"));
+                   end;
+
+                   AvailabilityAccData.addchild(XMLElement("Summa"              ,  String(SummaRest)   ));                                           
+                   AvailabilityAccData.addchild(XMLElement("CurrencyCode"       ,  ПолучитьКодФинИн(rs.value("fiid"))));                                           
+
+                   if(rs.value ("fiid") != 0)
+                      AvailabilityAccData.addchild(XMLElement("SummaRUB"        ,  String(RSL_getRestAcc(rs.value("account"), 0))   ));                                           
+                      if(0 == ПолучитьКурс(rate, 0, rs.value ("fiid"), 7))             
+                         var RateCur = rate.rate / rate.scale / pow(10, rate.point);
+
+                         AvailabilityAccData.addchild(XMLElement("DateChange"       ,  toFSSPdate({curdate})));                                           
+                         AvailabilityAccData.addchild(XMLElement("UnityExchange"    ,  rate.scale));                                           
+                         AvailabilityAccData.addchild(XMLElement("ExchangeRate"     ,  RateCur));                                           
+                      end;
+                   end;
+               
+              
+
+                   AvailabilityAccData.addchild(XMLElement("DeptCode"           ,  String(rs.value("NameBranch"))) );                                           
+                   
+                   Data.addchild(AvailabilityAccData);                                           
+                   Buffer.addchild(Data);
+                  
+                   if( isVIPAccount( rs.value( "account" ) ) ) saveAccountForTmp( id, rs.value( "account" ), true, false, "VIP-Клиент" );
+                   else                                        saveAccountForTmp( id, rs.value( "account" ), false, false, "" );  
+                   end;                                  
+                end;                              
+                if (not isAccDataExists)             
+                   insertAccLinks(ID, "", ClientID[clientCounter]);              
+                   isAccDataExists = false;
+                end;
+            clientCounter = clientCounter + 1;
+            end;           
+               
+        end;    
+
+        if (AnswerType == 0)
+           if (AvailabilityAccData.childs.size != 0) AnswerType = NOTICE_DATA_EXISTS;               
+           else                                      AnswerType = NOTICE_NO_DATA_EXISTS;                
+           end;   
+        end;
+        answer.addchild(XMLElement("AnswerType"   , string( AnswerType:2:o )));           
+
+        var j = 0;
+        while(j < buffer.childs.size)
+            answer.addchild(buffer.childs[j]);
+            j = j + 1;
+        end;
+
+        //answer.addChild(XMLElement("SignDateTime", toFSSPDateTime( date, time )));        
+
+        SetOutPut(OutFileName, false);         
+           println(SerializeXML(answer.toString));
+        SetOutput(null, true);
+         
+        var InputFileName = getMesName(ID);
+        if (InputFileName == "")  RunError("Не удалось получить имя файла"); end;
+
+        if(not moveFile(OutFileName, FSSPParams.fssp_dir_export + "/" + InputFileName))                     
+           RunError("Не удалось скопировать файл "+ InputFileName + "| в каталог "+ FSSPParams.fssp_dir_export);                
+        end;            
+
+        regAnswer( id, ExternalKey );
+
+        if  (ClientID.Size() == 0) UpdateDataScroll(ID, -1);
+        elif(ClientID.Size()  > 1) UpdateDataScroll(ID,  0);
+        else                       UpdateDataScroll(ID,  ClientID[0]); 
+        end;
+
+        if (RSLDefCon.IsinTrans) rsldefcon.CommitTrans;   end;      
+//        if(not (ActionMode == MULTI_ACTION_MODE)) viewfile(FSSPParams.fssp_dir_export + "/" + InputFileName); end;
+
+        if(     not (ActionMode == MULTI_ACTION_MODE)  
+            AND not (ActionMode == 3)  
+          )
+            viewfile(FSSPParams.fssp_dir_export + "/" + InputFileName); 
+        end;
+         
+   return 0;  
+   
+   onError(e)
+        catchUserError(e);
+   end; 
+
+   if(kindAction != 1) FSSP_QUERY(); end;
+
+end;
+                      	
+//var a = (TFSSP_QUERY(2061)); 
+//a.rollback;
+//printprops(a);
+//a.create(1);
+//exit(1);
+
+
+  
+
+ 
+ 

@@ -1,0 +1,202 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   Макрос комиссии 13.1.0 (бывшая 2.3.4 в ПРББ)
+ 
+       "Комиссия за перевод денежных средств на л/сч сотрудников организации по ЗП".
+
+       Тип комиссии - периодическая.
+
+//25-10-2012 Жаворонкова Н. (joy) Внесены изменения в рамках C-14670, вкл. измененные требования
+//19-04-2013 Гуцу Е. Алгоритм расчёта комиссии изменён в соответствии с заявкой C-18426 "Добавление условий в макрос списания комиссии за ЗП проект ПРББ"
+//24-07-2013 Гуцу Е. Добавлено условие - если у клиента нет счетов с типом Z комиссия не берётся.
+//RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+//02-07-2014 Жаворонкова Н. (joy) R-404644 Минимум комиссии списывается только в том, случае, если он задан
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, cb_sql, fg_Life_parm, globals, CommissLib;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+
+
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sfcalcal_addr /*  адрес алгоритма (sfcalcal) */, sfcontrStruc /*Cтруктура sfcontr*/, CommNumber_sfacrpay )
+
+    record sfcontr( sfcontr );
+    record calcal (sfcalcal);
+        
+    var query, rs, stat, cmd;
+    var CommSum     = $0,
+        CommQuont   = 0,
+        CommNumber ,
+        fgBank,
+        PayerAccountCondition,
+        UserTypeCondition;
+    array arrRecAcc;
+
+    var TarifValue = 0, MinValue = 0, MaxValue = 0, TarifType = 0;
+
+
+debugbreak;
+        
+    /* Определим счёт (счета) получателя для фильтра платежей.
+       Так как счёт может быть один, а может быть несколько, каждый из счетов необходимо
+       передавать отдельным параметром, т.к. переданную строчку sql не воспринимает. Отсутствие
+       параметра или значение null - не проблема. 
+       Если будет более 2 счетов, нужно добавить приём ещё одного параметра в in и его передачу
+       в запрос через cmd.AddParam. */
+/* joy Счета оставила как и были для нескольких банков*/
+    fgBank = fg_life_subject( {OurBank} );
+    if( fgBank.is_Prbb )
+       arrRecAcc(0) = "40817810809000060164";
+       arrRecAcc(1) = "40820810809000060164";
+
+    /* EVG 19/04/2013 Для ЭВ используется свой макрос exv_com1310p.mac*/
+    elif( fgBank.is_Exv )
+       arrRecAcc(0) = "40817810200000000706";
+    
+    elif( fgBank.is_EXV_Volgograd )
+       arrRecAcc(0) = "40817810901000000001";
+       arrRecAcc(1) = "40820810901000000001";
+    
+    elif( fgBank.is_Geb )
+       arrRecAcc(0) = "";         // Пока нет инфо
+
+    elif( fgBank.is_Vuz )
+       arrRecAcc(0) = "";         // Пока нет инфо
+    end;
+
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+        SetBuff( calcal, sfcalcal_addr );
+        CommNumber = calcal.CommNumber;               
+    else
+       Copy ( sfcontr, sfcontrStruc );
+       CommNumber = CommNumber_sfacrpay;             
+    end;
+
+    /* EVG 24/07/2013 Сначала нужно проверить, есть ли у клиента вообще счета с типом Z и, если нет,
+       то дальше не идти, комиссия в этом случае не взимается. */
+    query = " Select 1 from daccount_dbt where t_client = :client and instr( t_UserTypeAccount, 'Z' ) > 0 ";
+    cmd = rsdcommand( query );
+    cmd.AddParam( "client", RSDBP_IN, sfcontr.PartyID );
+    rs = rsdRecordSet(cmd);
+    
+       //  02.07.2014 joy R-404644 Получаем значение тарифа
+    GetTarifInfo( sfcontr, EndDate, EndDate, 1, CommNumber, @TarifValue, @MinValue, @MaxValue, @TarifType );
+    
+    if (rs and rs.moveNext())
+
+       query = "  Select nvl( sum( paym.t_Amount ), 0 ) " +
+               "   From dpmpaym_dbt  paym, " +
+               "        dacctrn_dbt arh, " +
+               "        dpmdocs_dbt  pmd, " +
+               "        daccount_dbt acc  " +
+               "  Where paym.t_Payer = :payer " + 
+               "    and paym.t_ReceiverAccount in ( :account1, :account2 ) " +
+               "    and paym.t_PaymStatus = 32000 " +
+               "    and paym.t_PayerBankID = paym.t_ReceiverBankID " +
+               "    and pmd.t_paymentid = paym.t_paymentid " +
+               "    AND ARH.T_ACCTRNID = PMD.T_ACCTRNID " +
+               "    and arh.t_date_carry BETWEEN trunc ( :begdate, 'month' ) " +
+               "                             AND last_day (:enddate) " +
+               "    and acc.t_Chapter = 1 " +
+               "    and arh.t_chapter = 1  " + // joy 06.11.2014 I-00529731 иначе задваиваются платежи
+               "    and acc.t_Account  = paym.t_PayerAccount ";
+
+       PayerAccountCondition = " and subStr( paym.t_PayerAccount, 1, 3 ) in ( '405', '406', '407', '408' ) ";
+       UserTypeCondition     = " and instr( acc.t_UserTypeAccount, 'Z' ) > 0 ";
+
+
+       // 1) Считаем сумму оборотов по (ДТ) всех счетов клиента с признаком "Z"
+       cmd = rsdcommand( query + UserTypeCondition );
+       cmd.AddParam( "payer",    RSDBP_IN, sfcontr.PartyID );
+       cmd.AddParam( "account1", RSDBP_IN, arrRecAcc(0)    );
+       cmd.AddParam( "account2", RSDBP_IN, arrRecAcc(1)    );
+       cmd.AddParam( "begdate",  RSDBP_IN, EndDate         );
+       cmd.AddParam( "enddate",  RSDBP_IN, EndDate         );
+       rs = rsdRecordSet(cmd);
+
+       if (rs and rs.moveNext())
+          CommSum = rs.value( 0, null, V_MONEY );
+       end;
+
+       // Если сумма оборотов больше нуля (перечисления были), то переходим к п. 2
+       if( CommSum > $0 )
+
+          // 2) Считаем сумму оборотов (ДТ) 405 - 407, 40802, 40807  -  (КТ) счета из массива
+          cmd = null; rs = null;
+          cmd = rsdcommand( query + PayerAccountCondition );
+          cmd.AddParam( "payer",    RSDBP_IN,sfcontr.PartyID );
+          cmd.AddParam( "account1", RSDBP_IN,arrRecAcc(0)    );
+          cmd.AddParam( "account2", RSDBP_IN,arrRecAcc(1)    );
+          cmd.AddParam( "begdate",  RSDBP_IN,EndDate         );
+          cmd.AddParam( "enddate",  RSDBP_IN,EndDate         );
+          rs = rsdRecordSet(cmd);
+          if (rs and rs.moveNext())
+             CommSum = rs.value( 0, null, V_MONEY );
+
+             // 4) Если полученная сумма комиссии меньше минимума из настройки тарифа (в том числе равна нулю), берём минимум
+                   // ... и минимум в настройке задан (02.07.2014 joy R-404644)
+             if (( CommSum == $0 ) and (MinValue != 0) ) 
+                CommSum = $1;    // Базовая сумма 1 возвращается для того, чтобы списалась мин. комиссия
+             end;
+
+          end;
+
+
+       // иначе, переходим к п. 4 (списывается минимальная комиссия)
+       else
+
+            if (MinValue != 0)  
+                CommSum = $1;    // Базовая сумма 1 возвращается для того, чтобы списалась мин. комиссия, но только в случае заданного минимума в настройках
+            end;
+
+       end;
+
+    end;
+
+
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_SUM;
+    sfbassum.baseSum  = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/

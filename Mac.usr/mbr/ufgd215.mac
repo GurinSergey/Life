@@ -1,0 +1,162 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация выписок по сообщениям УФЭБС ED215                              */
+/*                                                                          */
+/* Имя файла: ufgd215.mac                                                   */
+/* Создан:    06.07.06                                     Гайворонский Е.Г.*/
+/* Изменен:   10.04.12 Chesnokov D.S. по заявке С-9530 проверка на группу   */
+/****************************************************************************/
+import "ufgendoc.mac", "diver.mac";
+
+var ver_st = 1;
+file wlreq2 ("wlreq.dbt") key 3;
+
+macro НайтиКодРежима(answercode: string) :string
+
+  var result = "Неизвестный код режима: " + answercode;
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  select = "select t_description from dwlcodes_dbt where t_algnum = 42 and t_code=:code";
+  
+  params = makeArray( SQLParam("code", answercode));
+  rs = execSQLselect( select, params, FALSE );
+  if ( rs and rs.MoveNext() )
+     result = rs.value(0);
+  end;
+        
+  return result;
+end;
+
+macro GenDoc( addrMes )
+
+  if (not ВходитВГруппу({oper},198))
+    msgBox("Вы не включены в группу \"198 - Генерация сообщений УФЭБС\"");
+    return false;
+  end;
+
+  var xml:object = ActiveX( "MSXML.DOMDocument" );
+  var Node:object = ActiveX( "MSXML.DOMDocument" );
+  var Строка, Строка2, Receiver, Error, InitAuthor, Part = 0, field_name; 
+  var Cancel = KVIT_NORMAL, StatusCode = "", ErrDescription = "", CtrlCode = "", ReadFromNode = "";
+  var EDDate = "", j = 0;
+  var relRef = NULL;
+
+  SetBuff( wlmes, addrMes );
+
+  PrintLog( 2, "Генерация информационного сообшения по ED215" );
+
+  ClearRecord( wlreq );
+
+  while( СчитатьПоле( field_name, Строка ) )
+    if( field_name == XMLField )
+      if ( not xml.loadXML(Строка) )
+         println( string( "Неверный формат сообщения по форме ED215" ) );
+         return false;
+      end;
+    
+      EDDate = ReadAttribute(xml,"EDDate");
+      StatusCode = ReadOptinalAttribute(xml,"StatusCode");
+      if(StatusCode != "")
+        wlreq.Queries = StatusCode;
+        Строка2 = НайтиКодРежима(wlreq.Queries);
+        Cancel = UF_getCancelForConf(StatusCode, ver_st);
+      end;
+    
+      /* Заполнение учетных буферов */
+      wlreq.TRN                = wlmes.Trn; 
+      wlreq.OriginatorID       = ToRespID(ReadAttribute(xml,"EDAuthor"));
+      wlreq.OriginatorCodeKind = PTCK_BIC;
+      wlreq.OriginatorCode     = ПолучитьКодСубъекта(wlreq.OriginatorID, wlreq.OriginatorCodeKind, Error);
+      Receiver = ReadOptinalAttribute(xml,"EDReceiver");
+      wlreq.RecipientCodeKind  = PTCK_BIC;
+      if(Receiver)
+         wlreq.RecipientID     = ToRespID(Receiver);
+      else
+         wlreq.RecipientID     = {OurBank};
+      end;
+      wlreq.RecipientCode      = ПолучитьКодСубъекта(wlreq.RecipientID, wlreq.RecipientCodeKind, Error);
+    
+      wlreq.RelatedRef = wlmes.RelatedRef;
+    
+      if(ReadOptinalAttribute(xml,"EDNo","InitialED" ) != "")
+         wlreq.InitDateMes = ToDate_(ReadAttribute(xml,"EDDate","InitialED" ));//TAM
+         InitAuthor        = ToRespID(ReadAttribute(xml,"EDAuthor","InitialED" ));
+         wlreq.InitFormIDMes = НайтиФормуСообщенияПоРеференсу(wlreq.RelatedRef, TRANSP_UFBS);  
+      end;
+     
+      if( ver_st == 1 )
+         if( not ВставитьОтвет( wlreq, Строка2 ) )
+           std.msg("Ошибка при вводе ответа");
+           return FALSE;
+         end;
+      else
+         if( (not ПроверитьЭлелементPartInfoНаНаличие(xml, wlreq.PartAggregateID, Part)) Or (Part == 1))
+            if( not ВставитьОтвет( wlreq, Строка2 ) )
+               std.msg("Ошибка при вводе ответа");
+               return FALSE;
+            end;
+         else
+            ClearRecord( wlreq2 );
+            wlreq2.PartAggregateID = ReadAttribute(xml,"PartAggregateID","PartInfo");
+            wlreq2.Direct = "X";
+            if( GetEQ( wlreq2 ))
+               if( not ОбновитьОтвет( wlreq2, ""/*Строка2*/ ) )
+                  std.msg("Ошибка при обновлении ответа");
+                  return FALSE;
+               end;
+            else
+               std.msg("Не найдена головная часть ответа");
+               return FALSE;
+            end;  
+         end;
+      end;
+    elif( field_name == UFBSDocExtField )
+      if( not node.loadXML(Строка) )
+         println( string( "Неверный формат сообщения по форме ED215" ) );
+         return false;
+      end;
+
+      ClearRecord(wlconf);
+
+      if (Cancel == KVIT_ERROR)
+        std.msg( "Сообщения ED215 со статусом " + StatusCode + " обрабатываются без формирования подтверждений" );
+      else
+        ReadFromNode = Node.ChildNodes.Item(0).ChildNodes.Item(0).NodeName;
+        
+        relRef = EDNoDateAuthor();
+    
+        relRef.EDNo   = ReadAttribute(Node,"EDNo",          ReadFromNode);
+        relRef.EDDate = ToDate_(ReadAttribute(Node,"EDDate", ReadFromNode));//TAM
+        relRef.EDAuthor = ReadAttribute(Node, "EDAuthor",   ReadFromNode);
+   
+        wlconf.RelatedRef   = relRef.GetTrn();
+        wlconf.TransferDate = ToDate_(EDDate); //TAM
+        wlconf.Description = ПолучитьКодОтветаНаСообщение(StatusCode, TYPE_CODE_UFBS_ED203);
+        if(not СформироватьПодтверждение(wlconf, Cancel, node, ReadFromNode))
+          return false;
+        end;
+      end;
+    else 
+       std.msg( string( "Неизвестный код поля: ", field_name) );
+       return FALSE;
+    end; 
+    
+    
+  end; // while( СчитатьПоле( field_name, Строка ) )
+
+  return TRUE;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    std.msg(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+
+end;
+
+macro GenDocV2( addrMes )
+   ver_st = 2;
+   return GenDoc( addrMes );
+end;

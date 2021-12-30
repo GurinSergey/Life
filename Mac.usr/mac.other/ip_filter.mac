@@ -1,0 +1,426 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  Имя файла   : ip_filter.mac                                                */
+/*  Создан      : 17.01.2013                                                   */
+/*  Заявка      : C-16548 Создание новой роли для удаленного открытия счета ЮЛ */
+/*                 и фильрации доступа по IP                                   */
+/*  Описание    : В макросе реализован пользовательский скроллинг с фильтром   */
+/*                IP адресов и обработчик данного списка.                      */
+/*                                                                             */
+/*******************************************************************************/
+import BankInter, PTInter, RSD, RsbDataSet, likepy;
+import "lib_oper.mac", "lib_windows_system.mac", "oralib.mac", "globals.mac";
+
+var rs, str;
+var Col = TArray(), NumCol = 0, rec_ins, rec_upd;
+private var path, resname = "ip_filtr.lbr", pathfile;
+private var errCode;
+private var dlg_p;
+var ArrStrIP = TArray, FileNameIP = "";
+var Person = RSL_Person({oper});
+
+private macro ПрочитатьНастройки
+
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",V_STRING, path, errCode);
+  pathfile = FindPath(resname, path);
+  if (not pathfile)
+    msgbox("Не найдена LBR с именем " + resname);
+    return false;
+  end;
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR");
+    return false;
+  end;
+    
+  dlg_p = TRecHandler("ip_filtr", pathfile, True);
+  
+  return true;
+
+end;
+
+macro AddCol( ar,ind, fld, head, wdth, edit )
+  ar.value( ind * 6 + 0 ) = fld;  // fieldName            
+  ar.value( ind * 6 + 1 ) = head; // header               
+  ar.value( ind * 6 + 2 ) = wdth; // width                
+  ar.value( ind * 6 + 3 ) = edit; // fldType (2 = FBT)    
+  ar.value( ind * 6 + 4 ) = null; // decPoint             
+  ar.value( ind * 6 + 5 ) = 0;    // reserv               
+  NumCol = NumCol + 1;
+end;
+
+class IPFilter(_Host, _Mask, _Min_Host, _Max_Host)
+  
+  var m_Host;
+  var m_Mask;
+  var m_Min_Host;
+  var m_Max_Host;
+  var m_Valid:bool = false;
+  
+  m_Host     = _Host;
+  m_Mask     = _Mask;
+  m_Min_Host = _Min_Host;
+  m_Max_Host = _Max_Host;
+  
+end;
+
+class IpLoader()
+
+  macro ParseMask(p_mask, p_Host, p_Min_Host, p_Max_Host)
+    
+    var cmd;
+    
+    cmd = RsdCommand("begin usr_ip_filtr.GET_Min_Max_Host(?,?,?,?); end;");
+    cmd.addParam("host",   RSDBP_IN, p_Host);
+    cmd.addParam("mask",   RSDBP_IN, p_mask);
+    cmd.addparam("min_host", RSDBP_OUT, V_STRING, 255);
+    cmd.addparam("max_host", RSDBP_OUT, V_STRING, 255);
+    cmd.Execute();
+    
+    Setparm(3, cmd.param("min_host").value);
+    Setparm(4, cmd.param("max_host").value);
+    return true;
+  OnError
+    return false;
+  end;
+
+  macro ReadIPFilterFile(m_fileName)
+    
+    file f () txt;
+    var ret = "", str = "", mask, Host = "", Min_Host, Max_Host;
+        
+    if (not open (f, m_fileName))
+      msgbox("Не могу открыть для чтения файл: " + m_fileName);
+      return false;
+    end;
+
+    while (next (f))
+      if ((StrLen(Trim(f.str))) > 8 ) // если указана битовая маска
+         str = Trim(f.str);
+         if ((index(str, "/") != 0) or (index(str, "\\") != 0))
+           if (index(str, "/") != 0)
+             mask = int(Trim(Substr(str, index(str, "/") + 1)));
+             Host = Trim(Substr(str, 1, index(str, "/") - 1));
+           elif (index(str, "\\") != 0)
+             mask = int(Trim(Substr(str, index(str, "\\") + 1)));
+             Host = Trim(Substr(str, 1, index(str, "\\") - 1));
+           end;
+           if (((int(mask) >= 0 ) and (int(mask) <= 32 )) and (index(Host, ".") != 0)) // Проверка на маску, маска должна быть в диапазоне 0..32
+             if (ParseMask(mask, Host, Min_Host, Max_Host))
+               ArrStrIP(ArrStrIP.Size) = IPFilter(mask, Host, Min_Host, Max_Host);
+             end;
+           end;
+         else // если указан диапазон IP
+           if (index(str, "-") != 0)
+             Min_Host = Trim(SubStr(str, 1, index(str, "-") - 1));
+             Max_Host = Trim(SubStr(str, index(str, "-") + 1));
+             if ((index(Min_Host, ".") != 0) and (index(Max_Host, ".") != 0))
+               ArrStrIP(ArrStrIP.Size) = IPFilter(0, 0, Min_Host, Max_Host);
+             end;
+           end;
+         end;
+      end;
+    end;
+    
+  end;
+
+  macro ImportIPFilterFile()
+
+    var FilePath = RSI_SelectFile ("Текстовые файлы, *.txt");
+    
+    if (FilePath != "")
+      ReadIPFilterFile(FilePath);
+      FileNameIP = FilePath;
+    else
+      msgbox("Файл не выбран. Импортировать нечего.");
+    end;
+   
+  end;
+
+  macro Run
+    
+    /*Импорт файла IP фильра*/
+    this.ImportIPFilterFile();
+    
+  end;
+
+end;
+
+macro Event_Insert(dlg, cmd, id, key)
+  
+  if(cmd == DLG_KEY)
+    if (key == 322) //KEY_F8
+      return CM_IGNORE;
+    elif (key == 323) //KEY_F9
+      if ((dlg.rec.Min_Oktet_1 < 0) or (dlg.rec.Min_Oktet_1 > 255) or (dlg.rec.Min_Oktet_2 < 0) or (dlg.rec.Min_Oktet_2 > 255) or 
+          (dlg.rec.Min_Oktet_3 < 0) or (dlg.rec.Min_Oktet_3 > 255) or (dlg.rec.Min_Oktet_4 < 0) or (dlg.rec.Min_Oktet_4 > 255) or 
+          (dlg.rec.Max_Oktet_1 < 0) or (dlg.rec.Max_Oktet_1 > 255) or (dlg.rec.Max_Oktet_2 < 0) or (dlg.rec.Max_Oktet_2 > 255) or 
+          (dlg.rec.Max_Oktet_3 < 0) or (dlg.rec.Max_Oktet_3 > 255) or (dlg.rec.Max_Oktet_4 < 0) or (dlg.rec.Max_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_IGNORE;
+      else
+        return CM_SAVE;
+      end;
+    end;
+  
+  elif(cmd == DLG_REMFOCUS)
+    if (FldName(dlg, id) == "Min_Oktet_1")
+      if((dlg.rec.Min_Oktet_1 < 0) or (dlg.rec.Min_Oktet_1 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_2")
+      if((dlg.rec.Min_Oktet_2 < 0) or (dlg.rec.Min_Oktet_2 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_3")
+      if((dlg.rec.Min_Oktet_3 < 0) or (dlg.rec.Min_Oktet_3 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_4")
+      if((dlg.rec.Min_Oktet_4 < 0) or (dlg.rec.Min_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_1")
+      if((dlg.rec.Max_Oktet_1 < 0) or (dlg.rec.Max_Oktet_1 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_2")
+      if((dlg.rec.Max_Oktet_2 < 0) or (dlg.rec.Max_Oktet_2 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_3")
+      if((dlg.rec.Max_Oktet_3 < 0) or (dlg.rec.Max_Oktet_3 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_4")
+      if((dlg.rec.Max_Oktet_4 < 0) or (dlg.rec.Max_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    end;
+  end;
+  
+  UpdateFields(dlg);
+  
+end;
+
+macro Event_Update(dlg, cmd, id, key)
+
+  var Min_Host_ar: TArray, Max_Host_ar: TArray;
+  
+  if(cmd == DLG_INIT)
+  
+    Min_Host_ar = split(rs.value("t_min_host"),".");
+    Max_Host_ar = split(rs.value("t_max_host"),".");
+    dlg.rec.Min_Oktet_1 = Min_Host_ar(0);
+    dlg.rec.Min_Oktet_2 = Min_Host_ar(1);
+    dlg.rec.Min_Oktet_3 = Min_Host_ar(2);
+    dlg.rec.Min_Oktet_4 = Min_Host_ar(3);
+    dlg.rec.Max_Oktet_1 = Max_Host_ar(0);
+    dlg.rec.Max_Oktet_2 = Max_Host_ar(1);
+    dlg.rec.Max_Oktet_3 = Max_Host_ar(2);
+    dlg.rec.Max_Oktet_4 = Max_Host_ar(3);
+    dlg.rec.Comment = rs.value("t_comment");
+    
+  elif(cmd == DLG_KEY)
+    if (key == 322) //KEY_F8
+      return CM_IGNORE;
+    elif (key == 323) //KEY_F9
+      if ((dlg.rec.Min_Oktet_1 < 0) or (dlg.rec.Min_Oktet_1 > 255) or (dlg.rec.Min_Oktet_2 < 0) or (dlg.rec.Min_Oktet_2 > 255) or 
+          (dlg.rec.Min_Oktet_3 < 0) or (dlg.rec.Min_Oktet_3 > 255) or (dlg.rec.Min_Oktet_4 < 0) or (dlg.rec.Min_Oktet_4 > 255) or 
+          (dlg.rec.Max_Oktet_1 < 0) or (dlg.rec.Max_Oktet_1 > 255) or (dlg.rec.Max_Oktet_2 < 0) or (dlg.rec.Max_Oktet_2 > 255) or 
+          (dlg.rec.Max_Oktet_3 < 0) or (dlg.rec.Max_Oktet_3 > 255) or (dlg.rec.Max_Oktet_4 < 0) or (dlg.rec.Max_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_IGNORE;
+      else
+        return CM_SAVE;
+      end;
+    end;
+  
+  elif(cmd == DLG_REMFOCUS)
+    if (FldName(dlg, id) == "Min_Oktet_1")
+      if((dlg.rec.Min_Oktet_1 < 0) or (dlg.rec.Min_Oktet_1 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_2")
+      if((dlg.rec.Min_Oktet_2 < 0) or (dlg.rec.Min_Oktet_2 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_3")
+      if((dlg.rec.Min_Oktet_3 < 0) or (dlg.rec.Min_Oktet_3 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Min_Oktet_4")
+      if((dlg.rec.Min_Oktet_4 < 0) or (dlg.rec.Min_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_1")
+      if((dlg.rec.Max_Oktet_1 < 0) or (dlg.rec.Max_Oktet_1 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_2")
+      if((dlg.rec.Max_Oktet_2 < 0) or (dlg.rec.Max_Oktet_2 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_3")
+      if((dlg.rec.Max_Oktet_3 < 0) or (dlg.rec.Max_Oktet_3 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    elif (FldName(dlg, id) == "Max_Oktet_4")
+      if((dlg.rec.Max_Oktet_4 < 0) or (dlg.rec.Max_Oktet_4 > 255))
+        msgbox("Значение должно быть в диапазоне от 0 до 255");
+        return CM_CANCEL;
+      end;
+    end;
+  end;
+  
+  UpdateFields(dlg);
+  
+  
+end;
+
+macro Insert_Rec(parm)
+
+  if(ПрочитатьНастройки)
+    if (RunDialog(dlg_p, "Event_Insert"))
+      Setparm(0, dlg_p);
+    end;
+  end;
+
+end;
+
+macro Update_Rec(parm)
+
+  if(ПрочитатьНастройки)
+    if (RunDialog(dlg_p, "Event_Update"))
+      Setparm(0, dlg_p);
+    end;
+  end;
+  
+end;
+
+macro IP_Event(rs, cmd, id, key)
+  
+  var CM_FLAG = CM_DEFAULT;  /*Возвращаемое значение по умолчанию*/
+  var i = 0; // счетчик
+  var cmd_ins;
+  
+  if (cmd == DLG_KEY)
+    if (key == 13) //KEY_ENTER
+      Update_Rec(rec_upd);
+      if (ValType(rec_upd) == V_Undef)
+        CM_FLAG = CM_IGNORE;
+      else  
+        rs.Edit();
+        rs.value("t_min_host") = rec_upd.rec.Min_Oktet_1 + "." + rec_upd.rec.Min_Oktet_2 + "." + rec_upd.rec.Min_Oktet_3 + "." + rec_upd.rec.Min_Oktet_4;
+        rs.value("t_max_host") = rec_upd.rec.Max_Oktet_1 + "." + rec_upd.rec.Max_Oktet_2 + "." + rec_upd.rec.Max_Oktet_3 + "." + rec_upd.rec.Max_Oktet_4;
+        rs.value("t_date") = DtTm(Date ,Time());
+        rs.value("t_comment") = rec_upd.rec.Comment;
+        rs.value("t_isauto") = "0";
+        rs.Update();
+        
+        GoTOScroll (rs);
+        UpdateScroll (rs);
+        CM_FLAG = CM_IGNORE;
+      end;
+    elif (key == 317) //KEY_F3
+      
+      IpLoader.Run();
+      debugbreak;
+      ClrRmtStubs(); // Принудительное уничтожение RSCOM объектов
+      if (ArrStrIP.Size > 0 )
+        if(GetTrue(true, "В файле " + FileNameIP + " есть корректные записи. |Выполнить обновление? |ВНИМАНИЕ! Все существующие записи будут удалены."))
+          
+          RsdCommand("delete usr_ip_filter_dbt").Execute();
+          while (ArrStrIP.Size > i)
+            execSql ("insert into usr_ip_filter_dbt (T_MIN_HOST, T_MAX_HOST, T_DATE, T_ISAUTO, T_COMMENT) values (:MIN_HOST, :MAX_HOST, SYSDATE, 1, :COMENT)",
+                      makeArray (SqlParam ("MIN_HOST", ArrStrIP(i).m_Min_Host),
+                                 SqlParam ("MAX_HOST", ArrStrIP(i).m_Max_Host),
+                                 SqlParam ("COMENT", "Загружено из файла: " +FileNameIP)
+                                )
+                    );
+            i = i + 1;
+          end;
+          ArrStrIP.Size = 0; //Обнуляем массив
+          CM_FLAG = CM_SELECT;
+          
+        else
+          CM_FLAG = CM_IGNORE;
+        end;
+      else
+        if (FileNameIP != "")
+          Msgbox("В файле не найдены корректные записи. Обновление фильтра не производится.");
+        end;
+        CM_FLAG = CM_IGNORE;
+      end;
+    elif (key == 322) //KEY_F8
+      if (rs.RecCount > 0)
+        if (GetTrue(true, "Вы действительно хотите удалить запись?"))
+          rs.Delete();
+          CM_FLAG = CM_SELECT;
+        else
+          CM_FLAG = CM_IGNORE;
+        end;
+      end;
+    elif (key == 323) //KEY_F9
+      Insert_Rec(rec_ins);
+      if (ValType(rec_ins) == V_Undef)
+        CM_FLAG = CM_IGNORE;
+      else
+        rs.AddNew();
+        rs.value("t_min_host") = rec_ins.rec.Min_Oktet_1 + "." + rec_ins.rec.Min_Oktet_2 + "." + rec_ins.rec.Min_Oktet_3 + "." + rec_ins.rec.Min_Oktet_4;
+        rs.value("t_max_host") = rec_ins.rec.Max_Oktet_1 + "." + rec_ins.rec.Max_Oktet_2 + "." + rec_ins.rec.Max_Oktet_3 + "." + rec_ins.rec.Max_Oktet_4;
+        rs.value("t_date") = DtTm(Date ,Time());
+        rs.value("t_comment") = rec_ins.rec.Comment;
+        rs.Update();
+        
+        GoTOScroll (rs);
+        UpdateScroll (rs);
+        CM_FLAG = CM_IGNORE;
+
+      end;
+    end;
+  end;
+  
+  return CM_FLAG;
+  
+end;
+
+/****************************************************************/
+/*                       ТОЧКА ВХОДА                            */
+/****************************************************************/
+if ((person.ArmNumber != 1016) and (person.ArmNumber != 1001)) // Проверка на запуска пользователем АРМ 1016
+  msgbox("Вы не входите в АРМ 1016 Сотрудник HD. | Просмотр/редактирование списка запрещен.");
+  exit(1);
+else
+  str = " SELECT t_min_host, t_max_host, t_date, " +
+        "        t_isauto, t_comment " +
+        "   FROM usr_ip_filter_dbt ORDER BY t_date";
+
+  rs = RsdRecordSet(RsdCommand(str) ,RSDVAL_CLIENT, RSDVAL_STATIC );
+
+  AddCol(Col, NumCol, "t_min_host", "Начало диапазона", 15);
+  AddCol(Col, NumCol, "t_max_host", "Конец диапазона",  15);
+  AddCol(Col, NumCol, "t_date",     "Дата",             10);
+  AddCol(Col, NumCol, "t_comment",  "Комментарий",     40);
+
+  while(RunScroll(rs, NumCol, Col, "ip_filter", "IP_Event", "Список диапазонов IP адресов", "~ESC~ Выход ~Enter~ Редактировать ~F8~ Удалить ~F9~ Добавить ~F3~ Загрузить из файла", true, 15, 8, 97, 25))
+    rs = RsdRecordSet(RsdCommand(str) ,RSDVAL_CLIENT, RSDVAL_STATIC );
+  end;
+  rs.Close();
+  exit(1);
+end;

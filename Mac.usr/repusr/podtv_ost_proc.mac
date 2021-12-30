@@ -1,0 +1,719 @@
+/************************************************************************/
+/*          Автоматизированная банковская система RS-Bank v6.0          */
+/*                                                                      */
+/*               Copyright (c) R-Style Softlab Kiev                     */
+/*                                                                      */
+/*  Имя файла        : podtv_ost.mac                                    */
+/*                                                                      */
+/*  Описание         : Подтверждение остатков на конец года             */
+/*                                                                      */
+/*  Программист      : Солошенко В. А.                                  */
+/*                                                                      */
+/*  Создан           : 28.12.2009                                       */
+/*                                                                      */
+/*  Модифицирован    : Ярмольчук А.Ю.                                   */
+/*                   : 11.07.2012 vihrov C-12122 смена диапазонов кодов */
+/*                   : 10.01.2013 Gurin S. R-311870-2                   */
+/*                   : 14.12.2012 zmp I-00299763                        */
+/*                   : 13.02.2012 Gurin S. I-00325370-2                 */
+/*                   : 02.07.2014 Chesnokov D.S. C-26321 Добавлена на   */
+/*                      панель дата последней операции. Обрабатывается  */
+/*                      в массовм режиме                                */
+/*                   : 12.01.2015 DPN I-00541813-2 Адаптация под        */
+/*                      31-й патч                                       */
+/************************************************************************/
+import globals, oralib, bankinter, "KeyCodes.mac", repforms, Календарь, xlrep, PTInter, FIInter, CurrInter, rcw, rsexts ;
+import "adress.mac";
+/* EVG */
+import VBAconst;
+
+import WORDINTF;
+
+const Временное_решение=True; /*Ярмольчук. Используем временное решение пока не будет реализована возможность отправки 
+                                файлов с данными по подверждениям по системе Интернет-клиент.
+                                Во временном решении пользователю предоставляется выбор: временное решение или обычное. 
+                                Чтобы отказаться от выбора и использовать штатное решение ставим Временное_решение=False
+
+                                Временное решение заключается в том, что если у клиента есть счета с признаком Ё, то 
+                                все равно все счета по этому клиенту записиваются в один общий файл. Отдельные файлы на ИК 
+                                не формируются. У общего файла постфикс - "_all"
+                               */
+
+var path = "",
+    pathfile = "",
+    file_lbr = "RSU.lbr";
+
+var RepType, BalAcc, Oper, RepDate, DpdDate;
+var dlg_podtv;
+var Numb = 0, choise = 0;
+
+var arrRepType = TArray();
+    arrRepType[0] = "расчетные счета";
+    arrRepType[1] = "ссудные счета";
+    arrRepType[2] = "депозитные счета";
+
+var arrBalAcc = TArray();
+    arrBalAcc[0] = "404,405,406,407,408,409";
+    arrBalAcc[1] = "441,442,443,444,445,446,447,448,449,450,451,452,453,454,455,456,457,458";
+    arrBalAcc[2] = "314,415,416,417,420,421,422,425,438,440";
+
+record OperBuf (person);
+
+var Rate_In  = TRecHandler("ratedef.dbt");
+var RateIn;
+
+array Choice;
+var   Choice_select;
+var   Separate_file;
+var   Postfix;
+var   curr_line;
+var   curr_line_word; 
+var   str_line;
+var   ex_from_acc;
+//var   clnt_code_101;
+var   clnt_code_1; //11.07.2012 vihrov C-12122 смена диапазонов кодов
+var   NeedPrintLine = true;
+var   NeedPrintHead = true;
+
+const Строк_на_листе      = 82;  /* Ярмольчук */
+const Строк_на_листе_word = 100; /* Ярмольчук (для шаблона с Courier New=7)*/
+const Длина_наименования_на_строку = 64;
+
+private CONST RATETYPE_CB = 7;
+
+var arrOneClientAccInfo = TArray();
+var arrOneClientAccCurInfo = TArray();
+var arrOneClientAccRstInfo = TArray();
+var arrOneClientAccCurCodeInfo = TArray ();
+
+
+/* Несколько констант VBA */
+const wdPageBreak = 7;
+const wdSectionBreakNextPage = 2;
+const wdStory        =  6;
+/* EVG Заменил на import VBAconst, иначе - переопределение.
+const wdGoToField    =  7;
+const wdGoToNext     =  2;
+const wdGoToBookmark = -1;*/
+
+/******************************************************************************/
+/* Получить наименование нашего банка( с адресом или без - по настройке )     */
+/******************************************************************************/
+MACRO BankNameWithAddr():string
+
+  var err, RegValNameWithAddr;
+  var OurBankName = {Name_Bank};
+ 
+  RECORD addr ( adress );
+                     
+  GetRegistryValue( "CB\\CARRY\\BANKNAMEWITHADDR", V_BOOL, RegValNameWithAddr, err);
+
+  if( ( err == 0 ) and ( RegValNameWithAddr == true ) )
+    if( НайтиЮридическийАдресСубъекта( {OurBank}, addr) )
+      if( addr.District != "" )
+        OurBankName = OurBankName + ", " + addr.CodeDistrict + ". " + addr.District;
+      end;
+    end;
+  end;
+
+  return OurBankName;
+
+END;
+
+Private macro PrintHead(_date, _client, WordDoc, WordApp)
+
+
+[                           ###############################################](BankNameWithAddr());
+[    По состоянию на ########## года остаток, показанный Вами в выписках по] (_date);
+
+  if (strlen (_client)>Длина_наименования_на_строку)
+     [ счетам ###############################################################
+              ###############################################################]
+     (substr (_client, 1, Длина_наименования_на_строку), substr (_client, Длина_наименования_на_строку):w)
+  else
+     [ счетам ###############################################################
+     ](_client);
+  end;
+  curr_line=curr_line+4; /* по текущему количеству строк в шапке */
+  curr_line_word=curr_line_word+4;
+
+
+  if (WordDoc and NeedPrintHead)
+    WordDoc.Bookmarks("date_rep1").Range.Text = BankNameWithAddr()+"\n"+"\n По состоянию на "+_date; // KS 09.08.2010 Наименование Банка
+    WordDoc.Bookmarks("clnt_name1").Range.Text = _client+"\n";
+
+    WordDoc.Bookmarks("date_rep2").Range.Text = BankNameWithAddr()+"\n"+"\n По состоянию на "+_date; //Gurin S. 10.01.2013 R-311870-2 
+    WordDoc.Bookmarks("clnt_name2").Range.Text = _client+"\n";
+
+    NeedPrintHead=false;
+  end;
+end;
+
+                                                                                                                                 
+private macro PrintLine(_acc, _sum, WordDoc)
+  println(String(" № ", _acc, " в сумме ", _sum, " руб."));
+  curr_line=curr_line+1;
+  curr_line_word=curr_line_word+1;
+  str_line =str_line + String(" № ", _acc, " в сумме ", _sum, " руб.")+"\n";
+
+end;
+
+
+private macro PrintLineCur(_acc, _sum, _cur, _rate, _date, WordDoc)
+  println(String(" № ", _acc, " в сумме ", _sum, " ", _cur));
+  println(" Эквивалент в рублях РФ составил ", _sum*_rate, " руб. (по курсу ЦБ РФ на ", _date, ")");
+  curr_line=curr_line+2;
+  curr_line_word=curr_line_word+2;
+  str_line =str_line+String(" № ", _acc, " в сумме ", _sum, " ", _cur)+"\n"+String ("   Эквивалент в рублях РФ составил ", _sum*_rate, " руб. (по курсу ЦБ РФ на ", _date, ")","\n");
+
+end;
+
+
+Private macro PrintBottom(cnt_copy, WordDoc, WordApp)
+[ 
+  проверен по данным нашего учета.
+ 
+  Подтверждаем, что проверив по Вашим выпискам все записи, мы установили что 
+  они сделаны Вами правильно и что указанные Вами остатки полностью 
+  соответствуют остаткам, выведенным по нашему учету.
+ 
+ 
+  М.П.                    Подписи: Руководитель
+ 
+                                  Гл.бухгалтер
+ 
+  Настоящее подтверждение остатков сверено со счетом клиента и образцами 
+  подписей
+ 
+ 
+   _______________________20___ г. Подпись сотрудника банка
+ 
+  Возражения о расхождениях: _________________________________________________
+  ____________________________________________________________________________
+ 
+                                         Приложение на _____листах
+ 
+ 
+  М.П.                    Подписи: Руководитель
+ 
+                                  Гл.бухгалтер
+ 
+  Расхождение, указанное клиентом в сумме __________________________________
+  банком окончательно урегулировано
+ 
+                                        __________________________________
+                                        20___ г. Подпись сотрудника банка
+ 
+];
+  curr_line=curr_line+34; /* по текущему количеству строк в подписи */
+  curr_line_word = curr_line_word + 34;
+  if (cnt_copy==1) /* Ярмольчук. Если печатается 2-й или единственный экземляр, то выполняем перевод листа */
+     println ("");
+  else
+     if (curr_line>int (Строк_на_листе/2)) /* если первый лист занял больше половины, то 2-ю копию печатаем на отдельном листе */
+        println ("");
+        curr_line=1;
+     end;
+  end;
+
+  /* Вставляем данные по счетам */
+  if (WordDoc and NeedPrintLine)
+    WordDoc.Bookmarks("str_line1").Range.Text = str_line;
+    WordDoc.Bookmarks("str_line2").Range.Text = str_line;
+    NeedPrintLine = false;
+  end;
+
+  /* Вставляем разрыв страницы */
+  if (WordDoc and NeedPrintLine)
+    if (cnt_copy==1) /* итоговое вхождение в данную функцию */
+    if (curr_line_word>int (Строк_на_листе_word))
+       WordApp.ActiveDocument.Bookmarks ("uralsky").Select; /* позиционируемся на закладку куда будем вставлять разрыв */
+       WordApp.Selection.InsertBreak( wdPageBreak );
+       curr_line_word=1;
+    end;
+  end;
+ end;
+end;
+
+Private Macro Split_date (date_, dd_, mm_, yyyy_)
+
+ var dd, mm, yyyy;
+
+   datesplit (date_, dd, mm, yyyy);
+
+   if (dd<10)
+     dd="0"+string (dd);
+   else
+     dd=string (dd);
+   end;
+
+   if (mm<10)
+     mm="0"+string (mm);
+   else
+     mm=string (mm);
+   end;
+
+   SetParm (1, dd);
+   SetParm (2, mm);
+   SetParm (3, yyyy);
+
+End;
+
+
+private macro CreateWordApplication()
+
+var startAX, WordApplication;
+
+  if (isStandAlone())
+     return ActiveX("Word.Application");
+  else
+     startAX = CreateObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone());
+     WordApplication = startAX.CreateComObject("Word.Application");
+     WordApplication.Visible = true;
+     return WordApplication;
+  end;
+
+end;
+
+private macro ShowReportOnTerminal( WordApp, WordDoc )
+  
+  var DocFileName : string, TermFileName : string;
+
+  DocFileName = SplitFile( GetTxtFileName("") );
+
+  DocFileName = MergeFile( DocFileName, "fm_prn_" + string(UserNumber), ".doc" );
+
+  DocFileName = MergeFile( GetCurDir(), DocFileName );
+
+  WordApp.visible = true; 
+end;
+
+
+
+/* Макрос печати отчета */
+/* Если задан код клиента, то печатаем только по одному клиенту */
+Macro MakeReport(clnt_code)
+var select = "";
+var rs:object = NULL;
+var type:object = NULL; 
+var curClient;
+var curClientName;
+
+var i:integer = 0;
+var j:integer = 0;
+var isFirstTime = true;
+var isInetClient = false;
+var WordApp_podtv;
+var WordDoc_podtv;
+var RegParam = "";
+var Templ    = "";
+var temppath = "";
+
+
+var dd, mm,  yyyy;
+
+  Split_date (date, dd, mm, yyyy);
+
+  debugbreak;
+
+  if (valtype (clnt_code)!=V_UNDEF)
+     //13.02.2012 Gurin S. I-00325370-2
+     //GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+     Templ = "cpodtv.dot";
+                              
+     //temppath = findpath(Templ,RegParam); 
+     temppath = Check_templ(Templ);
+        if (not temppath)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+     /*temppath = "D:\\Softlab\\PRBB\\Stend\\mac.usr\\Templs\\cpodtv.dot";*/
+
+     WordApp_podtv = CreateWordApplication();
+
+     if (WordApp_podtv)
+
+       WordDoc_podtv = WordApp_podtv.Documents.Add( temppath );
+
+     end;
+
+  end;
+
+
+  select = " select *"
+           " from (select acc.*, decode(t_code_currency,0,0,1) currency"
+           "       from daccount_dbt acc"
+           "       where acc.t_open_date < '" + String(RepDate) + "'"
+           "             and (acc.t_close_date >= '" + String(RepDate) + "' or"
+           "                  acc.t_close_date = '01.01.0001')";  /* Ярмольчук. Исправил ошибку в условии */
+  if (Oper != 0)
+    select = select +
+           "             and acc.t_oper = " + Oper;
+  end;
+  if ((valtype(DpdDate)!=V_UNDEF) and (DpdDate != date(0,0,0)))
+    select = select +
+           "             and acc.t_final_date > to_date('"+DpdDate+"','dd.mm.yyyy')";
+  end;
+    select = select +
+           "             and (acc.t_type_account not like '%Н%' and"
+           "                  acc.t_type_account not like '%U%')"
+           "             and ((SELECT rsb_mask.comparestringwithmask('" + BalAcc + "',"
+           "                                                         SubStr(acc.t_account, 1, 3))"
+           "                   FROM DUAL) = 1)) clacc, dobjcode_dbt obj, dparty_dbt prt"
+           " where obj.t_objectid = clacc.t_client"
+           "       and obj.t_objecttype = 3"
+           "       and obj.t_codekind = 1 and obj.t_state=0 "
+           "       and prt.t_partyid = clacc.t_client";
+
+    if (valtype (clnt_code)!=V_UNDEF)
+       select = select + " and prt.t_partyid="+clnt_code;
+    end;
+
+    select = select +
+           " order by obj.t_code, currency, clacc.t_account";
+
+  Message("Идет построение выборки...");
+
+  debugbreak;
+  rs = ExecSQLSelect(select);
+  
+  var path:string;
+  GetRegistryValue("PRBB\\REPORT\\PATH", V_STRING, path);
+
+
+  if (rs)
+    InitProgress(-1," ~CtrlBreak~ Прекратить","Печатаются данные по клиентам");
+
+//    clnt_code_101=string (ПолучитьКодСубъекта (clnt_code,101));
+    clnt_code_1=substr(string (ПолучитьКодСубъекта (clnt_code,1)),7); //11.07.2012 vihrov C-12122 смена диапазонов кодов
+
+    if (not ex_from_acc)
+      SetOutPut(path + "\\apodtv"+string (dd)+string (mm)+string (yyyy)+"_"+string (Oper)+Postfix+".txt", false); /* чистим файл */
+    else
+//      SetOutPut(path + "\\cpodtv" + clnt_code_101 + ".txt", false); /* чистим файл */
+      SetOutPut(path + "\\cpodtv" + clnt_code_1 + ".txt", false); /* чистим файл */ //11.07.2012 vihrov C-12122 смена диапазонов кодов
+    end;
+
+
+    while (rs.MoveNext())
+      UseProgress(Numb = Numb + 1);
+      if (curClient != substr(rs.Value("t_code"),7)) /*14.12.2012 zmp I-00299763*/
+        /* Если этот клиент обслуживается по "Интернет-клиенту", то перенаправляем вывод 
+           и выставляем одиночную печать */
+        if (isInetClient)
+          j = 1;
+          SetOutPut(path + "\\iclient\\ipodtv" + curClient + ".txt");
+        end;
+
+        curClient = substr(rs.Value("t_code"),7);
+
+        if (isFirstTime)
+          curClientName = rs.Value("t_Name");
+          isFirstTime = false;
+        else
+          /* Выполняем двойную печать (если "Интернет-клиент", то одинарная) */
+          str_line = "";
+          curr_line=1;
+          curr_line_word=1;
+          while (j < 2)
+            PrintHead(RepDate, curClientName, WordDoc_podtv, WordApp_podtv);
+            i = 0;
+            while (i < arrOneClientAccInfo.Size())
+              if (arrOneClientAccCurInfo[i] == 0)
+                PrintLine(arrOneClientAccInfo[i], arrOneClientAccRstInfo[i], WordDoc_podtv);
+              else
+                //!!!Найти курс
+                RateIn=1;
+                if (ПолучитьКурс(Rate_In, NATCUR, arrOneClientAccCurCodeInfo[i], RATETYPE_CB)==0)
+                  if (ПолучитьЗначениеКурса(Rate_In, (RepDate-1))==0)
+                     RateIn=Rate_In.rec.Rate/10000;
+                  end;
+                end;
+                PrintLineCur(arrOneClientAccInfo[i], arrOneClientAccRstInfo[i], ПолучитьИмяФинИн (arrOneClientAccCurCodeInfo[i]), RateIn, RepDate-1, WordDoc_podtv);
+              end;
+              i = i + 1;
+            end;
+            PrintBottom(j, WordDoc_podtv, WordApp_podtv);
+            i = 0;
+            j = j + 1;
+          end;
+          j = 0;
+          curClientName = rs.Value("t_Name");
+
+          /* Сбрасываем параметры по клиенту в т.ч. и вывод */
+          isInetClient = false;
+          if (not ex_from_acc)
+             SetOutPut(path + "\\apodtv"+string (dd)+string (mm)+string (yyyy)+"_"+string (Oper)+Postfix+".txt", true);
+          else
+//             SetOutPut(path + "\\cpodtv" + clnt_code_101 + ".txt", true);
+             SetOutPut(path + "\\cpodtv" + clnt_code_1 + ".txt", true);//11.07.2012 vihrov C-12122 смена диапазонов кодов
+          end;
+          arrOneClientAccInfo.Size = 0;
+          arrOneClientAccCurInfo.Size = 0;
+          arrOneClientAccRstInfo.Size = 0;
+          arrOneClientAccCurCodeInfo.Size = 0;
+        end;
+      end;
+
+      if (Index(rs.Value("t_usertypeaccount"), "Ё") != 0)
+        isInetClient = true;
+        /* Временное решение по просьбе Кунделевой (до решения вопроса с отправкой файлов через Интернет-клиент) */
+        if (not Separate_file) /* если не разделяем файлы, то "забываем" про ИК несмотря на тип "Ё" */ 
+          isInetClient = false;
+        end;
+      end;
+      arrOneClientAccInfo[i] = rs.Value("t_Account");
+      arrOneClientAccCurInfo[i] = rs.Value("currency");
+      arrOneClientAccCurCodeInfo[i] = rs.Value ("t_code_currency");
+      if (arrOneClientAccCurInfo[i]==0)
+        arrOneClientAccRstInfo[i] = RestA (rs.Value("t_Account"), RepDate);/* Ярмольчук убрал rs.Value("t_R0");*/
+      else
+        arrOneClientAccRstInfo[i] = RestAC (rs.Value("t_Account"), rs.Value ("t_code_currency"), RepDate);/* Ярмольчук убрал rs.Value("t_R0");*/
+      end;
+      i = i + 1;
+    end; 
+
+    /* Добиваем данные по последнему клиенту */
+    if (not IsFirstTime)
+      /* Если этот клиент обслуживается по "Интернет-клиенту", то перенаправляем вывод 
+         и выставляем одиночную печать */
+      if (isInetClient)
+        j = 1;
+        SetOutPut(path + "\\iclient\\ipodtv" + curClient + ".txt");
+      end;
+
+      /* Выполняем двойную печать (если "Интернет-клиент", то одинарная) */
+      str_line ="";
+      curr_line=1;
+      curr_line_word=1;
+      while (j < 2)
+        PrintHead(RepDate, curClientName, WordDoc_podtv, WordApp_podtv);
+        i = 0;
+        while (i < arrOneClientAccInfo.Size())
+          if (arrOneClientAccCurInfo[i] == 0)
+            PrintLine(arrOneClientAccInfo[i], arrOneClientAccRstInfo[i], WordDoc_podtv);
+          else
+            //!!!Найти курс
+            RateIn=1;
+            if (ПолучитьКурс(Rate_In, NATCUR, arrOneClientAccCurCodeInfo[i], RATETYPE_CB)==0)
+              if (ПолучитьЗначениеКурса(Rate_In, RepDate-1)==0)
+                 RateIn=Rate_In.rec.Rate/10000;
+              end;
+            end;
+            PrintLineCur(arrOneClientAccInfo[i], arrOneClientAccRstInfo[i], ПолучитьИмяФинИн (arrOneClientAccCurCodeInfo[i]), RateIn, RepDate-1, WordDoc_podtv);
+          end;
+          i = i + 1;
+        end;
+        PrintBottom(j, WordDoc_podtv, WordApp_podtv);
+        i = 0;
+        j = j + 1;
+      end;
+      j = 0;
+      curClientName = rs.Value("t_Name");
+
+      /* Сбрасываем параметры по клиенту в т.ч. и вывод */
+      isInetClient = false;
+      if (not ex_from_acc)
+        SetOutPut(path + "\\apodtv"+string (dd)+string (mm)+string (yyyy)+"_"+string (Oper)+Postfix+".txt", true);
+      else
+//        SetOutPut(path + "\\cpodtv" + clnt_code_101 + ".txt", true);
+        SetOutPut(path + "\\cpodtv" + clnt_code_1 + ".txt", true);        //11.07.2012 vihrov C-12122 смена диапазонов кодов
+      end;
+      arrOneClientAccInfo.Size = 0;
+      arrOneClientAccCurInfo.Size = 0;
+      arrOneClientAccRstInfo.Size = 0;
+      arrOneClientAccCurCodeInfo.Size = 0;
+    end;
+
+
+    RemProgress();
+  else
+    MsgBox("Ошибка при формировании выборки");
+  end;
+  if (ex_from_acc)
+//     msgbox ("Файл с подтверждением по счету сформирован.|" + path + "\\cpodtv"+string (clnt_code_101)+".txt");
+     msgbox ("Файл с подтверждением по счету сформирован.|" + path + "\\cpodtv"+string (clnt_code_1)+".txt");  //11.07.2012 vihrov C-12122 смена диапазонов кодов
+     if (WordDoc_podtv)
+       if( IsStandAlone() )
+          WordApp_podtv.Visible = TRUE;
+       else
+        ShowReportOnTerminal( WordApp_podtv, WordDoc_podtv );
+       end; 
+     end;
+  end;
+  
+  OnError(Err)
+    Remprogress;
+    MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module); 
+END;
+
+macro GetNameOper(oper)
+  var sql_str, rs;
+  
+  sql_str = "select t_name from dperson_dbt where t_oper = " + oper;
+  rs = RsdRecordSet(sql_str);
+  
+  if (rs and rs.MoveNext)
+    return rs.value(0);
+  else
+    return "Операционист не найден";
+  end;
+end;
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event_podtv (dlg, cmd, id, key) 
+var const_message = "~F2~ Продолжить F3~ Выбор ~Space~ Выбор формы  ~ESC~ Выход ";
+
+  /*Первоначальная инициализация полей*/
+  if(cmd == DLG_INIT)
+     Message(const_message);
+     dlg.rec.RepType = arrRepType[0];
+     dlg.rec.BalAcc = arrBalAcc[0];
+     dlg.rec.Oper = "Все";
+     dlg.rec.OperName = "Все операционисты";
+     dlg.rec.RepDate = {curDate};
+     dlg.rec.DpdDate = Date(0,0,0);
+     UpdateFields(dlg); 
+
+  elif (cmd == DLG_KEY)
+    /*Выход из диалогового окна формирования отчета*/
+    if (KEY == KEY_ESC)
+      return exit(1);//CM_CANCEL;
+    /*Выбор данных из списка*/
+    elif ( KEY == KEY_F3)
+    /*Выбор даты из календаря*/
+      if (FldName(dlg,id) == "RepType")
+        choise = Menu (arrRepType, "Выберите вид отчета");
+        if (choise < 0)
+          choise = 0;
+        end;
+          dlg.rec.RepType = arrRepType[choise];
+          dlg.rec.BalAcc = arrBalAcc[choise];
+      elif (FldName(dlg,id) == "Oper")
+        if (ListOper(OperBuf, 0, 0))
+          dlg.rec.Oper = OperBuf.Oper;
+          dlg.rec.OperName = OperBuf.Name;
+        end;
+      elif (FldName(dlg,id) == "RepDate")
+        dlg.rec.RepDate = GetDateByCalendar ({curDate});
+      elif (FldName(dlg,id) == "DpdDate")
+        dlg.rec.DpdDate = GetDateByCalendar ({curDate});
+      end;
+
+    elif (KEY==KEY_DEL)
+      if (FldName(dlg,id)=="Oper")
+        dlg.rec.Oper = "все";
+        choise = 0;
+        UpdateFields(dlg); 
+      end;
+
+    elif ( KEY == KEY_F2 )
+       debugbreak;
+       RepType = dlg.rec.RepType;
+       BalAcc = dlg.rec.BalAcc;
+       Oper = Int(dlg.rec.Oper);
+       RepDate = dlg.rec.RepDate;
+       DpdDate = dlg.rec.DpdDate;
+
+       if (RepDate > {curdate})
+         MsgBox("Выбрана не корректная дата!"); 
+       else
+         Return CM_SAVE;
+       end;
+       
+      if (dlg.rec.DpdDate > {curdate})
+         MsgBox("Выбрана не корректная дата!"); 
+       else
+         Return CM_SAVE;
+       end;
+       
+    elif ( (KEY == KEY_ENTER) and (FldName(dlg,id) == "DpdDate") )
+      SetFocus(dlg, 0);
+      Return CM_IGNORE;
+    end;
+    
+    UpdateFields(dlg); 
+    
+  elif (cmd == DLG_REMFOCUS)
+    
+    if (FldName(dlg,id)=="Oper")
+      if (int(dlg.rec.Oper) == 0)
+        dlg.rec.OperName = "Все операционисты";
+      else
+        dlg.rec.OperName = GetNameOper(int(dlg.rec.Oper));
+      end;
+    end;
+    
+    UpdateFields(dlg);
+  end;
+END;
+
+macro Accept_rest (clnt_code)
+
+var dd, mm,  yyyy;
+
+   if (valtype (clnt_code)!=V_UNDEF) /* вызвали из счета */
+      ex_from_acc=true;
+   else
+      ex_from_acc=false;
+   end;
+
+//   msgbox ("Временное проверочное сообщение № 35. Нажмите ESC"); 
+
+   
+   if (not ex_from_acc) /*  вызвали через пункт меню   */
+
+      GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR", 2, path);
+      pathfile = FindPath(file_lbr, path);
+        if (not pathfile)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+      Dlg_podtv = TRecHandler("podt_ost", pathfile, True);
+
+      if (RunDialog(dlg_podtv, "Event_podtv"))
+
+       if (Временное_решение)
+        Choice [0] = "Формировать отдельные файлы если есть обслуживание через Интернет-клиент";
+        Choice [1] = "Включать все счета в один общий файл";
+        Choice_select = Menu (Choice, "Выберите параметры формирования отчетов", "Выберите параметры формирования отчетов"); 
+        if (Choice_select>=0)
+            if (Choice_select==0)
+              Separate_file=true;
+              Postfix="";
+            else
+              Separate_file=false;
+              Postfix="_all";
+              msgbox ("Внимание!|Вы используете временное решение при котором формируется только один общий файл - без учета обслуживания по Интернет-клиенту.");
+            end;
+            MakeReport();
+
+        else
+            msgbox ("Отказ от выпуска отчета");
+        end;
+       else
+         Separate_file=true;
+         Postfix="";
+         MakeReport();
+       end;
+
+      end;
+   else   /* вызвали из счета */
+
+      Split_date (date, dd, mm, yyyy);
+
+      /* Параметры по умолчанию */
+      RepDate = date (1,1,yyyy);
+      RepType = "расчетные счета";
+      BalAcc = "404,405,406,407,408,409";
+      Oper = 0;
+
+      Separate_file=false;
+      Postfix="_acc";
+
+      MakeReport(clnt_code);
+   end;
+
+end;

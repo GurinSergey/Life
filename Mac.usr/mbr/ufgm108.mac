@@ -1,0 +1,844 @@
+/****************************************************************************/
+/*                   R-Style SoftLab, RS-Bank 6.0                           */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщения ED108 транспорта УФЭБС                               */
+/*                                                                          */
+/*  Имя файла: ufgm108.mac                                                  */
+/*  Создан:    05.06.12                                Chukina T.           */
+/*  Адаптация: Gurin S. 12.06.2014 HF49                                     */
+/*             Gurin S. 22.12.2015 HotFix 2031.19.25 (Life_1 1.3)_11        */
+/****************************************************************************/
+
+import WldInter, "ufgenmes.mac", "multypm.mac", bnk_common, "pmlib.mac", 
+       "pmbudg_lib.mac", pm_const;
+
+private macro CheckCurrVal( CurrVal, FirstVal, // данные для сравнения
+                            ErrMsg : @string, IsErrFound : @bool, // результаты
+                            AddErrMsg : string // сообщение по текущей ошибке
+                          )
+  if(not IsErrFound)
+    if(CurrVal != FirstVal)
+      ErrMsg = ErrMsg + AddErrMsg;
+      IsErrFound = true;
+    end;
+  end;
+end;
+
+private macro GetUserYesNo(msg : string) : bool
+  if( not IsOprMultiExec() and
+      ( ConfWin( makeArray(msg, "Продолжить выгрузку?"), // Text
+                 makeArray("Да", "Нет"), // Buttons
+                 1 // Default
+               ) == 0 )
+    )
+    return TRUE;
+  end;
+
+  return FALSE;
+end;
+
+//Gurin S. 12.06.2014 HF49
+private macro CheckAuthorState( ErrMsg : @string, PaymentID, IsTaxAuthorState : @bool, NeedCheckBTTTICodeAndOKATO : @bool ) : bool
+  var IsFillTaxAuthorState = false,
+      IsErrTaxAuthorState = false;
+  NeedCheckBTTTICodeAndOKATO = false;
+
+  var sqlString = "SELECT rm.t_TaxAuthorState FROM dpmrmprop_dbt rm, dpmlink_dbt lnk WHERE " +
+                  " lnk.t_InitialPayment = :PaymentID " +
+                  " AND lnk.t_LinkKind =   :LinkKind " +
+                  " AND rm.t_PaymentID = lnk.t_PurposePayment ";
+
+  var params : TArray = makeArray( SQLParam("PaymentID", PaymentID),
+                                   SQLParam("LinkKind",  PMLINK_KIND_MULTYPM) );
+
+  var rsTax : RsdRecordset = execSQLselect( sqlString, params );
+
+  if( rsTax.moveNext() )
+    if( rsTax.value(0) != "" )
+      IsFillTaxAuthorState = true;
+    else
+      IsFillTaxAuthorState = false;
+    end;
+  end;
+
+  while( rsTax.moveNext() )
+    if( (NeedCheckBTTTICodeAndOKATO == false) AND ((rsTax.value(0) != "") OR (IsFillTaxAuthorState == true)) ) 
+      NeedCheckBTTTICodeAndOKATO = true;
+    end;
+
+    if( ((rsTax.value(0) != "") AND (IsFillTaxAuthorState == false)) OR
+        ((rsTax.value(0) == "") AND (IsFillTaxAuthorState == true))  )
+      ErrMsg = ErrMsg + "В платежном поручении на общую сумму с реестром не должны одновременно присутствовать платежи с заполненным и незаполненным статусом составителя. Оставьте в составе сводного только платежи с заданным статусом составителя, либо только с незаданным.";
+      IsErrTaxAuthorState = true;
+      break;
+    end;
+  end;
+  IsTaxAuthorState = IsFillTaxAuthorState;
+  return IsErrTaxAuthorState;
+end;
+
+private macro CheckMes(MultiPaym : RsbPayment, IsUBR : bool, ErrMsg : @string, IsTaxAuthorState : @bool) : bool //Gurin S. 12.06.2014 HF49
+
+  macro GetBTTTICode(BTTTICode : string, PayType : integer) : string
+    if( (PayType == BPT_PUBLIC_SERVICES) and (BTTTICode == "") )
+      // пустая строка совпадает с "0"
+      BTTTICode = "0";
+    end;
+
+    return BTTTICode;
+  end;
+
+
+  ErrMsg = "";
+  var IsOK : bool = TRUE;
+
+  var CountMultyPM = GetPaymCountIncludedInMultyPM( MultiPaym.PaymentID );
+  if(CountMultyPM == 0)
+    ErrMsg = ErrMsg + "Недостаточно данных для заполнения сообщения по форме ED108. Добавьте в сводный платеж хотя бы один документ. ";
+    IsOK = FALSE;
+  elif(CountMultyPM > 10000)
+    ErrMsg = ErrMsg + "Количество записей в реестре сообщения ED108 не должно превышать 10000. Исключите лишние платежи из состава сводного. ";
+    IsOK = FALSE;
+  end;
+
+    //Gurin S. 12.06.2014 HF49
+    var NeedCheckBTTTICodeAndOKATO = false;
+    var IsErrTaxAuthorState = CheckAuthorState( @ErrMsg, MultiPaym.PaymentID, @IsTaxAuthorState, @NeedCheckBTTTICodeAndOKATO );
+
+    var NeedCheckReceiverAccount : bool = (IsUBR or (MultiPaym.PayType > 0));
+
+    var q = "SELECT DISTINCT rm.t_Priority, paym.t_ReceiverBankID, rm.t_ShifrOper, " +
+            "                rm.t_BTTTICode, rm.t_OKATOCode, paym.t_PayType, " +
+            "                rm.t_TaxPmGround, rm.t_TaxPmType ";
+    if(NeedCheckReceiverAccount)
+      q = q + "            , paym.t_ReceiverAccount ";
+    end;
+    q = q + "  FROM dpmlink_dbt lnk, dpmpaym_dbt paym, dpmrmprop_dbt rm " +
+            " WHERE lnk.t_InitialPayment = :MPPaymentID " +
+            "   AND lnk.t_LinkKind       = :LinkKind " +
+            "   AND paym.t_PaymentID     = lnk.t_PurposePayment " +
+            "   AND rm.t_PaymentID       = lnk.t_PurposePayment ";
+
+    var params : TArray = makeArray( SQLParam("MPPaymentID", MultiPaym.PaymentID),
+                                     SQLParam("LinkKind",    PMLINK_KIND_MULTYPM) );
+    var rs : RsdRecordset = execSQLselect(q, params);
+
+    if(rs and rs.moveNext())
+      var Priority = rs.value("t_Priority"), IsErrPriority = false,
+          ReceiverBankID = rs.value("t_ReceiverBankID"), IsErrReceiverBankID  = false,
+          ShifrOper      = rs.value("t_ShifrOper"),      IsErrShifrOper       = false,
+          BTTTICode      = rs.value("t_BTTTICode"), 
+          OKATOCode      = rs.value("t_OKATOCode"),      IsErrTaxCodes        = false,
+          ErrMsgTaxCodes = "В платежное поручение на общую сумму с реестром включаются платежи с одинаковыми налоговыми реквизитами (КБК и ОКТМО). Оставьте в составе сводного только платежи с совпадающими КБК и ОКТМО. ",
+          PayType        = rs.value("t_PayType"),
+          ReceiverAccount = "",                          IsErrReceiverAccount = false,
+          TaxPmGround    = rs.value("t_TaxPmGround"),
+          TaxPmType      = rs.value("t_TaxPmType"),      IsErrTaxGroundType   = false,
+          ErrMsgTaxGroundType = "Для распоряжений о переводе средств в бюджет, администрируемых налоговыми органами, допускается только одно значение основания платежа и типа платежа. В платежах, включенных в состав сводного, значения этих реквизитов не совпадают.",
+          NeedCheckTaxGroundType : bool = (PayType == BPT_TAX);
+
+      if(NeedCheckReceiverAccount)
+        ReceiverAccount = rs.value("t_ReceiverAccount");
+      end;
+      BTTTICode = GetBTTTICode(BTTTICode, PayType);
+
+      while(rs.moveNext())
+        CheckCurrVal( rs.value("t_Priority"), Priority, @ErrMsg, @IsErrPriority,
+                     "В платежное поручение на общую сумму с реестром включаются платежи одной очередности. Оставьте в составе сводного только платежи с одинаковой очередностью. "
+                    );
+        CheckCurrVal( rs.value("t_ReceiverBankID"), ReceiverBankID, @ErrMsg, @IsErrReceiverBankID,
+                     "В платежное поручение на общую сумму с реестром включаются платежи в один банк получателя. Оставьте в составе сводного только платежи в один банк получателя. "
+                    );
+        CheckCurrVal( rs.value("t_ShifrOper"), ShifrOper, @ErrMsg, @IsErrShifrOper,
+                     "Платежное поручение на общую сумму с реестром не должно содержать документы с шифром операции отличным от \"01\". Оставьте в составе сводного только платежи с шифром = \"01\". "
+                    );
+        //Gurin S. 12.06.2014 HF49
+        if(NeedCheckBTTTICodeAndOKATO)
+          CheckCurrVal( GetBTTTICode(rs.value("t_BTTTICode"), rs.value("t_PayType")), BTTTICode, @ErrMsg, @IsErrTaxCodes,
+                        ErrMsgTaxCodes
+                     );
+          CheckCurrVal( rs.value("t_OKATOCode"), OKATOCode, @ErrMsg, @IsErrTaxCodes,
+                        ErrMsgTaxCodes
+                     );
+        end;
+
+        if(NeedCheckReceiverAccount)
+          CheckCurrVal( rs.value("t_ReceiverAccount"), ReceiverAccount, @ErrMsg, @IsErrReceiverAccount,
+                        IfThenElse( IsUBR, "В платежном поручении на общую сумму с реестром, направляемом клиенту Банка России, не допускается указание нескольких счетов получателей. Оставьте в составе сводного только платежи с одинаковым счетом получателя. ",
+                                           "В распоряжении о переводе средств в бюджет РФ не допускается указание нескольких счетов получателей. Оставьте в составе сводного только платежи с одинаковым счетом получателя или переформируйте платеж по переводам физических лиц"
+                                  )
+                      );
+        end;
+
+        if(NeedCheckTaxGroundType)
+          CheckCurrVal( rs.value("t_TaxPmGround"), TaxPmGround, @ErrMsg, @IsErrTaxGroundType,
+                        ErrMsgTaxGroundType
+                      );
+
+          CheckCurrVal( rs.value("t_TaxPmType"), TaxPmType, @ErrMsg, @IsErrTaxGroundType,
+                        ErrMsgTaxGroundType
+                      );
+        end;
+
+      end;
+
+      //Gurin S. 12.06.2014 HF49
+      if( IsErrPriority or IsErrReceiverBankID or IsErrShifrOper or IsErrTaxCodes or
+          IsErrReceiverAccount or IsErrTaxAuthorState)
+        IsOK = FALSE;
+      end;
+
+      // Если ошибка только в TaxPmGround, TaxPmType или PayType = 2, 
+      // то в единичном режиме даем выбор
+      if( IsOK and IsErrTaxGroundType )
+        IsOK = GetUserYesNo(ErrMsgTaxGroundType);
+      end;
+      if( PayType == BPT_CUSTOM )
+        var ErrMsgPayType = "Для распоряжений о переводе средств в бюджет, администрируемых таможенными органами, не предусмотрены платежи на общую сумму с реестром.";
+        ErrMsg = ErrMsg + ErrMsgPayType;
+
+        if(IsOK)
+          IsOK = GetUserYesNo(ErrMsgPayType);
+        end;
+      end;
+
+    end;
+
+
+  return IsOK;
+end;
+
+private macro GetFirstPaymData
+( MPPaymentID : integer,
+  Priority : @integer, CrBankCode : @string, ReceiverCorrAccNostro : @string, 
+  PayerINN : @string, PayerName : @string, PayerAccount : @string, 
+  ReceiverINN : @string, ReceiverName : @string, ReceiverAccount : @string, 
+  PayerChargeOffDate : @date, PayType : @integer,
+  TaxAuthorState : @string, BTTTICode : @string, OKATOCode : @string
+)
+  var q = "SELECT rm.t_Priority, cr.t_BankCode, rm.t_ReceiverCorrAccNostro, " +
+          "       rm.t_PayerINN, rm.t_PayerName, pm.t_PayerAccount,         " +
+          "       rm.t_ReceiverINN, rm.t_ReceiverName, pm.t_ReceiverAccount," +
+          "       rm.t_PayerChargeOffDate, pm.t_PayType,                    " +
+          "       rm.t_TaxAuthorState, rm.t_BTTTICode, rm.t_OKATOCode       " +
+          "  FROM dpmpaym_dbt pm, dpmrmprop_dbt rm, dpmprop_dbt cr          " +
+          " WHERE pm.t_PaymentID = (select lnk.t_PurposePayment             " +
+          "                           from dpmlink_dbt lnk                  " +
+          "                          where lnk.t_InitialPayment = :PaymentID" +
+          "                            and lnk.t_LinkKind = :LinkKind       " +
+          "                            and rownum = 1                       " +
+          "                        )                                        " +
+          "   AND rm.t_PaymentID = pm.t_PaymentID                           " +
+          "   AND cr.t_PaymentID = pm.t_PaymentID                           " +
+          "   AND cr.t_DebetCredit = :DebetCredit                           ";
+
+  var params : TArray = makeArray( SQLParam("PaymentID", MPPaymentID),
+                                   SQLParam("LinkKind",  PMLINK_KIND_MULTYPM),
+                                   SQLParam("DebetCredit", PRT_Credit) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+  if(rs and rs.moveNext())
+    Priority = rs.value("t_Priority");
+    CrBankCode = rs.value("t_BankCode");
+    ReceiverCorrAccNostro = rs.value("t_ReceiverCorrAccNostro");
+    PayerINN = rs.value("t_PayerINN");
+    PayerName = rs.value("t_PayerName");
+    PayerAccount = rs.value("t_PayerAccount");
+    ReceiverINN = rs.value("t_ReceiverINN");
+    ReceiverName = rs.value("t_ReceiverName");
+    ReceiverAccount = rs.value("t_ReceiverAccount");
+    PayerChargeOffDate = rs.value("t_PayerChargeOffDate");
+    PayType = rs.value("t_PayType");
+    TaxAuthorState = rs.value("t_TaxAuthorState");
+    BTTTICode = rs.value("t_BTTTICode");
+    OKATOCode = rs.value("t_OKATOCode");
+  end;
+end;
+
+// проверить равенство атрибутов платежей в составе сводного
+private macro CheckEqualPmAttributes
+( MPPaymentID : integer,
+  FirstPayerINN : string, FirstPayerName : string, FirstPayerAccount : string, 
+  FirstReceiverINN : string, FirstReceiverName : string, FirstReceiverAccount : string, 
+  FirstPayerChargeOffDate : date, FirstTaxAuthorState : string,
+  IsEqualPayer : @bool, IsEqualReceiver : @bool, IsEqualChargeOffDate : @bool,
+  IsEqualTaxAuthorState : @bool
+)
+  // пока различий не нашли
+  IsEqualPayer = IsEqualReceiver = IsEqualChargeOffDate = IsEqualTaxAuthorState = true;
+
+  var q = "SELECT rm.t_PayerINN, rm.t_PayerName, pm.t_PayerAccount,         " +
+          "       rm.t_ReceiverINN, rm.t_ReceiverName, pm.t_ReceiverAccount," +
+          "       rm.t_PayerChargeOffDate, rm.t_TaxAuthorState              " +
+          "  FROM dpmlink_dbt lnk, dpmpaym_dbt pm, dpmrmprop_dbt rm         " +
+          " WHERE lnk.t_InitialPayment = :MPPaymentID                       " +
+          "   AND lnk.t_LinkKind       = :LinkKind                          " +
+          "   AND pm.t_PaymentID       = lnk.t_PurposePayment               " +
+          "   AND rm.t_PaymentID       = lnk.t_PurposePayment               ";
+
+  var params : TArray = makeArray( SQLParam("MPPaymentID", MPPaymentID),
+                                   SQLParam("LinkKind",    PMLINK_KIND_MULTYPM) );
+  var rs : RsdRecordset = execSQLselect(q, params);
+
+  while(rs and rs.moveNext())
+    if(IsEqualPayer)
+      if( (rs.value("t_PayerINN") != FirstPayerINN) or
+          (rs.value("t_PayerName") != FirstPayerName) or
+          (rs.value("t_PayerAccount") != FirstPayerAccount) 
+        )
+        IsEqualPayer = false;
+      end;
+    end;
+
+    if(IsEqualReceiver)
+      if( (rs.value("t_ReceiverINN") != FirstReceiverINN) or
+          (rs.value("t_ReceiverName") != FirstReceiverName) or
+          (rs.value("t_ReceiverAccount") != FirstReceiverAccount) 
+        )
+        IsEqualReceiver = false;
+      end;
+    end;
+
+    if(IsEqualChargeOffDate)
+      if( rs.value("t_PayerChargeOffDate") != FirstPayerChargeOffDate )
+        IsEqualChargeOffDate = false;
+      end;
+    end;
+
+    if(IsEqualTaxAuthorState)
+      if( rs.value("t_TaxAuthorState") != FirstTaxAuthorState )
+        IsEqualTaxAuthorState = false;
+      end;
+    end;
+
+    // если все отличия уже найдены, прекращаем проверку
+    if( not IsEqualPayer and not IsEqualReceiver and 
+        not IsEqualChargeOffDate and not IsEqualTaxAuthorState )
+      break;
+    end;
+  end;
+end;
+
+private macro GetNotEmptyRmFld(MPPaymentID : integer, RmFld : string) : string
+  var FldValue : string = "";
+
+  var q = "SELECT rm.t_" + RmFld                           +
+          "  FROM dpmlink_dbt lnk, dpmrmprop_dbt rm      " +
+          " WHERE lnk.t_InitialPayment = :MPPaymentID    " +
+          "   AND lnk.t_LinkKind       = :LinkKind       " +
+          "   AND rm.t_PaymentID = lnk.t_PurposePayment  " +
+          "   AND rm.t_" + RmFld + " <> chr(1)           " +
+          "   AND rm.t_" + RmFld + " IS NOT NULL         " + 
+          "   AND rownum = 1                             ";
+
+  var params : TArray = makeArray( SQLParam("MPPaymentID",  MPPaymentID),
+                                   SQLParam("LinkKind",     PMLINK_KIND_MULTYPM) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+  if(rs and rs.moveNext())
+    FldValue = rs.value("t_" + RmFld);
+  end;
+
+  return FldValue;
+end;
+
+private macro GetPayerBICCorrespAcc( RsPaym : RsbPayment, 
+                                     PayerBIC : @string, 
+                                     PayerCorrespAcc : @string )
+  var q = "SELECT dep.t_PartyID, nvl(bankdprt.t_Coracc, chr(1)) Coracc " +
+          "  FROM dcorschem_dbt cors, ddp_dep_dbt dep, dbankdprt_dbt bankdprt " +
+          " WHERE cors.t_Number      = :CorsNumber " +
+          "   AND cors.t_FI_Kind     = :FI_Kind " +
+          "   AND cors.t_FIID        = :FIID " +
+          "   AND dep.t_Code         = cors.t_Department " +
+          "   AND bankdprt.t_PartyID(+) = dep.t_PartyID ";
+
+  var params : TArray = makeArray( SQLParam("CorsNumber", RsPaym.OutCorschem),
+                                   SQLParam("FI_Kind",    FIKIND_CURRENCY),
+                                   SQLParam("FIID",       RsPaym.OutCorschemFIID) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+
+  if(rs and rs.moveNext())
+    var error = 0;
+    PayerBIC = ПолучитьКодСубъекта(rs.value("t_PartyID"), PTCK_BIC, error, 1);
+    PayerCorrespAcc = rs.value("Coracc");
+  else
+    RunError("Не удалось определить реквизиты банка плательщика");
+  end;
+end;
+
+private macro FillSide( elem : object, Account : string, FullINN : string, Name : string, 
+                        BankBIC : string, BankCorrespAcc : string, xml : object,
+                        IsZeroFill : bool )
+  if(Account)
+    elem.setAttribute("PersonalAcc", Account);
+  end;
+
+  var INN : string = Str0( RemoveKPP(FullINN), IsZeroFill ),
+      KPP : string = Str0( RemoveINN(FullINN), IsZeroFill );
+  if(INN)
+    elem.setAttribute("INN", INN);
+  end;
+  if(KPP)
+    elem.setAttribute("KPP", KPP);
+  end;
+
+  var subelem = xml.createElement("Name");
+  subelem.appendChild( xml.createTextNode( TransTextField(substr(Name, 1, 160)) ) );
+  elem.appendChild(subelem);
+
+  subelem = xml.createElement("Bank");
+  subelem.setAttribute("BIC", BankBIC);
+  if(BankCorrespAcc)
+    subelem.setAttribute("CorrespAcc", BankCorrespAcc);
+  end;
+  subElem.appendChild(xml.createTextNode(""));
+  elem.appendChild(subelem);
+end;
+
+private macro FillSideInReestr( mes : object, IsSideInReestr : bool, ElementName : string,
+                                IDNote : string, Acc : string, FullINN : string, 
+                                Name : string, xml, IsZeroFill : bool )
+  var Address = "", ind1 = 0, ind2 = 0;
+
+  if( (FullINN == "") or (strlen(FullINN) == 12) )
+    Address = GetAddressFromPaymSideName(Name);
+  end;
+
+  if(IsSideInReestr or IDNote or Address) // если есть что записать в TransactionPayerInfo/TransactionPayeeInfo
+    var elem = xml.createElement(ElementName);
+    var subelem : object = null;
+    if(IDNote)
+      elem.setAttribute("PersonalID", IDNote);
+    end;
+
+    if(IsSideInReestr)
+      if(Acc)
+        elem.setAttribute("Acc", Acc);
+      end;
+
+      var INN : string = Str0( RemoveKPP(FullINN), IsZeroFill );
+      if(INN)
+        elem.setAttribute("INN", INN);
+      end;
+
+      if( (FullINN == "") or (strlen(FullINN) == 12) )
+        Name = substr(Name, 1, ind1 - 1);
+        subelem = xml.createElement("PersonName");
+        subelem.appendChild( xml.createTextNode( TransTextField(substr(Name, 1, 70)) ) );
+        elem.appendChild(subelem);
+      else
+        subelem = xml.createElement("TradeName");
+        subelem.appendChild( xml.createTextNode( TransTextField(substr(Name, 1, 140)) ) );
+        elem.appendChild(subelem);
+      end;
+    end;
+
+    if(Address)
+      subelem = xml.createElement("PersonAddress");
+      subelem.appendChild( xml.createTextNode( TransTextField(substr(Address, 1, 70)) ) );
+      elem.appendChild(subelem);
+    end;
+
+    elem.appendChild(xml.createTextNode(""));
+    mes.appendChild(elem);
+  end;
+end;
+
+macro GenMes( addrMes, addrPm )
+  SetBuff( wlmes,  addrMes );
+  SetBuff( wlpmpaym, addrPm );
+  var RsPaym = RsbPayment( wlpmpaym.PaymentID );
+  PrintLog(2,"Генерация сообщения по ED108");
+
+  var IsUBR : bool = БанкУБР(RsPaym.ReceiverBankID);
+
+  var ErrMsg : string = "";
+  //Gurin S. 12.06.2014 HF49
+  var IsTaxAuthorState : bool = false;
+  if(not CheckMes(RsPaym, IsUBR, @ErrMsg, @IsTaxAuthorState) )
+    std.msg(ErrMsg);
+    return FALSE;
+  elif( (IsTaxAuthorState == false) AND RsPaym.TaxAuthorState )
+    IsTaxAuthorState = true;
+  end;
+
+  var Priority = 0, CrBankCode = "", ReceiverCorrAccNostro = "", 
+      PayerINN = "", PayerName = "", PayerAccount = "",
+      ReceiverINN = "", ReceiverName = "", ReceiverAccount = "",
+      ChargeOffDate = date(0, 0, 0),
+      PayType : integer = 0,
+      TaxAuthorState = "", BTTTICode = "", OKATOCode = "";
+
+  // получаем данные из первого платежа в составе сводного
+  GetFirstPaymData(  RsPaym.PaymentID,
+                    @Priority, @CrBankCode, @ReceiverCorrAccNostro, 
+                    @PayerINN, @PayerName, @PayerAccount, 
+                    @ReceiverINN, @ReceiverName, @ReceiverAccount, 
+                    @ChargeOffDate, @PayType,
+                    @TaxAuthorState, @BTTTICode, @OKATOCode 
+                  );
+
+  // КБК, ОКАТО, тип бюджетного платежа берем из первого сведенного,
+  // только если они не заполнены в сводном
+
+  //Gurin S. 12.06.2014 HF49
+  if(IsTaxAuthorState)
+    if(RsPaym.BttTICode)
+      BTTTICode = RsPaym.BttTICode;
+    else
+      BTTTICode = "0";
+    end;
+    if(RsPaym.OKATOCode)
+      OKATOCode = RsPaym.OKATOCode;
+    end;
+    if( RsPaym.PayType )
+      PayType = RsPaym.PayType;
+    end;
+  end;
+
+  var IsEqualPayer : bool, IsEqualReceiver : bool, 
+      IsEqualChargeOffDate : bool, IsEqualTaxAuthorState : bool;
+
+  CheckEqualPmAttributes( RsPaym.PaymentID,
+                          PayerINN, PayerName, PayerAccount, 
+                          ReceiverINN, ReceiverName, ReceiverAccount, 
+                          ChargeOffDate, TaxAuthorState,
+                          @IsEqualPayer, @IsEqualReceiver, 
+                          @IsEqualChargeOffDate, @IsEqualTaxAuthorState );
+
+  // определяем заполнение реквизитов в общей части и в реестре
+  var IsPayerInReestr : bool, IsReceiverInReestr : bool, IsTaxAuthorStateInReestr : bool;
+
+  if( not RsPaym.PayType and IsEqualPayer )
+    IsPayerInReestr = false;
+    // в общей части - из первого платежа в составе сводного
+  else // платеж является платежом в бюджет или реквизиты плательщика различаются
+    IsPayerInReestr = true;
+    if(not IsEqualPayer)
+      PayerAccount = ""; // в общей части не заполняем
+    end;
+    // в общей части - по сводному платежу
+    PayerINN = RsPaym.PayerINN;
+    PayerName = RsPaym.PayerName;
+  end;
+
+  if(IsUBR or (RsPaym.PayType > 0))
+    IsReceiverInReestr = false;
+
+    if(RsPaym.ReceiverINN)
+      ReceiverINN = RsPaym.ReceiverINN;
+    elif(ReceiverINN)
+      // если в первом платеже в составе сводного реквизит заполнен, оставляем это значение
+      ;
+    else
+      ReceiverINN = GetNotEmptyRmFld(RsPaym.PaymentID, "ReceiverINN");
+    end;
+
+    if(RsPaym.ReceiverName)
+      ReceiverName = RsPaym.ReceiverName;
+    elif(ReceiverName)
+      // если в первом платеже в составе сводного реквизит заполнен, оставляем это значение
+      ;
+    else
+      ReceiverName = GetNotEmptyRmFld(RsPaym.PaymentID, "ReceiverName");
+    end;
+
+    if(RsPaym.ReceiverAccount)
+      ReceiverAccount = RsPaym.ReceiverAccount;
+    else
+      // оставляем значение из первого платежа в составе сводного, 
+      // т.к. ReceiverAccount у всех одинаковый, раз мы прошли проверку CheckMes
+      ;
+    end;
+  else
+    if( IsEqualReceiver )
+      IsReceiverInReestr = false;
+      // в общей части - из первого платежа в составе сводного
+    else
+      IsReceiverInReestr = true;
+      // в общей части заполняем по сводному платежу
+      ReceiverINN = RsPaym.ReceiverINN;
+      ReceiverName = RsPaym.ReceiverName;
+      ReceiverAccount = RsPaym.ReceiverAccount;
+    end;
+  end;
+
+  if( IsEqualTaxAuthorState and 
+      ( (RsPaym.TaxAuthorState == TaxAuthorState) or not RsPaym.TaxAuthorState )
+    )
+    IsTaxAuthorStateInReestr = false;
+    // в общей части - из первого платежа в составе сводного
+  else
+    IsTaxAuthorStateInReestr = true;
+    TaxAuthorState = RsPaym.TaxAuthorState; // в общей части - из сводного платежа
+  end;
+
+  // Заполнение сообщения
+  var xml:object = ActiveX("Microsoft.XMLDOM");
+
+  // Поле "xml"
+  var mes:object;
+  
+  mes = xml.createElement("ED108");
+  mes.setAttribute("xmlns", "urn:cbr-ru:ed:v2.0");
+  
+  FillEDNoDateAuthorByRef_XMLField(mes, wlmes.TRN);
+
+  var PaytKind : string = GetPaytKind("ED108", RsPaym.PaymentKind, wlmes.TpSchemID);
+  if(PaytKind)
+    mes.setAttribute("PaytKind", PaytKind);
+  end;
+
+  mes.setAttribute("Sum", double(RsPaym.BaseAmount) * 100 );
+  mes.setAttribute("TransKind", "01");
+  mes.setAttribute("Priority", Priority);
+  if( IsEqualChargeOffDate and (date(ChargeOffDate) != date(0, 0, 0)) and
+      (ChargeOffDate >= RsPaym.Date)
+    )
+    if(RsPaym.PayerBankEnterDate != date(0, 0, 0))
+      mes.setAttribute("ReceiptDate", YYYYMMDD(RsPaym.PayerBankEnterDate) );
+    end;
+
+    mes.setAttribute("ChargeOffDate", YYYYMMDD(ChargeOffDate) );
+  end;
+
+  /* Признак системы обработки SystemCode: Обязателен к заполнению для одиночных ЭПД и пакетов. 
+     Не должен быть заполнен для ЭПД в составе пакета. */ 
+  var IsPacket:bool;
+  //Gurin S. 26.03.2015 HF2031_19_25_148
+  if( not GetModePacketEPD_ESID(  wlmes, @IsPacket  ) )
+    RunError( "|Ошибка при определении режима использования пакетов ЭПД/ЭСИД" );
+  end;
+  if( not IsPacket )
+    mes.setAttribute("SystemCode", GetEDSystemCode( wlmes.TpSchemID ) );
+  end;
+
+  //DAI Hotfix HF2031_19_25_12
+  var UIN : string = RsPaym.GetPMRMPROP().rec.UIN;
+  if(UIN)
+    CheckUIN(RsPaym.ReceiverAccount, UIN);
+    mes.setAttribute("PaymentID", UIN);
+  end;
+
+  var elem : object = null;
+
+  elem = xml.createElement("AccDoc");
+  elem.setAttribute("AccDocNo",   int(GetLastSymbols(RsPaym.Number, PM_DOCNO_NONZERO_LEN)) );
+  elem.setAttribute("AccDocDate", YYYYMMDD(RsPaym.Date) );
+  elem.appendChild(xml.createTextNode(""));
+  mes.appendChild(elem);
+
+  // Блок "Payer"
+  elem = xml.createElement("Payer");
+  var PayerBIC = "", PayerCorrespAcc = "";
+  GetPayerBICCorrespAcc(RsPaym, @PayerBIC, @PayerCorrespAcc);
+  FillSide( elem, PayerAccount, PayerINN, PayerName, PayerBIC, PayerCorrespAcc, xml, 
+            IsBudgetPaymWithCheckAcc(RsPaym.TaxAuthorState, RsPaym.ReceiverAccount, RsPaym.PayType)
+          );
+  mes.appendChild(elem);
+
+  // Блок "Payee"
+  elem = xml.createElement("Payee");
+  FillSide( elem, ReceiverAccount, ReceiverINN, ReceiverName, CrBankCode, 
+            ReceiverCorrAccNostro, xml,
+            IsBudgetPaym(RsPaym.TaxAuthorState, RsPaym.PayType)
+          );
+  mes.appendChild(elem);
+
+  // Purpose
+  elem = xml.createElement("Purpose");
+  elem.appendChild( xml.createTextNode( TransTextField(substr(RsPaym.Ground, 1, 210)) ) );
+  mes.appendChild(elem);
+
+  // DepartmentalInfo
+  //Gurin S. 12.06.2014 HF49
+  if( (TaxAuthorState or RsPaym.TaxPmDate or RsPaym.TaxPmGround or
+      RsPaym.TaxPmNumber or RsPaym.TaxPmPeriod or RsPaym.TaxPmType or
+      BTTTICode or OKATOCode) and IsTaxAuthorState
+    )
+    elem = xml.createElement("DepartmentalInfo");
+
+    if(TaxAuthorState)
+      elem.setAttribute("DrawerStatus", TaxAuthorState );
+    end;
+    if(BTTTICode)
+      elem.setAttribute("CBC",          BTTTICode );
+    end;
+    if(OKATOCode)
+      elem.setAttribute("OKATO",        OKATOCode );
+    end;
+    elem.setAttribute("PaytReason",   "0" );
+    elem.setAttribute("TaxPeriod",    "0" );
+    elem.setAttribute("DocNo",        "0" );
+    elem.setAttribute("DocDate",      "0" );
+    elem.setAttribute("TaxPaytKind",  "0" );
+    elem.appendChild(xml.createTextNode(""));
+
+    mes.appendChild(elem);
+  end;
+
+  // InitialED
+  if(wlmes.RelatedRef)
+    elem = xml.createElement("InitialED");
+    FillEDNoDateAuthorByRef_XMLField(elem, wlmes.RelatedRef);
+    elem.appendChild(xml.createTextNode(""));
+    mes.appendChild(elem);
+  end;
+
+  ЗаписатьПолеЛог( "xml", mes.xml, TRUE );
+
+  // CreditTransferTransactionInfo
+  УстановитьКонтекстБлокаЛог( UFBSCreditTransferTransField );
+  RECORD pmpaym(pmpaym);
+  var i = 0, strPaymentID = "", note = "", note_date = date(0, 0, 0), address = "", note2 = "";
+  var q = "SELECT paym.t_PaymentID, rm.t_Number, rm.t_Date, paym.t_BaseAmount, " +
+          "       paym.t_PayerAccount, rm.t_PayerINN, rm.t_PayerName, " +
+          "       paym.t_ReceiverAccount, rm.t_ReceiverINN, rm.t_ReceiverName, " +
+          "       rm.t_Ground, rm.t_UIN, rm.t_TaxAuthorState, rm.t_TaxPmGround, " +
+          "       rm.t_TaxPmPeriod, rm.t_TaxPmNumber, rm.t_TaxPmDate, rm.t_TaxPmType, " +
+          "       paym.t_PayType " +
+          "  FROM dpmlink_dbt lnk, dpmpaym_dbt paym, dpmrmprop_dbt rm " +
+          " WHERE lnk.t_InitialPayment = :MPPaymentID " +
+          "   AND lnk.t_LinkKind       = :LinkKind " +
+          "   AND paym.t_PaymentID     = lnk.t_PurposePayment " +
+          "   AND rm.t_PaymentID       = lnk.t_PurposePayment ";
+
+  var params : TArray = makeArray( SQLParam("MPPaymentID", RsPaym.PaymentID),
+                                   SQLParam("LinkKind",    PMLINK_KIND_MULTYPM) );
+  var rs : RsdRecordset = execSQLselect(q, params);
+
+  while(rs and rs.moveNext())
+    i = i + 1;
+    pmpaym.PaymentID = rs.value("t_PaymentID");
+    strPaymentID = makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym);
+
+    mes = xml.createElement("CreditTransferTransactionInfo");
+    mes.setAttribute( "TransactionID", i );
+    if(rs.value("t_Number") != "")
+      mes.setAttribute( "PayerDocNo", GetLastSymbols(rs.value("t_Number"), 6) );
+    end;
+    if( date(rs.value("t_Date")) != date(0, 0, 0) )
+      mes.setAttribute( "PayerDocDate", YYYYMMDD(rs.value("t_Date")) );
+    end;
+
+    note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_UNI_OPERATIONID);
+    if(note != "") 
+      mes.setAttribute( "OperationID", substr(note, 1, 20) );
+    end; 
+
+    note_date = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_ACCEPTUATEDATE);
+    mes.setAttribute( "TransactionDate", YYYYMMDD(note_date) );
+
+    mes.setAttribute( "TransactionSum", double(rs.value("t_BaseAmount")) * 100 );
+
+    //DAI Hotfix HF2031_19_25_12
+    /*
+    note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_DOCINDEX);
+    if(note != "") 
+      mes.setAttribute( "DocIndex", substr(note, 1, 20) );
+    */
+      if(rs.value("t_UIN") != "")
+        CheckUIN(rs.value("t_ReceiverAccount"), rs.value("t_UIN"));
+        mes.setAttribute( "PaymentID", rs.value("t_UIN") );
+    end; 
+
+    // TransactionPayerInfo
+    note = "";
+    if( InList(rs.value("t_PayType"), 2, 3, 4) )
+      note = rs.value("t_TaxPmNumber");
+    end;
+    if(note == "")
+      note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_PAYERID);
+    end;
+    FillSideInReestr( mes, IsPayerInReestr, "TransactionPayerInfo", note,
+                      rs.value("t_PayerAccount"), rs.value("t_PayerINN"),
+                      rs.value("t_PayerName"), xml, 
+                      IsBudgetPaymWithCheckAcc(RsPaym.TaxAuthorState, RsPaym.ReceiverAccount, RsPaym.PayType)
+                    );
+  
+    // TransactionPayeeInfo
+    note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_PAYEEID);
+    FillSideInReestr( mes, IsReceiverInReestr, "TransactionPayeeInfo", note,
+                      rs.value("t_ReceiverAccount"), rs.value("t_ReceiverINN"), 
+                      rs.value("t_ReceiverName"), xml );
+
+    // TransactionPurpose
+    if( rs.value("t_Ground") != "" )
+      elem = xml.createElement("TransactionPurpose");
+      elem.appendChild( xml.createTextNode( TransTextField(substr(rs.value("t_Ground"), 1, 210)) ) );
+      mes.appendChild(elem);
+    end;
+
+    // RemittanceInfo
+    note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_ED108_INFO);
+    if(note)
+      elem = xml.createElement("RemittanceInfo");
+      elem.appendChild( xml.createTextNode( TransTextField(note) ) );
+      mes.appendChild(elem);
+    end;
+
+    // CTTDepartmentalInfo
+    note = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_OFK_ACCOUNT);
+    note2 = ReadNoteForObject(OBJTYPE_PAYMENT, strPaymentID, PM_NOTEKIND_PAYM_BUDGETRECEIVER_ACC);
+    // если есть что записать в CTTDepartmentalInfo
+    //Gurin S. 12.06.2014 HF49
+    if( (IsTaxAuthorStateInReestr and (rs.value("t_TaxAuthorState") != "") or
+        (rs.value("t_TaxPmGround") != "") or
+        (rs.value("t_TaxPmPeriod") != "") or
+        (rs.value("t_TaxPmNumber") != "") or
+        (rs.value("t_TaxPmDate") != "") or
+        (rs.value("t_TaxPmType") != "") or
+        note or note2) and IsTaxAuthorState
+      )
+      elem = xml.createElement("CTTDepartmentalInfo");
+      if( IsTaxAuthorStateInReestr and (rs.value("t_TaxAuthorState") != "") )
+        elem.setAttribute( "F101R", rs.value("t_TaxAuthorState") );
+      end;
+      if(rs.value("t_TaxPmGround") != "")
+        elem.setAttribute( "F106R", rs.value("t_TaxPmGround") );
+      end;
+      if(rs.value("t_TaxPmPeriod") != "")
+        elem.setAttribute( "F107R", rs.value("t_TaxPmPeriod") );
+      else
+        elem.setAttribute( "F107R", "0" );
+      end;
+      if( InList(rs.value("t_PayType"), 2, 3, 4) )
+        elem.setAttribute( "F108R", "0" );
+      elif(rs.value("t_TaxPmNumber") != "")
+        elem.setAttribute( "F108R", rs.value("t_TaxPmNumber") );
+      else
+        elem.setAttribute( "F108R", "0" );
+      end;
+      if(rs.value("t_TaxPmDate") != "")
+        elem.setAttribute( "F109R", rs.value("t_TaxPmDate") );
+      else
+        elem.setAttribute( "F109R", "0" );
+      end;
+      if(rs.value("t_TaxPmType") != "")
+        elem.setAttribute( "F110R", rs.value("t_TaxPmType") );
+      else
+        elem.setAttribute( "F110R", "0" );
+      end;
+      if(note)
+        elem.setAttribute( "F111R", note );
+      end;
+      if(note2)
+        elem.setAttribute( "F112R", note2 );
+      end;
+    end;
+    elem.appendChild(xml.createTextNode(""));
+    mes.appendChild(elem);
+
+    ЗаписатьПолеЛог( UFBSCreditTransferTransField, mes.xml, TRUE );
+  end;
+  УстановитьКонтекстБлокаЛог( ".." );
+
+  return TRUE; /* Успешное завершение */
+
+  OnError( er ) /* обработка ошибок */
+    std.msg(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE; 
+end;

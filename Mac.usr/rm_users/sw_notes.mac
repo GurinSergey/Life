@@ -1,0 +1,342 @@
+// -------------------------------------------------------------------------------------------------
+// @desc   : формирование кредитового авизо SWIFT (примечание 150) по данным примечания Payments (122)
+// @author : 2010-05-xx zip_z. - первоначальная реализация
+// @changes: 2013-01-20 zip_z. С-7683
+//           2013-01-20 zip_z. C-16285 добавлены функции формирования SWIFT-лоро
+//           2013-02-25 zip_z. C-16285 уточнения по реализации от Ольги Артамоновой и появление хардкода.
+//           Особенности:
+//              - имя файла должно содержать код банка получателя и сумму например 70288-980,90.ref  
+//                либо код банка и референс 70288-975.ref
+//              - поле отправитель/Sender -PRBMRUMMXXX Probusinessbank Moscow Building 1, 18/2 Petrovka Str
+//               127051 Moscow, поле получатель/Receiver- должно быть наименование по исходящей схеме расчетов
+//              - поле 32: Date - необходимо брать из даты значения при зачислении 
+// -------------------------------------------------------------------------------------------------
+import OraLib, LikePy, lib_const, lib_registry, lib_sqltools, rcw, BankInter, PaymInter, lib_party, Globals;
+
+
+/** общие константы, распространенные по макросу и не только **/ 
+const STRING_CR           = strfor (10); // перевод строки
+const STRING_DELIMITER_SW = ":";         // разделитель полей
+
+// название отправителя SWIFT-лоро (используется только для Пробизнесбанка)
+const HEAD_SENDER = "PRBMRUMMXXX Probusinessbank"                + "\n" + 
+                    "             Moscow"                        + "\n" + 
+                    "             Building 1, 18/2 Petrovka Str" + "\n" + 
+                    "             127051 Moscow";
+
+private macro SW_GetField32A_FullText_Date (_date)
+    var dd, mm, yyyy;
+    dateSplit (_date, dd, mm, yyyy);
+    
+    if   (mm == 1 ) mm = "JANUARY"
+    elif (mm == 2 ) mm = "FEBRUARY"
+    elif (mm == 3 ) mm = "MARCH"
+    elif (mm == 4 ) mm = "APRIL"
+    elif (mm == 5 ) mm = "MAY"
+    elif (mm == 6 ) mm = "JUNE"
+    elif (mm == 7 ) mm = "JULY"
+    elif (mm == 8 ) mm = "AUGUST"
+    elif (mm == 9 ) mm = "SEPTEMBER"
+    elif (mm == 10) mm = "OCTOBER"
+    elif (mm == 11) mm = "NOVEMBER"
+    elif (mm == 12) mm = "DECEMBER"
+    end; 
+    
+    return string (dd, " ", mm, " ", yyyy);
+end;
+
+
+private macro SW_GetField32A_FullText_Currency (_currency)
+    var ret = "";
+    var sql = "select t_ccy from dfininstr_dbt where t_fiid = :m_fiid";
+    sql = execSqlSelect (sql, makeArray (SQLParam ("m_fiid", _currency)));
+    if (sql.moveNext ())
+        ret = sql.value ("t_ccy", null, V_STRING);
+    end;
+    return ret;
+end;
+
+private macro SW_GetField32A_FullText_Amount (_amount)
+    return replace (string(_amount), ".", ",");
+end;
+
+private macro SW_GetField32A_FullText_AmountWithSeparator (_amount)
+    _amount = replace (string(_amount:a), ".", ",");
+    return string ("#" + replace (_amount, "'", ".") + "#");
+end;
+
+private macro SW_GetField32A_FullText (_date, _currency, _amount):string
+    var value =  "Date     :$Date$" 
+        + "\n" + "Currency :$Currency$"
+        + "\n" + "Amount   :$Amount$      $AmountWithSeparator$";
+
+    value = strSubst (value, "$Date$"               , SW_GetField32A_FullText_Date                (_date     ));
+    value = strSubst (value, "$Currency$"           , SW_GetField32A_FullText_Currency            (_currency ));
+    value = strSubst (value, "$Amount$"             , SW_GetField32A_FullText_Amount              (_amount   ));
+    value = strSubst (value, "$AmountWithSeparator$", SW_GetField32A_FullText_AmountWithSeparator (_amount   ));
+
+    return value;
+end;
+
+// @desc: проверка существования примечания к платежу
+macro PM_CheckExistsNote (PaymentID:integer, NoteKind:integer):bool
+    var sql = "select 1 from dnotetext_dbt " + 
+              " where t_objecttype = 501 " +
+              "   and t_documentid = lpad (to_char (:m_PaymentID), 10, '0') " +
+              "   and t_notekind = :m_NoteKind and t_validtodate = to_date ('31.12.9999', 'dd.mm.yyyy')";
+    var param = makeArray (SQLParam ("m_PaymentID", PaymentID), SQLParam ("m_NoteKind", NoteKind));
+    sql = execSQLselect (sql, param, false);
+    return sql.MoveNext ();
+onError 
+    return false;
+end;
+
+// @desc    : маленькая локальная функция получения наименования лоро-корреспондента по входящему платежу
+// @changes : 2013-02-25 zip_z.: наименование определяется по исходящей (а не входящей) схеме расчетов
+macro PT_GetPartyNameLoroCorrByPayment (paymentid:integer):string
+    var ret = PT_NAME_EMPTY;
+    const PT_NAME_TYPE_ADD = 4; // дополнительное наименование субъекта
+    
+    var sql = "SELECT t_name "
+              "  FROM dpartyname_dbt "
+              " WHERE t_partyid = ANY (SELECT t_client "
+              "                       FROM daccount_dbt "
+              "                       WHERE t_account IN (SELECT PM_SCRHLP.GetCorAccount (t.t_PayFIID, t.t_Corschem) "
+              "                                           FROM dpmprop_dbt t "
+              "                                           WHERE t_paymentid = :paymentid AND t_isSender = chr (0) AND t_debetCredit = 1)) "
+              "      AND t_NameTypeid = :nameTypeId";
+
+    sql = execSqlSelect (sql, makeArray (SqlParam ("paymentid",   paymentid        ), 
+                                         SqlParam ("nameTypeId",  PT_NAME_TYPE_ADD )));
+    if (sql.moveNext)
+        ret = sql.value ("t_name", null, V_STRING);
+    end;
+    return ret;
+
+end;
+
+// @desc: получить примечание 122 (PM_USR_NOTEKIND_PAYMENTS) и обработать строки (добавить заголовки, распарсить 32A)
+macro SW_GetPaymentsMessage (PaymentID:integer):string
+        var sql = "select usr_swift_parser.getnotebody (p_paymentid => :m_PaymentID) m_note from dual";
+        sql = execSQLselect (sql, makeArray (SQLParam ("m_PaymentID", PaymentID, V_INTEGER)));
+        if (sql.moveNext ())
+            return (sql.value ("m_note", null, V_STRING));
+        end;
+    return "";
+end;
+
+// @desc: вспомогательный класс строки (поля) SWIFT-сообщения
+class SW_MessageLine (_number, _name, _value)
+    var f_number = _number;   // номер    : например, 32A
+    var f_name   = _name;     // имя      : например, Value Date/Currency/Interbank Settled Amount
+    var f_value  = _value;    // значение : например, что угодно, включая символы перевода строки
+end;
+
+// @desc: вспомогательный класс SWIFT-сообщения
+class (TArray) SW_Message ()
+    initTArray ();
+    
+    // @desc: получить значение поля
+    macro GetField (m_number:string)
+        var i = 0;
+        while ( i < this.size )
+            if (trim (this[i].f_number) == m_number) return this[i].f_value; end;
+            i = i + 1;
+        end;
+        return "";
+    end;
+    
+    // @desc: заменить значение поля
+    macro ReplaceFieldValue (m_number:string, m_value:string)
+        var i = 0;
+        while ( i < this.size )
+            if (trim (this[i].f_number) == m_number) 
+                this[i].f_value = m_value + STRING_CR; 
+                return true;
+            end;
+            i = i + 1;
+        end;
+        return false;
+    end;
+
+
+    // @desc: заменить имя поля
+    macro ReplaceFieldName (m_numberfrom:string, m_numberto:string)
+        var i = 0;
+        while ( i < this.size )
+            if (trim (this[i].f_number) == m_numberfrom) 
+                this[i].f_number = m_numberto;
+                this[i].f_name   = execStoredFunc ("usr_swift_parser.sw_getfieldname", 
+                                                   V_STRING, 
+                                                   makeArray (SqlParam ("p_fieldname", m_numberto))); 
+                return true;
+            end;
+            i = i + 1;
+        end;
+        return false;
+    end;
+
+    
+    // @desc: получить полное сообщение
+    macro GetMessage ()
+        var ret = "", i = 0;
+        while ( i < this.size () )
+            ret = ret + this[i].f_number + STRING_DELIMITER_SW + this[i].f_name + STRING_CR + this[i].f_value;
+            i = i + 1;
+        end;
+        return ret;
+    end;
+end;
+
+// @desc: получить и хитро зазнать в класс SWIFT-сообщение Payments из примечания 121
+ macro PM_GetSwiftMessage (paymentid:integer):SW_Message
+    var msg = SW_GetPaymentsMessage (paymentid);
+    var sw  = SW_Message ();
+    
+    var msg_array = split (msg, STRING_CR);
+    var _number = "", _name = "", _value = "", tmp_array, increment, sz;
+
+    sz = msg_array.size;
+    var i = 0;
+    while (i < sz)
+        _value = ""; 
+        if (index (msg_array [i], STRING_DELIMITER_SW) < 5)
+            increment = true;
+            tmp_array = split (msg_array [i], STRING_DELIMITER_SW);
+            _number = tmp_array [0];
+            _name   = tmp_array [1];
+
+            i = i + 1;
+            while (((index (msg_array [i], STRING_DELIMITER_SW) > 5) or (index (msg_array [i], STRING_DELIMITER_SW) == 0))  and (i < sz))
+                _value = _value + msg_array [i] + STRING_CR;
+                i = i + 1;
+                increment = false;
+            end;
+            
+            sw (sw.size ()) = SW_MessageLine (_number, _name, _value);
+        end;
+        if (increment == true) i = i + 1; end;
+    end;
+
+    return sw;
+end;
+
+// @desc: получить имя файла для выгрузки. Формируется как RS-код клиента + paymentid + ".REF".
+ macro getSwFileNameByPayment (pm:RsbPayment):string
+    /*
+    var sql = "select t_code from dobjcode_dbt "
+              " where t_objectType = 3 and t_CodeKind = 1 and t_ObjectId = :id and t_state = 0";
+    sql = execSqlSelect (sql, makeArray (SqlParam (":id", pm.Receiver)));
+    if (sql.moveNext ())
+        return string ((sql.value ("t_code", null, V_STRING)), pm.PaymentID, ".ref");
+    end;
+    */
+    
+    return string (pm.PaymentID, ".ref");
+end;
+
+
+// @desc: вызов ХП для вставки примечания
+ macro PM_InsertNote_Callback (PaymentID:integer):integer
+    var sql = RSDCommand ("{ ? = call usr_swift_parser.insertnote (:p_paymentid)}");
+    sql.addParam ("p_retval",    RSDBP_RETVAL, V_INTEGER);
+    sql.addParam ("p_paymentid", RSDBP_IN, PaymentID);
+    sql.execute ();
+    return sql.value ("p_retval", null, V_INTEGER);
+onError return SW_ERRCODE_UNKNOWN;
+end;
+
+// @desc: вставка примечания (выдаёт msgbox, для массового режима пользуйте PM_InsertNote_Callback на ХП)
+// @used: rm100_15.mac; rminpm.mac
+ macro PM_FillNote ( PaymentID:integer ):integer
+    var fillNote         = true;
+    if (PM_CheckExistsNote (PaymentID, PM_USR_NOTEKIND_PAYMENTS )) /* 122 */
+        if (PM_CheckExistsNote (PaymentID, PM_USR_NOTEKIND_AVIZO_CREDIT )) /*150*/ 
+            GetTrue (fillNote, "Примечание 150 уже существует|Вы хотите его заменить?");
+        end;
+    else
+       msgbox ("Примечание 122 не существует: по платежу нет сообщения Payments.");
+       return SW_ERRCODE_EXIT_SUCCESS;
+    end;
+    if (fillNote)
+        var msg_string = "";
+        var ret = PM_InsertNote_Callback (PaymentID);
+        if (ret == SW_ERRCODE_EXIT_SUCCESS)  
+            msg_string = "Кредитовое авизо сформировано"; 
+        else
+            msg_string = "Кредитовое авизо не сформировано!|";
+            if   (ret == SW_ERRCODE_NOTE_TOO_LONG)  
+                msg_string = msg_string + "Длина примечания превышает 1500 знаков";
+            elif (ret == SW_ERRCODE_NO_DATA_FOUND)  
+                msg_string = msg_string + "Отсутствуют данные Payments";
+            elif (ret == SW_ERRCODE_UNKNOWN)  
+                msg_string = msg_string + "Ошибка во время выполнения пакетной процедуры";
+            end;
+        end;
+        msgbox (msg_string);
+    end;
+    return ret;
+onError end;
+
+// @desc: заполнение файла по данным примечания 122 (PM_USR_NOTEKIND_PAYMENTS)
+ macro PM_FillLoroFile (PaymentID:integer)
+    if (not (PM_CheckExistsNote (PaymentID, PM_USR_NOTEKIND_PAYMENTS )))
+        msgbox ("Не удалось прочитать сообщение Payments. Нет информации для выгрузки");
+        return;
+    end;
+    
+    var pay = RsbPayment (paymentid);
+    var msg = PM_GetSwiftMessage (paymentid);
+    // тупым переименованием поля пишем в 21 поле референс из 20-го
+    msg.ReplaceFieldName ("20", "21"); 
+
+    // заменяем даты в поле 32А (и вообще формируем его по-новому)
+    msg.ReplaceFieldValue ("32A", SW_GetField32A_FullText (pay.valueDate, pay.baseFiid, pay.baseAmount));
+    
+    var m_filename = getSwFileNameByPayment (pay); 
+    var m_message = msg.GetMessage ();  
+    
+    // условно считаем, что длина имени файла больше 5 символов - это уже корректно
+    if (StrLen (m_filename) <= 2) 
+        msgbox ("Не удалось получить имя файла выгрузки.|Файл не сформирован!" );
+        return;
+    end;
+    
+    // получаем дополнительное наименование (typeName = 4) субъекта
+    // 2013-02-25 zip_z. перенесено в HEAD_SENDER, код больше не нужен
+    /*********************************************************************************
+    var m_sender = PT_GetPartyNameAdd ({OurBank}, 4);
+    if (m_sender == PT_NAME_EMPTY)
+        msgbox ("Не удалось получить дополнительное наименование нашего банка. |Проверьте настройки псевдонимов субъекта экономики|Файл не сформирован!");
+        return;
+    end;
+    ********************************************************************************/
+    
+    // получаем дополнительное наименование владельца лоро-счета
+    var m_receiver = PT_GetPartyNameLoroCorrByPayment (paymentid);
+    if (m_receiver == PT_NAME_EMPTY)
+        msgbox ("Не удалось получить дополнительное наименование клиента лоро-счета. |Проверьте настройки псевдонимов субъекта экономики (Alt + E на клиенте)|Файл не сформирован!");
+        return;
+    end;
+    
+    // все основные проверки выполнены, можно выгружать..
+    var m_directory = RSL_GetRegistryValue ("PRBB/MESSWIFTPATH_LORO");
+    if (isNull (m_directory))
+        msgbox ("Не удалось получить путь каталога выгрузки. Файл не сформирован!");
+        return;
+    end;
+    
+    var m_full_filename = mergefile (m_directory, m_filename);
+    setOutput (m_full_filename);
+
+[FIN 103  : Single Customer Credit Transfer
+Sender   : #
+Receiver : #
+--------------------------------Message-Text-----------------------------------
+20 :Transaction Reference Number
+#
+#
+]  (HEAD_SENDER, m_receiver, pay.Number, m_message);
+    setOutput (null, true);
+    msgbox ("Файл выгружен по пути " + m_full_filename);
+end;

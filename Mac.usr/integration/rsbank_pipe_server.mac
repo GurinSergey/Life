@@ -1,0 +1,530 @@
+
+/******************************************************************************
+   Имя файла.:       rsbank_pipe_server.mac
+   Назначение:       Макрос обработки событий, полученных от СУБД через pipe канал
+   Дата......:       22.08.2008
+   Автор.....:       Селезнёв Владимир
+
+   Правки макроса:
+
+   10.12.2012 Golovkin Включение\выключение трассировки
+   //RR 28.02.2013 Добавлен режим 20 - для списания периодических комиссий
+   17.04.2013 LAO Добавлена проверка на ошибки компиляции
+   //RR 24.05.2013 R-190163-2 Убрал лишние задания
+   // KS 29.11.2013 Перенос пользовательских доработок в 31ю сборку
+******************************************************************************/
+
+import RSD, oralib, CommonInt, AccountProc, CategoriesProc, NotesProc, ClientProc, CarryProc,/* KS Убрал до адаптации*/ OperationsProc, CurDateProc;
+import "stat_pipe_server.mac"; /*31.05.12 Golovkin - для монитора*/
+import "Send_lotus.mac", "check_err_pipe.mac","fm_add_operation.mac";
+/******************************************************************************************************************/
+/*SDA 22.03.2012 импорт макросов для включения ЭИ обработчика*/
+/*Golovkin 23.09.2013 Закомментировал из-за проблем с ошибками компиляции*/
+/*
+import "pm_common.mac", "pm_setst.mac", "pmdefbo.mac", "pm_syscont.mac", "pmpurp.mac", "pmchk117.mac", "pschkrst.mac", "pmterror.mac", "pmprepromass.mac", "likepy.mac", "wlinstpm.mac" ,"pmpurp.mac", "pmsummo.mac";
+import "rmtools.mac", "cbctuncs.mac", "cbsttls.mac", "pm_tools.mac", "sf_lib.mac", "sfdiscount.mac", "mpckvit.mac","pmbencom.mac";
+import "Commisslib.mac", "AvtoCode.mac", "fg_Life_parm.mac", "SetVOStaff.mac", "naVK.mac", "Send_lotus.mac", "check_err_pipe.mac"; 
+*/
+/******************************************************************************************************************/
+const STOP_ERR=1;
+const FUNC_ACCOUNT  = 1;
+const FUNC_CATEGORY = 2;
+const FUNC_NOTE     = 3;
+const FUNC_DOCUMENT = 4;
+const FUNC_CLIENT   = 5;
+const FUNC_CARRY    = 6;
+const FUNC_HELLO    = 7; //проверка связи
+const FUNC_OPERATION= 8; 
+const FUNC_TRACE    = 9; //10.12.2012 Golovkin Включение\выключение трассировки
+const FUNC_COMISS_AGENT   = 20; // Команда на запуск агента комиссий
+const FUNC_FM       = 10; //
+
+
+private var cmd:object;
+private var sender_pipename;
+private var incoming_string;
+private var stat, ipos;
+private var i = 0, j = 0;
+
+private var FuncType;
+private var work_mode;
+private var FuncString;
+
+private var LastOperDay;
+
+private var ask = false;
+
+private var StatOperations = StatPaym(); /*31.05.12 Golovkin - для монитора*/
+private var inter_mode;
+private var StartTime = time(18,30,00); //RR 01.04.2013 Для отложенного запуска
+private var RTime; //RR 11.04.2013 Без нее неверно определяется текущий момент времени
+/*gettrue(ask,"В программном канале могут находится необработанные сообщения|очистить очередь?");
+if (ask)
+ cmd = RSDCommand("begin dbms_pipe.purge('rsbank.service'); end;");
+ cmd.Execute;
+end;
+*/
+
+macro send_answer(msg)
+
+   msg = StrSubst(msg,"'","");
+   
+   cmd = RSDCommand("{? = call usr_send_message('"+sender_pipename+"','"+msg+"')}");
+
+   // KS Адаптация патч 30 05.07.2011
+   cmd.addparam("stat", RSDBP_RETVAL, V_INTEGER );
+   cmd.addparam("sender_pipename", RSDBP_IN, sender_pipename);
+   cmd.addparam("mes", RSDBP_IN, msg);
+/*
+   cmd.addparam("stat", RSDBP_RETVAL, V_INTEGER );
+   cmd.addparam("sender_pipename", RSDBP_IN, V_STRING);
+   cmd.param("sender_pipename").value =  sender_pipename;
+   cmd.addparam("mes", RSDBP_IN, V_STRING);
+   cmd.param("mes").value = msg;
+*/
+   
+   cmd.execute();
+end;
+//установить каркасный план
+rsdcommand("ALTER  session SET USE_STORED_OUTLINES = USR_OUTLINELAO").execute;
+//инициализация пакета pm_common для работы с платежами   
+cmd = RSDCommand("{call pm_common.init()}");
+cmd.Execute();
+// Установить клиент инфо
+cmd = RSDCommand("{call DBMS_APPLICATION_INFO.SET_CLIENT_INFO ('"+GetClientInfo({oper})+"')}");
+cmd.Execute();
+
+macro processMessage(MsgSender, MsgValue)
+   
+/*   cmd = RSDCommand("{? = call usr_get_message(?,?,?)}");
+   
+   cmd.addparam("stat", RSDBP_RETVAL, V_INTEGER );
+   cmd.addparam("carry_pipename", RSDBP_IN, V_STRING);
+   cmd.param("carry_pipename").value =  rsbank_pipename;
+   cmd.addparam("sender_pipename", RSDBP_OUT, V_STRING);
+   cmd.addparam("message", RSDBP_OUT, V_STRING, 4000 );
+   
+   cmd.execute();*/
+
+   // KS 16.08.2011 Автоматическое переключение обработчиков в новый опердень
+   // Обязательно должен быть настроен планировщик!!!
+   // До открытия операционного дня - Параметры: -exec:190 -lastday:01.01.0001
+   // После открытия операционного дня - Параметры: -exec:190 -lastday:curdate
+   // Модуль 190 - это макрос - CurDateProc.mac
+   // Должа быть создана таблица usr_curdate
+   // LAO 04.03.2013 адаптация 20.31  usr_SetOperDay
+   StatOperations.TimeBeginOperation(); /*09.06.12 Golovkin - для монитора*/
+
+// KS 25.09.2012 РОБОТЫ-ПЛАНИРОВЩИКИ 24/7
+//   if (GetMaxOperDay() > {curdate})
+     LastOperDay = GetLastOperDay(); 
+     while (LastOperDay == date(0,0,0)) // Ждем пока откроют
+       LastOperDay = GetLastOperDay();
+     end;
+     if (LastOperDay > {curdate})       // Меняем день
+      usr_SetOperDay(); //устанавливаем последний открытый ОД
+     end;
+//   end;
+
+   sender_pipename = MsgSender;
+   incoming_string = MsgValue;
+   
+   FuncString = incoming_string;
+   
+   iPos     = Index(FuncString, chrDelimiter);
+   FuncType = substr(FuncString, 1, iPos - 1);
+            
+   FuncString = SubStr(FuncString, iPos + 1);
+
+   iPos     = Index(FuncString, chrDelimiter);        
+   work_mode  = substr(FuncString, 1, iPos - 1);  
+   
+   FuncString = SubStr(FuncString, iPos + 1);
+
+   if (FuncType == FUNC_HELLO)
+
+       send_answer("ready");
+
+   elif   (FuncType == FUNC_ACCOUNT)
+       setoutput(LogPathAccounts, true);
+       if   (work_mode == 1)
+
+           stat = rslCreateAccount(FuncString);      
+
+           if (stat != "")
+               send_answer(stat);
+           end;
+       
+       elif (work_mode == 2)
+           
+           stat = rslUpdateAccount(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 3)
+           
+           stat = rslCloseAccount(FuncString);
+           send_answer(stat);
+       elif (work_mode == 4) /*29.01.2013 обновление пользовательского счета C-14927-6 LAO*/
+           stat = rslUpdateAccount_type(FuncString);
+           send_answer(stat);
+       end; 
+       setoutput(null,true);
+   elif (FuncType == FUNC_CATEGORY)
+       setoutput(LogPathCategories, true);
+       if  (work_mode == 1) //установка значения категории
+           
+           stat = rslSetCategoryValue(FuncString);      
+           send_answer(stat);
+      
+       elif (work_mode == 2) //удаление значения категории
+           
+           stat = rslDelCategoryValue(FuncString);
+           send_answer(stat);
+       
+       end;
+       setoutput(null,true);
+   elif (FuncType == FUNC_NOTE)
+       setoutput(LogPathNotes, true);
+       if   (work_mode == 1)
+      
+           stat = rslSetNoteValue(FuncString);     
+           send_answer(stat);
+      
+       elif (work_mode == 2)
+           
+           stat = rslDelNoteValue(FuncString);
+           send_answer(stat);
+       
+       end;
+       setoutput(null,true);
+   
+   elif (FuncType == FUNC_CLIENT)
+       setoutput(LogPathClients, true);
+       
+       if   (work_mode == 1)
+      
+           stat = CreateClient(FuncString);     
+           send_answer(stat);
+      
+       elif (work_mode == 2)
+           
+           stat = UpdateClient(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 3)
+           
+           stat = DeleteClient(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 4) //постановка клиента на обслуживание
+           
+           stat = SetClientService(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 5) //снятие клиента с обслуживания
+           
+           stat = DelClientService(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 6) //Создание кода клиента
+           
+           stat = SetClientCode(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 7) //Удаление кода клиента
+           
+           stat = DelClientCode(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 8) //создание адреса клиента
+           
+           stat = SetClientAddress(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 9) //удаление адреса клиента
+           
+           stat = DelClientAddress(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 10) //создание рег. документа
+           
+           stat = SetClientRegDoc(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 11) //удаление рег. документа
+           
+           stat = DelClientRegDoc(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 12) //создание сотрудника клиента
+           
+           stat = SetClientOfficer(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 13) //удаление сотрудника клиента
+           
+           stat = DelClientOfficer(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 14) //создание документа клиента
+           
+           stat = SetClientPaper(FuncString);
+           send_answer(stat);
+       
+       elif (work_mode == 15) //удаление документа клиента
+           
+           stat = DelClientPaper(FuncString);
+           send_answer(stat);
+       
+       end;
+       
+       setoutput(null, true);   
+// KS 29.11.2013 Временно закомментировал до адаптации CarryProc
+  
+   elif (FuncType == FUNC_CARRY)
+
+       if (work_mode == 1) //проводка
+
+          setoutput(LogPathCarries, true);
+          stat = RunCarryWithStep(FuncString);
+          send_answer(stat);
+
+       elif (work_mode == 2)//откат проводки
+
+          setoutput(LogPathBackoutCarries, true);
+          stat = RunBackoutCarry(FuncString);
+          send_answer(stat);
+
+       end;
+       setoutput(null,true);
+
+
+   elif (FuncType == FUNC_OPERATION)
+
+       setoutput(LogPathRunOperationStep,true);
+       if (work_mode == 1) //выполнение шага
+
+           stat = RunOperationStep(FuncString);
+           send_answer(stat);
+
+       end;
+       setoutput(null,true);
+
+
+   /* 10.12.2012 Golovkin Включение\выключение трассировки */
+   elif (FuncType == FUNC_TRACE) //трассировка
+
+       if (work_mode == 1) //включение трассировки
+
+           inter_mode = SetDialogFlag(0);
+           stat = SetRSTrace(true);
+           SetDialogFlag(inter_mode);
+
+           if(stat == 1)
+               stat = no_error_msg + chrDelimiter + UserNumber();
+               send_answer(stat);
+           else
+               stat = "error #" + String(stat) + chrDelimiter + UserNumber();
+               send_answer(stat);
+           end;
+
+       elif (work_mode == 2) //выключение трассировки
+
+           inter_mode = SetDialogFlag(0);
+           stat = SetRSTrace(false);
+           SetDialogFlag(inter_mode);
+
+           if(stat == 1)
+               stat = no_error_msg + chrDelimiter + UserNumber();
+               send_answer(stat);
+           else
+               stat = "error #" + String(stat) + chrDelimiter + UserNumber();
+               send_answer(stat);
+           end;
+
+       end;
+    elif (FuncType == FUNC_FM)  
+        if (work_mode == 1) // LAO добавление операции по фм
+                stat=add_fm_oper(FuncString);
+                send_answer(stat);
+        elif (work_mode == 2) // LAO добавление субъекта фм
+                stat=add_fm_party(FuncString);
+                send_answer(stat);
+        end;
+   elif (FuncType == FUNC_COMISS_AGENT)  
+       debugbreak; 
+       if (work_mode == 0)
+
+           ExecMacroFile("Comiss_agent.mac", "CheckStateOfAgents", true,false);
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           
+       elif (work_mode == 1)
+       
+           while (execmacrofile("Comiss_agent.mac", "RunPay", work_mode) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 0))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss");
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 3) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 0) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 2) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+             end;
+           
+       elif (work_mode == 2)
+       
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 0))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss");
+           end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 0) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", work_mode) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+       elif (work_mode == 11)
+       /*
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 1))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss", 1);
+             end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 1) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           */  //RR 24.05.2013 R-190163-2
+           while (execmacrofile("Comiss_agent.mac", "RunPay", work_mode) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           RTime = time;
+           while (RTime < StartTime)
+            TestEvent(1000);
+            RTime = time;
+           end;
+           
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 0))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss");
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 120) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 0) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+             end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 12) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+       elif (work_mode == 12)
+       
+           RTime = time;
+           while (RTime < StartTime)
+            TestEvent(1000);
+            RTime = time;
+           end;
+           
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 0))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss");
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 120) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 0) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", work_mode) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+       elif (work_mode == 13)
+           
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 2))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss", 2);
+           end;
+           
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 3))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss", 3);
+           end;
+           
+           while (   (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 2))
+                  or (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 3)) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", work_mode) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+             end;
+             
+           RTime = time;
+           while (RTime < StartTime)
+            TestEvent(1000);
+            RTime = time;
+           end;
+           
+           ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           
+           if ( not ExecMacroFile ("Comiss_Agent.mac", "CheckIsConnectionInProgress", 0))
+              ExecMacroFile ("Comiss_Agent.mac", "RunConnectionComiss");
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 120) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (not execmacrofile("Comiss_agent.mac", "CheckIsConnectionComplete", 0) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+           while (execmacrofile("Comiss_agent.mac", "RunPay", 12) )
+             ExecMacroFile("Comiss_agent.mac", "RandomizePause",3,5);
+           end;
+           
+       end;
+
+   end;
+
+   /*09.06.12 Golovkin - для монитора*/
+   StatOperations.TimeEndOperation();
+   StatOperations.RegisterOperationForMonitor(stat,sender_pipename,msgvalue);
+   //LAO проверка на ошибки компиляции
+   debugbreak;
+   if (check_stat(stat,FuncType)==STOP_ERR)
+    inter_mode = SetDialogFlag(1);
+    msgbox("Обработчик остановлен из-за ошибок компиляции! \nДля полной остановки нажмите CTRL+PAUSE(BREAK), потом ESC");
+    SetDialogFlag(inter_mode);
+   end;  
+
+onerror(x)
+    setoutput(LogPathServErrors, true);
+    println(x.module + "[" + x.line + "]:" + x.message);
+    println(getRSDErrorsString(cmd));
+    setoutput(null,true);
+
+end;
+
+
+

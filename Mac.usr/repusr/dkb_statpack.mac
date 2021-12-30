@@ -1,0 +1,469 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: dkb_statpack.mac
+// @author  : 2012-12-14 zip_z. R-134426
+// @author  : 2012-12-14 zip_z. R-134426
+// @desc    : отчёт-выписка для ДКБ по тарифному плану в разрезе клиентов
+// @changes : RR 14.12.2012 Вдохнул жизнь в написанную оболочку
+// -------------------------------------------------------------------------------------------------
+
+import lib_registry, globals, ZubRunScroll, rsexts, rcw;
+
+/* константы. Злобная уличная магия */
+private const SFCONTR_TARIF_DEFAULT = "<< выберите тарифный план >>";
+private const V_KEY_ENTER = 13, V_KEY_ESC = 27, V_KEY_F3 = 317, V_KEY_F9 = 323;
+
+/* параметры тарифного плана. Вынесены как static ради удобства и от лени (чтобы не городить кучу кода) */
+private var g_sfcontr_tarif  = SFCONTR_TARIF_DEFAULT; 
+private var g_sfcontr_planid = 0;
+
+var bdate, edate, SplitedDate, TPName;
+
+private var FinInfArr = TArray();
+FILE rep_ac()txt write;
+private var str : string, m_path, tempFileName, tempFileNameBezPuti;
+private var all_local_puth:string;
+private var dd:date, tt:time, ii:integer;
+const TEXTDIR_REESTR = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+private var ex,ob;
+
+/*19.03.2013 Chesnokov D.S. логгирование запуска для поиска неиспользуемых макросов*/
+ExecmacroFile("lib_log.mac", "LogProcedure", "dkb_statpack.mac");
+
+ class FinInf(tpname_, client_name, account_, datecarry, num_, name_, inn_, acc_, bank_name, bank_bic, debet_, credit_, ground_)
+    var tpname     = tpname_;
+    var clientname = client_name;
+    var account    = account_;
+    var dat        = datecarry;
+    var num        = num_;
+    var name       = name_;
+    var inn        = inn_;
+    var acc        = acc_;
+    var bankname   = bank_name;
+    var bankbic    = bank_bic;
+    var debet      = debet_;
+    var credit     = credit_;
+    var ground     = ground_;
+ end;  
+
+private macro chekReestrRead(m_name:string, m_status:integer, m_err:integer)  //AAN
+	if ((m_status == V_UNDEF) or (m_err != 0))
+    	msgbox("Ошибка получения значения настройки реестра " + m_name + " \n Процедура GetRegistryValue вернула код ошибки "+m_err);
+   		exit(0);
+	end;
+end;
+
+private macro dayString(m_reestrName:string):string  //AAN
+   var m_errCode:integer = NULL;
+   var m_statusGetRegistry :integer = NULL;
+   var m_zna4enie:string  = NULL;
+   if (m_reestrName == "")
+      msgbox("При чтении реестра не задана строка реестра");
+      exit(0)
+   end;
+   m_statusGetRegistry=GetRegistryValue(m_reestrName, V_STRING, m_zna4enie, m_errCode);
+   chekReestrRead(m_reestrName, m_statusGetRegistry, m_errCode);
+   return(m_zna4enie);
+end;
+
+private macro Clear(str)
+   str = STRSUBST(STRSUBST(STRSUBST(str, ";", ","),strfor(13),""),strfor(10), "");
+   // надо выкинуть символы 10 и 13 из строки, а также все ; т.к. это разделитель в .csv файлах
+   return str;
+END;
+
+private macro createUniqueFile()      //AAN генерим универсальное имя файла
+	private var ff:string = "DKB"+{oper}+"_"+date+"_"+time;
+	private var file_ext:string = ".txt";
+	tempFileName = dayString(TEXTDIR_REESTR);
+	tempFileName = tempFileName + "\\" + ff;
+	tempFileNameBezPuti = ff;
+	tempFileName = StrSubst ( tempFileName, ".", "_" );
+	tempFileName = StrSubst ( tempFileName, ":", "_" );
+	tempFileName = StrSubst ( tempFileName, " ", "_" );
+	tempFileName = tempFileName + file_ext;
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ".", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ":", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, " ", "_" );
+	tempFileNameBezPuti = tempFileNameBezPuti + file_ext;
+	if (substr(tempFileName,1,2) == "__")
+		tempFileName=".."+substr(tempFileName,3)
+	end;
+end;
+
+private macro copyToMe()     //AAN  копируем файл временных данных с СП на терминал во временную папку(какую именно зависит от лок. настр.)
+   private var m_path: string = "";
+   m_path = "$" + tempFileNameBezPuti;
+   if (not CopyFile(tempFileNameBezPuti, m_path, TRUE))
+     println ("НЕ СМОГ скопировать файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+   else
+      println ("УСПЕШНО скопирован файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+      if (not removeFile(tempFileName))
+         println ("Не смог удалить файл "+tempFileName+" с сервера приложений. ничего сташного, продолжаем работу.");
+      else
+         println ("удален файл "+tempFileName+" с сервера приложений.");
+      end;
+   end;
+end;
+
+ //RR Макрофункция для получения списка счетов для обработки
+ macro GetAccRecSet(IdTP)
+  var cmd,rs,sql;
+    sql =  " SELECT   CONTR.T_OBJECT ACC, "
+   +"\n               CONTR.T_FIID FIID, "
+   +"\n               PLN.T_BEGIN BEGD, "
+   +"\n               PLN.T_END ENDD"
+   +"\n        FROM   dsfcontrplan_dbt pln, dsfcontr_dbt contr "
+   +"\n       WHERE   PLN.T_SFPLANID = :ID AND CONTR.T_ID = PLN.T_SFCONTRID "
+   +"\n    ORDER BY   CONTR.T_FIID, CONTR.T_OBJECT ASC ";
+    cmd = RSDCommand(sql);
+    cmd.AddParam("ID",RSDBP_IN, IdTP);
+    rs = RSDRecordSet (cmd);
+    return rs;
+ end;
+
+ //RR Макрофункция для получения данных о финансовых операция конкретного рублевого лицевого счета
+ macro GetFinInfForRurAccRecSet(Acc,BegD,EndD,TPName)
+  var cmd,rs,sql;
+    sql =  "    SELECT   :tpname tpname_, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_PAYER = :account1 "
+          +"\n              THEN PROP.T_PAYERNAME   "
+          +"\n              ELSE PROP.T_RECEIVERNAME  "
+          +"\n           END client_name, "
+          +"\n           :account2 account_, "
+          +"\n           ARH.T_DATE_CARRY datecarry, "
+          +"\n           ARH.T_NUMB_DOCUMENT, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_PAYER = :account3 "
+          +"\n              THEN PROP.T_RECEIVERNAME  "
+          +"\n              ELSE PROP.T_PAYERNAME  "
+          +"\n           END name_, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_PAYER = :account4 "
+          +"\n              THEN SUBSTR (PROP.T_RECEIVERINN,1,10) "
+          +"\n              ELSE SUBSTR (PROP.T_PAYERINN,1,10 ) "
+          +"\n           END inn_, "
+          +"\n           CASE "
+          +"\n              WHEN PAYM.T_PAYERBANKID != PAYM.T_RECEIVERBANKID "
+          +"\n              THEN PAYM.T_RECEIVERACCOUNT "
+          +"\n              ELSE ARH.T_ACCOUNT_RECEIVER "
+          +"\n           END acc_, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_PAYER = :account5 "
+          +"\n              THEN PROP.T_RECEIVERBANKNAME "
+          +"\n              ELSE PROP.T_PAYERBANKNAME "
+          +"\n           END bank_name, "
+          +"\n           CASE "
+          +"\n              WHEN PAYM.T_PAYERBANKID = :selfid1 AND PAYM.T_RECEIVERBANKID != :selfid2 "
+          +"\n              THEN (SELECT T_BANKCODE FROM DPMPROP_DBT WHERE T_PAYMENTID = PAYM.T_PAYMENTID AND T_DEBETCREDIT = 1) "
+          +"\n              WHEN PAYM.T_RECEIVERBANKID = :selfid3 AND PAYM.T_PAYERBANKID != :selfid4 "
+          +"\n              THEN (SELECT T_BANKCODE FROM DPMPROP_DBT WHERE T_PAYMENTID = PAYM.T_PAYMENTID AND T_DEBETCREDIT = 0) "
+          +"\n              ELSE (SELECT T_CODE FROM DOBJCODE_DBT WHERE T_OBJECTID = :selfid5 AND T_CODEKIND = 3) "
+          +"\n           END bank_bic, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_PAYER = :account6 "
+          +"\n              THEN PAYM.T_AMOUNT "
+          +"\n              ELSE 0 "
+          +"\n           END debet_, "
+          +"\n           CASE "
+          +"\n              WHEN ARH.T_ACCOUNT_RECEIVER = :account7 "
+          +"\n              THEN PAYM.T_AMOUNT "
+          +"\n              ELSE 0 "
+          +"\n           END credit_, "
+          +"\n           ARH.T_GROUND ground_ "
+          +"\n    FROM   darhdoc_dbt arh, "
+          +"\n           dpmdocs_dbt doc, "
+          +"\n           dpmpaym_dbt paym, "
+          +"\n           dpmrmprop_dbt prop "
+          +"\n   WHERE   ARH.T_DATE_CARRY BETWEEN :bdate "
+          +"\n                                AND :edate "
+          +"\n           AND (ARH.T_ACCOUNT_PAYER = :account8 "
+          +"\n                OR ARH.T_ACCOUNT_RECEIVER = :account9) "
+          +"\n           AND DOC.T_APPLICATIONKEY = ARH.T_APPLICATIONKEY "
+          +"\n           AND (SUBSTR(ARH.T_ACCOUNT_PAYER ,1,3)!= '202' "
+          +"\n                OR SUBSTR(ARH.T_ACCOUNT_RECEIVER ,1,3)!= '202') "
+          +"\n           AND PAYM.T_PAYMENTID = DOC.T_PAYMENTID "
+          +"\n           AND PROP.T_PAYMENTID = PAYM.T_PAYMENTID "
+          +"\n ORDER BY ARH.T_DATE_CARRY, ARH.T_SUM ";
+    cmd = RSDCommand(sql);
+    cmd.AddParam("tpname",     RSDBP_IN, TPName);
+    cmd.AddParam("account1",   RSDBP_IN, Acc);
+    cmd.AddParam("account2",   RSDBP_IN, Acc);
+    cmd.AddParam("account3",   RSDBP_IN, Acc);
+    cmd.AddParam("account4",   RSDBP_IN, Acc);
+    cmd.AddParam("account5",   RSDBP_IN, Acc);
+    cmd.AddParam("selfid1",    RSDBP_IN, {selfid});
+    cmd.AddParam("selfid2",    RSDBP_IN, {selfid});
+    cmd.AddParam("selfid3",    RSDBP_IN, {selfid});
+    cmd.AddParam("selfid4",    RSDBP_IN, {selfid});
+    cmd.AddParam("selfid5",    RSDBP_IN, {selfid});
+    cmd.AddParam("account6",   RSDBP_IN, Acc);
+    cmd.AddParam("account7",   RSDBP_IN, Acc);
+    cmd.AddParam("datebegin",  RSDBP_IN, BegD);
+    cmd.AddParam("dateend",    RSDBP_IN, EndD);
+    cmd.AddParam("account8",   RSDBP_IN, Acc);
+    cmd.AddParam("account9",   RSDBP_IN, Acc);
+    rs = RSDRecordSet (cmd);
+    return rs;
+ end;
+ 
+ macro OutExel()
+   var c = 0;
+   createUniqueFile();
+   open (rep_ac, tempFileName);
+   //debugbreak;
+   InitProgress(FinInfArr.Size,"Ждите...","Выводим данные на печать");
+   while(c <= ((FinInfArr.Size) - 1))
+   //debugbreak;
+     //DtTmSplit(FinInfArr(c).dat, SplitedDate, NULL);
+     str = FinInfArr(c).tpname + ";" +
+           FinInfArr(c).clientname + ";" +
+           FinInfArr(c).account + ";" +
+           SubStr(String(FinInfArr(c).dat),1,10) + ";" +
+           FinInfArr(c).num + ";" +
+           FinInfArr(c).name + ";" +
+           Clear(String(FinInfArr(c).inn)) + ";" +
+           FinInfArr(c).acc + ";" +
+           FinInfArr(c).bankname + ";" +
+           FinInfArr(c).bankbic + ";" +
+           Int(FinInfArr(c).debet) + ";" +
+           Int(FinInfArr(c).credit) + ";" +
+           FinInfArr(c).ground + ";";
+     /*str = Clear(String(SplitedDate)) + ";" +
+           Clear(String(FinInfArr(c).num)) + ";" +
+           Clear(String(FinInfArr(c).nameinn)) + ";" +
+           Clear(String(FinInfArr(c).acc)) + ";" +
+           Clear(String(FinInfArr(c).bankname)) + ";" +
+           Int(FinInfArr(c).debet) + ";" +
+           Int(FinInfArr(c).credit) + ";" +
+           Clear(String(FinInfArr(c).ground)) + ";";*/
+         rep_ac.str = ToAnsi (str, true);
+         insert (rep_ac);
+     c = c + 1;
+   UseProgress(c);
+   end;
+   RemProgress();
+   close(rep_ac);
+   copyToMe();
+   ob = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+   ex = ob.CreateComObject ("Excel.Application");
+   if (not(GetFileInfo("$"+tempFileNameBezPuti,@dd,@tt,@ii,@all_local_puth))); //all_local_puth- то что надо. полный путь абсолютный локальный
+      msgbox("не могу найти на локальном диске файл "+tempFileNameBezPuti+"          \n останавливаюсь");
+    exit(0);
+  end;
+  all_local_puth = SUBSTR(all_local_puth, 2);
+  
+   var aw  = tarray;
+   var w1  = tarray;
+   var w2  = tarray;
+   var w3  = tarray;
+   var w4  = tarray;
+   var w5  = tarray;
+   var w6  = tarray;
+   var w7  = tarray;
+   var w8  = tarray;
+   var w9  = tarray;
+   var w10 = tarray;
+   var w11 = tarray;
+   var w12 = tarray;
+   var w13 = tarray;
+   
+   w1(0)  = 1;  w1(1)   =2; //формат столбца - текст
+   w2(0)  = 2;  w2(1)   =2; //формат столбца - текст
+   w3(0)  = 3;  w3(1)   =2; //формат столбца - текст
+   w4(0)  = 4;  w4(1)   =2; //формат столбца - текст
+   w5(0)  = 5;  w5(1)   =2; //формат столбца - текст
+   w6(0)  = 6;  w6(1)   =2; //формат столбца - General
+   w7(0)  = 7;  w7(1)   =2; //формат столбца - General
+   w8(0)  = 8;  w8(1)   =2; //формат столбца - текст
+   w9(0)  = 9;  w9(1)   =2; //формат столбца - текст
+   w10(0) = 10; w10(1)  =2; //формат столбца - текст
+   w11(0) = 11; w11(1)  =2; //формат столбца - текст
+   w12(0) = 12; w12(1)  =2; //формат столбца - текст
+   w13(0) = 13; w13(1)  =2; //формат столбца - текст
+   
+   aw(0)   = w1;
+   aw(1)   = w2;
+   aw(2)   = w3;
+   aw(3)   = w4;
+   aw(4)   = w5;
+   aw(5)   = w6;
+   aw(6)   = w7;
+   aw(7)   = w8;
+   aw(8)   = w8;
+   aw(9)   = w9;
+   aw(10)  = w10;
+   aw(11)  = w11;
+   aw(12)  = w12;
+   aw(13)  = w13;
+
+   aw.MarshalByVal  = true; // работает только так. передача по значению через @aw вызывает ошибку
+   w1.MarshalByVal  = true;
+   w2.MarshalByVal  = true;
+   w3.MarshalByVal  = true;
+   w4.MarshalByVal  = true;
+   w5.MarshalByVal  = true;
+   w6.MarshalByVal  = true;
+   w7.MarshalByVal  = true;
+   w8.MarshalByVal  = true;
+   w9.MarshalByVal  = true;
+   w10.MarshalByVal = true;
+   w11.MarshalByVal = true;
+   w12.MarshalByVal = true;
+   w13.MarshalByVal = true;
+   
+   ex.Workbooks.opentext(all_local_puth,1251,1,1,-4142,false,false,true,false,false,false,";",aw,1,"."," ",true,true);
+   ex.Rows("1:1").Insert(-4121);
+   ex.Rows("1:1").Insert(-4121);
+   ex.Cells(1:1).value                = "Выписка по счетам за период с "+bdate+" по "+edate+"";
+   ex.Range("A1:M1").MergeCells       = true;
+   ex.Cells(2,1).value                = "Название ТП";
+   ex.Cells(2,2).value                = "Наименование клиента";
+   ex.Cells(2,3).value                = "Р/СЧ Клиента";
+   ex.Cells(2,4).value                = "Дата документа ";
+   ex.Cells(2,5).value                = "Номер документа";
+   ex.Cells(2,6).value                = "Наименование";
+   ex.Cells(2,7).value                = "ИНН";
+   ex.Cells(2,8).value                = "Номер счета";
+   ex.Cells(2,9).value                = "Наименование банка";
+   ex.Cells(2,10).value               = "БИК";
+   ex.Cells(2,11).value               = "Дебет";
+   ex.Cells(2,12).value               = "Кредит";
+   ex.Cells(2,13).value               = "Назначение платежа";
+   ex.Range("A2:M2").interior.color   = 1001000;
+   ex.Range("A2:M2").interior.color   = 4035000;
+   ex.Range("A1:A1").Font.Size        = 14;
+   ex.Range("A:A").ColumnWidth        = 10;
+   ex.Range("B:B").ColumnWidth        = 15;
+   ex.Range("C:C").ColumnWidth        = 20;
+   ex.Range("D:D").ColumnWidth        = 10;
+   ex.Range("E:E").ColumnWidth        = 10;
+   ex.Range("F:F").ColumnWidth        = 25;
+   ex.Range("G:G").ColumnWidth        = 10;
+   ex.Range("H:H").ColumnWidth        = 20;
+   ex.Range("I:I").ColumnWidth        = 30;
+   ex.Range("J:J").ColumnWidth        = 10;
+   ex.Range("K:K").ColumnWidth        = 10;
+   ex.Range("L:L").ColumnWidth        = 10;
+   ex.Range("M:M").ColumnWidth        = 35;
+   ex.Range("A:M").WrapText           = True;
+   ex.visible                         = true;
+ end;
+ 
+ //RR Макрофункция для обработки всех полученных данных 
+ macro MainProc (IdTP,BegD,EndD,TPName)
+ 
+  var EndDate,AccRecSet, RurAccRecSet, FinInfidx = 0, i = 0;
+  
+  AccRecSet = GetAccRecSet(IdTP);
+
+  InitProgress(-1,"Ждите...","Идет обработка счетов ");
+  while (AccRecSet and AccRecSet.movenext())
+   i = i + 1;
+    if (AccRecSet.value("FIID") == 0)
+      if(EndD <= AccRecSet.value("ENDD"))
+         EndDate = AccRecSet.value("ENDD");
+      else
+         EndDate = EndD;
+      end;
+      
+      RurAccRecSet = GetFinInfForRurAccRecSet(AccRecSet.value("ACC"),BegD,EndD,TPName);
+      UseProgress(i);
+      while (RurAccRecSet and RurAccRecSet.movenext())
+        FinInfArr(FinInfidx) = FinInf(RurAccRecSet.value(0), RurAccRecSet.value(1), RurAccRecSet.value(2), RurAccRecSet.value(3), 
+                                      RurAccRecSet.value(4), RurAccRecSet.value(5), RurAccRecSet.value(6), RurAccRecSet.value(7),
+                                      RurAccRecSet.value(8), RurAccRecSet.value(9), RurAccRecSet.value(10), RurAccRecSet.value(11),
+                                      RurAccRecSet.value(12));
+        FinInfidx = FinInfidx + 1;
+      end;
+    /*else
+      msgbox("Тут будет обработка валютных счетов");*/
+    end;
+  end;
+  RemProgress();
+  if(FinInfidx == 0)
+    msgbox("За данные период, движений по счетам указанного тарифного плана не было");
+  end;
+  //debugbreak;
+  OutExel();
+ end;
+
+ 
+/* обработчик клавиши Enter в листалке тарифных планов */
+macro catchSelect (cmd, rs) 
+    g_sfcontr_tarif  = rs.value ("t_Name");
+    g_sfcontr_planid = rs.value ("t_SFPlanID");
+    return CM_SELECT;
+end;
+
+/* предварительная инициализация листалки тарифных планов. Запуск - в панели TReportParameters*/
+private var tp = ZubScroll ();
+tp.sqlText        = "select t_SFPlanID, t_Num, t_Name from dsfplan_dbt order by t_Num";
+tp.scrollReadOnly = true;
+tp.setMacroOnKeys (V_KEY_ENTER, "CatchSelect");
+
+/* обработчик панели. В свойствах содержит данные для выпуска отчёта */
+private class (TRecHandler) TReportParameters ()
+    var sfcontr_planid :integer = g_sfcontr_planid;
+    var date_begin     :date;
+    var date_end       :date;
+    
+    initTRecHandler ("statpack", RSL_GetLbrPath ("dkb_kernel.lbr", true), true);
+
+    macro HandlePanel ( dlg, cmd, id, key )
+        var ret = CM_DEFAULT;
+        // Инициализатор
+        if   (cmd == DLG_INIT)
+            this.rec.m_date_begin    = {curdate};
+            this.rec.m_date_end      = {curdate};
+            this.rec.m_sfcontr_tarif = g_sfcontr_tarif;
+            updateFields (dlg);
+            
+        // F3 на поле "Тарифный план"
+        elif ((cmd == DLG_KEY) and (id == fldIndex ("m_sfcontr_tarif")) and (key == V_KEY_F3) ) 
+            if (tp.scroll ())
+                this.rec.m_sfcontr_tarif  = g_sfcontr_tarif;
+                this.sfcontr_planid = g_sfcontr_planid;
+                updateFields (dlg);
+            end;
+            
+        // F9 - запуск
+        elif ((cmd == DLG_KEY) and (key == V_KEY_F9) ) 
+            date_begin = this.rec.m_date_begin;
+            date_end   = this.rec.m_date_end;
+            bdate      = this.rec.m_date_begin;
+            edate      = this.rec.m_date_end;
+            if (this.rec.m_sfcontr_tarif == SFCONTR_TARIF_DEFAULT) 
+                msgbox ("Не выбран тарифный план"); 
+                ret = CM_IGNORE;
+            else                
+                debugbreak;
+                TPName = dlg.rec.m_sfcontr_tarif;
+                MainProc(sfcontr_planid, date_begin, date_end, TPName);
+                ret = CM_IGNORE;
+            end;
+            
+        // Проверки :)
+        else
+            if   (this.rec.m_date_begin > this.rec.m_date_end) msgbox ("Дата начала периода не может быть больше даты окончания");    ret = CM_IGNORE;
+            elif (this.rec.m_date_begin > {curdate})           msgbox ("Дата начала периода не может быть больше даты опер. дня");    ret = CM_IGNORE;
+            elif (this.rec.m_date_end   > {curdate})           msgbox ("Дата окончания периода не может быть больше даты опер. дня"); ret = CM_IGNORE;
+            end;
+        end;
+        
+        return ret;
+    end;
+    
+    macro ShowPanel ()
+        return runDialog (this, R2M (this, "HandlePanel"));
+    end;
+end;
+
+/* точка входа */
+var rep = TReportParameters ();
+
+if (rep.ShowPanel ())
+    msgBox ("+okay");
+end;
+
+exit (1);

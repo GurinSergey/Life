@@ -1,0 +1,956 @@
+/************************************************************************************************************************
+  Название макроса: control_transactions_report.mac
+  Описание        : "Отчёт по контролируемым сделкам" - содержит информацию о проводках по счетам 70601 и 70606, 
+                     где корреспондентами являются взаимозависимые лица(банки ФГ "ЛАЙФ") за заданный период
+  Номер заявки    : C-28073 от 31.03.2014
+  Автор           : DPN
+  Изменения       : 15.05.2014 DPN I-00486077-2
+                  : 11.02.2015 DPN I-00550635-2 Отформатировал запрос
+                  : 19.03.2015 DPN R-558800-2   Бралась неправильная дата действия кода клиента
+                  : 28.05.2015 VDN I-00569169   Не отбирались данные, если код контрагента обновлен новой датой начала действия
+************************************************************************************************************************/
+
+import rsexts, KeyCodes,Календарь;
+import PaymInter, PTInter, rmcmptl;
+import activeX, lib_sqltools;
+
+import rcw, rsexts, RSD;
+import globals, oralib;
+import "fg_Life_parm.mac";
+import BankInter;
+import  likePy;
+import Календарь;
+import RsbFormsInter;
+
+const TEXTDIR_REESTR = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+const TEMLSDIR_REESTR = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR";
+//const TEMLSDIR_REESTR = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERMACRODIR"; //Для тестирования 
+
+var output = "control_transactions_report.xls";
+var bName = "txtRep";
+var lname = "";
+var lname2 = "";
+var forExcel, forExcel2;
+var valueReg, out, fulloutput, cnt = 1, sum_all = $0.00, cnt_of_progress = 0, i_progress = 0;
+var k = 0, aw = Tarray;
+var NameDefaultPath;
+
+
+MACRO IsDigitNumber( Number )
+    var stat = 0, i = 1, ch, DigitString = "0123456789,;'";
+    while( (not stat) and (i <= strlen(Number)) )
+        ch = SubStr( Number, i, 1 );
+        if( not Index( DigitString, ch ))
+          stat = 1;
+        end;
+        i = i + 1;
+      end;
+  return stat;
+END;
+
+class infoObject()
+    var bDate = {curdate};
+    var eDate = {curdate};
+    var client = "";
+
+    macro checkClient()
+        if( client == "")
+            msgbox("Ошибка! Не задан код контрагента!");
+            exit();
+        else
+            if(IsDigitNumber(client) == 1)
+                msgbox("Ошибка! Код контрагента должен содержать только цифры!");
+                exit();
+                exit();
+            end;
+        end;
+    end;
+    
+    macro checkDate()
+        if ((bDate > {curdate}) or (eDate > {curdate}))
+            msgbox("Ошибка! Дата не может быть больше текущей!");
+            exit();
+        end;
+        if (eDate < bDate)
+            msgbox("Ошибка! Дата начала не может быть больше даты окончания!");
+            exit();
+        end;
+    end;
+end;
+macro chekReestrRead(m_name:string, m_status:integer, m_err:integer)
+    if((m_status == V_UNDEF) or (m_err != 0))
+       msgbox("Ошибка получения значения настройки реестра " + m_name + " \n Процедура GetRegistryValue вернула код ошибки "+m_err);
+       exit(0);
+    end;
+end;
+macro regOption(m_reestrName:string):string
+    private var m_errCode :integer = NULL;
+    private var m_statusGetRegistry :integer = NULL;
+    private var m_zna4enie          :string  = NULL;
+    if (m_reestrName == "")
+        msgbox("Не задана строка реестра!");
+        exit(0)
+    end;
+    m_statusGetRegistry = GetRegistryValue(m_reestrName, V_STRING, m_zna4enie, m_errCode);
+    chekReestrRead(m_reestrName, m_statusGetRegistry, m_errCode);
+    return(m_zna4enie);
+end;
+
+//Создаём текстовый файл, куда будем пилить отчёт
+macro createUniqueFile(BeginName, lastName, lastName2)
+    private var ff:string = BeginName +{oper}+"_"+date+"_"+time;
+    private var file_ext:string = ".txt";
+    private var tempFileName = regOption(TEXTDIR_REESTR);
+    tempFileName = tempFileName + "\\" + ff;
+    var tempFileNameBezPuti = ff;
+    tempFileName = StrSubst ( tempFileName, ".", "_" );
+    tempFileName = StrSubst ( tempFileName, ":", "_" );
+    tempFileName = StrSubst ( tempFileName, " ", "_" );
+    tempFileName = tempFileName + file_ext;
+    tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ".", "_" );
+    tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ":", "_" );
+    tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, " ", "_" );
+    var tempFileNameBezPuti2 = tempFileNameBezPuti +"d";
+    tempFileNameBezPuti = tempFileNameBezPuti + file_ext;
+    tempFileNameBezPuti2 = tempFileNameBezPuti2 + file_ext;
+
+    lastName = tempFileNameBezPuti;
+    lastName2 = tempFileNameBezPuti2;
+    
+    setParm(1, lastName);
+    setParm(2, lastName2);
+   
+end;
+
+
+macro OpenTempl(forExcel,forExcel2, object:infoObject)
+var qt, sel_range, obSheet, sql_cl, select, param, code = "", pool_begin, pool_end;
+    select = "select DP.T_NAME " +
+                 " from dobjcode_dbt dc, dparty_dbt dp " +
+                 " where dc.t_code = :1" +
+                 " and DC.T_CODEKIND = 1 and DC.T_OBJECTID = DP.T_PARTYID ";
+    param = makeArray (SQLParam ( "1", object.client));
+    sql_cl = execSQLSelect(select, param);
+    
+    if (sql_cl and sql_cl.movenext)
+        code = string(sql_cl.value(0));
+    end;
+    
+    ActiveSheet = ExcelApplication.worksheets(1);//ExcelApplication.ActiveSheet;
+    ActiveSheet.Range("B3") = object.bDate;
+    ActiveSheet.Range("D3") = object.eDate;
+    ActiveSheet.Range("C8") = ({name_Bank});
+    ActiveSheet.Range("C9") = code;
+    
+  //  ActiveSheet.Cells.NumberFormat = "####################";
+    ActiveSheet.Cells.Font.Name = "Times New Roman";
+    ActiveSheet.Cells.Font.Size = 12;
+   // ActiveSheet.Cells.NumberFormat = "@";
+   
+    qt = ActiveSheet.QueryTables.Add("TEXT;"+forExcel,ActiveSheet.Range("A13"));
+    qt.textFiledecimalSeparator = ".";
+    qt.FieldNames = True;
+    qt.RowNumbers = true;
+    qt.FillAdjacentFormulas = False;
+    qt.PreserveFormatting = True;
+    qt.RefreshOnFileOpen = true;
+    qt.RefreshStyle = 0; //xlOverwriteCells        1;  //xlInsertDeleteCells;
+    qt.SavePassword = False;
+    qt.SaveData = True;
+    qt.AdjustColumnWidth = false;
+    qt.RefreshPeriod = 0;
+    qt.TextFilePromptOnRefresh = False;
+    qt.TextFilePlatform = 866;
+    qt.TextFileStartRow = 1;
+    qt.TextFileParseType = 1; //xlDelimited;
+    qt.TextFileTextQualifier = 1; //xlTextQualifierDoubleQuote;
+    qt.TextFileConsecutiveDelimiter = false;
+    qt.TextFileTabDelimiter = True;
+    qt.TextFileSemicolonDelimiter = True;
+    qt.TextFileCommaDelimiter = false;
+    qt.TextFileSpaceDelimiter = False;
+    qt.TextFileTrailingMinusNumbers = True;
+    
+    sel_range = ActiveSheet.Range("A13:G"+(11+int(cnt)));
+    sel_range.Borders.value = 1;
+    sel_range = ActiveSheet.Range("A"+(12+int(cnt))+":E"+(12+int(cnt)));
+    sel_range.MergeCells = True;
+    sel_range.Borders.Weight=3;
+    
+    sel_range = ActiveSheet.Range("F"+(12+cnt)+":"+"G"+(12+cnt)).Borders.Weight=3;
+    sel_range = ActiveSheet.Range("A"+(12+cnt)) = "Сумма доходов по сделкам с контрагентом за календарный год";
+    sel_range = ActiveSheet.Range("F"+(12+cnt)) = sum_all; 
+    
+    sel_range = ActiveSheet.Range("A"+(14+cnt) +":E"+(14+int(cnt)));
+    sel_range.MergeCells = True;
+    sel_range = ActiveSheet.Range("A"+(14+cnt)) = "Если сумма доходов по сделкам с контрагентом за календарный год превышает суммовой критерий, то все сделки с контрагентом подлежат налоговому контролю";
+    sel_range = ActiveSheet.Range("A"+(16+cnt)) = "Дата отчёта:";
+    sel_range = ActiveSheet.Range("B"+(16+cnt)) = {curdate};
+    sel_range = ActiveSheet.Range("D"+(16+cnt)) = "Исполнитель:";
+    sel_range = ActiveSheet.Range("E"+(16+cnt)) = {name_oper};
+    sel_range = ActiveSheet.Range("F"+(16+cnt)) = "Подпись:";
+    
+    qt.Refresh(False);
+    
+    //---------------------------------------------------------------------------------
+    ActiveSheet = ExcelApplication.worksheets(2);//ExcelApplication.ActiveSheet;
+
+    qt = ActiveSheet.QueryTables.Add("TEXT;"+forExcel2,ActiveSheet.Range("A2"));
+    qt.textFiledecimalSeparator = ".";
+    qt.FieldNames = True;
+    qt.RowNumbers = true;
+    qt.FillAdjacentFormulas = False;
+    qt.PreserveFormatting = True;
+    qt.RefreshOnFileOpen = true;
+    qt.RefreshStyle = 0; //xlOverwriteCells        1;  //xlInsertDeleteCells;
+    qt.SavePassword = False;
+    qt.SaveData = True;
+    qt.AdjustColumnWidth = false;
+    qt.RefreshPeriod = 0;
+    qt.TextFilePromptOnRefresh = False;
+    qt.TextFilePlatform = 866;
+    qt.TextFileStartRow = 1;
+    qt.TextFileParseType = 1; //xlDelimited;
+    qt.TextFileTextQualifier = 1; //xlTextQualifierDoubleQuote;
+    qt.TextFileConsecutiveDelimiter = false;
+    qt.TextFileTabDelimiter = True;
+    qt.TextFileSemicolonDelimiter = True;
+    qt.TextFileCommaDelimiter = false;
+    qt.TextFileSpaceDelimiter = False;
+    qt.TextFileTrailingMinusNumbers = True;
+    
+    sel_range = ActiveSheet.Range("B1") = {name_Bank};
+    sel_range = ActiveSheet.Range("A1:B1");
+    sel_range.MergeCells = true;
+    
+    pool_begin = 2;
+    for (var e, 0, k-1)
+        pool_end = pool_begin + 3+aw(e);
+        
+        //Верхний текст
+        sel_range = ActiveSheet.Range("A" + (pool_begin) + ":B" + (pool_begin));
+        sel_range.Font.Bold = true;
+        
+        sel_range = ActiveSheet.Range("A" + (pool_begin + 1) + ":B" + (pool_begin + 1));
+        sel_range.Font.Bold = true;
+        //----------------------------------------------------------------------
+
+        //Основная (тонкая) рамочка 
+        sel_range = ActiveSheet.Range("A" +(pool_begin + 4) + ":F"+(pool_end)); 
+        sel_range.Borders.Weight = 2;
+
+        //Верхнее поле (заголовок таблицы) 
+        sel_range = ActiveSheet.Range("A" +(pool_begin + 2) + ":A"+(pool_begin + 3));
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+        
+        sel_range = ActiveSheet.Range("B" +(pool_begin + 2) + ":B"+(pool_begin + 3));
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+      
+        sel_range = ActiveSheet.Range("E" +(pool_begin + 2) + ":E"+(pool_begin + 3));
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+        
+        sel_range = ActiveSheet.Range("F" +(pool_begin + 2) + ":F"+(pool_begin + 3));
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+      
+        sel_range = ActiveSheet.Range("C" +(pool_begin + 3) + ":D"+(pool_begin + 3));
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+      
+        sel_range = ActiveSheet.Range("C" +(pool_begin + 2) + ":D"+(pool_begin + 2)); 
+        sel_range.Borders.Weight = 3;
+        sel_range.MergeCells = true;
+        
+        sel_range = ActiveSheet.Range("A" +(pool_begin + 2) + ":F"+(pool_begin + 3));
+        sel_range.Interior.ColorIndex=15;
+       
+      //-------------------------------------------------------------------------------
+       
+      //Нижняя (толстая) рамочка
+       sel_range = ActiveSheet.Range("A" +(pool_end + 1) + ":E"+(pool_end + 1)); 
+       sel_range.Borders.Weight = 3;
+       sel_range = ActiveSheet.Range("A" +(pool_end + 1) + ":D"+(pool_end + 1));
+       sel_range.MergeCells = true;
+       sel_range.Font.Bold = true;
+ 
+       pool_begin = pool_end + 4;
+   end;
+    
+    ActiveSheet.Cells.Font.Name = "Times New Roman";
+    ActiveSheet.Cells.Font.Size = 12;
+    qt.Refresh(False);
+    
+    if (not removeFile("$"+forExcel))
+        println("Не смог удалить файл "+forExcel+" с локального диска. Ничего сташного, продолжаем работу.");
+    else
+        println("УСПЕШНО удален файл "+forExcel+" с локального диска.");
+    end;
+    
+    if (not removeFile("$"+forExcel2))
+        println("Не смог удалить файл "+forExcel2+" с локального диска. Ничего сташного, продолжаем работу.");
+    else
+        println("УСПЕШНО удален файл "+forExcel2+" с локального диска.");
+    end;
+    
+    ExcelApplication.visible = true;
+    
+end;
+macro transToExcel(tempFileName, tempFileName2)
+    private var m_errCode :integer = NULL;
+
+    //Создаём файл на терминале, куда скопируем текст с разделителями
+    forExcel =output+{oper}+"_"+date+"_"+time; 
+    forExcel = StrSubst ( forExcel, ".", "_" );
+    forExcel = StrSubst ( forExcel, ":", "_" );
+    forExcel = StrSubst ( forExcel, " ", "_" );
+    
+    forExcel2 =output+"sheet2"+{oper}+"_"+date+"_"+time; 
+    forExcel2 = StrSubst ( forExcel2, ".", "_" );
+    forExcel2 = StrSubst ( forExcel2, ":", "_" );
+    forExcel2 = StrSubst ( forExcel2, " ", "_" );
+    
+    
+    if (ExcelApplication == null)
+         if (startAX == null)
+            startAX = CreateObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone());
+         end;
+         ExcelApplication = startAX.CreateComObject("Excel.Application");
+         debugbreak;
+   end;
+   
+   NameDefaultPath = ExcelApplication.defaultFilePath;
+   
+      
+    forExcel ="$"+NameDefaultPath + "\\" +forExcel;
+    if (not CopyFile(tempFileName, forExcel))
+        println ("Error Copy file");
+    end;
+    
+    forExcel2 ="$"+NameDefaultPath + "\\"+forExcel2;
+    if (not CopyFile(tempFileName2, forExcel2))
+        println ("Error Copy file");
+    end;
+    
+    //Ищем файл шаблона
+    GetRegistryValue(TEMLSDIR_REESTR,2,out);
+    Fulloutput = FindPath(output, out);                    
+    if (not Fulloutput)
+        msgbox("Не найден шаблон "+output+" в директории реестра "+out);
+        exit();
+    end;
+    
+    //Создаём эксель-файл на терминале, куда скопируем шаблон
+    var xl = "$"+NameDefaultPath + "\\" + output;
+    if( not CopyFile(fulloutput, xl))
+        Msgbox("Ошибка при передаче файла на терминал\n");
+    end;
+    
+    xl = substr(xl, 2);;
+
+
+    if(not ExcelApplication.Workbooks.Add (xl))
+       exit(0, "Не открыт файл шаблона отчета");
+    else 
+        ExcelApplication.Visible = false;
+    end; 
+
+    forExcel = substr(forExcel, 2);
+    forExcel2 = substr(forExcel2, 2);
+    setParm(1, forExcel);
+    setParm(2, forExcel2);
+end;
+
+macro maker(object: infoObject, tempFileName, tempFileName2)
+    var select, query_dohod, query_rashod, query_pair, query_no_pair;
+    var debet_acc, debet_name, credit_acc, credit_name, sum, ground, mask, type, number, cdate, query_general_d, ac_d, prim_select,query_first_d;
+    var pdate, ac_k, ac_k_name, sum_k, gr_k, doc_num;
+    var condition = ""; 
+
+    SetOutPut(tempFileName2, true);
+    
+ /********************************************** Доходы ************************************************/
+ 
+ //--------------------------------Кусок основного запроса-----------------------------------------------
+    select = " (SELECT dD.T_DATE_CARRY pdate, SUBSTR (dd.t_account_payer, 1, 4)|| SUBSTR(dd.t_account_payer, 6, 3)|| substr(dd.t_account_payer, -5) mask, " +
+             "         dd.t_account_payer payer, AC.T_NAMEACCOUNT payer_name, dd.t_account_receiver receiver, " +
+             " (select acco.T_NAMEACCOUNT "
+             " from daccount_dbt acco "
+             " where DD.T_ACCOUNT_RECEIVER = acco.t_account) receiver_name," +
+             " dd.t_sum_natcur summ, ac.t_type_account ac_TYPE, DD.T_NUMB_DOCUMENT, TRANSLATE(TRANSLATE (dd.t_ground, ';', ','), chr(10), chr(1)) ground " + 
+             " FROM daccTrn_dbt dd,  dobjcode_dbt dc, daccount_dbt ac " +
+             " WHERE     SUBSTR (dd.t_account_receiver, 1, 5) = '70601' " +
+             " AND SUBSTR (dd.t_account_receiver, 10, 8) != '00002201' " +
+             " AND SUBSTR (dd.t_account_receiver, 14, 4) != '4201' " +          // 15.05.2014 DPN I-00486077-2
+             " and not REGEXP_LIKE (dd.t_account_receiver, '70601........6305') " +
+             " AND dc.t_code = '" + object.client + "'" +
+             " AND dc.t_codekind = 1  AND dc.t_objecttype = 3 " +
+             " AND dd.t_date_carry BETWEEN TO_DATE ('" + object.bDate + "', 'dd.mm.YYYY') AND  TO_DATE ('" + object.eDate + "', 'dd.mm.YYYY') " +
+             " AND ac.t_account = dd.t_account_payer " +
+             " AND ac.t_client = dc.t_objectid " +
+             " AND (dc.T_BANKCLOSEDATE >= to_date('" + object.eDate + "','DD.MM.YYYY') or dc.T_BANKCLOSEDATE = to_date('01.01.0001', 'dd.mm.yyyy')) " +
+             /*" AND dc.T_BANKDATE <= to_date('" + object.eDate + "','DD.MM.YYYY') " + //19.03.2015 R-558800-2 DPN */
+             /*VDN 28.05.2015 I-00569169 Проверку на дату вынес в блок ниже, добавил проверку на актуальность кода*/
+             " AND 1 = CASE "+
+             "           WHEN (SELECT COUNT ( * ) FROM dobjcode_dbt WHERE t_objectid = dc.t_objectid AND t_codekind = 1 AND t_objecttype = 3) = 1 THEN 1 "+ /*Если код один - на дату начала действия не смотрим*/
+             "           WHEN dc.t_bankdate <= TO_DATE ('"+ object.eDate +"', 'DD.MM.YYYY') AND dc.t_code = '"+ object.client +"'                 THEN 1 "+ /*Если кодов несколько, смотрим на дату начала действия*/
+             "                                                                                                                                    ELSE 0 "+
+             "         END "+
+             " and substr(DD.T_ACCOUNT_PAYER,1,5) not in ('30215', '30220', '30227', '30230', '30231', '30232', '30233', '30235', '30236') " +  // 15.05.2014 DPN I-00486077-2
+             " and not exists (select 1 " +
+             "                 from dpmpaym_dbt paym, dpmdocs_dbt doc " +
+             "                 where PAYM.T_PAYMENTID = DOC.T_PAYMENTID " +
+             "                 and paym.t_payer = -1 " +
+             "                 and DOC.T_ACCTRNID = DD.T_ACCTRNID " +
+             "                 and regexp_like(substr(PAYM.T_PAYERACCOUNT, 1, 5),('30[0-9][0-9][0-9]|40[89][0-9][0-9]|4[1-7][0-3][0-9][0-9]|60320'))) " +
+             ")";
+    
+    sql_execute(" CREATE or replace VIEW payer_receiver_view_" + {oper} + " AS " + " select distinct payer, receiver from " + select );
+    debugbreak;
+    
+    //----------------------------------Основной запрос. Здесь отбираются все проводки по счетам доходов, а также сторнирующие--------------
+    select = select + " union all " +
+             " (SELECT dd.t_date_carry pdate, SUBSTR (dd.t_account_receiver, 1, 4)||SUBSTR(dd.t_account_receiver, 6, 3)||SUBSTR (dd.t_account_receiver, -5) mask, " +
+             "         dd.t_account_receiver payer, ac.t_nameaccount payer_name, dd.t_account_payer receiver, "+
+             "        (SELECT acco.t_nameaccount " +
+             "         FROM daccount_dbt acco " +
+             "         WHERE dd.t_account_payer = acco.t_account) receiver_name, " +
+             "         -dd.t_sum_natcur summ, ac.t_type_account ac_type, dd.t_numb_document, " +
+             "         TRANSLATE (TRANSLATE (dd.t_ground, ';', ','), CHR (10), CHR (1)) ground " +
+             " FROM daccTrn_dbt dd, dobjcode_dbt dc, daccount_dbt ac, payer_receiver_view_" + {oper} +" prv " + 
+             " WHERE to_char(dd.t_account_payer) = prv.RECEIVER AND dc.t_code = '" + object.client + "' AND dc.t_codekind = 1 " +
+             " AND dc.t_objecttype = 3 AND dd.t_date_carry BETWEEN TO_DATE ('" + object.bDate + "', 'dd.mm.YYYY') AND  TO_DATE ('" + object.eDate + "', 'dd.mm.YYYY') " +
+             " AND ac.t_account = dd.t_account_receiver AND to_char(ac.t_account) = prv.PAYER AND ac.t_client = dc.t_objectid " +
+             " AND (dc.t_bankclosedate >= TO_DATE ('" + object.eDate + "', 'DD.MM.YYYY') " + 
+             "        OR dc.t_bankclosedate = TO_DATE ('01.01.0001', 'dd.mm.yyyy')) " +
+             /*" AND dc.t_bankdate <= TO_DATE ('" + object.eDate + "', 'DD.MM.YYYY') " + //19.03.2015 R-558800-2 DPN */
+             /*VDN 28.05.2015 I-00569169 Проверку на дату вынес в блок ниже, добавил проверку на актуальность кода*/
+             " AND 1 = CASE "+
+             "           WHEN (SELECT COUNT ( * ) FROM dobjcode_dbt WHERE t_objectid = dc.t_objectid AND t_codekind = 1 AND t_objecttype = 3) = 1 THEN 1 "+ /*Если код один - на дату начала действия не смотрим*/
+             "           WHEN dc.t_bankdate <= TO_DATE ('"+ object.eDate +"', 'DD.MM.YYYY') AND dc.t_code = '"+ object.client +"'                 THEN 1 "+ /*Если кодов несколько, смотрим на дату начала действия*/
+             "                                                                                                                                    ELSE 0 "+
+             "         END "+
+             " ) " +
+             " order by receiver, payer ";
+
+    initprogress(-1,"Производится расчет, ждите...", "Обработка счетов доходов");
+    prim_select = " select receiver from (" + select + ") group by receiver order by receiver";
+    
+    query_general_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );
+    while ((query_general_d) and (query_general_d.movenext))
+        ac_d = string(query_general_d.value(0));
+        var sum_per_ac = $0.00, cnt_per_ac = 0;
+        condition = "";
+
+        println("Проводки за период;с" + object.bDate + " по " + object.eDate);
+        println("Лицевой счёт:;`" + ac_d);
+        println(";;Контрагент");
+        println("Дата операции;Номер док.;Счет;Наименование;Сумма операции;Основание/Назначение платежа");
+       
+        //------------- По каждому из счетов плательщика отбирается группа счетов получателя----------------------------  
+        prim_select = " select payer, payer_name, sum(summ)from (" + select + ") where receiver = '" + ac_d +"' group by payer, payer_name";
+        query_first_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );        
+        
+        while((query_first_d) and (query_first_d.movenext))
+            if (money(query_first_d.value(2), 2) == $0.00)
+                condition = condition + " AND payer != '" + string(query_first_d.value(0)) + "' "; 
+            end;
+        end;
+                
+        prim_select = " select pdate, T_NUMB_DOCUMENT, payer, payer_name, summ, ground from (" + select + ") where receiver = '" + ac_d +"' order by pdate, summ";  // 15.05.2014 DPN I-00486077-2
+        query_first_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );
+      
+  
+
+        while ((query_first_d) and (query_first_d.movenext))
+            pdate = date(query_first_d.value(0));
+            doc_num = string(query_first_d.value(1));
+            ac_k = string(query_first_d.value(2));
+            ac_k_name = string(query_first_d.value(3));
+            sum_k = money(query_first_d.value(4), 2);
+            gr_k = string(query_first_d.value(5));
+            
+            sum_per_ac = sum_per_ac + sum_k;
+            cnt_per_ac = cnt_per_ac + 1;
+            
+            println(pdate + ";" + doc_num + ";`" + trim(ac_k) + ";" + trim(ac_k_name) + ";"+sum_k + ";" + gr_k);
+        end;
+        aw(k) = cnt_per_ac;
+        k = k + 1;
+        cnt_of_progress = cnt_of_progress + cnt_per_ac;
+        println("ИТОГО:;;;;"+ money(sum_per_ac,2));
+        println(); println();
+        useprogress(int(cnt_of_progress));
+    end;
+    
+    SetOutPut(null,true);
+    
+    SetOutPut(tempFileName, true);
+    
+    select = " CREATE or replace VIEW trans_view_" + {oper} + " AS " + select;
+    sql_execute(select);
+    //---------------Формирование основного отчёта (Лист1 Эксель)--------------------
+    //----------------Отбор проводок с участием парных счетов -----------------------
+    select = " create or replace view trans_pair_view_" + {oper} + " as " +
+             " select distinct pair.cnt, pair.mask, " +
+             " CASE WHEN pair.cnt = 1 THEN ctv.payer ELSE '-' END payer, " +
+             " CASE WHEN pair.cnt = 1 THEN ctv.payer_name ELSE '-' END payer_name, pair.receiver, " +
+             " (select acco.T_NAMEACCOUNT from daccount_dbt acco where ctv.RECEIVER = acco.t_account) receiver_name, " +
+             " pair.summ, pair.ac_type, " +
+             "        case " +
+             "            when pair.cnt  = 1 then ctv.ground " +
+             "            else '-' " +
+             "        end ground " +
+             " from trans_view_" + {oper} + " ctv, " +
+             " (select count(*) cnt, vv.mask mask, vv.receiver, sum(vv.summ) summ, vv.ac_type ac_type " +
+             "  from trans_view_" + {oper} + " vv " +
+             "  where vv.ac_type LIKE '%Ш%' " +
+             "  group by vv.mask, vv.receiver,  vv.ac_type ) pair " +
+             "  where pair.mask = ctv.mask and pair.receiver = ctv.receiver and pair.ac_type = ctv.ac_type " ;
+             
+    sql_execute(select);
+    
+    //----------------Отбор проводок с участием НЕпарных счетов -----------------------
+    select = " create or replace view  trans_no_pair_view_" + {oper} + " AS " +
+             " SELECT no_pair_group.cnt, no_pair_group.mask, no_pair_group.payer, no_pair_group.payer_name, no_pair_group.receiver, no_pair_group.receiver_name, no_pair_group.summ, " +
+             "           no_pair_group.ac_type, nvl(less_two.ground, '-') ground " +
+             " FROM    (SELECT COUNT ( * ) cnt, no_pair.mask, no_pair.payer, no_pair.payer_name, no_pair.receiver,no_pair.receiver_name, SUM (no_pair.summ) summ, no_pair.ac_type, " +
+             "                 CASE WHEN COUNT ( * ) > 1 THEN '-' ELSE 'ground' END ground " +
+             "          FROM (SELECT * FROM trans_view_" + {oper} +
+             "                WHERE not (ac_type LIKE '%Ш%' ))no_pair " +
+             "          GROUP BY no_pair.mask, no_pair.payer, no_pair.payer_name, no_pair.receiver, no_pair.receiver_name, no_pair.ac_type) no_pair_group " +
+             "      LEFT JOIN " +
+             "        (SELECT COUNT (vv.payer) cnt, vv.payer payer, vv.receiver receiver, SUM (vv.summ) summa, vv.ac_type TYPE, vv.ground " +
+             "         FROM  trans_view_" + {oper} + " vv " +
+             "         GROUP BY vv.payer, vv.receiver, vv.ac_type, vv.ground " +
+             "         HAVING COUNT (vv.payer) < 2 " +
+             "         ORDER BY vv.receiver) less_two " +
+             "     ON no_pair_group.cnt = less_two.cnt " +
+             "     AND no_pair_group.payer = less_two.payer " +
+             "     AND no_pair_group.receiver = less_two.receiver " +
+             "     AND no_pair_group.summ = less_two.summa " +
+             "     AND no_pair_group.ac_type = less_two.TYPE " +
+             "     AND no_pair_group.ground = 'ground' ";
+        
+     sql_execute(select);
+     
+          select = " select nvl(sum(summ),0) sum  " +
+              " from (select * from (trans_pair_view_" + {oper} + ") " +
+              "       union " +
+              "      (select * from trans_no_pair_view_" + {oper} + ")) " ;
+     query_dohod = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+     if (query_dohod.movenext)  
+         sum_all = money(query_dohod.value(0), 2);
+     end;
+     //-------------------Собираем все проводки вместе -------------------------------------
+     select = " select cnt, mask, payer, payer_name, receiver, receiver_name, summ, ac_type, ground " +
+              " from (select * from trans_pair_view_" + {oper} + ") " +
+              "       union " +
+              "      (select * from trans_no_pair_view_" + {oper} + ") " +
+              " order by receiver, payer";
+              
+     query_dohod = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+       
+     while (query_dohod.movenext)
+        
+         
+        mask = string(query_dohod.value(1));
+        debet_acc = string(query_dohod.value(2));
+        debet_name = string(query_dohod.value(3));
+        credit_acc = string(query_dohod.value(4));
+        credit_name = string(query_dohod.value(5));
+        sum = money(query_dohod.value(6), 2);
+        type = string(query_dohod.value(7));
+        ground = string(query_dohod.value(8));
+        var buff_ac = ""; // хранит предыдущий счёт
+        var buff_ac_res = ""; //хранит результирующее значение счетов
+        var buff_name = ""; //
+        
+        if (debet_acc == "-")
+            select = " select vv.payer, vv.payer_name " +
+                     " from trans_view_" + {oper} + " vv" +
+                     " where vv.MASK = " + mask +
+                     " and vv.receiver = '" + credit_acc + "'" +
+                     " and vv.receiver_name = '" + credit_name + "'" +
+                     " and vv.ac_TYPE = '" + type + "'";
+            query_pair = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+
+           //----- Если есть несколько счетов с одним контрагентом - пишем их в одну ячейку Эксель --------------
+            while (query_pair.movenext)
+                debet_acc = string(query_pair.value(0));
+                debet_name = string(query_pair.value(1));
+                if (trim(buff_ac) != trim(debet_acc))
+                    buff_ac = debet_acc;
+                    buff_ac_res =buff_ac_res + buff_ac + " ";
+                    buff_name = buff_name + debet_name + ", ";
+                end;
+            end;            
+            debet_acc = buff_ac_res;
+            debet_name = buff_name;
+        end;
+        if (sum != $0.00)
+            println(cnt + ";`" + trim(debet_acc) + ";" + trim(debet_name) + ";`"+credit_acc + ";" + credit_name + ";" + sum + ";" + ground);
+        end;        
+        cnt = cnt + 1;
+       // msgbox(cnt);
+       
+       
+    end; 
+    
+    sql_execute("drop view trans_view_" + {oper});
+    sql_execute("drop view trans_pair_view_" + {oper});
+    sql_execute("drop view trans_no_pair_view_" + {oper});
+    sql_execute("drop view payer_receiver_view_" + {oper});
+    remprogress(cnt_of_progress);
+   /******************************************************* Расходы ****************************************************************/
+   
+    SetOutPut(tempFileName2, true);
+    cnt_of_progress = 0;
+   //--------------------------------Кусок основного запроса-----------------------------------------------
+    select = " (SELECT dD.T_DATE_CARRY pdate, SUBSTR (dd.t_account_receiver, 1, 4) ||SUBSTR(dd.t_account_receiver, 6, 3)|| SUBSTR (dd.t_account_receiver, -5) mask, " +
+             "        dd.t_account_receiver receiver, ac.t_nameaccount receiver_name, dd.t_account_payer payer, " +
+             "                  (SELECT acco.t_nameaccount " +
+             "                   FROM daccount_dbt acco " +
+             "                   WHERE dd.t_account_payer = acco.t_account) payer_name, " +
+             "        dd.t_sum_natcur summ, ac.t_type_account ac_type, DD.T_NUMB_DOCUMENT, TRANSLATE(TRANSLATE (dd.t_ground, ';', ','), chr(10), chr(1)) ground " +
+             " FROM daccTrn_dbt dd, dobjcode_dbt dc, daccount_dbt ac " +
+             " WHERE     SUBSTR (dd.t_account_payer, 1, 5) = '70606' " +
+             " AND SUBSTR (dd.t_account_payer, 10, 8) != '00002101' " +
+             " and not REGEXP_LIKE (DD.T_ACCOUNT_PAYER, '70606........5302') " +  // 15.05.2014 DPN I-00486077-2
+             " AND dc.t_code = '"+ object.client +"'" +
+             " AND dc.t_codekind = 1 AND dc.t_objecttype = 3 " +
+             " AND dd.t_date_carry BETWEEN TO_DATE ('" + object.bDate + "', 'dd.mm.YYYY') AND  TO_DATE ('" + object.eDate + "', 'dd.mm.YYYY') " +
+             " AND ac.t_account = dd.t_account_receiver " +
+             " AND ac.t_client = dc.t_objectid " +
+             " AND (dc.T_BANKCLOSEDATE >= to_date('" + object.eDate + "','DD.MM.YYYY') or dc.T_BANKCLOSEDATE = to_date('01.01.0001', 'dd.mm.yyyy')) " +
+             /*" AND dc.T_BANKDATE <= to_date('" + object.eDate + "','DD.MM.YYYY') " + //19.03.2015 R-558800-2 DPN */
+             /*VDN 28.05.2015 I-00569169 Проверку на дату вынес в блок ниже, добавил проверку на актуальность кода*/
+             " AND 1 = CASE "+
+             "           WHEN (SELECT COUNT ( * ) FROM dobjcode_dbt WHERE t_objectid = dc.t_objectid AND t_codekind = 1 AND t_objecttype = 3) = 1 THEN 1 "+ /*Если код один - на дату начала действия не смотрим*/
+             "           WHEN dc.t_bankdate <= TO_DATE ('"+ object.eDate +"', 'DD.MM.YYYY') AND dc.t_code = '"+ object.client +"'                 THEN 1 "+ /*Если кодов несколько, смотрим на дату начала действия*/
+             "                                                                                                                                    ELSE 0 "+
+             "         END "+
+             " and substr(DD.T_ACCOUNT_RECEIVER,1,5) not in ('30215', '30220', '30227', '30230', '30231', '30232', '30233', '30235', '30236') " +  // 15.05.2014 DPN I-00486077-2
+             " and  NOT exists (select 1 " +
+             "                  from dpmpaym_dbt paym, dpmdocs_dbt doc " +
+             "                  where PAYM.T_PAYMENTID = DOC.T_PAYMENTID " +
+             "                  and paym.t_RECEIVER = -1 " +
+             "                  and DOC.T_ACCTRNID = DD.T_ACCTRNID " +
+             "                  and regexp_like(substr(PAYM.T_RECEIVERACCOUNT, 1, 5),('30[0-9][0-9][0-9]|40[89][0-9][0-9]|4[1-7][0-3][0-9][0-9]|60320'))) " +
+             " )";
+             
+    sql_execute(" CREATE or replace VIEW payer_receiver_view_" + {oper} + " AS select distinct payer, receiver from  " + select);
+    
+    //----------------------------------Основной запрос. Здесь отбираются все проводки по счетам расходов, а также сторнирующие---------------
+    select = select + " union all " +
+            " (SELECT dd.t_date_carry pdate, SUBSTR (dd.t_account_payer, 1, 4) ||SUBSTR(dd.t_account_payer, 6, 3)|| SUBSTR (dd.t_account_payer, -5) mask, " +
+            "         dd.t_account_payer receiver, ac.t_nameaccount receiver_name, " +
+            "         dd.t_account_receiver payer, (SELECT acco.t_nameaccount " +
+            "                                       FROM daccount_dbt acco " +
+            "                                       WHERE dd.t_account_receiver LIKE acco.t_account) payer_name," +
+            "         -dd.t_sum_natcur summ, ac.t_type_account ac_type, dd.t_numb_document, " +
+            "         TRANSLATE (TRANSLATE (dd.t_ground, ';', ','), CHR (10), CHR (1)) ground " +
+            "  FROM daccTrn_dbt dd, dobjcode_dbt dc, daccount_dbt ac, payer_receiver_view_" + {oper} +" prv " +
+            "  WHERE  to_char(dd.t_account_receiver) = prv.payer AND dc.t_code = '"+ object.client +"' AND dc.t_codekind = 1 " +
+            "  AND dc.t_objecttype = 3 AND dd.t_date_carry BETWEEN TO_DATE ('" + object.bDate + "', 'dd.mm.YYYY') AND  TO_DATE ('" + object.eDate + "', 'dd.mm.YYYY') " +
+            "  AND to_char(ac.t_account) = prv.receiver AND to_char(dd.t_account_payer) = prv.receiver and ac.t_client = dc.t_objectid " +
+             " AND (dc.t_bankclosedate >= TO_DATE ('" + object.eDate + "', 'DD.MM.YYYY') " + 
+             "        OR dc.t_bankclosedate = TO_DATE ('01.01.0001', 'dd.mm.yyyy')) " +
+           /*  " AND dc.t_bankdate <= TO_DATE ('" + object.eDate + "', 'DD.MM.YYYY') " +  //19.03.2015 R-558800-2 DPN */
+             /*VDN 28.05.2015 I-00569169 Проверку на дату вынес в блок ниже, добавил проверку на актуальность кода*/
+             " AND 1 = CASE "+
+             "           WHEN (SELECT COUNT ( * ) FROM dobjcode_dbt WHERE t_objectid = dc.t_objectid AND t_codekind = 1 AND t_objecttype = 3) = 1 THEN 1 "+ /*Если код один - на дату начала действия не смотрим*/
+             "           WHEN dc.t_bankdate <= TO_DATE ('"+ object.eDate +"', 'DD.MM.YYYY') AND dc.t_code = '"+ object.client +"'                 THEN 1 "+ /*Если кодов несколько, смотрим на дату начала действия*/
+             "                                                                                                                                    ELSE 0 "+
+             "         END "+
+             " ) " +
+             " order by payer, receiver ";
+
+    initprogress(-1,"Производится расчет, ждите...", "Обработка счетов расходов");
+    
+    //------------ Формируется расшифровка к отчёту(Лист2 Эксель) путём отбора счетов плательщика------------------
+    prim_select = " select payer from (" + select + ") group by payer order by payer";
+    
+    query_general_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );
+    while ((query_general_d) and (query_general_d.movenext))
+        ac_d = string(query_general_d.value(0));
+        sum_per_ac = $0.00; cnt_per_ac = 0;
+        condition = "";
+
+        println("Проводки за период;с" + object.bDate + " по " + object.eDate);
+        println("Лицевой счёт:;`" + ac_d);
+        println(";;Контрагент");
+        println("Дата операции;Номер док.;Счет;Наименование;Сумма операции;Основание/Назначение платежа");
+       
+    //------------- По каждому из счетов плательщика отбирается группа счетов получателя----------------------------           
+        prim_select = " select receiver, receiver_name, sum(summ)from (" + select + ") where payer = '" + ac_d +"' group by receiver, receiver_name";
+        query_first_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );
+         
+        while((query_first_d) and (query_first_d.movenext))
+            if (money(query_first_d.value(2), 2) == $0.00)
+                condition = condition + " AND receiver != '" + string(query_first_d.value(0)) + "' "; 
+            end;
+        end;
+           
+        prim_select = " select pdate, T_NUMB_DOCUMENT, receiver, receiver_name, summ, ground from (" + select + ") where payer = '" + ac_d +"' " + condition +  " order by pdate, summ"; // 15.05.2014 DPN I-00486077-2
+        query_first_d = RSDRecordset(RSDCommand(prim_select), RSDVAL_CLIENT, RSDVAL_Static );
+        
+        while ((query_first_d) and (query_first_d.movenext))
+            pdate = date(query_first_d.value(0));
+            doc_num = string(query_first_d.value(1));
+            ac_k = string(query_first_d.value(2));
+            ac_k_name = string(query_first_d.value(3));
+            sum_k = money(query_first_d.value(4), 2);
+            gr_k = string(query_first_d.value(5));
+            
+            sum_per_ac = sum_per_ac + sum_k;
+            cnt_per_ac = cnt_per_ac + 1;
+            
+            println(pdate + ";" + doc_num + ";`" + trim(ac_k) + ";" + trim(ac_k_name) + ";"+sum_k + ";" + gr_k);
+        end;
+        aw(k) = cnt_per_ac;
+        cnt_of_progress = cnt_of_progress + cnt_per_ac;
+        k = k + 1;
+        println("ИТОГО:;;;;"+ money(sum_per_ac,2));
+        println(); println();
+        useprogress(int(cnt_of_progress));
+    end;
+    
+    SetOutPut(null,true);
+    
+    SetOutPut(tempFileName, true);
+    
+    //---------------Формирование основного отчёта (Лист1 Эксель). Отбор проводок с участием парных счетов ----------------
+    select = " CREATE or replace VIEW trans_view_" + {oper} + " AS " + select;
+    sql_execute(select);
+        
+    
+    select = " create or replace view trans_pair_view_" + {oper} + " as " +
+             " SELECT DISTINCT pair.cnt, pair.mask, CASE WHEN pair.cnt = 1 THEN ctv.receiver ELSE '-' END receiver, " +
+             "        CASE WHEN pair.cnt = 1 THEN ctv.receiver_name ELSE '-' END receiver_name, " +
+             "        pair.payer, (SELECT acco.t_nameaccount FROM daccount_dbt acco WHERE ctv.payer = acco.t_account) payer_name, " +
+             "        pair.summ, pair.ac_type, " +
+             "        CASE WHEN pair.cnt = 1 THEN ctv.ground ELSE '-' END ground " +
+             " FROM trans_view_" + {oper} + " ctv, "
+             "      (SELECT COUNT ( * ) cnt, vv.mask mask, vv.payer, SUM (vv.summ) summ, vv.ac_type ac_type " +
+             "       FROM trans_view_" + {oper} + " vv " +
+             "       WHERE vv.ac_type LIKE '%Ш%' "
+             "       GROUP BY vv.mask, vv.payer, vv.ac_type) pair " +
+             " WHERE pair.mask = ctv.mask AND pair.payer = ctv.payer AND pair.ac_type = ctv.ac_type ";
+    sql_execute(select);
+    
+    //------------------- Отбор проводок с участием НЕпарных счетов ----------------
+        select = " create or replace view  trans_no_pair_view_" + {oper} + " AS " +
+             " SELECT no_pair_group.cnt, no_pair_group.mask, no_pair_group.receiver, no_pair_group.receiver_name, no_pair_group.payer, " +
+             "         no_pair_group.payer_name, no_pair_group.summ, no_pair_group.ac_type, NVL (less_two.ground, '-') ground " +
+             " FROM    (SELECT COUNT ( * ) cnt, no_pair.mask, no_pair.receiver, no_pair.receiver_name, no_pair.payer, no_pair.payer_name, " +
+             "                 SUM (no_pair.summ) summ, no_pair.ac_type, CASE WHEN COUNT ( * ) > 1 THEN '-' ELSE 'ground' END ground " +
+             "          FROM (SELECT * FROM trans_view_"+ {oper} + " WHERE NOT (ac_type LIKE '%Ш%')) no_pair " +
+             " GROUP BY no_pair.mask, no_pair.receiver, no_pair.receiver_name, no_pair.payer, no_pair.payer_name, no_pair.ac_type) no_pair_group " +
+             " LEFT JOIN " +
+             "  (SELECT COUNT (vv.receiver) cnt, vv.payer receiver, vv.receiver payer, SUM (vv.summ) summa, vv.ac_type TYPE, vv.ground " +
+             "   FROM trans_view_"+ {oper} + " vv  GROUP BY vv.receiver, vv.payer, vv.ac_type, vv.ground HAVING COUNT (vv.receiver) < 2 " +
+             "   ORDER BY vv.payer) less_two " +
+             " ON no_pair_group.cnt = less_two.cnt AND no_pair_group.receiver = less_two.receiver AND no_pair_group.payer = less_two.payer " +
+             " AND no_pair_group.summ = less_two.summa AND no_pair_group.ac_type = less_two.TYPE AND no_pair_group.ground = 'ground' ";
+    sql_execute(select);
+     
+    select = " select nvl(sum(summ),0) sum  " +
+              " from ((select * from trans_pair_view_" + {oper} + ") " +
+              "       union " +
+              "      (select * from trans_no_pair_view_" + {oper} + ")) " ;
+     query_rashod = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+     if (query_rashod.movenext)  
+         sum_all = money(sum_all, 2) + money(query_rashod.value(0), 2);
+     end;
+    
+    //-------------------Собираем все проводки вместе -------------------------------------
+    select = " SELECT cnt, mask, receiver, receiver_name, payer, payer_name, summ, ac_type, ground " +
+             " FROM (SELECT * FROM trans_pair_view_" + {oper} + ")" +
+             "  UNION " +
+             " (SELECT * FROM trans_no_pair_view_" + {oper} + ")" +
+             " ORDER BY payer, receiver ";
+    query_rashod = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+    
+    while (query_rashod.movenext)
+      //  UseProgress();
+        mask = string(query_rashod.value(1));
+        debet_acc = string(query_rashod.value(4));
+        debet_name = string(query_rashod.value(5));
+        credit_acc = string(query_rashod.value(2));
+        credit_name = string(query_rashod.value(3));
+        sum = money(query_rashod.value(6), 2);
+        type = string(query_rashod.value(7));
+               ground = string(query_rashod.value(8));
+        buff_ac = "";
+        buff_ac_res = ""; //хранит результирующее значение счетов
+        buff_name = ""; //
+
+        if (credit_acc == "-")
+            select = " select vv.receiver, vv.receiver_name " +
+                     " from trans_view_" + {oper} + " vv" +
+                     " where vv.MASK = " + mask +
+                     " and vv.payer = '" + debet_acc + "'" +
+                     " and vv.payer_name = '" + debet_name + "'" +
+                     " and vv.ac_TYPE = '" + type + "'";
+            query_pair = RSDRecordset(RSDCommand(select), RSDVAL_CLIENT, RSDVAL_Static );
+       
+            while (query_pair.movenext)
+                credit_acc = string(query_pair.value(0));
+                credit_name = string(query_pair.value(1));
+                if (trim(buff_ac) != trim(credit_acc))
+                    buff_ac = credit_acc;
+                    buff_ac_res =buff_ac_res + buff_ac + " ";
+                    buff_name = buff_name + credit_name + ", ";
+                end;
+            end;            
+            credit_acc = buff_ac_res;
+            credit_name = buff_name;
+        end;
+        if (sum != $0.00)
+            println(cnt + ";`" + trim(debet_acc) + ";" + trim(debet_name) + ";`"+credit_acc + ";" + credit_name + ";" + sum + ";" + ground);
+        end;
+        cnt = cnt + 1;
+      //  useprogress(int(cnt));
+    end;
+   sql_execute("drop view trans_view_" + {oper});
+   sql_execute("drop view trans_pair_view_" + {oper});
+   sql_execute("drop view trans_no_pair_view_" + {oper});
+   sql_execute("drop view payer_receiver_view_" + {oper});
+   SetOutPut(null,true);
+   remprogress(cnt_of_progress);
+end;
+
+class(TRsbPanel) MainPanel()
+    InitTRsbPanel();
+    
+    setCaption("Определение контролируемых сделок:");
+    setStatus("F2 - Выполнить, F3 - Выбор даты, Esc - Выход");
+   
+    private const FT_DATE = 9;
+    private const FT_STRING = 7;
+    var dateCarry = {curdate};
+    var startVal = "";
+    var info: infoObject;
+    
+    private var labelDateBegin: TRsbLabel = TRsbLabel(10, 2, "Начальная дата:");
+    private var labelDateEnd: TRsbLabel = TRsbLabel(11, 4, "Конечная дата:");
+    private var labelClient: TRsbLabel = TRsbLabel(11, 6, "Контрагент:");
+    private var labelCurrDate: TRsbLabel = TRsbLabel(3, 8, "Дата формирования отчёта:");
+    
+    private var fieldDateBegin: TRsbEditField = TRsbEditField(FT_DATE);
+    private var fieldDateEnd: TRsbEditField = TRsbEditField(FT_DATE);
+    private var fieldClient: TRsbEditField = TRsbEditField(FT_STRING);
+    private var fieldCurrDate: TRsbEditField = TRsbEditField(FT_DATE);
+
+    setSize(35,10);
+    setPosition(43,15);
+
+    fieldDateBegin.bindValue(this,"dateCarry", 8);
+    fieldDateBegin.setPosition(22,2);   
+    fieldDateBegin.setSize(8,1);
+    fieldDateBegin.onKeyPressed(R2M(this, "callCalendarBegin"));
+
+    fieldDateEnd.bindValue(this, "dateCarry", 8);
+    fieldDateEnd.setPosition(22,4);   
+    fieldDateEnd.setSize(8,1);
+    fieldDateEnd.onKeyPressed(R2M(this, "callCalendarEnd")); 
+    
+
+    fieldClient.bindValue(this, "startVal", 20);
+    fieldClient.setPosition(20,6);  
+    fieldClient.setSize(10,1);
+    fieldClient.onKeyPressed(R2M(this, "fieldListener"));
+
+    fieldCurrDate.bindValue(this, "dateCarry", 8);
+    fieldCurrDate.setPosition(22,8);   
+    fieldCurrDate.setSize(8,1);
+    fieldCurrDate.editable = false;
+
+    addlabel(labelDateBegin);
+    addlabel(labelDateEnd);
+    addlabel(labelClient);
+    addlabel(labelCurrDate);
+    
+    addControl(fieldDateBegin);
+    addControl(fieldDateEnd);
+    addControl(fieldClient);
+    addControl(fieldCurrDate);
+    
+    macro startReport(object:infoObject)
+        createUniqueFile(bName, lName, lname2);
+        maker(object, lName, lname2);
+        if (cnt < 2)
+            msgbox("Данные отсутствуют");
+            close(0);
+            exit(0);
+        end;
+        transToExcel(lName, lname2);
+        OpenTempl(forExcel,forExcel2, object);
+        close(0);
+        exit(0);
+    end;
+    
+    macro fieldListener(key:TRsbKeyPressedEvent)
+        if(key.KeyCode == KEY_F2)
+
+            info.client = fieldClient.value;
+            info.bDate = fieldDateBegin.value; 
+            info.eDate = fieldDateEnd.value;
+            info.checkClient();
+            info.checkDate();
+            startReport(info);
+            close();
+            exit(0);
+        end;
+    end;
+    
+    macro callCalendarBegin(key:TRsbKeyPressedEvent)
+        if(key.keyCode == KEY_F3)
+            var d:Date = Date(GetDateByCalendar({curdate}));
+            if ((d > fieldDateEnd.value) )
+                fieldDateBegin.value = fieldDateEnd.value;
+            else
+                fieldDateBegin.value = d; 
+            end;
+            info.bDate = fieldDateBegin.value;            
+        end;        
+        if(key.KeyCode == KEY_F2)
+            info.client = fieldClient.value;
+            info.checkClient();
+            info.checkDate();
+            startReport(info);
+            close();
+            exit(0);
+        end;
+    end;
+   
+    macro callCalendarEnd(key:TRsbKeyPressedEvent)
+        if(key.keyCode == KEY_F3)
+            var d:Date = Date(GetDateByCalendar({curdate}));
+            if ((d < fieldDateBegin.value))
+                fieldDateEnd.value = fieldDateBegin.value;
+            else
+                fieldDateEnd.value = d; 
+            end;           
+            info.eDate = fieldDateEnd.value; 
+        end;        
+        if(key.KeyCode == KEY_F2)
+            info.client = fieldClient.value;
+            info.checkClient();
+            info.checkDate();
+            startReport(info);
+            close();
+            exit(0);
+        end;
+    end;
+end;
+
+
+var panel:TRsbPanel = MainPanel;
+panel.run;    
+panel.close(0);
+exit(0);
+

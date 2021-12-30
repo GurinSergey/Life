@@ -1,0 +1,1312 @@
+/************************************************************************/
+/*         Автоматизированная банковская система RS-Bank                */
+/*                 Copyright (c) R-Style Software Lab 2007              */
+/*                                                                      */
+/*  Имя файла        : pr_coctr.mac                                     */
+/*                                                                      */
+/*  Описание         : Протокол контроля по базе данных ВО              */
+/*                                                                      */
+/*  Создан           : 28.03.2007                                       */
+/*                                                                      */
+/*  Изменен  30.11.11 по заявке C-6608 (Добавлено сохранение параметров */
+/*(входных и выходных) в таблице статистики (User_Timestat_dbt)Лисименко*/
+/*  Изменен  05.12.11   Оптимизирован запрос для Индексного сканирования*/
+/*Изменен: Телешова 31.01.2012 C-6867*/
+//Lavrenov: 24.05.2012 I-00198457-2 добавил градусник и сообщение в статус
+// KS 29.05.2012 I-00198430
+// KS 08.06.2012 I-00198430
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// LVV 4.12.2014 I-00537033-2 заменил по всему макросу party.t_PartyID на NVL (party.t_PartyID,0) 
+// DPN 03.02.2015 R-536792-4 Добавил условие для того чтобы не задваивались доки, у которых несколько записей по вал. операциям
+// TAM 27.02.2015 C-36469 Упорядочивание по коду ВО
+/************************************************************************/
+
+import bcprncom, PSInter, oralib, pm_common, pm_tools;
+import prpm, gnd120p;
+const КомуПредставляется = "";
+import "ASVKB_mas.mac";
+import "or_rep_h.mac";
+
+import "valid_paym.mac";
+
+//TAM 16.11.11 C-6608 - сбор статистики по старому запросу
+import "TimeStat.mac";
+import "fg_Life_parm.mac"; //26.11.2012 TAM
+
+//Dex
+var nerezedent , rezedent ="401*,402*,403*,404*,405*,406*,407*,40802*";
+getRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\СЧЕТА НЕРЕЗИДЕНТОВ",V_string,nerezedent);
+//TAM 31.01.2012 C-6867
+var Ner = "40807*,40820*,426*";
+
+//TAM 20.07.2012 I-00223929-2
+var spec:SpecVal;
+spec = NullVal;
+//TAM 26.11.2012
+private var fgBank = fg_life_subject({OurBank});
+
+
+array m_rez, m_nerez;
+
+// TAM 23.07.2012 
+//ARRAY pay_arr, pay_arr_n, pay_arr_sum, pay_arr_date, pay_arr_flag, FIVArrSum, arr_countVOOP, arr_firstVOOP; // массив платежей для выгрузки
+
+var pay_arr = TARRAY;
+var pay_arr_n = TARRAY;
+var pay_arr_sum = TARRAY;
+var pay_arr_date = TARRAY;
+var pay_arr_flag = TARRAY;
+var FIVArrSum = TARRAY;
+var arr_countVOOP = TARRAY;
+var arr_firstVOOP = TARRAY; // массив платежей для выгрузки
+
+
+var i=0, FIVArrSumCur = 0;
+var    CountVOOP = 0, FirstVOOP = 0;
+
+macro get_mask(a, mask);   // возвращает массив масок счетов (для резидентов/нерезидентов)
+   var fl = 0;
+   var pos;
+   while ( fl < 1 )
+      pos = index (a,",");
+         if (pos!=0)
+               mask[i] = substr(a,1,pos-2);
+         a = substr(a,pos+1);
+         else
+      mask[i] = substr(a,1,5);
+            fl = 1
+         end;
+      i = i + 1;
+   end;
+return mask;
+end;
+
+macro isrezedent(id)       // проверка на резидентность
+var sql, rs;
+      sql = " Select  T_NOTRESIDENT "+
+                  "  From dparty_dbt  "+  
+            " Where T_PARTYID   = "+id;
+            rs = trsbdataset(sql);
+      if (rs.movenext())
+         if (rs.value(0)=="X")
+                  return false;
+         else
+            return true;
+         end;
+      else
+            return true;
+            end; 
+end;
+
+Private Macro IFConv(doc_kind, sum1,sum2)
+      if(doc_kind == 200)
+         return sum1;
+      else
+         return sum2;
+      end;
+end;
+
+
+private macro chek_id(id,ttt) // проверка на уникальность id операций  в массиве для выгрузки
+var tmp = 0;
+   while (tmp<=ttt)
+      if(pay_arr(tmp)==id)
+         return false
+      end;
+   tmp = tmp+1;
+   end;
+return true;
+end;
+
+/// end Dex
+
+record Payment   ( pmpaym   );
+record RmProp    ( pmrmprop );
+record Pmco      ( pmco     );
+
+/* EVG ID примечания вида "Курс для цены контракта" */
+const NOTE_KIND_VOCodes     = 111,
+         NOTE_KIND_ContrCourse = 116;
+
+//TAM 31.01.2012 C-6867
+macro GetBikByID(ID)
+      var rs:object;
+      var select:string;
+      select = " select t_code from dobjcode_dbt where t_objectid = " + ID + " and t_codekind = 3";
+      rs = execSQLselect( select, NULL, FALSE );
+      if(rs.MoveNext())
+            return rs.value(0);
+      end;
+      return "";
+end;
+
+/* получить значение из результата запроса */
+private macro getValue( rs : RsdRecordset, fld, nullValue : variant ) : variant
+  var val = rs.value(fld);
+  if( val == nullVal )
+     if( nullValue != null ) val = nullValue;
+     else                    val = "";
+     end;
+  end;
+  return val;
+end;
+
+macro GetRegDate( ID )
+  var rs:object;
+  var select:string;
+  var d:date;
+  select = " select rg.t_StartDate"+
+           " from dobjrgdoc_dbt rg"+
+           " where rg.t_ObjectType = 3"+
+             " and rg.t_RegDocKind = 2"+
+             " and rg.t_ObjectID =" + ID;
+  rs = execSQLselect( select, NULL, FALSE );
+  if(rs.MoveNext())
+    return d = rs.value(0);
+  end;
+  return "";
+end;
+
+macro GetCoutryAndAdress( ID, NotResident, Country:@string, Place:@string )
+   FILE adr(adress) key 0;
+   FILE party(party) key 0;
+   var AttrID = 0;
+   party.PartyID = ID;
+   if( not getEQ(party) )
+      return 1;
+   end;
+   ClearRecord(adr);
+   adr.PartyID = ID;
+   adr.Type    = 1;
+   if( getEQ(adr) )
+      if( (adr.Country == "") and (NotResident == "X") )
+            Country = "997";
+      else
+         GetMainObjAttr( null, OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 32, AttrID, NULL, NULL, NULL );
+         if( AttrID == 1 )
+            Country = "998";
+         else
+            Country = adr.Country;
+         end;
+      end;
+      Place = Country + ", " + adr.Adress;
+   end;
+end;
+
+macro GetPaymentAttribute(Payment,Category_id:integer)
+   var result = " ";
+   record pm(pmpaym);
+   pm.PaymentId = Payment;
+   GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(pm,OBJTYPE_PAYMENT), Category_id, /*AttrID*/null,/*Code*/null, result);
+   return result;
+end;
+
+
+macro GetCoutry(id, CountryContragent:@string )
+   FILE adr(adress) key 0;
+   FILE party(party) key 0;
+   var AttrID = 0;
+   party.PartyID = ID;
+   if( not getEQ(party) )
+      return 1;
+   end;
+   ClearRecord(adr);
+   adr.PartyID = ID;
+   adr.Type    = 1;
+   if( getEQ(adr) )
+      if( (adr.Country == "") )
+            CountryContragent = "997";
+      else
+            GetMainObjAttr( null, OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 32, AttrID, NULL, NULL, NULL );
+            if( AttrID == 1 )
+            CountryContragent = "998";
+            else
+            CountryContragent = adr.Country;
+            end;
+      end;
+   end;
+
+   var zapros   :RSDRecordset;
+   var SQLQuery :string  = "";
+
+   SQLQuery = " select t_codenum3"
+             +" from dcountry_dbt"
+             +" where t_codelat3 = '"+CountryContragent+"'";
+
+   zapros = RSDRecordset(SQLQuery); /*результат запроса*/
+   while (zapros.moveNext)
+      CountryContragent = zapros.value(0);
+   end;
+end;
+
+
+/* EVG */
+macro GetContrPriceSum ( PaymID, PaymCurr, ContrCurr, PaymentPrice:money, ContrPrice:@money )
+   var ContrCourse = 0.00;
+   /* По умолчанию сумма в валюте цены контракта равна сумме платежа */
+   ContrPrice = PaymentPrice;
+   /* Если валюта цены контракта отличается от валюты платежа,
+   сумма в валюте цены контракта = сумма платежа * курс из примечания 116 */
+   if ( PaymCurr != ContrCurr )
+      ContrCourse = money ( ReadNoteForPayment ( PaymID, NOTE_KIND_ContrCourse ));
+      if (ContrCourse != 0) // KS 14.06.2012 Добавлю условие с курсом
+         ContrPrice = money(PaymentPrice * ContrCourse);
+      end;
+   end;
+end;
+
+
+private macro conv(rez, kind, dir, acc) // для конверсии
+   if (kind == 200) // только по документам конверсии
+      if(dir == 2) // списание  2
+         if (rez == "X") // если нерезидент
+            if((substr(acc,6,3)) == "810" )
+               return true;
+            end;
+         else      //  если резидент
+            if((substr(acc,6,3)) != "810" )
+               return true;
+            end;
+         end;
+         return false;
+      else            // зачисление  1
+         if (rez == "X") //  если нерезидент
+            if((substr(acc,6,3)) == "810" )
+               return true;
+            end;
+         else      // если резидент
+            if((substr(acc,6,3)) != "810" )
+               return true;
+            end;  
+         end;
+         return false;
+      end;
+   end;
+   return true;
+end;
+
+/* EVG */
+macro GetVOCodesFromNote ( PaymID, p1,p2,p3, TransSum )
+   var NoteStr = "",
+         STR_Pasp = "",
+         STR_Code = "",
+         STR_Sums = "";
+   var Pasp, Code, Sums;
+   var pos, restStr;
+   var p_CodeBeg = 0,
+         p_CodeEnd = 0,
+         p_DealDelim = 0;
+
+   var first = true, cont = true, MainSum = $0 ;
+   if (TransSum == $14622.59)
+      debugbreak;
+   end;
+
+   NoteStr = ReadNoteForPayment ( PaymID, NOTE_KIND_VOCodes );
+   /*FIV Данный цикл определяет начальную сумму в 111 примечании*/
+   while ((cont) and ( strLen(NoteStr) > 0 ))
+      restStr = NoteStr;
+      /*FIV Цикл Суммирует текущую сумму списания с транзитного счета из примечения
+      со всеми последующими, чтобы определить что текущий + n последующих сумм =  сумме списания с транзитного счета*/
+      while ((cont) and ( strLen (restStr) > 0 ))
+         p_CodeBeg = index(restStr, "{");
+         p_CodeEnd = index(restStr, "}");
+         p_DealDelim = index(restStr, ";");
+         // если заполнено некореектно что бы не было зацикливаниея
+         if (p_DealDelim == 0)
+            p_DealDelim = index(restStr, "$");
+         end;
+         if (index(restStr, "$") == 0)
+            //p_DealDelim = index(restStr, "$");
+            restStr = "";
+         end;
+
+         Pasp = subStr( restStr, 1, p_CodeBeg-1 );
+         Code = subStr( restStr, p_CodeBeg+1, (p_CodeEnd - p_CodeBeg)-1 );
+         Sums = subStr( restStr, p_CodeEnd+1, (p_DealDelim - p_CodeEnd)-1 );
+
+         if ( strUpr(Pasp) != "ХХХХХХХХ/2412/0000/Х/0" )
+            STR_Pasp = STR_Pasp + " " + Pasp;
+         end;
+         
+         if ( strUpr(Code) != "XXXXX" )
+            STR_Code = STR_Code + " " + Code;
+         end;
+
+         if ( strUpr(Sums) != "$" )
+            if (not first)
+               STR_Sums = STR_Sums + "\n";
+            end;
+            CountVOOP = CountVOOP + 1;  /*FIV Количество валютных операций*/
+            MainSum = MainSum + money(Sums) /*FIV Сумма набора сумм из 111 примечания*/;
+            STR_Sums = STR_Sums + money(Sums);
+         
+            /*FIV Помещаем суммы из 111 примечания в массив, чтобы потом заменить ими суммы в выгрузке в АСВКБ*/
+            if (FIVArrSumCur == 0)
+               FIVArrSum[asize(FIVArrSum)] = Money(Sums);
+            end;
+            /*FIV Если сумма набора сумм = сумме из распоряжения списания с транзитного счета, 
+            то искомый набор найден - выходим и`з циклов*/
+            if (MainSum == TransSum)
+               cont = false;
+            end;
+         end;
+         /* С символа ; идёт следующий код ВО */
+         restStr = subStr( restStr, p_DealDelim+1 );
+         first = false;
+         //else
+         //   VOCodes = restStr;
+         //   restStr = "";
+         //end;
+      end;
+      
+      if (cont)
+         p_DealDelim = index(NoteStr, ";");
+         // если заполнено некореектно что бы не было зацикливаниея
+         if (p_DealDelim == 0)
+            p_DealDelim = index(NoteStr, "$");
+            //restStr
+         end;
+         if (index(NoteStr, "$") == 0)
+            //p_DealDelim = index(restStr, "$");
+            NoteStr = "";
+            cont = false;
+         end;
+        
+         NoteStr = subStr( NoteStr, p_DealDelim+1 );
+         MainSum = $0;
+         asize(FIVArrSum,0);
+         STR_Pasp = "";
+         STR_Code = "";
+         STR_Sums = "";
+         first = true;
+         CountVOOP = 0;
+      end;
+      FirstVoOp = FirstVoOp + 1; /* номер первой подходящей по сумме операции в примечании*/
+   end;
+
+   SetParm(1, trim(STR_Code));
+   SetParm(2, trim(STR_Pasp));
+   SetParm(3, trim(STR_Sums));
+
+end;
+
+// сбор данных для выгрузки в АСВКБ 
+//MACRO ASVKB_find(id);
+/*
+Payment,                record Payment   ( pmpaym   );
+Rmprop,                 record RmProp    ( pmrmprop );
+pmco,                   record Pmco      ( pmco     );
+режим,
+Macros,                 var Macros:integer; Macros=3;//memorder 
+ZachSpis,               1/2
+payment.payeraccount,   payment.payeraccount
+flV                     var Flv=0;//выгрузка платежа СОВСЕМ без кодов 0/1
+*/
+/*   var zapros   :RSDRecordset;
+   var SQLQuery :string  = "";
+   SQLQuery = " select t_codenum3"
+             +" from dcountry_dbt"
+             +" where t_codelat3 = '"+Country+"'";
+   zapros = RSDRecordset(SQLQuery); //результат запроса
+   while (zapros.moveNext)
+      country = zapros.value(0);
+   end;
+
+
+
+*/
+
+
+/*
+If ((payment.payerBankId==213)and(payment.receiverBankId==213))
+            ZachSpis=2;
+            ASVKB(Payment,Rmprop,pmco,режим,Macros,ZachSpis,payment.payeraccount,flV);
+                     If (flV==1) //если
+                     ZachSpis=1;
+                     ASVKB(Payment,Rmprop,pmco,режим,Macros,ZachSpis,payment.receiveraccount,flV); 
+                     End;
+Elif
+            (payment.payerBankId==213);
+            ZachSpis=2;
+            ASVKB(Payment,Rmprop,pmco,режим,Macros,ZachSpis,payment.payeraccount,flV);
+Elif
+            (payment.receiverBankId==213);
+            ZachSpis=1;
+            ASVKB(Payment,Rmprop,pmco,режим,Macros,ZachSpis,payment.receiveraccount,flV); 
+Else
+            Msgbox("транзитный");
+End;
+
+
+END;
+*/
+/* окончание сбора данных для выгрузки в АСВКБ */
+
+/*
+macro PrintHeader( BegDate, EndDate )
+
+[
+##################################################
+      
+Информация из базы данных по валютным операциям       с ########## 
+                                                      по ########## 
+]
+( {Name_Bank}, BegDate, EndDate );
+[
+┌────┬──────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ №  │ Сведения об операции                     │ Сведения о контракте и паспорте сделки                                      │ Сведения о клиенте                                                         │ Сведения о контрагенте                                                                                                              │
+│п/п │                                          │                                                                             │                                                                            │                                                                                                                                     │
+├────┼──────────┬─────────────────┬──────┬──────┼───────────────┬──────────┬───────────────┬──────────┬─────┬─────────────────┼────────────────────┬────────────┬─────────┬──────┬─────────────────────────┼──────────────────────────────┬────────────┬──────────────────────────────┬────────────┬────┬────────────────────────────────────────┤
+│    │Дата      │Сумма списания со│Направ│Код   │Номер контракта│ Дата     │  № паспорта   │ Дата     │Код  │Сумма ВО в валюте│ Наименование       │ ИНН        │ КПП     │Код   │ Номер счета             │Наименование                  │ ИНН        │Наименование банка            │Код банка   │Код │ Наименование страны банка              │
+│    │зачисления│счета, ед. валюты│ление │вида  │               │ контракта│   сделки      │ паспорта │валю-│цены контракта   │                    │            │         │страны│                         │получателя/                   │            │контрагента                   │            │стра│                                        │
+│    │(списания)│счета            │(1-зач│валют-│               │          │               │ сделки   │ты   │                 │                    │            │         │места │                         │плательщика                   │            │                              │            │ны  │                                        │
+│    │средств   │                 │исле- │ной   │               │          │               │          │цены │                 │                    │            │         │житель│                         │                              │            │                              │            │бан │                                        │
+│    │          │                 │ние,  │опера-│               │          │               │          │конт-│                 │                    │            │         │ства(м│                         │                              │            │                              │            │ка  │                                        │
+│    │          │                 │2-спи-│ции   │               │          │               │          │ракта│                 │                    │            │         │еста р│                         │                              │            │                              │            │    │                                        │
+│    │          │                 │сание)│      │               │          │               │          │     │                 │                    │            │         │егистр│                         │                              │            │                              │            │    │                                        │
+│    │          │                 │      │      │               │          │               │          │     │                 │                    │            │         │ации) │                         │                              │            │                              │            │    │                                        │
+├────┼──────────┼─────────────────┼──────┼──────┼───────────────┼──────────┼───────────────┼──────────┼─────┼─────────────────┼────────────────────┼────────────┼─────────┼──────┼─────────────────────────┼──────────────────────────────┼────────────┼──────────────────────────────┼────────────┼────┼────────────────────────────────────────┤
+];                                                                                                                                                                                                                                   
+
+end;                                        
+*/
+macro PrintHeader( BegDate, EndDate )
+[                                                  
+##################################################
+                                                                              
+                                                Информация из базы данных по валютным операциям      
+                                                      За период с ########## по ##########           
+]({Name_Bank}, BegDate, EndDate );
+[
+┌───┬──────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────┐
+│ № │ Сведения об операции                                                                         │ Сведения о клиенте                                                                                                                      │ Сведения о контрагенте                                                         │
+│п/п│                                                                                              │                                                                                                                                         │                                                                                │
+├───┼──────────┬──────────┬───┬──────────────┬───┬───┬─────┬──────────────────────┬───┬────────────┼──────────────────┬───────────────────────┬───────────────────────┬──────┬──────────┬────────────────────┬────────────────────┬──────────┼────────────────────┬──────┬──────┬────────────┬───────────────────┬────────────┤
+│   │Дата      │ Дата     │При│ Сумма операци│Код│Нап│Код  │Номер паспорта        │Код│Сумма ВО в  │ Наименование     │        Дебет          │        Кредит         │Код   │Дата гос  │ Адрес              │ ИНН                │ Дата     │Наименование        │Код   │Код   │ ИНН        │Наименование банка │Код банка   │
+│   │совершения│ платежа  │зна│ ед. валюты   │вал│рав│вида │сделки                │вал│в валюте    │                  │                       │                       │страны│регист-   │                    │                    │ открытия │получателя/         │страны│страны│            │контрагента        │контрагента │
+│   │операции  │          │к  │ счета        │юты│лен│валют│                      │юты│цены        │                  │                       │                       │места │рации     │                    │                    │ счета    │плательщика         │места │банка │            │                   │            │
+│   │          │          │про│              │опе│ие │ной  │                      │це-│контракта   │                  │                       │                       │житель│          │                    │                    │          │                    │житель│      │            │                   │            │
+│   │          │          │сро│              │рац│1- │опера│                      │ны │            │                  │                       │                       │ства(м│          │                    │                    │          │                    │ства(м│      │            │                   │            │
+│   │          │          │чки│              │ии │зач│ции  │                      │кон│            │                  │                       │                       │еста р│          │                    │                    │          │                    │еста р│      │            │                   │            │ 
+│   │          │          │   │              │   │2- │     │                      │тра│            │                  │                       │                       │егистр│          │                    │                    │          │                    │егистр│      │            │                   │            │
+│   │          │          │   │              │   │спи│     │                      │кта│            │                  │                       │                       │ации) │          │                    │                    │          │                    │ации) │      │            │                   │            │
+├───┼──────────┼──────────┼───┼──────────────┼───┼───┼─────┼──────────────────────┼───┼────────────┼──────────────────┼───────────────────────┼───────────────────────┼──────┼──────────┼────────────────────┼────────────────────┼──────────┼────────────────────┼──────┼──────┼────────────┼───────────────────┼────────────┤
+│ 1 │    2     │    2.1   │2.2│       3      │ 4 │ 5 │  6  │          7           │ 8 │     9      │         10       │     11                │     11.1              │  12  │     13   │         14         │       15           │    16    │         17         │  18  │  19  │     20     │         21        │     22     │
+├───┼──────────┼──────────┼───┼──────────────┼───┼───┼─────┼──────────────────────┼───┼────────────┼──────────────────┼───────────────────────┼───────────────────────┼──────┼──────────┼────────────────────┼────────────────────┼──────────┼────────────────────┼──────┼──────┼────────────┼───────────────────┼────────────┤
+];
+end; 
+/*
+┌┬─┐
+││ │
+├┼─┤
+└┴─┘
+*/
+//macro PrintDocument(Num,OpDate:date,OpSumm,Direction,OpVCode,ContNum,ContDate:date,PSNum,PSDate:date,CurCodeAgr,OpSummAgr,NameCl,INNCl,KPPCl,Country,AccCl,NameContr,INNcontr,BankContrName,BankContrCode,BankCountryCode,BankName)
+macro PrintDocument(Num,OpDate:date,OpSumm,Direction,OpVCode,PSNum,CurCodeAgr,OpSummAgr,NameCl,AccCl,tt,Country,RegDate,AddressCl,INNCl,OpenDate:date,NameContr, CountryContragent, CountryBankContragent,INNcontr,BankContrName,BankContrCode,OpCode, RealOpDate)
+   array str1, str2, str3, str4;
+   var i = 1;
+   var prpr = "";
+
+/* EVG Незаполненный шаблон кода ПС в отчёт не выводим */
+if ( SubStr (PSNum, 1, 8) == "ХХХХХХХХ")
+      PSNum = ""
+end;
+
+/* A.Gregeradsky - 04.02.2010 - Признак просрочки 7 рабочих дней для неидентифицированных сумм */
+if(trim(string(OpVCode)) == "00000")
+      // zmp 06.08.2014 I-00507083-2
+      if(valtype(RealOpDate) == v_undef) RealOpDate = OpDate;  end;
+
+      if(({curdate} - GetDateAfterWorkDays(RealOpDate,7)) > 0)
+      prpr = "X";
+      end;
+end;
+/* End Gregeradsky */
+
+/* EVG
+[│####│##########│#################│  ##  │##### │###############│##########│###############│##########│ ### │#################│####################│############│#########│ ###  │#########################│##############################│############│##############################│############│ ###│########################################│]
+(Num,OpDate:c:f,OpSumm,Direction,OpVCode,ContNum,ContDate:c:f,PSNum,PSDate:c:f,CurCodeAgr,OpSummAgr,NameCl:w,INNCl:w,KPPCl,Country,AccCl:w,NameContr:w,INNcontr:w,BankContrName:w,BankContrCode:w,BankCountryCode:w,BankName:w);
+*/
+var tmpdate = RealOpDate;
+if(valtype(tmpdate) == v_undef) tmpdate = OpDate; end;
+
+
+[│###│##########│##########│###│##############│###│ # │#####│######################│###│############│##################│#######################│#######################│ ###  │##########│####################│####################│##########│####################│ ###  │ ###  │############│###################│############│]
+(Num,OpDate,tmpdate,prpr,OpSumm:r:w,OpCode,Direction,OpVCode:w,PSNum:w,CurCodeAgr,OpSummAgr:0:2,NameCl:w,AccCl,tt,Country,RegDate,AddressCl:w,INNCl,OpenDate,NameContr:w,CountryContragent, /*TAM 03.09.2012*/ CountryBankContragent,INNcontr,BankContrName:w,BankContrCode); //TAM 03.09.2012 I-00223824-2
+end;
+
+macro PrintItog()
+[└───┴──────────┴──────────┴───┴──────────────┴───┴───┴─────┴──────────────────────┴───┴────────────┴──────────────────┴───────────────────────┴───────────────────────┴──────┴──────────┴────────────────────┴────────────────────┴──────────┴────────────────────┴──────┴──────┴────────────┴───────────────────┴────────────┘
+   Исполнитель #################################### (Ф.И.О.)
+
+   __________##########____________________]
+( {Name_Oper}, Date() );
+end;
+
+private macro CheckForRub(PaymentID)
+   FILE pmco(pmco) key 0;
+   FILE rm( pmrmprop ) key 0;
+   FILE pm( pmpaym ) key 0;
+   FILE llval(llvalues) key 0;
+   pmco.PaymentID = PaymentID;
+   rm.PaymentID = PaymentID;
+   pm.PaymentID = PaymentID;
+   llval.List = 1805;
+   llval.Element = Pmco.VO_Code;
+//  //debugbreak;
+   if( getEQ(pmco) and getEQ(rm) and getEQ(pm) and getEQ(llval))    
+      if(pm.FIID = pm.PayFIID = pm.BaseFIID = 0)
+            if(llval.Code != GetVOCodeFromGround(rm.Ground))
+               return 0;
+            end;
+
+            if((pmco.PassportNumber != "") and (pmco.PassportNumber != GetPassNumFromGround(rm.Ground)))
+            return 0;
+            end;
+
+            if((GetPassNumFromGround(rm.Ground) != "") and (pmco.PassportNumber != GetPassNumFromGround(rm.Ground)))
+            return 0;
+            end;
+      end;
+   end;
+   return 1;
+end;
+
+MACRO PrintCORep ( MapVal:PSRepMap )
+  debugbreak;
+  var BegDate:date     = MapVal.Value( "BegDate"          );
+  var EndDate:date     = MapVal.Value( "EndDate"          );
+  var FIID             = MapVal.Value( "FIID"             );
+  var DepNum           = MapVal.Value( "DepNum"           );
+  var Mode             = MapVal.Value( "Mode"             );
+  var ClientID         = MapVal.Value( "ClientID"         );
+  var BalanceAcc       = MapVal.Value( "BalanceAcc"       );
+  var Account          = MapVal.Value( "Account"          );
+  var PassNum          = MapVal.Value( "PassportNumber"   );
+  
+  PrintHeader(BegDate,EndDate);
+  
+  var Nodes:TArray = TArray();
+  GetNodeList(DepNum,Mode,Nodes);
+  var s = Nodes.size, i = 0;
+ 
+  var params:TArray = TArray();
+  var queryPay, queryRec; 
+  var queryPayO, queryPayT, queryPayE,
+      queryRecO, queryRecT, queryRecE; 
+  var select, from, where;
+  var Num, Country = "", Adress = "";
+  var CountryContragent = "";
+   //TAM 03.09.12 I-00223824-2
+   var CountryBankContragent = "";
+   /* EVG */
+   var CodeVO = "", Pass = "", Sum = $0,
+         ContrPriceSum = $0,
+         NOTE_CodeVO, NOTE_Pass, NOTE_Sums;
+   var cmd_fill, cmd_del;
+
+   // Для занесения входных и выходных параметров в usr_timestat_dbt  ЛАО.
+   var paramstat:TArray = TArray(); //
+   var stat;                        //
+   var z :integer=0;                //
+   var f :integer=0;                //
+   var ampar:integer=0;             //
+      
+   // Разбивка запроса на три части  ЛАО.
+   // var Start_query:string="Select * from (";// Шапка запроса
+   var partOne:string;              // Извлекает данные из ordinf 
+   var partTwo:string;              // Извлекает данные из dpmpaym as cr 
+   var partEnd:string;              // Извлекает данные из dpmpaym 
+   //  var End_Query:string=  ") where (flag = -1 AND paymstatus = 32000 OR flag <> -1) order by here";
+
+   var WhereO:string=" Where ordinf.now between ? and ?"+
+                              " and pmpaym.t_closedate >= ordinf.now " + //TAM 17.04.2012 R-52176-4
+                              " and (NVL (ordinf.flag, -1) = -1 AND pmpaym.t_paymstatus = 32000 OR NVL(ordinf.flag, -1) <> -1) ";
+
+   var WhereT:string=" Where ordinf.now is null and cr.T_TRANSFERDATE between ? and ?"+
+                              " and (NVL (ordinf.flag, -1) = -1 AND pmpaym.t_paymstatus = 32000 OR NVL(ordinf.flag, -1) <> -1) ";
+
+   var WhereE:string=" Where ordinf.now is null and cr.T_TRANSFERDATE=TO_DATE ('0001-01-01', 'YYYY-MM-DD') and  pmpaym.t_valuedate between ? and ? "+
+                              " and (NVL (ordinf.flag, -1) = -1 AND pmpaym.t_paymstatus = 32000 OR NVL(ordinf.flag, -1) <> -1) ";
+
+   var WhereALL:string;
+   var BlockF:integer=0;
+   var BlockC:integer=0;
+   var BlockP:integer=0;
+
+   var ValidSum; // KS 29.05.2012 I-00198430
+//  cmd_fill = RsdCommand("INSERT INTO usr_vkorders_info SELECT * FROM usr_vkorders");
+//  cmd_fill.execute();
+      //TAM 16.11.11
+
+      
+   /* decode(cr.T_TRANSFERDATE,to_date('01.01.0001','dd.mm.yyyy'),pmpaym.t_valuedate,cr.T_TRANSFERDATE) as here */
+   /* A.Gregeradsky - 12.02.2010 - Платежи по зачислению валюты на транзитник резидента отражать в АСВКБ датой исполнения первого распоряжения по транзитному счету */
+   /* Для этого реализовано вспомогатльеное представление usr_paymintrans */
+   select = "select * from ( SELECT decode((select 1 from dual where pmpaym.t_paymentid in (select pmid from usr_vkorders)),"+
+                                                               "1,"+
+                                                               "ordinf.now /*(select min(tr.now) from usr_paymintrans tr where tr.pmid = pmpaym.t_paymentid)*/,"+
+                                                               "decode(cr.T_TRANSFERDATE, to_date('01.01.0001','dd.mm.yyyy'), pmpaym.t_valuedate, cr.T_TRANSFERDATE)) as here, nvl(ordinf.summ/*_itog FIV Сумму берем не конвертированную*/, pmpaym.T_Amount), llvalues.t_Code, pmco.t_PassportNumber,"+
+                           /* EVG Если в параметрах вал. операции не задан код валюты, брать его из платежа. */
+                           " nvl (fi.t_FI_Code, fi_paym.t_FI_Code), " + 
+                           /* EVG Не нужно конвертировать валюту по курсу ЦБ. Курс берётся из примечания вида 116.
+                           /* EVG Т.к. код валюты в параметрах ВО задан не всегда, нужно, когда его нет, брать валюту 
+                              платежа. */
+                           " RSB_FIInstr.ConvSum( pmpaym.t_BaseAmount, " +
+                           "                      pmpaym.t_BaseFIID,   " +
+                           "                      decode (pmco.t_contractfiid, -1, pmpaym.t_Basefiid, pmco.t_contractfiid)," +
+                           "                      pmpaym.T_ValueDate)," +
+                           */
+                           " 1, " // EVG Чтобы не сбивалась нумерация
+                           " party.t_NotResident, NVL(party.t_PartyID,0), acc.t_open_date, acc.t_Account,"+
+                           " pmrmprop.t_PayerName, NVL(pmrmprop.t_PayerINN, ' ') , pmrmprop.t_ReceiverName, NVL(pmrmprop.t_ReceiverINN, ' ') "; 
+            
+   
+//  partOne="Select ordinf.now as here, nvl(ordinf.summ, pmco.t_amount),"
+   // KS 29.05.2012 End I-00198430
+   partOne="Select  /*+ LEADING (ordinf acc) USE_HASH(ordinf)*/  ordinf.now as here, decode(NVL (pmco.t_amount, 0), 0, nvl(ordinf.summ, pmpaym.T_Amount), pmco.t_amount),"
+               + " llvalues.t_Code, pmco.t_PassportNumber,"
+               + " nvl (fi.t_FI_Code, fi_paym.t_FI_Code), 1, "  
+               + " party.t_NotResident, NVL(party.t_PartyID,0), acc.t_open_date, acc.t_Account,"
+               + " pmrmprop.t_PayerName, NVL(pmrmprop.t_PayerINN, ' ') , pmrmprop.t_ReceiverName, NVL(pmrmprop.t_ReceiverINN, ' ') ";
+
+//  partTwo=" Union Select cr.T_TRANSFERDATE as here, nvl(ordinf.summ, pmpaym.T_Amount),"
+   // KS 29.05.2012 End I-00198430: 
+   //TAM 19.06.2013  R-205195-2: UNION ALL не делает SELECT DISTINCT
+   partTwo=" Union  ALL Select  /*+ LEADING (ordinf acc) USE_HASH(ordinf)*/ cr.T_TRANSFERDATE as here, decode(NVL (pmco.t_amount, 0), 0, nvl(ordinf.summ, pmpaym.T_Amount), pmco.t_amount),"
+               + " llvalues.t_Code, pmco.t_PassportNumber,"
+               + " nvl (fi.t_FI_Code, fi_paym.t_FI_Code), 1, "
+               + " party.t_NotResident, NVL(party.t_PartyID,0), acc.t_open_date, acc.t_Account,"
+               + " pmrmprop.t_PayerName, NVL(pmrmprop.t_PayerINN, ' ') , pmrmprop.t_ReceiverName, NVL(pmrmprop.t_ReceiverINN, ' ') ";
+
+//  partEnd=" Union Select /*+ LEADING (ordinf acc) USE_HASH(ordinf)*/  pmpaym.t_valuedate as here, nvl(ordinf.summ/*_itog FIV Сумму берем не конвертированную*/, pmpaym.T_Amount),"
+   //TAM 19.06.2013  R-205195-2: UNION ALL не делает SELECT DISTINCT
+   partEnd=" Union  ALL Select /*+ LEADING (ordinf acc) USE_HASH(ordinf)*/  pmpaym.t_valuedate as here, decode(NVL (pmco.t_amount, 0), 0, nvl(ordinf.summ/*_itog FIV Сумму берем не конвертированную*/, pmpaym.T_Amount), pmco.t_amount),"
+               + " llvalues.t_Code, pmco.t_PassportNumber,"
+               + " nvl (fi.t_FI_Code, fi_paym.t_FI_Code), 1, " // EVG Чтобы не сбивалась нумерация 
+               + " party.t_NotResident, NVL(party.t_PartyID,0), acc.t_open_date, acc.t_Account,"
+               + " pmrmprop.t_PayerName, NVL(pmrmprop.t_PayerINN, ' ') , pmrmprop.t_ReceiverName, NVL(pmrmprop.t_ReceiverINN, ' ') ";
+
+   var selectPay = " , pmrmprop.t_ReceiverBankName, cr.t_BankCode, pmco.t_contractfiid, pmpaym.T_PAYMENTID as pmid, pmpaym.T_Receiver, fi_paym.t_FI_Code, pmpaym.T_ReceiverAccount , nvl(ordinf.summ_itog, pmpaym.t_BaseAmount) as BaseA, pmpaym.t_DOCKIND, decode(cr.T_TRANSFERDATE, to_date('01.01.0001','dd.mm.yyyy'), pmpaym.t_valuedate, cr.T_TRANSFERDATE) as OpDate, nvl(ordinf.flag, -1) as flag, pmpaym.t_paymstatus as paymstatus "; /* предпоследнее значение добавлено для страны контрагента */
+   var selectRec = " , pmrmprop.t_PayerBankName, db.t_BankCode, pmco.t_contractfiid, pmpaym.T_PAYMENTID as pmid, pmpaym.T_Payer, fi_paym.t_FI_Code, pmpaym.T_PayerAccount , nvl(ordinf.summ_itog, pmpaym.t_BaseAmount) as BaseA , pmpaym.t_DOCKIND, decode(cr.T_TRANSFERDATE, to_date('01.01.0001','dd.mm.yyyy'), pmpaym.t_valuedate, cr.T_TRANSFERDATE) as OpDate, nvl(ordinf.flag, -1) as flag, pmpaym.t_paymstatus as paymstatus ";         /* предпоследнее значение добавлено для страны плательщика (контрагента) */
+   // KS 29.05.2012 I-00198430 // Ещё несколько полей
+   selectPay = selectPay + ", pmco.t_contractamount pmcocontractamount, pmco.t_amount pmcoamount ";
+   selectRec = selectRec + ", pmco.t_contractamount pmcocontractamount, pmco.t_amount pmcoamount ";
+   // KS 29.05.2012 End I-00198430
+
+   from   = " FROM dpmpaym_dbt pmpaym, dpmrmprop_dbt pmrmprop, dpmco_dbt pmco," +
+                        " dpmprop_dbt cr, dpmprop_dbt db, daccount_dbt acc, dllvalues_dbt llvalues, "+
+                        " dfininstr_dbt fi, dfininstr_dbt fi_paym, dparty_dbt party , usr_vkorders/*_info*/ ordinf " ;  /*FIV Заккоментировал _info: пусть берет данные без временной таблицы */
+
+   WhereALL=           " and pmpaym.T_PAYMENTID = pmrmprop.T_PAYMENTID" +
+                                 " and pmpaym.T_PAYMENTID = pmco.T_PAYMENTID(+) " +
+                                 " and pmpaym.T_PAYMENTID = cr.T_PAYMENTID" +
+                                 " and cr.T_DEBETCREDIT = 1" +
+                                 " and pmpaym.T_PAYMENTID = db.T_PAYMENTID" +
+                                 " and db.T_DEBETCREDIT = 0" +
+                              /*   " and pmco.T_VO_CODE > 0" + */  
+                                 " and llvalues.T_Element (+)= pmco.T_VO_CODE"+
+                                 " and llvalues.T_List (+)= 1805"+
+                                 //Gurin S. 13.02.2015 R-542579-2
+                                 //" AND PMCO.T_GENERAL(+) = 'X' " +  //03.02.2015 R-536792-4 DPN 
+                                 //" AND PMCO.T_AMOUNT(+) != 0 " +    
+                                 " and acc.T_Chapter = 1 "+  
+                                 " and fi.t_FIID (+)= pmco.t_ContractFIID" +
+                                 " and fi_paym.t_FIID = pmpaym.t_BaseFiid" +
+                                 " and ordinf.pmid(+) = pmpaym.t_paymentid" +
+                                 " and ordinf.summ(+) != 0";
+
+   where  = " WHERE pmpaym.T_PAYMENTID = pmrmprop.T_PAYMENTID" +
+                                 " and pmpaym.T_PAYMENTID = pmco.T_PAYMENTID(+) " +
+                                 " and pmpaym.T_PAYMENTID = cr.T_PAYMENTID" +
+                                 " and cr.T_DEBETCREDIT = 1" +
+                                 " and pmpaym.T_PAYMENTID = db.T_PAYMENTID" +
+                                 " and db.T_DEBETCREDIT = 0" +
+                                 /* EVG Код ВО может быть задан и в примечании 116
+                                 " and pmco.T_VO_CODE > 0" +*/
+                                 " and llvalues.T_Element (+)= pmco.T_VO_CODE"+
+                                 " and llvalues.T_List (+)= 1805"+
+                                 //Gurin S. 13.02.2015 R-542579-2
+                                 //" AND PMCO.T_GENERAL(+) = 'X' " + //03.02.2015 R-536792-4 DPN 
+                                 //" AND PMCO.T_AMOUNT(+) != 0 " +    
+                                 //" and cr.T_TRANSFERDATE BETWEEN :BegDate and :EndDate" +
+                                 //" and pmpaym.T_VALUEDATE BETWEEN :BegDate and :EndDate" +
+                                 " and acc.T_Chapter = 1 "+  
+                                 " and fi.t_FIID (+)= pmco.t_ContractFIID" +
+                                 " and fi_paym.t_FIID = pmpaym.t_BaseFiid" +
+                                 " and ordinf.pmid(+) = pmpaym.t_paymentid" +
+                                 " and ordinf.summ(+) != 0";
+
+/* поле "t_Branch" устанавливается только = 1, поэтому остальные документы в отчет не попадают     Lapik */
+/*
+   where = where + " and acc.t_Branch  in ( ";
+   while( i < s )
+      if( i != 0 )
+         where = where + ", ";
+      end;
+      where = where + Nodes[i] ;
+      i = i + 1;
+   end;
+   where = where + " ) ";
+*/
+      paramstat[paramstat.size]= string(BegDate)+"/";
+      paramstat[paramstat.size]= string(EndDate)+"/";
+      paramstat[paramstat.size]= "Dep "+string(DepNum)+"/";
+      paramstat[paramstat.size]= "Mod "+string(Mode)+"/";   //0-Podr //1 -Filial
+      
+//  msgbox(FIID);
+   if( FIID >= 0 )                                               
+      where = where + " and pmpaym.T_BASEFIID = ?";
+      whereAll = whereAll + " and pmpaym.T_BASEFIID = ?";
+      paramstat[paramstat.size]= "Fi "+string(FIID)+"/";
+      BlockF=1;
+   elif( FIID == -2 )
+      where = where + " and pmpaym.T_BASEFIID <> 0";
+      whereAll = whereAll + " and pmpaym.T_BASEFIID <> 0";
+      paramstat[paramstat.size]= "Fi Not_Base/";
+   elif ( FIID == -1 ) 
+      paramstat[paramstat.size]= "Fi ALL/";
+   end;
+
+   
+   queryPay = " and acc.T_Account(+) = pmpaym.T_PayerAccount "+
+                  " and acc.T_Code_Currency(+) = pmpaym.T_FIID "+
+                  " and party.t_PartyID(+) = pmpaym.t_payer";
+   queryRec = " and acc.T_Account(+) = pmpaym.T_ReceiverAccount "+
+                  " and acc.T_Code_Currency(+) = pmpaym.T_PayFIID "+
+                  " and party.t_PartyID(+) = pmpaym.t_receiver";     
+   
+   if( Account != "" ) 
+      queryPay = queryPay + " and " + ConvertMaskToSQLFormat( Account, "pmpaym.T_PayerAccount" );
+      queryRec = queryRec + " and " + ConvertMaskToSQLFormat( Account, "pmpaym.T_ReceiverAccount" );
+      paramstat[paramstat.size]= Account+"/";
+   end;
+
+//Dex
+   if( Account == "" )     // учтём маски счетов
+      queryPay = queryPay + " and ( " + ConvertMaskToSQLFormat( rezedent, " pmpaym.T_PayerAccount " ) +" or " +  ConvertMaskToSQLFormat( nerezedent, " pmpaym.T_PayerAccount " )+ " )  ";
+      queryRec = queryRec + " and ( " + ConvertMaskToSQLFormat( rezedent, " pmpaym.T_ReceiverAccount ") +" or  "+ ConvertMaskToSQLFormat( nerezedent, " pmpaym.T_ReceiverAccount ")+ " )  "; 
+      paramstat[paramstat.size]=  "ALL_Account/";
+end;
+// end Dex
+
+   if( ClientID >= 0 )
+      //debugbreak;
+      queryPay = queryPay + " and pmpaym.t_Payer = ? ";
+      queryRec = queryRec + " and pmpaym.t_Receiver = ? ";
+      paramstat[paramstat.size]= string(ClientID)+"/";
+      BlockC=1;
+   else
+      paramstat[paramstat.size]= "ALL_Client/";  
+   end;
+
+   if( BalanceAcc != "" )
+      where = where + " and " + ConvertMaskToSQLFormat( BalanceAcc, "acc.T_BALANCE" );
+      whereAll = whereAll + " and " + ConvertMaskToSQLFormat( BalanceAcc, "acc.T_BALANCE" );
+      paramstat[paramstat.size]= string(BalanceACC)+"/";
+   else
+      paramstat[paramstat.size]= "ALL_Balans/" ;
+   end;
+
+   if( PassNum != "" )
+      where = where + " and pmco.T_PassportNumber = :PassportNumber";
+      whereAll = whereAll + " and pmco.T_PassportNumber = ?";
+      paramstat[paramstat.size]= "Pas "+PassNum+"/" ;
+      BlockP=1;
+   else
+      paramstat[paramstat.size]= "ALL_Passp/"  ;
+   end;
+
+
+      f=paramstat.size-1;
+      stat="";
+      
+      for (z,0,f)
+      stat=stat+paramstat(z); //собираем все параметры
+      end;
+      if (StrLen(stat)>250)
+      stat=substr(stat,1,250);
+      end;
+   SaveBeginTime(stat);   //сохраняем начальные параметры 
+
+/*  var end_qw;
+   
+   end_qw = " ) where here  between :begdate and :enddate AND (flag = -1 AND paymstatus = 32000 OR flag <> -1)"; /*FIV Добавил условие, что платежи без списаний по транзитным должны быть закрыты*/
+   */
+/* var select1 = select + selectPay + from + where + queryPay + end_qw;*/
+/* var select2 = select + selectRec + from + where + queryRec + end_qw; */ 
+
+   for (z,1,3)
+      params[params.size] = ( SQLParam( "BegDate"+string(z)   , BegDate ));
+      params[params.size] = ( SQLParam( "EndDate"+string(z)   , EndDate ));
+      if (BlockF==1)
+      params[params.size] = ( SQLParam( "FIID"+string(z), FIID ));
+      end;
+      if (BlockC==1)
+      params[params.size] = ( SQLParam( "ClientID"+string(z), ClientID ));
+      end;
+      if (BlockP==1)
+      params[params.size] = ( SQLParam( "PassportNumber"+string(z), PassNum ));
+      end;
+   end;     
+                                 
+      //TAM 06.07.2012 I-00213576-2
+      var front = "select * from ( ";
+      var back = " ) order by t_code, pmid "; //TAM C-36469 27.02.2015
+   var select1 = front + PartOne+SelectPay+From+WhereO+WhereAll+QueryPay 
+                        +PartTwo+SelectPay+From+WhereT+WhereAll+QueryPay + PartEnd
+                        +SelectPay+From+WhereE+WhereAll+QueryPay +back;   
+
+
+
+/*msgbox(PartOne);
+msgbox(SelectPay);
+msgbox(From);
+msgbox(WhereO);
+msgbox(WhereAll);
+msgbox(QueryPay); */
+   
+   //TAM 26.11.2012 I-00268336-2 - делаем для поступлений валюты на транзитный счет
+   var QueryRec_aviso = " AND acc.T_Account = pmpaym.T_FutureReceiverAccount " +
+                        " AND acc.T_Code_Currency = pmpaym.T_PayFIID " +
+                        " AND party.t_PartyID = " +
+                                    " (SELECT   T_client " +
+                                    " FROM   daccount_dbt " +
+                                    " WHERE   t_account = pmpaym.T_FutureReceiverAccount " +
+                                    " AND t_code_currency <> 0) " +
+                        " AND pmpaym.T_ReceiverAccount LIKE '30109%'";
+
+   var select2 = front + PartOne+SelectRec+From+WhereO+WhereAll+QueryRec
+                        +PartTwo+SelectRec+From+WhereT+WhereAll+QueryRec
+                        +PartEnd+SelectRec+From+WhereE+WhereAll+QueryRec;
+   //TAM 26.11.2012 I-00268336-2
+   if( fgBank.is_EXV and FIID != 0 )
+      params[params.size] = ( SQLParam( "BegDate4", BegDate ));
+      params[params.size] = ( SQLParam( "EndDate4", EndDate ));
+      //Gurin S. 16.10.2015 I-00584378-2
+      params[params.size] = ( SQLParam( "FIID4",    FIID ));
+      //TAM 19.06.2013  R-205195-2: UNION ALL не делает SELECT DISTINCT
+      select2 = select2 +" Union ALL "+PartOne+SelectRec+From+WhereO+WhereAll+QueryRec_aviso+back;
+   else
+      select2 = select2 + back;
+   end;
+   
+
+   Num = 0;
+/*  println(select1);
+      println(ClientID);
+//msgbox(select1);
+exit;
+*/  
+
+//Lavrenov: 24.05.2012 I-00198457-2 добавил градусник и сообщение в статус
+message("Идет формирование отчета...");
+begaction(0,"Идет формирование отчета...",false);
+
+var rs:RsdRecordset = execSQLselect(select1,params,true, RSDVAL_CLIENT, RSDVAL_STATIC);
+//println(select1);
+//msgbox(select1);   
+/* Из-за условия "rs.value(16)>=0" (на документах РКО оно = -1) не пропускались платежи в отчет             Lapik */
+
+   while(rs.MoveNext())
+   // если есть код ВО в альт+В либо  в примечании, то по  любому в отчет
+      CodeVO = rs.value(2, null, V_STRING);
+      Pass   = rs.value(3, null, V_STRING);
+      Sum    = rs.value(1, null, V_MONEY);
+      
+      NOTE_CodeVO = NOTE_Pass = NOTE_Sums = "";
+   CountVOOP = 0;
+   FirstVOOP = 0;
+//   msgbox("go");
+      GetVOCodesFromNote ( rs.value(17) /*PaymentID*/, NOTE_CodeVO, NOTE_Pass, NOTE_Sums, rs.value(1)  );
+      //if (strLen(CodeVO) == 0)
+      if ( strLen(NOTE_CodeVO) > 0 )
+            CodeVO = NOTE_CodeVO;
+            Pass   = NOTE_Pass;
+            Sum    = NOTE_Sums;
+      end;
+      //TAM 28.01.2012 C-6867
+      //Коншина: если списание (2) или зачисление (1) с\на счета нерезидентов, то поле "номер 
+      //паспорта сделки" не заполняется. В данном случае списание (2): счет для списания в 
+      //rs.value(9)
+      if (not CompareStrWithMasks(Ner,rs.value(9)))
+            Pass = "";
+      end;
+      //end;
+
+      /* EVG В отчёт выводятся только операции с заданным кодом ВО */
+      if ( strLen (CodeVO) > 0 ) 
+      if (conv(rs.value(6), rs.value(22) , 2, rs.value(9))) 
+            if((strlen(rs.value(12))>0) and (strlen(rs.value(14))>0)/* and (rs.value(16)>=0)*/ and (CheckForRub(rs.value(17))) )  
+               Num = Num + 1;
+               Country = "";
+               Adress = "";
+            //  debugbreak;
+               GetCoutryAndAdress(rs.value(7), rs.value(6), @Country, @Adress);
+               GetCoutry(rs.value(18), @CountryContragent);
+               //TAM 30.08.2012 I-00223824-2 если не нашли по клиенту, смотрим по категории платежа
+               if(CountryContragent == "")
+                  CountryContragent = GetPaymentAttribute(rs.Value(17),119); //TAM 03.09.12 I-00223824-2
+               end;
+               CountryBankContragent = GetPaymentAttribute(rs.Value(17),117);
+               
+               
+               
+
+               //debugbreak;
+               // KS 29.05.2012 I-00198430 Закомментирую и перепишу
+               /* EVG Получить курс из примечания 116 и посчитать сумму в валюте цены контракта */
+//          GetContrPriceSum( rs.value(17) /*PaymentID*/, rs.value(19) /*Валюта платежа*/, GetValidFICode(rs.Value(17), 2) /* rs.value(4)*//* Валюта цены контракта*/,
+//                            GetValidSum(rs.Value(17), 2, rs.Value(1), rs.Value(24)) /* rs.value(21, null, V_MONEY)*/ /*Сумма в валюте платежа*/, @ContrPriceSum );
+               if ((rs.Value(27) != 0)  and (rs.Value(27) != spec)) //TAM I-00223929-2 20.07.2012
+                  ValidSum = rs.Value(27);
+               elif ((rs.Value(26) != 0) and (rs.Value(26) != spec))
+                  ValidSum = rs.Value(1);
+               else
+                  ValidSum = GetValidSum(rs.Value(17), 2, rs.Value(1), rs.Value(24));
+               end;
+
+
+               /* EVG Получить курс из примечания 116 и посчитать сумму в валюте цены контракта */
+               GetContrPriceSum( rs.value(17) /*PaymentID*/, rs.value(19) /*Валюта платежа*/, GetValidFICode(rs.Value(17), 2) /* rs.value(4)*//* Валюта цены контракта*/,
+                                          ValidSum /*Сумма в валюте платежа*/, @ContrPriceSum );
+
+               // KS 29.05.2012 End I-00198430
+
+               //Dex - добавление id в массив для выгрузки
+               //msgbox(rs.value(17));
+               //if (chek_id(rs.value(17),i))
+                  pay_arr[i]   = rs.value(17);
+                  pay_arr_n[i] = 2;
+                  if(rs.Value(24) != -1)
+                     if (FIVArrSumCur < asize(FIVArrSum))
+                        pay_arr_sum[i] =  FIVArrSum[FIVArrSumCur];
+                        FIVArrSumCur = FIVArrSumCur + 1;
+                     else
+                        asize(FIVArrSum,0);
+                        FIVArrSumCur = 0;
+                        pay_arr_sum[i] = rs.Value(1);
+                     end;
+                     pay_arr_date[i] = rs.Value(0);
+                     pay_arr_flag[i] = "X";
+                  else
+                     pay_arr_sum[i] = 0;
+                     pay_arr_date[i] = date(0,0,0);
+                     pay_arr_flag[i] = "";
+                  end;
+                  arr_countVOOP[i] = CountVOOP;
+                  arr_firstVOOP[i] = FirstVOOP;
+                  i=i+1;
+                  if ((FIVArrSumCur > 0) and (FIVArrSumCur == asize(FIVArrSum)))
+                        asize(FIVArrSum,0);
+                        FIVArrSumCur = 0;
+                  end;
+               //end;
+               //msgbox(rs.value(9));
+               /// end Dex
+
+               Sum = IFConv(rs.value(22), GetValidSum(rs.Value(17), 2, rs.Value(1), rs.Value(24)),/*rs.value(21, null, V_MONEY)*/ Sum);
+               PrintDocument( Num, 
+                                    rs.value(0)/*OpDate*/, 
+                                    Sum/*OpSumm*/, 
+                                    2          /*Direction*/, 
+                                    /* EVG 
+                                    rs.value(2)/*OpVCode*/, */
+                                    CodeVO,
+                                    Pass/*PSNum*/,
+                                    GetValidFICode(rs.Value(17), 2)/*rs.value(4)*//*CurCodeAgr*/,
+                                    /* EVG
+                                    rs.value(5)/*OpSummAgr*/,*/
+                                    ContrPriceSum,
+                                    rs.value(10) /*NameCl*/,
+                                    rs.value(9)/*AccCl*/,
+                                    rs.value(20)/*корееспонденция*/,
+                                    Country    /*Country*/,
+                                    GetRegDate(rs.value(7))/*RegDate*/, 
+                                    Adress     /*AddressCl*/, 
+                                    rs.value(11) /*INNCl*/, 
+                                    rs.value(8)/*OpenDate*/, 
+                                    rs.value(12)/*NameContr*/,
+                                    CountryContragent /*CountryContragent*/,
+                                    CountryBankContragent, /*TAM 03.09.2012 I-00223824-2*/
+                                    rs.value(13)/*INNcontr*/, 
+                                    rs.value(14)/*BankContrName*/, 
+                                    rs.value(15)/*BankContrCode*/,
+                                    substr(rs.value(9),6,3), //rs.value(19)/*OpCode*/) 
+                                    date(rs.value(23)) ); /* А.Gregeradsky - 16.02.2010 - Реальная дата операции выводится в отчет, может отличаться от даты операции для платежей, по которым существуют распоряжения по транзитному счету */
+
+
+            end;
+            end;
+      end; // if ( strLen (CodeVO > 0) )
+      
+   end;
+//ampar=i;
+
+   rs = null;
+   /*FIV 23.03.10 Добавил RSDVAL_CLIENT, RSDVAL_STATIC иначе рекордсету сносило башню и мувнекст мог выполниться непредсказуемое количество раз*/
+   rs = execSQLselect(select2,params,true, RSDVAL_CLIENT, RSDVAL_STATIC);
+// msgbox(rs.RecCount);          
+/*  println(select2);
+      println(ClientID);
+*/  while(rs.MoveNext())
+   
+   // то же самое... сначала проверка на код ВО
+      CodeVO = rs.value(2, null, V_STRING);
+      Pass   = rs.value(3, null, V_STRING);
+      Sum    = rs.value(1, null, V_MONEY);
+
+      NOTE_CodeVO = NOTE_Pass = NOTE_Sums = "";
+   CountVOOP = 0;
+   FirstVOOP = 0;
+
+      GetVOCodesFromNote ( rs.value(17) /*PaymentID*/, NOTE_CodeVO, NOTE_Pass, NOTE_Sums, rs.value(1) );
+   // if (strLen(CodeVO) == 0)
+      if ( strLen(NOTE_CodeVO) > 0 )
+            CodeVO = NOTE_CodeVO;
+            Pass   = NOTE_Pass;
+            Sum    = NOTE_Sums;
+      end;
+
+      //TAM 28.01.2012 C-6867
+      //Коншина: если списание (2) или зачисление (1) с\на счета нерезидентов, то поле "номер 
+      //паспорта сделки" не заполняется. В данном случае зачисление (1): счет для зачисления в 
+      //rs.value(9)
+      if (not CompareStrWithMasks(Ner,rs.value(9)))
+            Pass = "";
+      end;
+   // end;  
+      /* EVG В отчёт выводятся только операции с заданным кодом ВО */
+      if ( strLen (CodeVO) > 0 ) 
+         if (conv(rs.value(6), rs.value(22) , 1, rs.value(9))) 
+            if((strlen(rs.value(10)) > 0) and (strlen(rs.value(14)) > 0)/* and (rs.value(16)>=0)*/ and (CheckForRub(rs.value(17))))  
+               Num = Num + 1;
+               Country = "";
+               Adress = "";
+               GetCoutryAndAdress(rs.value(7), rs.value(6), @Country, @Adress);
+               GetCoutry(rs.value(18), @CountryContragent);
+               //TAM 30.08.2012 I-00223824-2 если не нашли по клиенту, смотрим по категории платежа
+               if(CountryContragent == "")
+                  CountryContragent = GetPaymentAttribute(rs.Value(17),118); //TAM 03.09.12 I-00223824-2
+               end;
+               CountryBankContragent = GetPaymentAttribute(rs.Value(17),117);
+               /* EVG Получить курс из примечания 116 и посчитать сумму в валюте цены контракта */
+
+               //debugbreak;
+
+               // KS 29.05.2012 I-00198430 Закомментирую и перепишу
+               /* EVG Получить курс из примечания 116 и посчитать сумму в валюте цены контракта */
+//          GetContrPriceSum( rs.value(17) /*PaymentID*/, rs.value(19) /*Валюта платежа*/, GetValidFICode(rs.Value(17), 1)/*rs.value(4)*//*Валюта цены контракта*/,
+//                            GetValidSum(rs.Value(17), 1, rs.Value(1), rs.Value(24)) /*rs.value(21, null, V_MONEY)*/ /*Сумма в валюте платежа*/, @ContrPriceSum );
+               if ((rs.Value(27) != 0)  and (rs.Value(27) != spec)) //TAM I-00223929-2 20.07.2012
+                  ValidSum = rs.Value(27);
+               elif ((rs.Value(26) != 0) and (rs.Value(26) != spec))
+                  ValidSum = rs.Value(1);
+               else
+                  ValidSum = GetValidSum(rs.Value(17), 2, rs.Value(1), rs.Value(24));
+               end;
+
+
+               /* EVG Получить курс из примечания 116 и посчитать сумму в валюте цены контракта */
+               GetContrPriceSum( rs.value(17) /*PaymentID*/, rs.value(19) /*Валюта платежа*/, GetValidFICode(rs.Value(17), 1)/*rs.value(4)*//*Валюта цены контракта*/,
+                                          ValidSum /*rs.value(21, null, V_MONEY)*/ /*Сумма в валюте платежа*/, @ContrPriceSum );
+
+               // KS 29.05.2012 End I-00198430
+
+               //Dex - добавление id в массив для выгрузки
+               //msgbox(rs.value(17));
+               //if (chek_id(rs.value(17),i))
+                  pay_arr[i] = rs.value(17);
+                  pay_arr_n[i] = 1;
+                  if(rs.Value(24) != -1)
+                     if (FIVArrSumCur < asize(FIVArrSum))
+                        pay_arr_sum[i] =  FIVArrSum[FIVArrSumCur];
+                        FIVArrSumCur = FIVArrSumCur + 1;
+                     else
+                        asize(FIVArrSum,0);
+                        FIVArrSumCur = 0;
+                        pay_arr_sum[i] = rs.Value(1);
+                     end;
+                     pay_arr_date[i] = rs.Value(0);
+                     pay_arr_flag[i] = "X";
+                  else
+                     pay_arr_sum[i] = 0;
+                     pay_arr_date[i] = date(0,0,0);
+                     pay_arr_flag[i] = "";
+                  end;
+                  arr_countVOOP[i] = CountVOOP;
+                  arr_firstVOOP[i] = FirstVOOP;
+
+                  if ((FIVArrSumCur > 0) and (FIVArrSumCur == asize(FIVArrSum)))
+                        asize(FIVArrSum,0);
+                        FIVArrSumCur = 0;
+                  end;
+
+                  i=i+1;
+               //end;
+               /// end Dex
+
+               Sum = IFConv(rs.value(22), GetValidSum(rs.Value(17), 1, rs.Value(1), rs.Value(24)),/*rs.value(21, null, V_MONEY)*/ Sum);
+
+               //TAM 28.01.2012 - begin
+               //если платеж внутренний
+               if( rs.value(15) == GetBikByID({OurBank}))
+                  PrintDocument( Num, 
+                                          rs.value(0)/*OpDate*/, 
+                                          Sum/*OpSumm*/, 
+                                          1   /*Direction*/, 
+                                          /* EVG 
+                                          rs.value(2)/*OpVCode*/, */
+                                          CodeVO,
+                                          Pass/*PSNum*/,
+                                          GetValidFICode(rs.Value(17), 1)/*rs.value(4)*//*CurCodeAgr*/,
+                                          /* EVG
+                                          rs.value(5)/*OpSummAgr*/,*/
+                                          ContrPriceSum,
+                                          rs.value(12) /*NameCl*/,
+                                          rs.value(20)/*корееспонденция*/,
+                                          rs.value(9)/*AccCl*/,
+                                          // rs.value(20)/*корееспонденция*/,
+                                          Country    /*Country*/,
+                                          GetRegDate(rs.value(7))/*RegDate*/, 
+                                          Adress     /*AddressCl*/, 
+                                          rs.value(13) /*INNCl*/, 
+                                          rs.value(8)/*OpenDate*/, 
+                                          rs.value(10)/*NameContr*/,
+                                          CountryContragent /*CountryContragent*/,
+                                          CountryBankContragent, /*TAM 03.09.2012 I-00223824-2*/
+                                          rs.value(11)/*INNcontr*/, 
+                                          rs.value(14)/*BankContrName*/, 
+                                          rs.value(15)/*BankContrCode*/,
+                                          substr(rs.value(9),6,3), //rs.value(19)/*OpCode*/) 
+                                          date(rs.value(23)) ); 
+               //TAM - end
+               else
+               PrintDocument( Num, 
+                                    rs.value(0)/*OpDate*/, 
+                                    Sum/*OpSumm*/, 
+                                    1   /*Direction*/, 
+                                    /* EVG 
+                                    rs.value(2)/*OpVCode*/, */
+                                    CodeVO,
+                                    Pass/*PSNum*/,
+                                    GetValidFICode(rs.Value(17), 1)/*rs.value(4)*//*CurCodeAgr*/,
+                                    /* EVG
+                                    rs.value(5)/*OpSummAgr*/,*/
+                                    ContrPriceSum,
+                                    rs.value(10) /*NameCl*/,
+                                    rs.value(20)/*корееспонденция*/,
+                                    rs.value(9)/*AccCl*/,
+                                    // rs.value(20)/*корееспонденция*/,
+                                    Country    /*Country*/,
+                                    GetRegDate(rs.value(7))/*RegDate*/, 
+                                    Adress     /*AddressCl*/, 
+                                    rs.value(11) /*INNCl*/, 
+                                    rs.value(8)/*OpenDate*/, 
+                                    rs.value(12)/*NameContr*/,
+                                          CountryContragent /*CountryContragent*/,    
+                                    rs.value(13)/*INNcontr*/, 
+                                    rs.value(14)/*BankContrName*/, 
+                                    rs.value(15)/*BankContrCode*/,
+                                    substr(rs.value(9),6,3), //rs.value(19)/*OpCode*/) 
+                                    date(rs.value(23)) ); /* А.Gregeradsky - 16.02.2010 - Реальная дата операции выводится в отчет, может отличаться от даты операции для платежей с распоряжениями по транзитному счету */
+                  end;
+            end;
+         end;
+      end; // if ( strLen (CodeVO > 0) )
+
+   end; //    while(rs.MoveNext())
+   ampar=i;
+   SaveAmount(i); //сохраняем в статистике кол-во документов
+
+      PrintItog();
+   //TAM 16.11.11
+   SaveEndTime(13);// Заканчиваем и записываем время выполнения
+   //Lavrenov: 24.05.2012 I-00198457-2 добавил градусник и сообщение в статус
+   endaction();
+
+
+//  cmd_del = RsdCommand("TRUNCATE TABLE usr_vkorders_info");
+//  cmd_del.execute();
+
+
+   var t=0;
+   // KS 08.06.2012 I-00198430
+   var pay_last = -1,  // Какой платёж мы обработали в последний раз
+         pay_cnt  =  1;  // Сколько раз мы обработали платёж
+   // KS 08.06.2012 End I-00198430
+
+/*
+   [
+   
+   
+   
+   Справочная информация для отладки отчёта... 
+   ];
+
+   while (t < i) // выгрузка сформированного массива
+      println(t+1,"  ",pay_arr[t],"   -    ",pay_arr_n[t]);
+      t=t+1;
+   end;
+
+   println(t);
+*/
+
+   /* EVG */
+   var txtPath = "..\\TxtFile\\";
+   file report () txt;
+
+   SetOutPut(txtPath + "1", false);
+      If ( open ( report, txtPath + "pr_corep." + UserNumber()))
+            ViewFile (report);
+      end;
+   SetOutPut(null, false);
+
+
+   debugbreak;
+   t=0;
+   if (GetTrue(false, "Выгружать операции в АСВКБ?"))
+   clear();
+   InitProgress (i,"Выгрузка... Ждите...","Выгрузка операций... Ждите...");
+   //отсортируем ма
+      while(t<i) // выгрузка сформированного массива
+         //msgbox(pay_arr_n[t]);
+         // KS 08.06.2012 I-00198430 Считаем сколько раз обработали один платёж и передаём это количество в процедуру
+         //                          Такая странная структура программы - по-другому не получилось
+         if (pay_last == pay_arr[t])
+            pay_cnt = pay_cnt + 1;
+         else
+            pay_cnt = 1;
+         end;
+         pay_last = pay_arr[t];
+         //ASVKB(pay_arr[t]/*pmpaym.T_PAYMENTID*/, pay_arr_n[t], pay_arr_sum[t], pay_arr_date[t], pay_arr_flag[t], arr_firstVOOP[t], arr_countVOOP[t]);
+         ASVKB(pay_arr[t]/*pmpaym.T_PAYMENTID*/, pay_arr_n[t], pay_arr_sum[t], pay_arr_date[t], pay_arr_flag[t], arr_firstVOOP[t], arr_countVOOP[t], pay_cnt); // Добавили параметр
+         // KS 08.06.2012 End I-00198430
+         t=t+1;
+         UseProgress (t);
+      end;
+   RemProgress (t);   
+   
+   //SetOutput(null,true);  
+   
+/*
+var = path1;
+getRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ПУТЬ К ФАЙЛУ OPLATA.D",V_string,path1);
+path1=path1+"Oplata.d";
+
+println("Файл  с выгруженными данными лежит тут: ", path1); */
+   
+      //end Dex
+      // ASVKB(rs.value(17)/*pmpaym.T_PAYMENTID*/);
+//     flagASVKB = true;
+   end;
+/*
+   if (flagASVKB) //если вначале выбрали выгрузку в АСВКБ, то выгружаем информацию по конкретному платежу
+      ASVKB(rs.value(17)/*pmpaym.T_PAYMENTID*/);
+   end;
+*/
+   Exit (1);
+
+
+END;

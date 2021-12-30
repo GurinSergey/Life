@@ -1,0 +1,746 @@
+/*           Кредитовые обороты по расчетным счетам клиентов             */
+/*Тихомиров А.Н. 16.02.2009                                              */
+/* Модифицировано: Коркин И.Н. 21.06.2010                                */
+/* Доработана возможность запуска отчета из планировщика                 */
+/* и сохранение отчета                                                   */
+/* Изменен zmp 15.06.2012 I-00193919 сделал возможность                  */
+/* выпуска отчета в несколько потоков                                    */
+
+/*  23.07.2012 R-78081-2 AAN переделал получение Ексель-файла с          */
+/* отчётом чтобы не падал Ексель при запуске нескольких окон             */
+/* сразу + ускорил формирование файла = робит быстро и кашерно           */
+/*************************************************************************/
+//zmp 12.12.2012 I-00296611 Исправлен запрос, в отчет попадали только те клиенты у которых был 101-й код
+import globals, oralib, bankinter, rsexts, rmcmptl, RSD, Календарь, rsbdataset, "xlc.mac", "getperiodforrep.mac";
+
+/* Коркин И.Н. По заявке I-013680 */
+private var period, interval, path1=""  , file_name=""; 
+private var param1, param2;
+private var SQL,cmd,ex,ob,obbook,/*obsheet,*/ mon, year, acc, dprt_v, rsd, namedep, clientobjcode101;
+
+const  KEY_F1      =315;
+const  KEY_F2      =316;
+const  KEY_F3      =317;
+const KEY_ESC      = 27;
+const KEY_SPACE    = 32;
+const KEY_ENTER    = 13;
+
+record Department ("dp_dep.dbt");
+private var Fulloutputl, outl, outputl="kracc.lbr";
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+private var dlg = TRecHandler("kracc", fulloutputl, TRUE); 
+
+private var clientcode, Clientname, takings1, takings2, credit_without1, credit_without2, clientobjcode;
+private var branch, DateBegin1, DateBegin2,
+    DateEnd1, DateEnd2,
+    Office:double  = 0,
+    OfficeName = "По всем офисам";
+private var  maxs:integer, n:integer;
+
+FILE rep_ac()txt write;
+private var str : string, m_path, tempFileName, tempFileNameBezPuti;
+private var all_local_puth:string;
+private var dd:date, tt:time, ii:integer;
+const TEXTDIR_REESTR = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+
+private macro bankid(bid)
+   var bank="select count(*) cnt from ddp_dep_dbt where t_partyid= "+bid;
+   var databank = TRsbDataSet(bank);
+   databank.movenext();
+   if (databank.cnt!=0)
+      return true;
+   else
+      return false;
+   end;
+end;
+
+/*Найдем имя по PartyID*/
+private macro GetClientName(id)
+   var  sl=string(" select t_name from dparty_dbt t where t.t_PartyID=",id);
+   var  DataS=TRsbDataSet(sl);
+   if( DataS.moveNext())
+      return DataS.name;
+   else
+      if (id !=0)
+         msgbox("Субъект не найден в party.dbt");
+         return 0;
+       else
+         return {Name_Bank};
+      end;
+   end;
+END;
+
+private macro Clear(str)        //AAN
+   str = STRSUBST(STRSUBST(STRSUBST(str, ";", ","),strfor(13),""),strfor(10), "");
+   // надо выкинуть символы 10 и 13 из строки, а также все ; т.к. это разделитель в .csv файлах
+   return str;
+END;
+
+private macro chekReestrRead(m_name:string, m_status:integer, m_err:integer)  //AAN
+	if ((m_status == V_UNDEF) or (m_err != 0))
+    	msgbox("Ошибка получения значения настройки реестра " + m_name + " \n Процедура GetRegistryValue вернула код ошибки "+m_err);
+   		exit(0);
+	end;
+end;
+
+private macro dayString(m_reestrName:string):string  //AAN
+   var m_errCode:integer = NULL;
+   var m_statusGetRegistry :integer = NULL;
+   var m_zna4enie:string  = NULL;
+   if (m_reestrName == "")
+      msgbox("При чтении реестра не задана строка реестра");
+      exit(0)
+   end;
+   m_statusGetRegistry=GetRegistryValue(m_reestrName, V_STRING, m_zna4enie, m_errCode);
+   chekReestrRead(m_reestrName, m_statusGetRegistry, m_errCode);
+   return(m_zna4enie);
+end;
+
+private macro createUniqueFile()      //AAN генерим универсальное имя файла
+	private var ff:string = "Kr_acc_"+{oper}+"_"+date+"_"+time;
+	private var file_ext:string = ".txt";
+	tempFileName = dayString(TEXTDIR_REESTR);
+	tempFileName = tempFileName + "\\" + ff;
+	tempFileNameBezPuti = ff;
+	tempFileName = StrSubst ( tempFileName, ".", "_" );
+	tempFileName = StrSubst ( tempFileName, ":", "_" );
+	tempFileName = StrSubst ( tempFileName, " ", "_" );
+	tempFileName = tempFileName + file_ext;
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ".", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ":", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, " ", "_" );
+	tempFileNameBezPuti = tempFileNameBezPuti + file_ext;
+	if (substr(tempFileName,1,2) == "__")
+		tempFileName=".."+substr(tempFileName,3)
+	end;
+end;
+
+private macro copyToMe()     //AAN  копируем файл временных данных с СП на терминал во временную папку(какую именно зависит от лок. настр.)
+   private var m_path: string = "";
+   m_path = "$" + tempFileNameBezPuti;
+   if (not CopyFile(tempFileNameBezPuti, m_path, TRUE))
+     println ("НЕ СМОГ скопировать файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+   else 
+      println ("УСПЕШНО скопирован файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+      if (not removeFile(tempFileName))
+         println("Не смог удалить файл "+tempFileName+" с сервера приложений. ничего сташного, продолжаем работу.");
+      else
+         println("удален файл "+tempFileName+" с сервера приложений.");
+      end;
+   end;
+end;
+
+/*Найдем имя по Счету*/
+private macro GetClientID(account)
+/*   var  sl="select * from daccount_dbt where t_account='"+account+"'"+
+           " union "+
+           "select * from daccount$_dbt where t_account='"+account+"'";*/
+   var  sl="select * from daccount_dbt where t_account='"+account+"'";        
+   var  DataS=TRsbDataSet(sl);
+   if( DataS.moveNext())
+      return DataS.client;
+   else
+      return 0;
+   end;
+END;
+
+private macro kred (account,dateb,datee, client, accountR)
+   var kr=0, sc, datas, datasc, sq, datasq, krin, datakr;
+   var s = "SELECT T_ACCTRNID , t_sum_natcur, t_account_receiver as accR  "+
+            " FROM dacctrn_dbt "+
+            "WHERE t_account_receiver = '"+ account+ "'"+
+              "AND t_date_carry BETWEEN to_date('"+dateb+"', 'DD-MM-YYYY') AND to_date('"+dateE+"', 'DD-MM-YYYY') "+
+              "AND t_result_carry != 23 ";
+   if (account == "40802810808070042005")
+      debugbreak;
+   end;
+   DataS=TRsbDataSet(s);
+   while (datas.movenext())
+      sc = "SELECT count(*) as cnt "+
+             "FROM dpmpaym_dbt pmpaym, dpmdocs_dbt docs, dpmrmprop_dbt rm, dacctrn_dbt arh "+
+            "WHERE arh.T_ACCTRNID = docs.T_ACCTRNID "+
+              "AND pmpaym.t_paymentid = docs.t_paymentid "+
+              "AND rm.t_paymentid = pmpaym.t_paymentid "+
+              "AND arh.T_ACCTRNID = "+datas.acctrnid; 
+      DataSc=TRsbDataSet(sc);
+      datasc.movenext();
+      if (datasc.cnt!=0)
+         sq = "SELECT pmpaym.t_payer, pmpaym.t_receiver, arh.t_sum_natcur, pmpaym.t_paymentid, "+
+              "rm.t_PayerName, pmpaym.t_payerbankid, pmpaym.t_receiverbankid, "+
+              "rm.t_ReceiverName, pmpaym.t_payeraccount, pmpaym.t_receiveraccount, "+
+              "rm.t_payerinn, rm.t_receiverinn, pmpaym.t_payfiid "+
+              "FROM dpmpaym_dbt pmpaym, dpmdocs_dbt docs, dpmrmprop_dbt rm, dacctrn_dbt arh "+
+              "WHERE arh.T_ACCTRNID = docs.T_ACCTRNID "+
+              "AND pmpaym.t_paymentid = docs.t_paymentid "+
+              "AND rm.t_paymentid = pmpaym.t_paymentid "+
+              "AND arh.T_ACCTRNID = "+datas.acctrnid; 
+         DataSq=TRsbDataSet(sq);
+         while (datasq.movenext())
+            krin= "select * from dwlpm_dbt wl,  dpmrmprop_dbt rm where wl.t_paymentid="+datasq.paymentid+" and wl.t_paymentid=rm.t_paymentid";
+            datakr=TRsbDataSet(krin);
+               if (bankid(datasq.payerbankid) and (bankid(datasq.receiverbankid)))  /*Если внутрибанковский*/
+                  if (datasq.payer!=datasq.receiver)     /*Если разные - прибавляем сумму*/
+                     kr=kr+datasq.sum_natcur;
+                  end;
+               elif (/*(datakr.direct!="X") and */(not bankid(datasq.payerbankid)))  /*Если внешний - входящий*/
+                  if (datasq.receiverINN!=datasq.payerINN)
+ //                   if  (СравнитьНаименования( datasq.PayerName, datasq.PayerAccount, datasq.PayerINN, datasq.PayFIID )!=
+ //                        СравнитьНаименования( datasq.receivername, datasq.receiverAccount, datasq.receiverINN, datasq.payFIID ))
+                     kr=kr+datasq.sum_natcur;
+ //                   end;
+                  end;
+               end;
+         end;
+      else
+         if (client!=GetClientID(datas.accR))
+            kr=kr+datas.sum;
+         end;
+      end;
+   end;
+   return kr;
+end;
+
+private macro doc(account,dateb,datee)
+   var s = "SELECT count(*) as cnt "+
+       "FROM dacctrn_dbt "+
+       "WHERE t_account_receiver = '"+ account+ "'"+
+       "AND t_date_carry BETWEEN to_date('"+dateb+"', 'DD-MM-YYYY') AND to_date('"+dateE+"', 'DD-MM-YYYY') "+
+       "AND t_result_carry != 23 ";
+   var DataS=TRsbDataSet(s);
+   datas.movenext();
+   if (datas.cnt==0) return false;
+      else return true;
+   end;
+end;
+
+private macro Post (account,dateb,datee, client, accountR)
+   var kred=0, sc, datas, datasc, sq, datasq, krin, datakr;
+   var s = "SELECT T_ACCTRNID, t_account_receiver as accR "+
+             "FROM dacctrn_dbt "+
+            "WHERE t_account_receiver = '"+ account+ "'"+
+              "AND t_date_carry BETWEEN to_date('"+dateb+"', 'DD-MM-YYYY') AND to_date('"+dateE+"', 'DD-MM-YYYY')"+
+              "AND t_result_carry != 23 ";
+   DataS=TRsbDataSet(s);
+   if (account == "40802810808070042005")
+      debugbreak;
+   end;
+
+   while (datas.movenext())
+      sc = "SELECT count(*) as cnt "+
+             "FROM dpmpaym_dbt pmpaym, dpmdocs_dbt docs, dpmrmprop_dbt rm, dacctrn_dbt arh "+
+            "WHERE arh.T_ACCTRNID = docs.T_ACCTRNID "+
+              "AND pmpaym.t_paymentid = docs.t_paymentid "+
+              "AND rm.t_paymentid = pmpaym.t_paymentid "+
+              "AND arh.T_ACCTRNID = "+datas.ACCTRNID; 
+      DataSc=TRsbDataSet(sc);
+      datasc.movenext();
+      if (datasc.cnt!=0)
+         sq = "SELECT pmpaym.t_payer, pmpaym.t_receiver, arh.t_sum_natcur, pmpaym.t_paymentid, "+
+               "rm.t_PayerName, pmpaym.t_payerbankid, pmpaym.t_receiverbankid, "+
+               "rm.t_ReceiverName, pmpaym.t_payeraccount, pmpaym.t_receiveraccount, "+
+               "rm.t_payerinn, rm.t_receiverinn, pmpaym.t_payfiid "+
+               "FROM dpmpaym_dbt pmpaym, dpmdocs_dbt docs, dpmrmprop_dbt rm, dacctrn_dbt arh "+
+               "WHERE arh.T_ACCTRNID = docs.T_ACCTRNID "+
+               "AND pmpaym.t_paymentid = docs.t_paymentid "+
+               "AND rm.t_paymentid = pmpaym.t_paymentid "+
+               "AND arh.T_ACCTRNID = "+datas.ACCTRNID; 
+         DataSq=TRsbDataSet(sq);
+         while (datasq.movenext())
+            krin= "select * from dwlpm_dbt wl,  dpmrmprop_dbt rm where wl.t_paymentid="+datasq.paymentid+" and wl.t_paymentid=rm.t_paymentid";
+            datakr=TRsbDataSet(krin);
+            if (bankid(datasq.payerbankid) and  (bankid(datasq.receiverbankid)))  /*Если внутрибанковский*/
+            elif ((datakr.direct!="X") and (bankid(datasq.payerbankid)!=true))
+               if (datasq.receiverINN==datasq.payerINN)
+                  kred=kred+datasq.sum_natcur;
+               elif((datasq.receiverINN=="") or (datasq.payerINN=""))
+                  if  (СравнитьНаименования( datasq.PayerName, datasq.PayerAccount, datasq.PayerINN, datasq.PayFIID )==
+                       СравнитьНаименования( datasq.receivername, datasq.receiverAccount, datasq.receiverINN, datasq.payFIID ))
+                     kred=kred+datasq.sum_natcur;
+                  end;
+               end;
+            end;
+         end;
+      end;
+   end;
+   return kred;
+end;
+
+private macro OutAll()
+   var count=0, datec;
+   /*Определяем общее количество счетов*/
+   var sl = "select count(*) cnt from (select  * from daccount_dbt acc where acc.t_account between '401%' and "+ 
+         "'4089%'"+branch+") accs inner join (SELECT t.t_partyid "+
+         "FROM dpartyown_dbt t "+
+         "WHERE t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Клиент') "+ 
+         "minus "+
+         "select t.t_partyid   FROM dpartyown_dbt t "+
+         "where t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Банк') "+ 
+         "minus "+
+         "select t.t_partyid   FROM dpartyown_dbt t "+
+         "where t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Центральный банк')) "+
+         "client on accs.t_client = client.t_partyid "+   
+         "where (accs.t_close_date > TO_DATE ('"+datebegin1+"', 'DD-MM-YYYY') or accs.t_open_close=chr(0)) "+
+         "and accs.t_open_date <= TO_DATE ('"+dateend2+"', 'DD-MM-YYYY') "; 
+
+   var DataS = TRsbDataSet(sl);
+   DataS.movenext();
+   maxS=datas.cnt;
+   debugbreak;
+   /* Отбираем все счета, по маске, клиентов, исключаем банки */
+ /*  sql = "select t_account, t_nameaccount, t_partyid, t_client, t_code, c101 from "+
+         " (select  acc.t_account, acc.t_nameaccount, acc.t_client, obj2.t_code as c101, obj.t_code, "+
+         " acc.t_close_date, acc.t_open_close, acc.t_open_date from daccount_dbt acc, dobjcode_dbt obj, dobjcode_dbt obj2 where "+
+         " acc.t_account between '401%' and '4089%'"+branch+" and  obj.t_codekind=1 and obj.t_objectid=acc.t_client and  obj2.t_codekind=101 and obj2.t_objectid=acc.t_client) accs "+
+         " inner join (SELECT t.t_partyid FROM dpartyown_dbt t "+
+         "WHERE t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Клиент') "+ 
+         "minus "+
+         "select t.t_partyid   FROM dpartyown_dbt t "+
+         "where t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Банк') "+ 
+         "minus "+
+         "select t.t_partyid   FROM dpartyown_dbt t "+
+         "where t.t_partykind = (select t_partykind from dptkind_dbt where T_NAME2='Центральный банк')) "+
+         "client on accs.t_client = client.t_partyid "+   
+         "where (accs.t_close_date > TO_DATE ('"+datebegin1+"', 'DD-MM-YYYY') or accs.t_open_close=chr(0)) "+
+         "and accs.t_open_date <= TO_DATE ('"+dateend2+"', 'DD-MM-YYYY') "+
+   //      " and accs.t_account like '%15809' "+
+         " order by t_code"; */
+/* Formatted on 12.12.2012 13:44:11 (QP5 v5.115.810.9015) */
+/*zmp 12.12.2012 I-00296611 переделал немного запрос, прежний отбирал только тех клиентов, у которых был 101-й код */
+sql = "  SELECT   t_account, "+
+      "     t_nameaccount,   "+
+      "     t_partyid,       "+
+      "     t_client,        "+
+      "     t_code,          "+
+      "   decode(c101, null, ' ',c101)  c101             "+
+  "  FROM      (SELECT   acc.t_account,      "+
+  "                      acc.t_nameaccount,  "+
+  "                      acc.t_client,       "+
+  "                      (SELECT   o.t_code   "+
+  "                         FROM   dobjcode_dbt o                         "+
+  "                        WHERE       o.t_state = 0                      "+
+  "                                AND O.T_CODEKIND = 101                 "+
+  "                                AND O.T_OBJECTTYPE = 3                 "+
+  "                                AND O.T_OBJECTID = ACC.T_CLIENT)       "+
+  "                         c101,                                         "+
+  "                      obj.t_code,                                      "+
+  "                      acc.t_close_date,                                "+
+  "                      acc.t_open_close,                                "+
+  "                      acc.t_open_date                                  "+
+  "               FROM   daccount_dbt acc, dobjcode_dbt obj               "+
+  "              WHERE       acc.t_account BETWEEN '401%' AND '4089%'"+branch+
+  "                      AND obj.t_codekind = 1                                    "+
+  "                      AND obj.t_objectid = acc.t_client                         "+
+  "                      AND OBJ.T_STATE = 0                                       "+
+  "                                                                                "+
+  "            ) accs                                                              "+
+  "         INNER JOIN                                                             "+
+  "            (SELECT   t.t_partyid                                               "+
+  "               FROM   dpartyown_dbt t                                           "+
+  "              WHERE   t.t_partykind = (SELECT   t_partykind                     "+
+  "                                         FROM   dptkind_dbt                     "+
+  "                                        WHERE   T_NAME2 = 'Клиент')             "+
+  "             MINUS                                                              "+
+  "             SELECT   t.t_partyid                                               "+
+  "               FROM   dpartyown_dbt t                                           "+
+  "              WHERE   t.t_partykind = (SELECT   t_partykind                     "+
+  "                                         FROM   dptkind_dbt                     "+
+  "                                        WHERE   T_NAME2 = 'Банк')               "+
+  "             MINUS                                                              "+
+  "             SELECT   t.t_partyid                                               "+
+  "               FROM   dpartyown_dbt t                                           "+
+  "              WHERE   t.t_partykind = (SELECT   t_partykind                     "+
+  "                                         FROM   dptkind_dbt                     "+
+  "                                        WHERE   T_NAME2 = 'Центральный банк'))  "+
+  "            client                                                              "+
+  "         ON accs.t_client = client.t_partyid                                    "+
+  " WHERE   (accs.t_close_date > TO_DATE ('"+datebegin1+"', 'DD-MM-YYYY')            "+
+  "          OR accs.t_open_close = CHR (0))                                       "+
+  "         AND accs.t_open_date <= TO_DATE ('"+dateend2+"', 'DD-MM-YYYY')         "+
+  " ORDER BY   t_code                                                              ";
+   initprogress(-1, "Отбираются счета, ждите", "Отбираются счета");
+   useprogress;
+   var DataSet = TRsbDataSet(sql);
+   remprogress;
+
+   createUniqueFile();
+   initprogress(maxs, "Выводится отчет, ждите", "Выводится отчет");
+   open (rep_ac, tempFileName);
+               //голова отчёта заливается в *.csv
+   str = "Отчет по кредитовым оборотам по расчетным счетам клиентов за " + DateBegin1 + " - " +
+            DateEnd1 + " и " + DateBegin2 + " - " + DateEnd2 + ";";
+   rep_ac.str = ToAnsi (str, true);
+   insert (rep_ac);
+   
+   str = officename;
+   rep_ac.str = ToAnsi (str, true);
+   insert (rep_ac);
+   
+   str =  "Код клиента" + ";" + "Код клиента 101" + ";" + "Наименование клиента" + ";"
+   + "КО без поступлений со всех счетов этой компании за " + DateBegin1 + " - " + DateEnd1 + ";"
+   + "Поступление из других банков со всех счетов этой компании за " + DateBegin1 + " - " + DateEnd1 + ";"
+   + "КО без поступлений со всех счетов этой компании за " + DateBegin2 + " - " + DateEnd2 + ";"
+   + "Поступление из других банков со всех счетов этой компании за " + DateBegin2 + " - " + DateEnd2;
+   rep_ac.str = ToAnsi (str, true);
+   insert (rep_ac);
+   
+   n = 0;
+   if (maxs!=0)
+      dataset.movenext();
+      clientobjcode=dataset.code;
+      clientobjcode101=dataset.c101;
+      clientcode = dataset.client;
+      Clientname = dataset.nameaccount;
+      acc = dataset.account;
+      n = 1;
+   end;
+   takings1 = 0;
+   takings2 = 0;
+   credit_without1 = 0;
+   credit_without2 = 0;
+   while (dataset.movenext())
+   n = n + 1;
+     /*Заполняем таблицу*/
+   if (dataset.code==clientobjcode)
+       if ((doc(acc,datebegin1,dateend1) or doc(acc,datebegin2,dateend2)) or ((takings1!=0) or (takings2!=0) or (credit_without1!=0) or (credit_without2!=0)))
+         takings1=takings1+Post (acc,datebegin1,dateend1, clientcode);
+         takings2=takings2+Post (acc,datebegin2,dateend2, clientcode);
+         credit_without1=credit_without1+Kred (acc,datebegin1,dateend1, clientcode);
+         credit_without2=credit_without2+Kred (acc,datebegin2,dateend2, clientcode);
+       end;
+   else
+      if (doc(acc,datebegin1,dateend1) or doc(acc,datebegin2,dateend2))
+         takings1=takings1+Post (acc,datebegin1,dateend1, clientcode);
+         takings2=takings2+Post (acc,datebegin2,dateend2, clientcode);
+         credit_without1=credit_without1+Kred (acc,datebegin1,dateend1, clientcode);
+         credit_without2=credit_without2+Kred (acc,datebegin2,dateend2, clientcode);
+      end;
+      if ((takings1!=0) or (takings2!=0) or (credit_without1!=0) or (credit_without2!=0))
+         str = Clear(String(clientobjcode))+";"
+              +String(clientobjcode101)+";"
+              +Clear(String(GetClientName(clientcode)))+";"
+              +Clear(String(credit_without1))+";"
+              +Clear(String(takings1))+";"
+              +Clear(String(credit_without2))+";"
+              +Clear(String(takings1))+";";
+         rep_ac.str = ToAnsi (str, true);
+         insert (rep_ac);
+      end;
+      takings1 = 0;
+      takings2 = 0;
+      credit_without1 = 0;
+      credit_without2 = 0;
+   end;
+   useprogress (n);
+   clientobjcode = dataset.code;
+   clientobjcode101 = dataset.c101;
+   clientcode = dataset.client;
+   Clientname = dataset.nameaccount;
+   acc = dataset.account;
+   end;
+   if ((takings1 != 0) or (takings2 != 0) or (credit_without1 != 0) or (credit_without2 != 0))
+      str = Clear(String(clientobjcode))+";"
+           +String(clientobjcode101)+";"
+           +Clear(String(GetClientName(clientcode)))+";"
+           +Clear(String(credit_without1+Kred (acc,datebegin1,dateend1, clientcode)))+";"
+           +Clear(String(credit_without2+Kred (acc,datebegin2,dateend2, clientcode)))+";"
+           +Clear(String(takings2+Post (acc,datebegin2,dateend2, clientcode)))+";";
+      rep_ac.str = ToAnsi (str, true);
+      insert (rep_ac);
+   end;
+   remprogress(n);
+   close(rep_ac);
+   copyToMe();
+   ob = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+   ex = ob.CreateComObject ("Excel.Application");
+   if (not(GetFileInfo("$"+tempFileNameBezPuti,@dd,@tt,@ii,@all_local_puth))); //all_local_puth- то что надо. полный путь абсолютный локальный
+      msgbox("не могу найти на локальном диске файл "+tempFileNameBezPuti+"          \n останавливаюсь");
+    exit(0);
+  end;
+  all_local_puth = SUBSTR(all_local_puth, 2);
+  
+   var aw=tarray;
+   var w1=tarray;
+   var w2=tarray;
+   var w3=tarray;
+   var w4=tarray;
+   var w5=tarray;
+   var w6=tarray;
+   var w7=tarray;
+   var w8=tarray;
+   var w9=tarray;
+
+   w1(0)=1; w1(1)=1; //формат столбца - текст
+   w2(0)=2; w2(1)=1; //формат столбца - General
+   w3(0)=3; w3(1)=1;//формат столбца - General
+   w4(0)=4; w4(1)=1;//формат столбца - General
+   w5(0)=5; w5(1)=1;//формат столбца - General
+   w6(0)=6; w6(1)=1;//формат столбца - General
+   w7(0)=7; w7(1)=1;//формат столбца - General
+   w8(0)=8; w8(1)=1;//формат столбца - текст
+   w9(0)=9; w9(1)=1;//формат столбца - текст
+   
+   aw(0)=w1;
+   aw(1)=w2;
+   aw(2)=w3;
+   aw(3)=w4;
+   aw(4)=w5;
+   aw(5)=w6;
+   aw(6)=w7;
+   aw(7)=w8;
+   aw(8)=w8;
+
+	aw.MarshalByVal =true; // работает только так. передача по значению через @aw вызывает ошибку
+	w1.MarshalByVal =true;
+	w2.MarshalByVal =true;
+	w3.MarshalByVal =true;
+	w4.MarshalByVal =true;
+	w5.MarshalByVal =true;
+	w6.MarshalByVal =true;
+	w7.MarshalByVal =true;
+	w8.MarshalByVal =true;
+   w9.MarshalByVal =true;
+   
+   ex.Workbooks.opentext(all_local_puth,1251,1,1,-4142,false,false,true,false,false,false,";",aw,1,"."," ",true,true);
+   var format_str:string = "# ##0" + ex.International(3) + "00";
+   ex.Sheets(1).Range("A:A").ColumnWidth=15;
+   ex.Sheets(1).Range("B:B").ColumnWidth=12;
+   ex.Sheets(1).Range("C:C").ColumnWidth=33;
+   ex.Sheets(1).Range("D:D").ColumnWidth=23;
+   ex.Sheets(1).Range("E:E").ColumnWidth=23;
+   ex.Sheets(1).Range("F:F").ColumnWidth=22;
+   ex.Sheets(1).Range("G:G").ColumnWidth=25;
+   ex.Sheets(1).Rows("3:3").RowHeight=65;
+   ex.Sheets(1).Range("A1:E1").MergeCells=true;
+   ex.Sheets(1).Range("A2:B2").MergeCells=true;
+   ex.Sheets(1).Range("A:G").WrapText=True;
+   ex.Sheets(1).Rows("3:3").VerticalAlignment = 2;
+   ex.Sheets(1).Range("A:G").HorizontalAlignment = 3;
+   ex.Sheets(1).Range("A3:G3").interior.color = 4035000;
+   ex.Sheets(1).Range("A:G").Font.Name = "Arial";
+   ex.Sheets(1).Range("A:G").Font.Size = 10;
+   ex.Sheets(1).Range("D:G").NumberFormat = format_str;
+
+
+/* Коркин И.Н. Сохранение отчета. По заявке I-013680 */
+   if ((path1 != "") and (file_name != ""))
+      var mon12, day12, year12;
+      DateSplit({curdate}, day12, mon12, year12);
+      path1 =  path1 +"\\" + file_name + day12 + mon12 + year12 + string(random(100)) + ".xls";
+      ex.obBook.SaveAs(path1);
+   end;
+   ex.Visible = true;
+END;  //OutAll()
+
+ /*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key) 
+
+   var const_mess = "~F2~ Продолжить ~SPACE~ По всем офисам ~ESC~ Выход ";
+   var const_mess2 = "~F2~ Продолжить ~SPACE~ ~ESC~ Выход ";
+
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dprt_v = 0;
+      dlg.rec.dprt_code  ="";
+      dlg.rec.dprt_name = officename;
+      datesplit({curdate},null,mon,year);
+      if (mon==1)
+         mon=13; year=year-1;
+      end;
+      dlg.rec.Datebegin1 = date(1,mon-1,year);
+      if (mon==13)
+         mon=1; year=year+1;
+      end;
+      dlg.rec.DateEnd1 = date(1,mon,year)-1;
+      dlg.rec.Datebegin2 = date(1,mon,year);
+      dlg.rec.DateEnd2 = {curDate};
+      UpdateFields(dlg); 
+   end;
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+      if (FldName(dlg,id)=="dprt_code") 
+         message(" ~F3~ Список подразделений "+const_mess);
+      elif (FldName(dlg,id)=="DateBegin1")
+         message(" ~F3~ Выбор даты из календаря "+const_mess2);
+      elif (FldName(dlg,id)=="DateEnd1")
+         message(" ~F3~ Выбор даты из календаря "+const_mess2);
+      elif (FldName(dlg,id)=="DateBegin2")
+         message(" ~F3~ Выбор даты из календаря "+const_mess2);
+      elif (FldName(dlg,id)=="DateEnd2")
+         message(" ~F3~ Выбор даты из календаря "+const_mess2);
+      end;
+   end;
+   if (cmd == DLG_REMFOCUS)
+     /*Проверка корректности дат отчета*/
+      if (FldName(dlg,id) == "DateBegin1")
+         if ( dlg.rec.DateBegin1 > {curdate} )
+            MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+            return CM_CANCEL;
+         elif ( dlg.rec.DateBegin1 > dlg.rec.DateEnd1 )
+            MsgBox("Дата начала периода не может быть больше даты окончания периода");
+            return CM_CANCEL;
+         end;
+      end;
+      if (FldName(dlg,id) == "DateEnd1")
+         if ( dlg.rec.DateEnd1 > {curdate} )
+            MsgBox("Дата не может быть больше даты текущего операционного дня");
+            return CM_CANCEL;
+         elif ( dlg.rec.DateBegin1 > dlg.rec.DateEnd1 )
+            MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+            return CM_CANCEL;
+         end;
+       end;
+      if(FldName(dlg,id) == "DateBegin2")
+         if ( dlg.rec.DateBegin2 > {curdate} )
+            MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+            return CM_CANCEL;
+         elif ( dlg.rec.DateBegin2 > dlg.rec.DateEnd2 )
+            MsgBox("Дата начала периода не может быть больше даты окончания периода");
+            return CM_CANCEL;
+         end;
+      end;
+      if (FldName(dlg,id) == "DateEnd2")
+         if ( dlg.rec.DateEnd2 > {curdate} )
+            MsgBox("Дата не может быть больше даты текущего операционного дня");
+            return CM_CANCEL;
+         elif ( dlg.rec.DateBegin2 > dlg.rec.DateEnd2 )
+            MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+            return CM_CANCEL;
+         end;
+      end;
+      UpdateFields(dlg); 
+   end;
+   if (cmd == DLG_KEY)
+     /*Выход из диалогового окна формирования отчета*/
+      if (KEY == KEY_ESC)
+         return exit(1);//CM_CANCEL;
+     /*Выбор данных из списка*/
+      elif ( KEY == KEY_F3)
+        /*Выбор подразделения банка из списка подразделений */
+         if (FldName(dlg,id) == "dprt_code")
+            if (ListDepartment (Department))
+               dprt_v = department.code; 
+               dlg.rec.dprt_code = Department.name;
+               dlg.rec.dprt_name = GetClientName(Department.PartyID);
+               message(" ~F3~ Список подразделений "+const_mess);
+               UpdateFields(dlg);
+            end;
+         end;
+        /*Выбор даты из календаря*/
+         if (FldName(dlg,id) == "DateBegin1")
+            dlg.rec.datebegin1 = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "DateEnd1")
+            dlg.rec.dateend1 = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "DateBegin2")
+            dlg.rec.datebegin2 = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "DateEnd2")
+            dlg.rec.dateend2 = GetDateByCalendar ({curDate});
+         end;
+      elif (KEY == KEY_SPACE)
+         /*Сброс установок в поле офис банка*/
+         if (dlg.rec.dprt_code != 0 ) 
+            dlg.rec.dprt_code="";
+            dlg.rec.dprt_name = "По всем офисам";
+            dprt_v = 0;
+            UpdateFields(dlg);
+         end;
+         if (dlg.rec.dprt_code == "По всем офисам") 
+            message(" ~F3~ Список подразделений "+const_mess);
+            UpdateFields(dlg);
+         end;
+      elif (( KEY == KEY_F2 ) or ( KEY == KEY_ENTER ))         //Проверки при вводе  
+         if ( dlg.rec.DateBegin1 > {curdate} )
+            MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+            return CM_IGNORE;
+         elif ( dlg.rec.DateBegin1 > dlg.rec.DateEnd1 )
+            MsgBox("Дата начала периода не может быть больше даты окончания периода");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.DateEnd1 > {curdate} )
+            MsgBox("Дата не может быть больше даты текущего операционного дня");
+            return CM_IGNORE;
+         elif ( dlg.rec.DateBegin1 > dlg.rec.DateEnd1 )
+            MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.DateBegin2 > {curdate} )
+            MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+            return CM_IGNORE;
+         elif ( dlg.rec.DateBegin2 > dlg.rec.DateEnd2 )
+            MsgBox("Дата начала периода не может быть больше даты окончания периода");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.DateEnd1 > {curdate} )
+            MsgBox("Дата не может быть больше даты текущего операционного дня");
+            return CM_IGNORE;
+         elif ( dlg.rec.DateBegin2 > dlg.rec.DateEnd2 )
+            MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+            return CM_IGNORE;
+         end;
+         if ((strlen(dlg.rec.dprt_code) != 0) and (dlg.rec.dprt_name != "По всем офисам"))
+            if (department.nodetype == 2)                   
+               branch = "and acc.t_branch="+dprt_v;
+               officename=dlg.rec.dprt_name;
+            else
+               branch = "and acc.t_department="+dprt_v;
+               officename=dlg.rec.dprt_name;
+            end;
+         elif (dlg.rec.dprt_Name == "По всем офисам") 
+            branch = "";
+            officename=dlg.rec.dprt_name;
+         elif (dprt_v == 0)
+            branch = "";
+            officename=dlg.rec.dprt_name;
+         end;
+         Datebegin1  = dlg.rec.Datebegin1;
+         Dateend1 = dlg.rec.DateEnd1;
+         Datebegin2  = dlg.rec.Datebegin2;
+         Dateend2 = dlg.rec.DateEnd2;
+         Return CM_SAVE;
+//      else
+  //       Return CM_IGNORE;
+      end;
+   end;
+END; //MACRO Event
+
+/*Точка входа в макрос*/
+/*if ((GetCmdLineParm("datebegin1",datebegin1)) and (GetCmdLineParm("dateend1",dateend1)) and
+(GetCmdLineParm("datebegin2",datebegin2)) and (GetCmdLineParm("dateend2",dateend2)) and
+(GetCmdLineParm("namedep",namedep)))
+*/
+/* Коркин И.Н. По заявке I-013680 */
+if (((GetCmdLineParm("period", period)) and (GetCmdLineParm("interval", interval)) and (GetCmdLineParm("namedep",namedep)) and (GetCmdLineParm("path1", path1)) and (GetCmdLineParm("filename", file_name))) or
+	 ((GetCmdLineParm("interval", interval)) and (GetCmdLineParm("date_begin",datebegin1)) and 
+	  (GetCmdLineParm("date_end",dateend2)) and (GetCmdLineParm("namedep",namedep))  and (GetCmdLineParm("path1", path1)) and (GetCmdLineParm("filename", file_name))))
+
+   cmd = rsdcommand("select dep.t_code, party.t_name from ddp_dep_dbt dep, dparty_dbt party where party.t_partyid = dep.t_partyid and dep.t_name = ?");
+   cmd.addparam("name", RSDBP_IN, namedep);
+   rsd = rsdrecordset(cmd);
+   datebegin1 = date(datebegin1);
+   dateend1 = date(dateend1);
+
+   datebegin2 = date(datebegin2);
+   dateend2 = date(dateend2);
+
+   getPeriod (period, interval, @datebegin1, @dateend1);
+   datebegin2 = dateend1 + 1;
+   dateend2 = {curdate};
+
+   if (rsd.movenext())
+    if (namedep == "000")
+      branch = "and acc.t_department="+rsd.value(0);
+    else
+      branch = "and acc.t_branch="+rsd.value(0);
+    end;
+    officename=rsd.value(1);
+    OutAll();
+   end;
+else
+   if (RunDialog(dlg, "Event"))
+      OutAll();
+   end;
+end;

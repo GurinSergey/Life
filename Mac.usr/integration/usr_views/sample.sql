@@ -1,0 +1,1 @@
+select * from table(usr_views.get_view_payment('paymentid>2223 and paymentid<2323'))

@@ -1,0 +1,183 @@
+/*************************************************************************/
+/*     Дополнение к автоматизированной банковской системе RS-Bank        */
+/*                                                                       */
+/*    Имя файла        : rep_rest_sks.mac                                */
+/*                                                                       */
+/*    Программист      : Котов С.С.                                      */
+/*                                                                       */
+/*    Создан           : 25.06.2011                                      */
+/*                                                                       */
+/*************************************************************************/
+
+import Globals;
+import oralib, likepy;
+import "FrontCommon.mac";
+
+var dt1={curdate};
+var i=0;
+var mask="405*,406*,407*,40820*";
+var flag_ubs=true; // true - коннект с UBS установлен
+
+private var oConnection_lib = ActiveX("ADODB.Connection");
+
+   var oConnection;
+   var connstring, procname = "EES_GET_REST_ACC", note;
+   var ruleidmask, eCode;
+   var rset, rs, cmd;
+
+private macro init
+
+   // Констринг беру из любого из правил, указанных в PRBB\МАРШРУТИЗАЦИЯ\UBSRULES
+   GetRegistryValue("PRBB\\МАРШРУТИЗАЦИЯ\\UBSRULES", V_STRING, ruleidmask, eCode);
+   if ( eCode > 0 )
+     println("Не найдено правило со строкой соединения");
+     flag_ubs = false;
+   end;
+
+   cmd = RSDCommand(
+                    "select rule_id,  state, connstring, extprocname, execcarry_type, note, need_ask from usr_route_parm "+
+                    "where state = 0 and (" + ConvertMaskToSQLFormat(  ruleidmask, "rule_id" ) + ")"
+                   );
+   rs = RSDRecordset(cmd);
+
+   if (rs.movenext) // Берём первое подходящее правило для ЮБС
+     connstring = rs.value("connstring");
+     note       = rs.value("note");
+   else
+     println("Не найдена строка соединения");
+     flag_ubs = false;
+   end;
+
+   oConnection = oConnection_lib;
+   oConnection.CursorLocation = 3 ;
+   oConnection.Open(connstring) ;
+
+   OnError
+     println("Не удалось соединится с внешней системой!!! ("+note+")");
+     flag_ubs = false;
+
+end;
+
+private macro limitUBS(acc,dt1)
+
+   array aInput, aOutput;
+
+   if (not flag_ubs)
+     return 0;
+   end;
+
+/*
+Имя процедуры: EES_GET_REST_ACC
+    Параметры:
+        @Razdel tinyint - раздел учета (0 - "А", 2 - "В", 3 - "Г")
+        @DateRest datetime - дата, ЗА которую запрашивается остаток
+        @StrAccount varchar(25) - счет, по которому запрашивается остаток
+        @Rest money output -- остаток счета (со знаком)
+        @StrError varchar(255) output --заполняется в случае ошибки
+
+*/
+   // { ? = call EES_GET_REST_ACC(?, ?, ?, ?, ?) }
+
+   //Инициализация входных параметров
+   aInput(0) = 0;        //@Razdel tinyint - раздел учета (0 - "А", 2 - "В", 3 - "Г")
+   aInput(1) = dt1;      //@DateRest datetime - дата, ЗА которую запрашивается остаток
+   aInput(2) = acc;      //@StrAccount varchar(25) - счет, по которому запрашивается остаток
+
+   //Инициализация выходных параметров
+   aInput(3) = 0.0;      //1 @Rest money output -- остаток счета (со знаком)
+   aInput(4) = "";       //2 @StrError varchar(255) output --заполняется в случае ошибки
+
+   rset = RSADORecordset(ExecuteFrontProcEx(procname, aInput, oConnection));
+
+   if (not(rset))
+     return 0;
+   end;
+
+   return rset.rs.ActiveCommand.Parameters(4).value;  //1 @Rest money output -- остаток счета (со знаком)
+
+end;
+
+private macro PrintTop(dt1)
+  [Отчет "Сравнение остатков и лимитов по овердрафтом СКС <Зеленый коридор> в RS-Bank V6 и UBS"
+   Дата ##########
+   ┌─────┬────────────────────┬───────────────┬───────────────┬───────────────┬────────────────┐
+   │  №  │       № СКС        │   Дебетовый   │Доступный лимит│Общая доступная│   Доступный    │
+   │ п/п │                    │остаток RS, руб│    RS, руб    │ сумма RS, руб │остаток UBS, руб│
+   ├─────┼────────────────────┼───────────────┼───────────────┼───────────────┼────────────────┤](date(dt1));
+end;
+
+var sumrest=0,sumlimit=0,sumlimitUBSval=0;
+private macro PrintLine(dt1,acc,rest,client)
+   i=i+1;
+   // Определим доступный лимит
+   var limit = 0,
+       limitUBSval = 0;
+   var query:string = "select t_account, " +
+                       //"       rsb_account.resta(t_account,:dt1,t_chapter,t_r0) " + TAM 31.01.2014 Adaptation_2031
+                       "       rsb_account.restac(t_account, t_code_currency, :dt1, t_chapter, 0) " +
+                       "  from daccount_dbt sks \n" +
+                       " where t_usertypeaccount like '%G%' \n" +
+                       "   and t_client = :client \n" +
+                       "   and t_chapter = 3 \n" +
+                       "   and substr(t_account,10,2)='09' \n" +
+                       "   and substr(t_account,12,1)='2'";
+   var params:TArray = makeArray(SQLParam("dt1",dt1),
+                                 SQLParam("client",client));
+   var rs:RsdRecordSet = execSQLselect( query, params );
+   if ((rs)and(rs.moveNext()))
+      if (rs and (ValType(rs.value(0)) != 26))
+         limit = rs.value(1);
+      end;
+   end;
+
+   limitUBSval = limitUBS(acc,dt1);
+
+  [│#####│####################│###############│###############│###############│################│]
+   (i:r,acc:c:w,money(rest):r,money(limit):r,money(rest+limit):r,money(limitUBSval));
+
+   sumrest        = sumrest + rest;
+   sumlimit       = sumlimit + limit;
+   sumlimitUBSval = sumlimitUBSval + limitUBSval;
+end;
+
+private macro PrintBottom(sumrest,sumlimit,sumlimitUBSval)
+  [├─────┴────────────────────┼───────────────┼───────────────┼───────────────┼────────────────┤
+   │ Итого по всем счетам, руб│###############│###############│###############│################│
+   └──────────────────────────┴───────────────┴───────────────┴───────────────┴────────────────┘]
+   (money(sumrest),money(sumlimit),money(sumrest+sumlimit),money(sumlimitUBSval));
+end;
+
+private macro GetData(dt1)
+   var query:string = "select t_account, " +
+                    //"       rsb_account.resta(t_account,:dt1,t_chapter,t_r0) " + TAM 31.01.2014 Adaptation_2031
+                    "       rsb_account.restac(t_account, t_code_currency, :dt1, t_chapter, 0) " +
+                    "       t_client \n" +
+                    "  from daccount_dbt sks \n" +
+                    " where t_usertypeaccount like '%G%' \n" +
+                    "   --and t_type_account like '%O%' \n" +
+                    "   and (" + ConvertMaskToSQLFormat( mask, "t_account" ) + ") "
+                    "   and t_chapter = 1 \n" +
+                    "   and substr(t_account,10,2)='09' \n" +
+                    "   and ((t_open_close = CHR(0) or t_close_date >= :dt1)and \n" +
+                    "        (t_open_date <= :dt1) \n" +
+                    "       ) \n order by substr(t_account,1,8),substr(t_account,10)";
+   var params:TArray = makeArray(SQLParam("dt1",dt1));
+   var rs:RsdRecordSet = execSQLselect( query, params );
+   PrintTop(dt1);
+   while ((rs)and(rs.moveNext()))
+      if (rs and (ValType(rs.value(0)) != 26))
+         PrintLine(dt1,rs.value(0),rs.value(1),rs.value(2));
+      end;
+   end;
+   PrintBottom(sumrest,sumlimit,sumlimitUBSval);
+   return 0;
+end;
+
+macro work
+   if (getdate(dt1, "Выберите дату"))
+      GetData(dt1);
+   end;
+end;
+
+init;
+work;

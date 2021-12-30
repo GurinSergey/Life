@@ -1,0 +1,726 @@
+/****************************************************/
+/* ОСВ в эксель                                     */
+/* Коркин И.Н.                                      */
+/* 11.10.2010                                       */
+/* Реализовано по заявке I-060068.                  */
+/* Выпуск ОСВ в эксель за период по главе           */
+/* только л/с без подитогов,                        */
+/* требовалось для проверки ЦБ                      */
+// 07.05.2012 vihrov переделал вывод в эксель. теперь, наконец-то, стало нормально, правильно. хотя нет, в xml будет правильнее
+// 12.02.2014 R-326546-3 DPN - Адаптация под 31-й патч 
+// 16.01.2015 I-00544792-2 DPN Не выводились остатки\обороты в рублях
+/****************************************************/
+
+import rsexts;
+import RsbDataSet, globals, календарь;
+import "KeyCodes.mac";
+import "VBAconst.mac";
+
+const TEXTDIR_REESTR		= "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+
+
+var 	exst, i, i_old, page, flag, ex, ob, out, f, countlist,
+		output="osv.xlsx",
+		fulloutput, obBook, obsheet;
+
+var begindate, enddate, chapter, che, acc_mask;
+
+var account_bal,restinA_bal,restinP_bal,debet_bal,kredit_bal,restoutA_bal,restoutP_bal;
+
+var SheetBalance= false;
+che = 3;
+countlist = 1;
+var _i=0,bal2="",bal="";    
+
+var tempFileName:string = "", tempFileNameBezPuti:string ="";
+private var dd:date, tt:time, ii:integer, ss:string;  // это переменные для использования FileInfo
+var strok_end:integer=1,strok_begin:integer=0; // кол-во строк в файле данных.
+var new_bal2:string= "", old_bal2:string="", strok_bal2:integer=0;
+
+var Fulloutputlbr, outlbr, outputlbr="osvinexcel_prbb.lbr";                    
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outlbr);
+Fulloutputlbr = FindPath(outputlbr, outlbr);
+if (not Fulloutputlbr)
+	msgbox("Не найдена LBR "+outputlbr);
+	exit();
+end;
+
+var dlg = TRecHandler("dates", fulloutputlbr, TRUE); 
+
+ /*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key)
+   array gname;
+   gname(0)="А 'Балансовые счета'";
+   gname(1)="В 'Внебалансовые счета'";
+   gname(2)="Г 'Срочные сделки'";
+   var g;
+   var const_mess = " ~F3~ Выбор значения из списка ~F2~ Продолжить ~ESC~ Выход ",
+   SQLQuery, SQLQuery1, rsrec, cmd1;
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dlg.rec.begindate = {curdate};//date("01.05.2011");//
+      BeginDate  = dlg.rec.beginDate;
+      dlg.rec.enddate = {curdate};//date("30.04.2012");//
+      EndDate  = dlg.rec.EndDate;
+      dlg.rec.chapter = "А";
+      chapter = 1;
+      dlg.rec.chaptername = "Балансовые счета";
+      acc_mask = "";
+      dlg.rec.account = "";
+      SheetBalance = false;
+      UpdateFields(dlg); 
+   end;
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+      if(FldName(dlg,id) == "Account")
+        message("Введите маску счета. Например, '40702*,40802*' ~F2~ Продолжить ~ESC~ Выход");
+      else
+        message(const_mess);
+      end;
+   end;
+   if (cmd == DLG_REMFOCUS)
+      /*Проверка корректности дат отчета*/
+      UpdateFields(dlg); 
+   end;
+   if (cmd == DLG_KEY)
+      /*Выход из диалогового окна формирования отчета*/
+      if (KEY == KEY_ESC)
+         return CM_CANCEL;
+      /*Выбор данных из списка*/
+      elif ( KEY == KEY_F3)
+         if (FldName(dlg,id) == "begindate")
+            dlg.rec.begindate = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "enddate")
+            dlg.rec.enddate = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "chapter")
+            dlg.rec.chapter = 1;
+            dlg.rec.chaptername = 1;
+            g=menu(gname,"Глава счетов");
+            if (g==0)  
+              dlg.rec.chapter = "А";
+              dlg.rec.chaptername = "Балансовые счета";
+              chapter = 1;
+              message(" ~F3~ Список глав счетов "+const_mess);
+              UpdateFields(dlg);
+            elif (g==1)
+              dlg.rec.chapter = "В";
+              dlg.rec.chaptername = "Внебалансовые счета";
+              chapter = 3;
+              message(" ~F3~ Список глав счетов "+const_mess);
+              UpdateFields(dlg);
+            elif (g==2)
+              dlg.rec.chapter= "Г";
+              dlg.rec.chaptername = "Срочные сделки";
+              chapter = 4;
+              message(" ~F3~ Список глав счетов "+const_mess);
+              UpdateFields(dlg);
+            else 
+              message(" ~F3~ Список глав счетов "+const_mess);
+              UpdateFields(dlg);
+            end;
+         end;
+      elif (( KEY == KEY_F2 ) or (KEY == KEY_ENTER))         //Проверки при вводе
+         if ( dlg.rec.begindate > {curDate} )
+            MsgBox("Дата начала периода должна быть не больше текущей даты");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.begindate > dlg.rec.enddate )
+            MsgBox("Дата начала периода должна быть не больше конечной даты");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.chapter == "" )
+            MsgBox("Выберите главу");
+            return CM_IGNORE;
+         end;
+         BeginDate  = dlg.rec.beginDate;
+         endDate  = dlg.rec.endDate;
+         acc_mask = dlg.rec.account;
+         Return CM_SAVE;
+      elif (KEY==KEY_SPACE)
+         if(FldName(dlg,id)=="button")
+            if (dlg.rec.button == "")
+                dlg.rec.button = "X";
+                SheetBalance = true;
+            else
+                dlg.rec.button = "";
+                SheetBalance = false;
+            end;
+            UpdateFields(dlg);
+         end;
+    	if ( (trim(fldname(dlg, id)) == "null_need"))      
+		    dlg.rec.null_need = strfor (88 - codefor (dlg.rec.null_need));              
+		    return CM_DEFAULT;                                                 
+        end;                                                                   
+      end;
+   else
+      Return CM_IGNORE;
+   end;
+END;
+
+macro calculate(chapter, begindate, enddate)
+	var query, data;
+   
+   //12.02.2014 R-326546-3 DPN - Адаптация под 31-й патч (Переписал запрос)
+   
+   query = "   SELECT   t_account, restinA, restinP, debet, kredit, restoutA, restoutP, t_nameaccount "
+   + "\n" + "    FROM   (SELECT   ac.t_account, "
+  + "\n" + "                     CASE "
+   + "\n" + "                        WHEN T_KIND_ACCOUNT = 'А' "
+   + "\n" + "                        THEN "
+//   + "\n" + "                         /*  ABS */-(rsb_account.resta ( "
+   + "\n" + "                         /*  ABS */-(usr_rsi_rsb_account.resta ( "
+   + "\n" + "                                  t_account, "
+   + "\n" + "                                  TO_DATE ('" + begindate + "', 'dd.mm.yyyy') - 1, "
+   + "\n" + "                                  t_chapter, "
+   + "\n" + "                                  0, t_code_currency, 0  " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                               )) "
+   + "\n" + "                        ELSE "
+   + "\n" + "                           0 "
+   + "\n" + "                     END "
+   + "\n" + "                        AS restinA, "
+   + "\n" + "                     CASE "
+   + "\n" + "                        WHEN T_KIND_ACCOUNT = 'А' "
+   + "\n" + "                        THEN "
+   + "\n" + "                           0 "
+   + "\n" + "                        ELSE "
+   + "\n" + "                       /*  ABS */(usr_rsi_rsb_account.resta ( "
+   + "\n" + "                                  t_account, "
+   + "\n" + "                                  TO_DATE ('" + begindate + "', 'dd.mm.yyyy') - 1, "
+   + "\n" + "                                  t_chapter, "
+   + "\n" + "                                  0, t_code_currency, 0  " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                               )) "
+   + "\n" + "                     END "
+   + "\n" + "                        AS restinP, "
+   + "\n" + "                     ABS (usr_rsi_rsb_account.debeta (t_account, "
+   + "\n" + "                                            t_chapter, "
+   + "\n" + "                                            TO_DATE ('" + begindate + "', 'dd.mm.yyyy'), "
+   + "\n" + "                                            TO_DATE ('" + enddate + "', 'dd.mm.yyyy'), t_code_currency, 0) " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                     ) "
+   + "\n" + "                        debet, "
+   + "\n" + "                     ABS (usr_rsi_rsb_account.kredita (t_account, "
+   + "\n" + "                                             t_chapter, "
+   + "\n" + "                                             TO_DATE ('" + begindate + "', 'dd.mm.yyyy'), "
+   + "\n" + "                                             TO_DATE ('" + enddate + "', 'dd.mm.yyyy'), t_code_currency, 0) " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                     ) "
+   + "\n" + "                        kredit, "
+   + "\n" + "                     CASE "
+   + "\n" + "                        WHEN T_KIND_ACCOUNT = 'А' "
+   + "\n" + "                        THEN "
+   + "\n" + "                         /*  ABS */-(usr_rsi_rsb_account.resta ( "
+   + "\n" + "                                  t_account, "
+   + "\n" + "                                  TO_DATE ('" + enddate + "', 'dd.mm.yyyy'), "
+   + "\n" + "                                  t_chapter, "
+   + "\n" + "                                  0, t_code_currency, 0  " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                               )) "
+   + "\n" + "                        ELSE "
+   + "\n" + "                           0 "
+   + "\n" + "                     END "
+   + "\n" + "                        AS restoutA, "
+   + "\n" + "                     CASE "
+   + "\n" + "                        WHEN T_KIND_ACCOUNT = 'А' "
+   + "\n" + "                        THEN "
+   + "\n" + "                           0 "
+   + "\n" + "                        ELSE "
+   + "\n" + "                         /*  ABS */(usr_rsi_rsb_account.resta ( "
+   + "\n" + "                                  t_account, "
+   + "\n" + "                                  TO_DATE ('" + enddate + "', 'dd.mm.yyyy'), "
+   + "\n" + "                                  t_chapter, "
+   + "\n" + "                                  0, t_code_currency, 0 )) " //16.01.2015 I-00544792-2 DPN
+   + "\n" + "                     END "
+   + "\n" + "                        AS restoutP, "
+   + "\n" + "                     ac.T_NAMEACCOUNT, "
+   + "\n" + "                     ac.t_sort "
+   + "\n" + "              FROM   daccount_dbt ac, drestdate_dbt rest"
+   + "\n" + "             WHERE   ac.t_chapter = " + chapter
+   + "\n" + "               AND   ac.t_accountid = rest.t_accountid ";
+// KS 28.01.2011 Фильтр по лицевому счету
+if (acc_mask!="")
+   query = query
+   + "\n" + "               AND   (" + ConvertMaskToSQLFormat(acc_mask, "t_Account") +")";
+end;
+   query = query
+   + "\n" + "                     AND (t_open_date BETWEEN TO_DATE ('" + begindate + "', 'dd.mm.yyyy') "
+   + "\n" + "                                          AND  TO_DATE ('" + enddate + "', 'dd.mm.yyyy') "
+   + "\n" + "                          OR t_close_date BETWEEN TO_DATE ('" + begindate + "', 'dd.mm.yyyy') "
+   + "\n" + "                                              AND  TO_DATE ('" + enddate + "', 'dd.mm.yyyy') "
+   + "\n" + "                          OR (t_open_date <= TO_DATE ('" + begindate + "', 'dd.mm.yyyy') "
+   + "\n" + "                              AND (t_close_date >= "
+   + "\n" + "                                      TO_DATE ('" + enddate + "', 'dd.mm.yyyy') "
+   + "\n" + "                                   OR t_close_date = "
+   + "\n" + "                                        TO_DATE ('01.01.0001', 'dd.mm.yyyy'))))" 
+   + "\n" + "                    AND (rest.t_restdate = ( SELECT MAX (r.t_restdate) "
+   + "\n" + "                                             FROM drestdate_dbt r RIGHT JOIN daccount_dbt acc "
+   + "\n" + "                                                                 ON acc.t_accountid = r.t_accountid "
+   + "\n" + "                                             WHERE ac.t_accountid = acc.t_accountid " 
+   + "\n" + "                                             AND rest.t_restcurrency = 0 "
+   + "\n" + "                                             AND r.t_restdate <= TO_DATE ('" + enddate + "', 'dd.mm.yyyy') "
+   + "\n" + "                                           ) "
+   + "\n" + "                        ) "
+   + "\n" + "                    OR rest.t_restdate IS NULL "
+   + "\n" + "                    AND (rest.t_restcurrency = 0 OR rest.t_restcurrency IS NULL)) ";
+   if (dlg.rec.null_need == strfor(88))
+   else
+   	query = query + "   WHERE   debet != 0 OR kredit != 0 OR restinA != 0 OR restinP != 0 OR restoutA != 0 OR restoutA != 0 ";
+   end;
+   if (SheetBalance)
+     query = query
+     + "\n" + "ORDER BY   SUBSTR (t_account, 1, 5) desc, t_sort";
+   else
+     query = query
+     + "\n" + "ORDER BY   SUBSTR (t_account, 1, 5)  asc, t_sort";
+   end;
+   message("Расчет...");
+   debugbreak;
+   data = TRsbDataset(query);
+   return data;
+end;    
+    
+
+
+macro writeHead()
+	private var m_range:string="A"+(che+1)+":h"+(che+1);
+	obSheet.Cells(1,1).Value= "ОСВ в рублях";	
+	obSheet.Cells(2,1).Value= "За период с " + begindate + " по " + enddate;
+	obSheet.Cells(3,1).Value= "По главе " + chapter;
+	obSheet.Cells(che + 1,1).Value= "Счет";	
+	obSheet.Cells(che + 1,2).Value= "Актив";
+	obSheet.Cells(che + 1,3).Value= "Пассив";
+	obSheet.Cells(che + 1,4).Value= "Дебет";
+	obSheet.Cells(che + 1,5).Value= "Кредит";
+	obSheet.Cells(che + 1,6).Value= "Актив";
+	obSheet.Cells(che + 1,7).Value= "Пассив";
+	obSheet.Cells(che + 1,8).Value= "Наименование";
+
+   obSheet.Range(m_range).Borders.Weight=2;
+   obSheet.Range(m_range).interior.color=4035000;
+	obSheet.Range(m_range).HorizontalAlignment = xlCenter;
+	obSheet.Range(m_range).font.Name = "Calibri";
+	obSheet.Range(m_range).font.FontStyle = "bold";
+	obSheet.Range(m_range).font.Size = 12;
+
+    obSheet.Columns("A:A").ColumnWidth = 20;
+    var format_str:string = "# ##0" + ex.International(3) + "00"; // вот это важная штука. ex.DecimalSeparator - фигня, может не использоваться, т.к. стоит галка "использовать региональные настройки". А эта штука походу вернет верное значение, даже если эта галка не стоит.
+
+//    var format_str:string = "0,00";
+    obSheet.Columns("B:G").NumberFormat = format_str;
+    obSheet.Columns("B:H").EntireColumn.AutoFit;
+
+//    obsheet.Range("a1").Select;
+end;
+
+macro writeSum(st,fin)
+
+        obSheet.Range("A"+(fin+1)).value="Итого по "+bal2;
+        obSheet.Range("B"+(fin+1)).value="=СУММ(B"+(st)+":B"+(fin)+")";
+        obSheet.Range("C"+(fin+1)).value="=СУММ(C"+(st)+":C"+(fin)+")";
+        obSheet.Range("D"+(fin+1)).value="=СУММ(D"+(st)+":D"+(fin)+")";
+        obSheet.Range("E"+(fin+1)).value="=СУММ(E"+(st)+":E"+(fin)+")";
+        obSheet.Range("F"+(fin+1)).value="=СУММ(F"+(st)+":F"+(fin)+")";
+        obSheet.Range("G"+(fin+1)).value="=СУММ(G"+(st)+":G"+(fin)+")";
+
+end;
+
+macro AddNewSheet(bal,i);
+   obBook.sheets("пустышка").select;
+   obBook.sheets("пустышка").Copy(obBook.sheets(1));
+   obBook.sheets(1).name = bal;
+   obBook.sheets(bal).select;
+end;
+
+
+macro chekReestrRead(m_name:string, m_status:integer, m_err:integer)
+	if ((m_status == V_UNDEF) or (m_err != 0))
+    	msgbox("Ошибка получения значения настройки реестра " + m_name + " \n Процедура GetRegistryValue вернула код ошибки "+m_err);
+   		exit(0);
+	end;
+end;
+
+
+macro dayString(m_reestrName:string):string
+	private var m_errCode			:integer = NULL;
+	private var m_statusGetRegistry :integer = NULL;
+    private var m_zna4enie          :string  = NULL;
+	if (m_reestrName == "")
+		msgbox("При чтении реестра не задана строка реестра");
+		exit(0)
+	end;
+	m_statusGetRegistry=GetRegistryValue(m_reestrName, V_STRING, m_zna4enie, m_errCode);
+	chekReestrRead(m_reestrName, m_statusGetRegistry, m_errCode);
+	return(m_zna4enie);
+end;
+
+
+macro createUniqueFile()
+	private var ff:string = "osv__"+{oper}+"_"+date+"_"+time;
+	private var file_ext:string = ".txt";
+	tempFileName = dayString(TEXTDIR_REESTR);
+	tempFileName 		= tempFileName + "\\" + ff;
+	tempFileNameBezPuti = ff;
+	tempFileName = StrSubst ( tempFileName, ".", "_" );
+	tempFileName = StrSubst ( tempFileName, ":", "_" );
+	tempFileName = StrSubst ( tempFileName, " ", "_" );
+	tempFileName = tempFileName + file_ext;
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ".", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ":", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, " ", "_" );
+	tempFileNameBezPuti = tempFileNameBezPuti + file_ext;
+	if (substr(tempFileName,1,2) == "__")
+		tempFileName=".."+substr(tempFileName,3)
+	end;
+//		aa.str="fggfgdfdrgergegergergerge4gegergergergerg";
+//		insert(aa);
+//		close(aa);
+end;
+
+
+
+macro writeBody(data)
+	private macro day_stroku_for_itog(b:string,s:integer)
+		return toansi("итого по "+b + "|=сумм(R[-"+s+"]C[0]:R[-1]C[0])"+"|=сумм(R[-"+s+"]C[0]:R[-1]C[0])"+"|=сумм(R[-"+s+"]C[0]:R[-1]C[0])"+"|=сумм(R[-"+s+"]C[0]:R[-1]C[0])"+"|=сумм(R[-"+s+"]C[0]:R[-1]C[0])"+"|=сумм(R[-"+s+"]C[0]:R[-1]C[0])", true);
+	end;
+
+	var account,restinA,restinP,debet,kredit,restoutA,restoutP,nameaccount;
+	var first= true;
+	i = che + 2;
+    i_old = i;
+	InitProgress(-1, "Отобранные ранее счета выводятся в файл", "ОСВ в эксель. Глава " + chapter + ". С " + begindate + " по " + enddate);
+
+	createUniqueFile();
+	FILE aa () txt write;
+	open(aa, tempFileName);
+	aa.str = " "; insert(aa); //если ничего в файле не будет то он может не создастся и не переслаться на терминал и пользователь получит неверную ошибку.
+
+	var first_row:bool = true;
+   while (data.movenext)
+	  
+
+/*      bal = substr(string(data.value(0)),1,5);
+      if (bal2!=bal) // Новый балансовый
+        if (SheetBalance)
+         ob.Show; // Показываем
+         if (bal2!="") 
+           obBook.ActiveSheet.Range("A4:h"+(i)).Borders.Weight=2;
+           writeSum(i,i_old,i-1);
+         end;              
+         AddNewSheet(bal,i); // Открываем новый лист
+         bal2=bal;
+         i = che + 2;
+        else
+         if (bal2!="") 
+          writeSum(i,i_old-1,i-1);
+          i = i + 1;
+         end;
+         i_old = i + 1;
+         bal2=bal;
+        end;
+     end;
+*/
+     account=strsubst(StrSubst(strsubst(string(data.value("t_account")),"|"," "),strfor(10),""),strfor(13),"");
+     restinA=round(money(data.value("restinA")),2);
+     restinP= round(money(data.value("restinP")),2);
+     debet= round(money(data.value("debet")),2);
+     kredit= round(money(data.value("kredit")),2);
+     restoutA= round(money(data.value("restoutA")),2);
+     restoutP= round(money(data.value("restoutP")),2);
+     nameaccount= strsubst(strsubst(StrSubst(string(data.value("t_nameaccount")),"|",""), strfor(10),""),strfor(13),"");
+
+     new_bal2 = substr(account,1,5);
+     if (first_row) old_bal2 = new_bal2; first_row = false; end;
+     if (old_bal2 != new_bal2) aa.str=day_stroku_for_itog(old_bal2, strok_bal2);  insert(aa); strok_bal2=0; strok_end = strok_end +1; end;
+
+	 aa.str = account + "|" + restinA + "|" + restinP + "|" + debet + "|" + kredit + "|" + restoutA + "|" + restoutP + "|" + nameaccount;
+	 aa.str = toansi(aa.str, true);
+	 insert(aa); strok_end = strok_end +1; strok_bal2 = strok_bal2 +1;
+	 old_bal2 = new_bal2;
+/*
+     InsertElement(ob,"A"+i,account);
+     InsertElement(ob,"B"+i,restinA);
+     InsertElement(ob,"C"+i,restinP);
+     InsertElement(ob,"D"+i,debet);
+     InsertElement(ob,"E"+i,kredit);
+     InsertElement(ob,"F"+i,restoutA);
+     InsertElement(ob,"G"+i,restoutP);
+     InsertElement(ob,"H"+i,nameaccount);
+
+     i = i + 1;*/
+     UseProgress(_i=_i + 1);
+   end;
+   aa.str = day_stroku_for_itog(old_bal2, strok_bal2); insert(aa); strok_end = strok_end +1; 
+   close(aa);
+
+   RemProgress();
+//   println(strok_end);
+/*   obBook.sheets(bal2).Range("A1:h"+(i-1)).Borders.Weight=2;*/
+end;
+
+macro copyToMe()
+//		getstring(tempFileNameBezPuti);
+	private var m_path: string = "";
+	m_path = "$" + tempFileNameBezPuti;
+	if (not CopyFile(tempFileNameBezPuti, m_path, TRUE))
+		println ("НЕ СМОГ скопировать файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+	else 
+		println ("УСПЕШНО скопирован файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+//			getstring(m_path);
+		if (not removeFile(tempFileName))
+			println("Не смог удалить файл "+tempFileName+" с сервера приложений. ничего сташного, продолжаем работу.");
+		else
+			println("удален файл "+tempFileName+" с сервера приложений.");
+		end;
+	end;
+end;
+
+macro format_osv(b:integer, e:integer)
+	private var m_range:string="a"+b+":h"+e;
+	obSheet.range(m_range).Borders(xlEdgeLeft).LineStyle = xlContinuous;
+    obSheet.range(m_range).Borders(xlDiagonalDown).LineStyle = xlNone;           
+    obSheet.range(m_range).Borders(xlDiagonalUp).LineStyle = xlNone;             
+    obSheet.range(m_range).Borders(xlEdgeLeft).LineStyle = xlContinuous;         
+    obSheet.range(m_range).Borders(xlEdgeLeft).Weight = xlThin;                  
+    obSheet.range(m_range).Borders(xlEdgeLeft).ColorIndex = xlAutomatic;         
+    obSheet.range(m_range).Borders(xlEdgeTop).LineStyle = xlContinuous;          
+    obSheet.range(m_range).Borders(xlEdgeTop).Weight = xlThin;                   
+    obSheet.range(m_range).Borders(xlEdgeTop).ColorIndex = xlAutomatic;          
+    obSheet.range(m_range).Borders(xlEdgeBottom).LineStyle = xlContinuous;       
+    obSheet.range(m_range).Borders(xlEdgeBottom).Weight = xlThin;                
+    obSheet.range(m_range).Borders(xlEdgeBottom).ColorIndex = xlAutomatic;       
+    obSheet.range(m_range).Borders(xlEdgeRight).LineStyle = xlContinuous;        
+    obSheet.range(m_range).Borders(xlEdgeRight).Weight = xlThin;                 
+    obSheet.range(m_range).Borders(xlEdgeRight).ColorIndex = xlAutomatic;        
+    obSheet.range(m_range).Borders(xlInsideVertical).LineStyle = xlContinuous;   
+    obSheet.range(m_range).Borders(xlInsideVertical).Weight = xlThin;            
+    obSheet.range(m_range).Borders(xlInsideVertical).ColorIndex = xlAutomatic;   
+    obSheet.range(m_range).Borders(xlInsideHorizontal).LineStyle = xlContinuous; 
+    obSheet.range(m_range).Borders(xlInsideHorizontal).Weight = xlThin;          
+    obSheet.range(m_range).Borders(xlInsideHorizontal).ColorIndex = xlAutomatic; 
+end;
+
+macro osvInExcel()
+	var data;
+	begaction(2000, "Производится отбор счетов, ждите...", false); message("Производится отбор счетов, ждите...");
+	data = calculate(chapter, begindate, enddate);
+	endaction();
+/*	openExcel(output);
+	writeHead();
+    obBook.sheets(1).select;
+    obBook.sheets(1).name = "пустышка";
+    if (not SheetBalance) 
+       AddNewSheet("Все",i);
+    end;
+*/
+debugbreak;
+	writeBody(data);
+//    ob.Show;
+//	obBook.ActiveSheet.Range("A4:h"+(i-1)).Borders.Weight=2;
+//	obBook.ActiveSheet.Range("A4:h"+(i)).Borders.Weight=2;
+
+/*
+        if (not SheetBalance)
+          i_old=i_old-1;
+        end;
+        writeSum(i,i_old,i-1);
+
+        obBook.Sheets("пустышка").Visible = False;
+*/  message("Файл с данными пересылается на терминал");
+	copyToMe();
+
+//	typedef enum { xlA1 = 1, xlR1C1 = -4150 } XlReferenceStyle; 
+    message("запускается EXCEL");
+	ob = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+	ex = ob.CreateComObject ("Excel.Application", True);
+	ex.ReferenceStyle = -4150; //R1C1
+	ex.visible=false;
+//	ex.DecimalSeparator =",";
+//	msgbox(ex.DecimalSeparator);// = ".";
+
+   if (not(GetFileInfo("$"+tempFileNameBezPuti,@dd,@tt,@ii,@ss))); //ss- то что надо. полный путь абсолютный локальный
+	   msgbox("не мог найти на локальном диске файл "+tempFileNameBezPuti+"          \n останавливаюсь");
+	   exit(0);
+   end;
+   ss = substr(ss,2); // откусили первый знак бакса
+
+//   msgbox(ss);
+   //obBook = ex.Workbooks.open(fulloutput); 
+   var aw=tarray;
+   var w1=tarray;
+   var w2=tarray;
+   var w3=tarray;
+   var w4=tarray;
+   var w5=tarray;
+   var w6=tarray;
+   var w7=tarray;
+   var w8=tarray;
+   
+
+   w1(0)=1; w1(1)=2; //формат столбца - текст
+   w2(0)=2; w2(1)=1; //формат столбца - General
+   w3(0)=3; w3(1)=1;//формат столбца - General
+   w4(0)=4; w4(1)=1;//формат столбца - General
+   w5(0)=5; w5(1)=1;//формат столбца - General
+   w6(0)=6; w6(1)=1;//формат столбца - General
+   w7(0)=7; w7(1)=1;//формат столбца - General
+   w8(0)=8; w8(1)=2;//формат столбца - текст
+
+   aw(0)=w1;
+   aw(1)=w2;
+   aw(2)=w3;
+   aw(3)=w4;
+   aw(4)=w5;
+   aw(5)=w6;
+   aw(6)=w7;
+   aw(7)=w8;
+
+	aw.MarshalByVal =true; // работает только так. передача по значению через @aw вызывает ошибку
+	w1.MarshalByVal =true;
+	w2.MarshalByVal =true;
+	w3.MarshalByVal =true;
+	w4.MarshalByVal =true;
+	w5.MarshalByVal =true;
+	w6.MarshalByVal =true;
+	w7.MarshalByVal =true;
+	w8.MarshalByVal =true;
+
+	begaction(2000, "Файл с данными загружается в EXCEL", false); message("файл с данными загружается в EXCEL");
+	obBook = ex.Workbooks.opentext(ss,1251,1,1,2,false,false,false,false,false,true,"|",aw,1,"."," ",true,true);//,0,1,0,0,0,0, w1);  
+	endaction;
+//	msgbox("после опена "+ex.DecimalSeparator);
+
+//	obBook = ex.Workbooks.add(ss);
+	strok_begin = 2;
+//debugbreak;
+
+/*
+Name Required/Optional Data Type Description 
+Filename Required String Specifies the file name of the text file to be opened and parsed. 
+имя файла
+
+Origin Optional Variant Specifies the origin of the text file. Can be one of the following XlPlatform constants: xlMacintosh, xlWindows, or xlMSDOS. Additionally, this could be an integer representing the code page number of the desired code page. For example, "1256" would specify that the encoding of the source text file is Arabic (Windows). If this argument is omitted, the method uses the current setting of the File Origin option in the Text Import Wizard. 
+кодировка
+
+StartRow Optional Variant The row number at which to start parsing text. The default value is 1. 
+с какой строки начинать грузить данные. не строка в экселе (в экселе всегда с первой будет грузить),а строка файла данных какая.
+
+DataType Optional Variant Specifies the column format of the data in the file. Can be one of the following XlTextParsingType constants: xlDelimited or xlFixedWidth. If this argument is not specified, Microsoft Excel attempts to determine the column format when it opens the file. 
+текст с разделителями или фиксированной ширины (1 - с разделителями, 2- фикс. ширина)
+
+TextQualifier Optional XlTextQualifier Specifies the text qualifier. 
+обозначатель текста. вобще не понял для фига он. 1="  2=' -4142=нет определителя
+
+ConsecutiveDelimiter Optional Variant True to have consecutive delimiters considered one delimiter. The default is False. 
+true - объединить несколько идущих подряд разделителей в один, false =не делать
+
+Tab Optional Variant True to have the tab character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это табуляция. false = не табуляция
+
+Semicolon Optional Variant True to have the semicolon character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это ; false = не ; (точка с запятой)
+
+Comma Optional Variant True to have the comma character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это , false = не , (запятая)
+
+Space Optional Variant True to have the space character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это пробел false = не пробел
+
+Other Optional Variant True to have the character specified by the OtherChar argument be the delimiter (DataType must be xlDelimited). The default value is False. 
+true = есть другой символ для определения разделителя колонок false = нет другого символа.
+
+OtherChar Optional Variant (required if Other is True). Specifies the delimiter character when Other is True. If more than one character is specified, only the first character of the string is used; the remaining characters are ignored. 
+определяет этот самый "другой символ" для разделителя колонок.
+
+FieldInfo Optional Variant An array containing parse information for individual columns of data. The interpretation depends on the value of DataType. When the data is delimited, this argument is an array of two-element arrays, with each two-element array specifying the conversion options for a particular column. The first element is the column number (1-based), and the second element is one of the XlColumnDataType constants specifying how the column is parsed. 
+пары чисел, определящие номер столбца и тип данных. В доке сказано, что порядок не имеет значения, но у меня получилось только все по порядку, т.е. строго столько элементов массива, сколько колонок
+например счет если выгружать в эксель по дефолту - он будет как число и хвост забьет нулями. нужно указывать этот столбец как текст.
+
+TextVisualLayout Optional Variant The visual layout of the text. 
+какое-то визуальное оформление текста. не понял чо это такое. может быть имеется в виду зеленый трегольничек в левом верхнем углу ячейки. ставлю единицу
+
+DecimalSeparator Optional Variant The decimal separator that Microsoft Excel uses when recognizing numbers. The default setting is the system setting. 
+офигенски важный параметр. разделитель целой и дробной части в файле данных. 
+а вот как надо форматировать текст, например: 
+    var format_str:string = "# ##0" + ex.International(3) + "00";
+    obSheet.Columns("D:D").NumberFormat = format_str;
+   ex.DecimalSeparator; - брать нельзя, т.к. может стоять галочка в офисе "использовать региональные настройки".
+  А вот ex.International(3) - вернет то что надо, независимо от того, стоит эта галочка или нет.
+
+ThousandsSeparator Optional Variant The thousands separator that Excel uses when recognizing numbers. The default setting is the system setting. 
+символ - разделитель разрядов для удобочитаемости. надо бы оставить дефолтный, т.е. пропустить параметр, но я не знаю как.
+
+TrailingMinusNumbers Optional Variant Specify True if numbers with a minus character at the end should be treated as negative numbers. If False or omitted, numbers with a minus character at the end are treated as text. 
+true = минус вначале числа будет пониматься как отрицательное число, false = это будет просто текст.
+
+Local Optional Variant Specify True if regional settings of the machine should be used for separators, numbers and data formatting. 
+true - использовать региональные сеттинги, толком не понял эту фигню, но ставлю true. По дефолту вроде false оно, упускать нельзя, надо явно прописать.
+
+XlTextParsingType Enumeration 
+xlDelimited 1 Default. Indicates that the file is delimited by delimiter characters. 
+xlFixedWidth 2 Indicates that the data in the file is arranged in columns of fixed widths. 
+
+ 
+XlTextQualifier Enumeration 
+xlTextQualifierDoubleQuote 1 Double quotation mark ("). 
+xlTextQualifierNone -4142 No delimiter. 
+xlTextQualifierSingleQuote 2 Single quotation mark ('). 
+
+XlColumnDataType can be one of these XlColumnDataType constants. 
+xlGeneralFormat. General 
+xlTextFormat. Text  
+xlMDYFormat. MDY Date 
+xlDMYFormat. DMY Date 
+xlYMDFormat. YMD Date 
+xlMYDFormat. MYD Date 
+xlDYMFormat. DYM Date 
+xlYDMFormat. YDM Date 
+xlEMDFormat. EMD Date 
+xlSkipColumn. Skip Column 
+You can use xlEMDFormat only if Taiwanese language support is installed and selected. The xlEMDFormat constant specifies that Taiwanese era dates are being used.
+The column specifiers can be in any order. If a given column specifier is not present for a particular column in the input data, the column is parsed with the xlGeneralFormat setting. This example causes the third column to be skipped, the first column to be parsed as text, and the remaining columns in the source data to be parsed with the xlGeneralFormat setting. 
+Array(Array(3, 9), Array(1, 2))
+
+
+
+*/
+
+//   ex.visible =true;
+   
+   obSheet=ex.Sheets(1);
+   ex.Sheets(1).Rows("1:1").Insert(-4121); strok_begin = strok_begin +1; strok_end = strok_end +1;
+   ex.Sheets(1).Rows("1:1").Insert(-4121); strok_begin = strok_begin +1; strok_end = strok_end +1;
+   ex.Sheets(1).Rows("1:1").Insert(-4121); strok_begin = strok_begin +1; strok_end = strok_end +1;
+
+
+   begaction(2000,"Данные загружены в EXCEL, производится форматирование...", false); message("Данные загружены в EXCEL, производится форматирование...");
+   writeHead();
+   format_osv(strok_begin, strok_end);
+   endaction;
+
+   println;
+   println("ОСВ сформирована в EXCEL успешно. Для продолжения нажмите ESC ");
+	ex.visible=true;
+
+/*
+expression.Insert(Shift)
+
+expression Required. An expression that returns one of the objects in the Applies To list.Shift   Optional XlInsertShiftDirection . Specifies which way to shift the cells.
+XlInsertShiftDirection can be one of these XlInsertShiftDirection constants. 
+xlShiftToRight 
+xlShiftDown 
+If this argument is omitted, Microsoft Graph decides based on the shape of the range.
+ 
+XlInsertShiftDirection Enumeration 
+xlShiftDown -4121 Shift cells down. 
+xlShiftToRight -4161 Shift cells to the right. 
+
+*/
+
+end;
+
+/*Точка входа в макрос*/
+if (RunDialog(dlg, "Event"))                  
+	osvInExcel();
+end; 
+exit(0);
+
+
+                                              

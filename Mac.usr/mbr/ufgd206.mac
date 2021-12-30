@@ -1,0 +1,140 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация подтверждений по сообщениям УФЭБС ED206                        */
+/*                                                                          */
+/* Имя файла: ufgd206.mac                                                   */
+/* Создан:    27.10.04                                      Фомченкова Л.Н. */
+/* Изменен:   10.04.12 Chesnokov D.S. по заявке С-9530 проверка на группу   */
+/*            22.12.15 Gurin S. HotFix 2031.19.25 (Life_1 1.3)_11           */
+/****************************************************************************/
+/*SDA 06/12/2013 адаптация для 31-й */
+
+import "ufgendoc.mac", "diver.mac", "wltools.mac";
+
+var ver_st = 1;
+
+private macro GetDKFlag(DC : string)
+  if(DC == "3")
+    CreateWarning(null, WLD_WARN_MACRO, "Признак дебета/кредита в подтверждении имеет значение 3 \"Дебет и кредит\".| Действующая ревизия форматов не предполагает прием и обработку таких сообщений.|Подтверждение загружено со значением Д/К = Дебет");
+    return WL_DEBET;
+  else
+    return UF_GetDKFlag(DC);
+  end;
+end;
+
+macro GenDoc( addrMes )
+
+  if (not ВходитВГруппу({oper},198))
+    msgBox("Вы не включены в группу \"198 - Генерация сообщений УФЭБС\"");
+    return false;
+  end;
+
+  var xml:object = ActiveX( "MSXML.DOMDocument" );
+  var Строка, Сумма, Currency, Error, CorrBIK:string;
+  var WlPmID = 0;
+  var PaymentID = 0;
+
+//Seleznev подтверждения не квитуем и генерация не нужна
+  return true;
+
+  SetBuff( wlmes, addrMes );
+
+  PrintLog( 2, "Генерация подтверждения по ED206" );
+
+  ClearRecord( wlconf );
+
+  if( not СчитатьПоле( XMLField, Строка ) )
+    return FALSE;
+  end;
+
+  if ( not xml.loadXML(Строка) )
+    println( string( "Неверный формат сообщения по форме ED206, невозможно загрузить xml-документ" ) );
+     return false;
+  end;
+
+  /* Заполнение учетных буферов */
+  wlconf.Number       = wlmes.TRN;
+  wlconf.RelatedRef   = wlmes.RelatedRef;
+  wlconf.FIID         = 0;
+  wlconf.DateValue    = ToDate_(ReadAttribute(xml,"EDDate", "EDRefID"));
+  wlconf.Account      = ReadAttribute(xml,"Acc");
+  Сумма = ReadAttribute(xml,"Sum");
+  wlconf.Sum          = moneyL( Сумма )/100;
+  wlconf.DKFlag = UF_GetDKFlag(ReadAttribute(xml, "DC"));
+  wlconf.TransferDate = ToDate_(ReadAttribute(xml,"TransDate"));
+  wlconf.DocNumber    = ReadAttribute(xml, "AccDocNo", "AccDoc");
+
+  /*ЗАП.№ 110284*/
+  if(ver_st == 2)
+    ReadAttribute(xml,"TransTime");
+
+    var PaytKind : string = ReadOptinalAttribute(xml, "PaytKind");
+    if(PaytKind)
+      var CodeDescr = ПолучитьКодОтветаНаСообщение(PaytKind, TYPE_CODE_UFBS_ED206);
+      if(CodeDescr)
+        wlconf.Description = wlconf.Description + "Вид платежа: " + CodeDescr;
+      else
+        std.msg( "Недопустимое значение атрибута 'PaytKind'" );
+        return FALSE;
+      end;
+    end;
+  end;
+
+  /* Определяем схему расчетов */
+  wlconf.Corschem = ПолучитьКорсхемуПоУмолчанию( wlmes.OutsideAbonentID, wlconf.FIID, 1 );
+  if( wlconf.Corschem == -1 )
+    Currency = ПолучитьКодФинИн(wlconf.FIID, error);
+    if ( error )
+       Currency = "???";
+    end;
+    std.msg( "Не определена схема расчетов для респондента по валюте " + Currency );
+    return FALSE;
+  end;
+
+  /* Заполняем ссылку на банк плательщика/получателя */
+  wlconf.BankID = ToRespID( ReadAttribute(xml, "EDAuthor", "EDRefID"), wlconf.CodeValue );
+  if( ПолучитьСубъекта( wlconf.BankID, wlparty ) != 0 )
+    std.msg( "Не найден банк плательщик/получатель с идентификатором: " + wlconf.CodeValue );
+    return FALSE;
+  end; 
+  wlconf.CodeKind = PTCK_BIC;
+  wlconf.BankName = wlparty.Name;
+  
+  /* Банк - корреспондент*/
+  CorrBIK = ReadOptinalAttribute(xml,"BICCorr");
+  if( CorrBIK != "" )
+    ClearRecord(wlparty);
+      wlconf.CorrCodeKind  = PTCK_BIC;
+      wlconf.CorrCodeValue  = RectoreNull(CorrBIK,9);
+      wlconf.CorrBankID = ПолучитьКодСубъекта( wlconf.CorrCodeValue, wlconf.CorrCodeKind, Error );
+      if( Error )
+        std.msg( "Не найдена ссылка на банк корреспондент: " + wlconf.CorrCodeValue );
+        return FALSE;
+      end;
+    if( ПолучитьСубъекта( wlconf.CorrBankID, wlparty ) != 0 )
+        std.msg( "Не найден банк корреспондент" );
+        return FALSE;
+      end; 
+    wlconf.CorrBankName = wlparty.Name;
+  end;
+
+  /* Вставляем запись в таблицу подтверждений */
+  if( not ВставитьПодтверждение( wlconf ) )
+    std.msg("Ошибка при вводе подтверждения");
+    return FALSE;
+  end;
+ 
+  
+  return TRUE;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    std.msg(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+end;
+
+macro GenDocV2( addrMes )
+   ver_st = 2;
+   return GenDoc( addrMes );
+end;

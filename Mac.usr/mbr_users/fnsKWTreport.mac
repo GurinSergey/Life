@@ -1,0 +1,383 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: fnsKWTreport.mac
+// @author  : Зленко М.П. 
+// @desc    : Отчет по квитовке KWT
+// @request : C-8597 
+// @modify  : C-10076 09.04.2012 Chesnokov D.S.
+//          : C-12403 09.07.2012 Lavrenov A.A
+//          : I-00254295 18.09.2012 Chesnokov D.S. Обработка некорректных KWT
+//          : R-495517 17.11.2014 Chesnokov D.S. Исправлено формирование папок с архивом квитанций
+// -------------------------------------------------------------------------------------------------
+import  rsexts, globals, KeyCodes,likepy, treport, Календарь, RSbdataset, BankInter;
+
+var PATH_KWT; 
+var KWT_FILE_MASK, ARCHIVE_PATH=""; 
+var FileNamesArray:TArray = Tarray();
+var Code20:TArray = Tarray();
+var ContainerObj:Tarray = Tarray();
+var path = "";
+var pathfile = "";
+var deleteAll:bool;
+var filen = "365P.lbr"; 
+var errCode;
+
+macro update_MES365_LOG(obj, file_name, error)
+  var cmd, str, check;
+
+  if (error)
+    check = StrFor(88);
+  else
+    check = StrFor(1);
+  end;
+
+  str = " MERGE INTO dmes365_log_dbt d " +
+        "      USING (SELECT 1 FROM DUAL) o " +
+        "         ON (Substr(d.t_outsidemes, 1, length(d.t_outsidemes) - 4) = ?) " +
+        " WHEN MATCHED " +
+        " THEN " +
+        "    UPDATE SET " +
+        "       d.t_kwt_date = ?, " +
+        "       d.t_check = ?, " +
+        "       d.t_kwt_mes = ?, " +
+        "       d.t_kwt_oper = rsbsessiondata.oper " +
+        " WHEN NOT MATCHED " +
+        " THEN " +
+        "    INSERT (d.t_reqid,       d.t_insidemes, " +
+        "            d.t_date_in,     d.t_outsidemes, " +
+        "            d.t_date_out,    d.t_time, " +
+        "            d.t_recipientid, d.t_oper, " +
+        "            d.t_kwt_date,    d.t_check, " +
+        "            d.t_kwt_mes,     d.t_kwt_oper) " +
+        "    VALUES (NULL, NULL, " +
+        "            NULL, NULL, " +
+        "            NULL, NULL, " +
+        "            NULL, NULL, " +
+        "            ?, ?, " +
+        "            ?, rsbsessiondata.oper)";
+  cmd = RsdCommand(str);
+  cmd.AddParam("obj.m_fileName", RSDBP_IN, obj.m_filename);
+  cmd.AddParam("kwt_date",       RSDBP_IN, {Curdate});
+  cmd.AddParam("check",          RSDBP_IN, check);
+  cmd.AddParam("file_name",      RSDBP_IN, file_name);
+  cmd.AddParam("kwt_date1",      RSDBP_IN, {Curdate});
+  cmd.AddParam("check2",         RSDBP_IN, check);
+  cmd.AddParam("file_name1",     RSDBP_IN, file_name);
+  cmd.execute;
+  
+end;
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",V_STRING,path);
+pathfile = FindPath(filen,path);
+  if (not pathfile)
+    msgbox("Не найдена LBR");
+    exit();
+  end;
+var dlg = TRecHandler("dateimp",pathfile,True);  
+
+private macro LogError(Category, Message)
+  println(Category, ": ", Message);
+end;
+
+class KWTMessage(_fileName,_dateCheck, _FileDate, _codeCheck:TArray,_textCheck:TArray)
+  var m_fileName  = _fileName ;
+  var m_dateCheck = _dateCheck;
+  var m_FileDate   = _FileDate;
+  var m_codeCheck:TArray = _codeCheck;
+  var m_textCheck:TArray = _textCheck;
+    
+  macro getCode(n)
+    return m_codeCheck(n);
+  end;
+
+  macro getText(n)
+    return m_textCheck(n);
+  end; 
+   
+end;
+
+private macro normalizePath(path)
+  if (SubStr(path, StrLen(path), 1)!="\\")
+    path = path + "\\";
+  end;
+  return path;
+end;
+
+private macro readNotice(_filename):KWTMessage
+  file f_pointer () txt;var ДатаПров,FileDate;
+  var НаимФайла;
+  var КодПров   :TArray = TArray(),
+      ТекстПров :TArray = TArray(),
+      Конец:bool;
+  
+  open(f_pointer,PATH_KWT +_filename); 
+  next(f_pointer);
+  НаимФайла = trim(substr(f_pointer.str,1,index(f_pointer.str,"###")-1));
+  Конец = false;
+  while ((next (f_pointer)) and (not Конец))
+        if (f_pointer.str != "@@@")
+          if (index(f_pointer.str,"@@@") == 0)
+             КодПров(КодПров.size()) = trim(substr(f_pointer.str,1,2));
+             ТекстПров(ТекстПров.size()) = trim(substr(f_pointer.str,4,strlen(f_pointer.str)));
+          else
+             КодПров(КодПров.size()) = trim(substr(f_pointer.str,1,2));
+             if(Substr(f_pointer.str, strlen(f_pointer.str)-3, strlen(f_pointer.str)) == "@@@") //I-00254295 18.09.2012 Chesnokov D.S.
+               ТекстПров(ТекстПров.size()) = trim(substr(f_pointer.str,4,strlen(f_pointer.str) - 6));
+             else
+               ТекстПров(ТекстПров.size()) = trim(substr(f_pointer.str,4,strlen(f_pointer.str)));
+             end;
+             next (f_pointer);
+             break;
+          end;
+        else
+          Конец = true;
+        end;
+  end;
+  if (f_pointer.str == "@@@")
+      next(f_pointer);
+  end;
+  ДатаПров = trim(substr(f_pointer.str,1,index(f_pointer.str,"@@@")-1));
+  getFileInfo(PATH_KWT +_filename, FileDate); 
+  return KWTMessage(НаимФайла, ДатаПров, FileDate, КодПров,ТекстПров);
+end;
+
+//Lavrenov: 09.07.2012 Определяем номер сессии
+private macro get_sess_number()
+  var rs;
+  rs = trsbdataset("select RSBSESSIONDATA.CNUM  from dual ");
+  if (rs and rs.movenext)
+    return int(rs.cnum);
+  else
+    return {oper};
+  end;
+end;
+
+//Lavrenov: 09.07.2012 Создаем папку для архива
+private macro get_archive_path(path, filedate)
+  var strdate, dd,mm,yyyy;
+
+  datesplit(filedate,dd,mm,yyyy);
+
+  if(dd<=9)
+     dd = "0"+dd;
+  end;
+
+  if(mm<=9)
+     mm = "0"+mm;
+  end;
+
+  //R-495517 Chesnokov D.S. Функция datesplit возвращает параметры INTEGER,
+  //  поэтому если месяц или день > 9 то получается сложение INTEGER, а не STRING
+  strdate = string(yyyy) + string(mm) + string(dd);
+
+//  strdate = string(yyyy+mm+dd);
+  //Создаем папку, если такая уже есть, то вернем ее имя
+  MakeDir (path+"\\"+strdate);
+  MakeDir (path+"\\"+strdate+"\\KWT");
+ 
+  return path+"\\"+strdate+"\\KWT\\";
+end;
+
+//Lavrenov: 09.07.2012 Получаем либо создаем логфайл 
+private macro get_logfile_name(numsess, oper, path)
+  var file_name, i = 1;
+  var rs, str, cmd;
+  
+  str = " select t_filename from Dwllogfile_usr "+
+        " where t_num = "+numsess+ 
+        " and t_directory = '"+path+"'";
+   
+   rs = trsbdataset(str);
+   //Если уже есть, то возвращаем имя файла
+   if(rs and rs.movenext)
+      return rs.t_filename; 
+   end;
+  
+   //Если нет формируем новое
+   file_name = path+"Batch_"+OPER+"_"+i+".txt"; 
+   while( existfile( file_name ))
+     i = i + 1;
+     file_name = path+"Batch_"+OPER+"_"+i+".txt"; 
+   end;
+   
+   //Сразу в файл суем шапку   
+   setoutput(file_name,true);
+   [       Сообщения, загруженные в RS-Bank
+     Операционистом: #####  за дату: ########## ##########
+     
+    =====                                             ]
+   ({oper}, date, time);
+   setoutput(null,true);
+   
+   //В темповскую таблицу суем данные по файлу
+   cmd = rsdcommand("insert into Dwllogfile_usr values ("+numsess + ", '"+path +"', '" +file_name+ "');");
+   cmd.execute;
+   
+   return file_name;
+end;
+
+private macro isFileExist(SourceFilesPath:string);
+    var i = 0, j = 0, DirList;
+    var obj;
+    var v_dirname, v_filename, v_log_filename, cnum;
+    debugbreak;
+    DirList = TDirList(SourceFilesPath + KWT_FILE_MASK,"F");   
+   // DirList.Sort(2); zmp 11.09.2014 R-448645-2 избавляемся от тормозов
+    while (i < DirList.Count)
+        if (substr(DirList.Name(i),1,3) == "KWT") //приходится ставить проверку, так как маска в  TDirList работает через одно место.
+            obj = readNotice(DirList.Name(i));
+            if( (DirList.FDate(i) >= dlg.rec.BeginDate) and ( DirList.FDate(i) <= dlg.rec.EndDate)) 
+                if (obj.getCode(0) == 20 )
+                    Code20(Code20.Size()) = DirList.Name(i);
+                    update_MES365_LOG(obj, DirList.Name(i), false);
+                else
+                    FileNamesArray(FileNamesArray.Size()) = DirList.Name(i) ;
+                    ContainerObj(ContainerObj.Size()) = obj;  
+                    update_MES365_LOG(obj, DirList.Name(i), true);
+                end;
+                
+                //Lavrenov: 09.07.2012 C-12403
+                //Если прочитать настройку не удалось или в ней пусто то ни чего не делаем.
+                if(ARCHIVE_PATH != "")
+                    //Формируем новое имя файла
+                    v_dirname = get_archive_path(ARCHIVE_PATH, DirList.FDate(i));
+                    // Получаем имя файла
+                    cnum =  get_sess_number();     
+                    v_log_filename =  get_logfile_name(cnum, {oper}, v_dirname);  
+
+                    v_filename = v_dirname + DirList.Name(i);
+           
+                    //Если файл уже есть добавляем префикс к нему
+                    j = 0;
+                    while( existfile( v_filename ))
+                        j = j + 1;
+                        v_filename = v_dirname + DirList.Name(i) + "_" + String( j );
+                    end;
+
+                    //Если скопировать не удалось возвращаем ошибку
+                    if (not CopyFile(SourceFilesPath+DirList.Name(i), v_filename))//, true, v_filename))
+                        println("!!!ОШИБКА: Ошибка копирования файла " + SourceFilesPath+DirList.Name(i) + " в " + v_filename);
+                    else
+                        //Пишем в лог
+                        setoutput(v_log_filename,true);
+                        println(SourceFilesPath+DirList.Name(i));
+                        setoutput(null,true);
+                    end;
+                end;
+            end;
+            obj = null;
+        end;
+        i = i + 1;
+    end;
+  if (FileNamesArray.Size() > 0)
+    return true;
+  end;
+  return false;
+end;
+
+private macro printReport(Folder)
+   var i:integer = 0;
+   var k;
+   var obj;
+   var table = ctablereport();
+   var isFirst;
+   if(isFileExist(Folder))
+     gettrue(deleteAll,"Удалить сообщения  из каталога импорта после вывода отчета?"); 
+        table.addcolumn("Наименование полученного файла без разрешения",40, AL_LEFT); 
+        table.addcolumn("Дата завершения проверки",10, AL_CENTER);
+        table.addcolumn("Дата сообщения",10, AL_CENTER); 
+        table.addcolumn("Код обработки",2, AL_CENTER);
+        table.addcolumn("Причина отрицательного результата проверки",30,AL_LEFT);
+        table.printhead("                             Журнал обработанных сообщений по запросам налоговых органов c "+ dlg.rec.BeginDate +" по "+ dlg.rec.EndDate);
+
+        while (i < ContainerObj.size())
+          isFirst = true;
+          k = 0;
+          table.printseparator();
+            while(k < ContainerObj(i).m_codeCheck.Size())
+              if (isFirst)
+                table.printstringtransferbyword(ContainerObj(i).m_filename,ContainerObj(i).m_dateCheck,ContainerObj(i).m_FileDate,ContainerObj(i).getCode(k),ContainerObj(i).getText(k)) ;
+              else
+                table.printstringtransferbyword("", "", "", ContainerObj(i).getCode(k), ContainerObj(i).getText(k)) ;
+              end;
+              isFirst = false;
+              k = k + 1;   
+            end;
+          i = i + 1;
+        end;
+        table.printbottom("  Всего:  " +ContainerObj.size());        
+        if (deleteAll)
+          i = 0;
+          while(i < FileNamesArray.Size()) 
+            if (not RemoveFile(Folder + FileNamesArray(i)))
+              LogError("Предупреждение", "Файл "+FileNamesArray(i)+" не удалён!");
+            end; 
+            i = i + 1;
+          end;
+        end;
+   else
+     msgBox("За указанный период, сообщения с ошибками не найдены!");
+   end;  //удяляем все сообщения с кодом 20; 
+   i = 0;
+   while(i < Code20.Size()) 
+      if (not RemoveFile(Folder + Code20(i)))
+         LogError("Предупреждение", "Файл "+Code20(i)+" не удалён!");
+      end; 
+   i = i + 1;
+   end;
+end;
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key)     
+   var rs;
+ 
+   if(cmd == DLG_INIT)
+     message("~F2~ продолжить, ~F3~ Выбрать дату, ~ESC~ выход");
+     dlg.rec.BeginDate = {curdate};
+     dlg.rec.EndDate   = {curdate};
+
+   end;
+   if(KEY==KEY_F3)
+      if (FldName(dlg, id) == "BeginDate")
+         dlg.rec.BeginDate = GetDateByCalendar({curdate});           
+      elif (FldName(dlg, id) == "EndDate")
+          dlg.rec.EndDate = GetDateByCalendar({curdate});
+      end;
+      UpdateFields(dlg);
+   elif ((KEY==KEY_F2) or (KEY==KEY_ENTER))
+       if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+          MsgBox("Дата начала больше даты окончания отчетного периода");
+          return CM_IGNORE;
+       end;
+
+       GetRegistryValue("PRBB\\FNS\\KWT\\BASE_PATH", V_STRING, PATH_KWT, errCode);
+       if ( errCode > 0 )
+          msgbox("Проверьте наличие настройки: PRBB\\FNS\\KWT\\BASE_PATH");
+          exit();
+       end;
+
+       GetRegistryValue("PRBB\\FNS\\KWT\\FILE_MASK", V_STRING, KWT_FILE_MASK, errCode);
+       if ( errCode > 0 )
+          msgbox("Проверьте наличие настройки: PRBB\\FNS\\KWT\\FILE_MASK");
+          exit();
+       end;
+       
+      GetRegistryValue("PRBB\\FNS\\ARCHIVE_PATH", V_STRING, ARCHIVE_PATH, errCode);
+      if ( errCode > 0 )
+         ARCHIVE_PATH = "";
+      else
+         ARCHIVE_PATH = ARCHIVE_PATH + "\\IMPORT";
+      end;        
+
+    rs = rsdcommand("truncate table Dwllogfile_usr; ");
+    rs.execute;
+      
+    PATH_KWT = normalizePath(PATH_KWT);  
+    printReport(PATH_KWT);   	  
+    return CM_save;
+
+   end;
+   UpdateFields(dlg); 
+END;
+
+if ( RunDialog(dlg, "Event"))
+end;

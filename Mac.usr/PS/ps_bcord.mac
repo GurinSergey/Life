@@ -1,0 +1,437 @@
+/************************************************************************/
+/*         Автоматизированная банковская система RS-Bank                */
+/*                 Copyright (c) R-Style Software Lab 1998              */
+/*                                                                      */
+/*  Имя файла        : ps_bcord.mac                                     */
+/*                                                                      */
+/*  Описание         : Инициализация и проверки заявок                  */
+/*                     на продажу/покупку валюты                        */
+/*                                                                      */
+/*  Изменен           30,01,2012 Gurin S. N. I-00147652-2               */
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+/************************************************************************/
+import BankInter, CTInter, PaymInter, globals, "payconst.mac", "pmchoper.mac","pm_tools.mac", likepy, pm_opr;
+import "FS.mac";
+/* Режимы функции проверки: */
+CONST BOMAC_DELETE    = 1; /* - удаление */
+CONST BOMAC_INSERT    = 2; /* - ввод     */
+CONST BOMAC_UPDATE    = 3; /* - обновление */
+
+record bo         ( ps_bcord );
+record old_bo     ( ps_bcord );
+record Pmpaym     ( Pmpaym   );
+record OldPmpaym  ( Pmpaym   );
+record Pmprop     ( pmprop   );
+record OldPmprop  ( pmprop   );
+record Pmrmprop   ( pmrmprop );
+record OldPmrmprop( pmrmprop );
+record CurTr      ( pmcurtr  );
+record OldCurTr   ( pmcurtr  );
+record Pmkz       ( pmkz     );
+record OldPmkz    ( pmkz     );
+
+macro Новая_Заявка( )
+  Pmpaym.scale = 1;
+  return 0;
+end;
+
+/* EVG 20/04/2012 Глобальная переменная для сохранения основания */
+var newGround;
+
+/*  Определение, что две записи(имеющие одинаковое описание в bank.def)
+    совпадают, или отличаются только одним полем с заданным именем.
+    Если записи совпадают, возвращается true */
+MACRO ПроверкаИдентичностиЗаявки(Запись1, Запись2, НаименованиеНепроверяемогоПоля)
+
+  var НомерНепроверяемогоПоля = -1;
+  var i = 0;
+
+  if( (ValType(НаименованиеНепроверяемогоПоля) == V_STRING) and (НаименованиеНепроверяемогоПоля != "") )
+    НомерНепроверяемогоПоля = FldIndex(Запись1,НаименованиеНепроверяемогоПоля);
+  end;
+
+  while(i < FldNumber(Запись1))
+    if( (i != НомерНепроверяемогоПоля) and (Запись1(i) != Запись2(i)) ) return false; end;
+    i = i + 1;
+  end;
+
+  return true;
+END;
+/*Для документа, полученного по системе "Клиент-Банк" можно менять только курс и сумму платежа*/
+MACRO ИзмененыНедопустимыеПоля()
+
+  var i = 0, flag = false, NotCheckAmount;
+  if(not (ПроверкаИдентичностиЗаявки(bo,       old_bo     ) and 
+          ПроверкаИдентичностиЗаявки(Pmrmprop, OldPmrmprop)) ) flag = true;
+  end;
+/*  разрешаем менять только нефиксированную сумму */
+  if( Pmpaym.IsFixAmount == "X" ) 
+      NotCheckAmount = FldIndex(Pmpaym, "PAYAMOUNT");
+  else                            
+      NotCheckAmount = FldIndex(Pmpaym, "AMOUNT");
+  end;
+  while( i <= FldNumber(Pmpaym) )
+    if( (i != FldIndex(Pmpaym, "RATE"     ))  and
+        (i != FldIndex(Pmpaym, "RATETYPE" ))  and
+        (i != NotCheckAmount               )  and
+        (Pmpaym(i) != OldPmpaym(i)) )                          flag = true;  
+    end;
+    i = i + 1;
+  end;
+  return flag;
+
+END;
+
+macro Проверить_Заявку( Режим )
+
+  var stat     :integer = 0 ,
+      note     :string  = "",
+      save_note:string  = "",
+      ret_val  :bool;
+  var fld_Number:TArray = makeArray( 1, 1, 1 );
+  var fld_Date:TArray = makeArray( 2, 2, 2 );
+  var fld_DateValue:TArray = makeArray( 21, 20, 26 );
+  var fld_Amount:TArray = makeArray( 18, 15, 13 );
+  var msg_Amount:TArray = makeArray( "Не задана сумма обеспечения", "Не задана сумма валюты", "Не задана сумма продажи" );
+  var fld_PayAmount:TArray = makeArray( 15, 18, 14 );
+  var msg_PayAmount:TArray = makeArray( "Не задана сумма валюты", "Не задана сумма к зачислению", "Не задана сумма покупки" );
+  var fld_Rate:TArray = makeArray( 11, 11, 15 );
+  var fld_Exchange:TArray = makeArray( 19, 19, 21 );
+  var fld_LimRate:TArray = makeArray( 22, 21, 22 );
+  var msg_LimRate:TArray = makeArray( "Поле \"Курс не выше\" должно быть не заполнено",
+                                      "Поле \"Курс не ниже\" должно быть не заполнено",
+                                      "Поле \"Лимитированный курс\" должно быть не заполнено" );
+  var errors:TArray = TArray();
+
+  if( (Режим == BOMAC_INSERT) or (Режим == BOMAC_UPDATE) or (Режим == 8) )
+    
+    if( StrLen( Pmrmprop.Number ) == 0 )
+      MsgBox("Не задан номер документа");
+      return fld_Number[(bo.BCOrdKind-1)];
+    end;
+    if( Pmpaym.ValueDate < {curdate} )
+      msgbox("Дата валютирования не должна быть|меньше текущей операционной даты");
+      return fld_DateValue[(bo.BCOrdKind-1)];
+    end;
+    if( Pmpaym.ValueDate < Pmrmprop.Date )
+      msgbox("Некорректно задана дата документа");
+      return fld_Date[(bo.BCOrdKind-1)];
+    end;
+
+    if( (Pmpaym.Amount <= 0) AND (Pmpaym.PayAmount <= 0) )
+      if( Pmpaym.Amount <= 0 )
+        msgbox(msg_Amount[(bo.BCOrdKind-1)]);
+        return fld_Amount[(bo.BCOrdKind-1)];
+      else
+        msgbox(msg_PayAmount[(bo.BCOrdKind-1)]);
+        return fld_PayAmount[(bo.BCOrdKind-1)];
+      end;
+    end;
+    if( bo.BankFunds == "X" )
+      if( Pmpaym.Rate == 0 )
+        msgbox("Не задан курс" );
+        return fld_Rate[(bo.BCOrdKind-1)];
+      end;
+    else
+      if( bo.ExchangeID < 0 )
+        msgbox("Не задана торговая плoщадка");
+        return fld_Exchange[(bo.BCOrdKind-1)];
+      end;
+      if( (Pmpaym.Amount > 0) AND (Pmpaym.PayAmount > 0) AND (Pmpaym.PayFIID != bo.ExchangeFIID) AND (bo.LimRate != 0) )
+        msgbox(msg_LimRate[(bo.BCOrdKind-1)]);
+        return fld_LimRate[(bo.BCOrdKind-1)];
+      end;
+    end;
+    
+    /* EVG 24/08/2010 По согласованию с Г. Байдуловой, для поручений на ППК валюты проверка реквизитов ВО не нужна.
+    /*проверка реквизитов валютной операции*/
+    stat = PM_CheckCO(Pmpaym,Pmrmprop,0,Pmprop);*/
+    if( stat ) return stat; end;
+
+    // проверка корректности фактического курса
+    if( CheckCorrectRateTypeOnDate( Pmpaym, errors ) )
+      msgbox( errors[0].name );
+      return 1;
+    end;
+  end;
+
+  /* Если документ получен по системе "Клиент-Банк", то запрещаем корректировку */
+  /* Происхождения заявок: PSBCORD_OR_CLB- Клиент банка */
+  if( (Режим == BOMAC_UPDATE) and (bo.Origin == PSBCORD_OR_CLB) )
+  /* Курс валюты и сумму можно редактировать и для документа, полученного по системе "Клиент-Банк" */
+      if( ИзмененыНедопустимыеПоля() )
+            msgbox("Документ получен по системе \"Клиент-Банк\".|Корректировка реквизитов запрещена.");
+            return 1;
+      end;
+  end;
+  if( (Режим == BOMAC_UPDATE) and (bo.Origin == PSBCORD_OR_INRQ) )
+    msgbox("Документ порожден инкассовым поручением.|Корректировка реквизитов запрещена.");
+    return 1;
+  end;
+
+  if( (Режим == BOMAC_UPDATE) and (bo.State != PSBCORD_ST_DEFERRED) and (bo.State != PSBCORD_ST_REJECTED))  /* РЕДАКТИРОВАНИЕ ДОКУМЕНТА */
+    
+    /* Запрет редактирования проконтролированного документа */
+    if( Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "К" ) and (Pmpaym.PaymStatus != PM_REJECTED) )
+      if( not (ПроверкаИдентичностиЗаявки(bo      , old_bo     ) and
+               ПроверкаИдентичностиЗаявки(Pmpaym  , OldPmpaym  ) and
+               ПроверкаИдентичностиЗаявки(Pmprop  , OldPmprop  ) and
+               ПроверкаИдентичностиЗаявки(Pmrmprop, OldPmrmprop)) )
+         stat = CHANG_NOTKEEP;
+         return stat;
+      end;
+    end;
+
+    /*При редактировании производим проверку важности внесенных изменений */
+    /* Константы важности внесенных изменений:           */
+    /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+    /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+    /* CHANG_NOTKEEP        - не сохранять изменения */
+    /* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+    /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+       и сохранение изменений можно производить без отката операции      */
+    if(  (not (ПроверкаИдентичностиЗаявки(bo, old_bo))) or
+
+         (Pmpaym.Payer     != OldPmpaym.Payer     ) or
+         (Pmpaym.ValueDate != OldPmpaym.ValueDate ) or
+         (Pmrmprop.Date    != OldPmrmprop.Date    ) or
+
+         (Pmpaym.FIID         != OldPmpaym.FIID         ) or
+         (Pmpaym.Amount       != OldPmpaym.Amount       ) or
+         (Pmpaym.PayerAccount != OldPmpaym.PayerAccount ) or
+         (Pmpaym.NumberPack   != OldPmpaym.NumberPack   ) or
+
+         (Pmpaym.PayFIID         != OldPmpaym.PayFIID          ) or
+         (Pmpaym.PayAmount       != OldPmpaym.PayAmount        ) or
+         (Pmpaym.ReceiverAccount != OldPmpaym.ReceiverAccount  )
+      )
+      stat = CHANG_IMPORTANT;
+    end;
+
+  end;
+
+  if( Режим == BOMAC_DELETE )
+    if(not isDLMRuning())
+      if( bo.Origin == PSBCORD_OR_AUTO )
+/*        MsgBox( "Нельзя удалять документы, созданные системой автоматически" );
+        return 1;*/
+      elif( bo.Origin == PSBCORD_OR_INRQ )
+        msgbox("Документ порожден инкассовым поручением.|Удаление запрещено.");
+        return 1;
+      /* Документ из Клиент-Банк'а (или БОУРМ) */
+      elif( bo.Origin == PSBCORD_OR_CLB )
+        save_note = note = readNoteForObject(OBJTYPE_PSBCORDER, makeObjectID(OBJTYPE_PSBCORDER, NULL, bo), NOTEKIND_PSBC_DELETEGROUND);
+        ret_val = GetString(note, "Основание для удаления документа, полученного по системе \"Клиент-Банк\"", 68);
+        if( ret_val and (save_note != note) )
+          stat = addNoteForObject(OBJTYPE_PSBCORDER, makeObjectID(OBJTYPE_PSBCORDER, null, bo), NOTEKIND_PSBC_DELETEGROUND, note);
+          if( stat )
+            MsgBox("Ошибка добавления примечания к документу");
+            return stat;
+          end;
+        end;
+        if( not note )
+          MsgBox("Документ получен по системе \"Клиент-Банк\".|Удаление без ввода основания запрещено.");
+          return 1;
+        end;
+      end;
+    end;
+  end;
+
+  if(Режим == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                               // (изменения в буферах не сохраняются)
+    return IsImportantChangeForOperBuyCurOrder(Pmpaym, OldPmpaym, Pmrmprop, OldPmrmprop, bo, old_bo, Pmprop, OldPmprop);
+  end;
+
+  return stat;
+end;
+
+macro    Функция_Пользователя( Режим:integer )
+ /*
+ Возможные значения Режим:
+  UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+  UFN_PANEL_EDIT(2) - функция вызвана из панели корректировки объекта;
+  UFN_SCROL(3) - функция вызвана из панели скролинга, единичный вызов, любая корректировка объекта запрещена;
+  UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, вызов до начала обработки, любая корректировка объекта запрещена;
+ 
+// Пример работы: 
+ if( Режим == UFN_SCROL )
+   return UPDTPAGE;    // Обновить страницу записей и область скролинга
+   //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+ end;
+ */ 
+ var cmd;
+ var m;
+ array mn;
+ //LVV 18.07.2014 C-25642 добавление возможности корректировки очередности 
+  mn(0) = "Категория \"источник финансирования платежа\"";
+  mn(1) = "Поставить очередность";
+  m=menu(mn,null,"Выбeрите действие");
+    if (m == -2) 
+        return 0; // Обработка ESC
+    elif(m == 0)
+        debugbreak;
+        Edit_FS(Pmpaym.paymentid);
+        return 0;
+	elif(m == 1)
+        if (Getint(Pmrmprop.Priority,"Укажите требуемую очередность","Укажите требуемую очередность")) 
+            If ((Pmrmprop.Priority >=0) and (Pmrmprop.Priority <=5)) //TAM 12.12.13 C-25730 
+                cmd = RSDCommand ("update dpmrmprop_dbt set t_priority = :priority where t_paymentid =:paymentId");
+                cmd.addParam ("priority", RSDBP_IN, Pmrmprop.Priority);
+                cmd.addParam ("paymentId", RSDBP_IN, Pmpaym.paymentId);
+                cmd.execute ();
+                OldPmrmprop.Priority = Pmrmprop.Priority;
+                if (GetTrue(true,"Разрешить оплату при наличии приостановлений налоговых органов?")) //Gurin  23.08.2012 I-00241814-3
+                    execMacroFile ("lib_menu_common.mac", "ChangeType", 1, Pmpaym.paymentId ); 
+                else
+                    execMacroFile ("lib_menu_common.mac", "ChangeType", 0, Pmpaym.paymentId ); 
+                end;
+                msgbox ("Выполнено успешно");
+                return 0;
+            end;
+		else 
+		    return 0; 
+		end;
+    else
+        return 0;
+    end;
+end;
+
+/* Установка подсказки для скролингов из макроса */
+
+private const Hint_ByValueDate:string = "/*+FIRST_ROWS(200) LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx11) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+private const Hint_ByCloseDate:string = "/*+FIRST_ROWS(200) LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx15) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+private const Hint_ByStatus   :string = "/*+FIRST_ROWS(200) LEADING(t pmpaym pmrmprop oproper oprcurst) INDEX(t dps_bcord_dbt_idx2) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t pmpaym pmrmprop oproper oprcurst)*/";
+private const Hint_ByStep     :string = "/*+FIRST_ROWS(200) LEADING(t oproper ps_bcord pmpaym pmrmprop oprcurst) INDEX(t doprstep_dbt_idx10) INDEX(ps_bcord dps_bcord_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t oproper ps_bcord pmpaym pmrmprop oprcurst)*/";
+private const Hint_ByRequest  :string = "/*+FIRST_ROWS(200) LEADING(ps_bcexe t pmpaym pmrmprop oproper oprcurst) INDEX(ps_bcexe dps_bcexe_dbt_idx1) INDEX(t dps_bcord_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(ps_bcexe t pmpaym pmrmprop oproper oprcurst)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+  /* Возможные значения ScrolStates:
+     0 - Все
+     1 - Отложенные
+     2 - Открытые
+     3 - Закрытые
+     4 - Отвергнутые
+     5 - Подготовленные к шагу
+     +1000 - По конкретной биржевой заявке */
+  
+  /* Все */
+  if( ScrolStates == 0 ) 
+    return Hint_ByValueDate;
+  /* Отложенные, Открытые, Отвергнутые */
+  elif( ( ScrolStates == 1 ) or 
+        ( ScrolStates == 2 ) or 
+        ( ScrolStates == 4 ) )
+    return Hint_ByStatus;
+  /* Закрытые */
+  elif( ScrolStates == 3 )
+    return Hint_ByCloseDate;
+  /* Подготовленные к шагу */
+  elif( ScrolStates == 5 )
+    return Hint_ByStep;
+  /* По конкретной биржевой заявке */
+  elif( ScrolStates >= 1000 )
+    return Hint_ByRequest;
+  end;
+
+  return DefaultHint;
+END;
+
+
+/* EVG 8/03/2012 Функция разбора спецпеременных в основании */
+macro prcGround( grnd )
+
+   grnd = strSubst( grnd, "{Number}",   Pmrmprop.Number );
+   grnd = strSubst( grnd, "{Date}",     trim(string(Pmrmprop.Date)) );
+   grnd = strSubst( grnd, "{Client}",   Pmrmprop.PayerName );
+   grnd = strSubst( grnd, "{FactRate}", string(money(Pmpaym.Rate/10000)) );
+   //grnd = strSubst( grnd, "{}", Pmrmprop.PayerName);
+
+   return grnd;
+end;
+
+
+private var globalvaluedate = date(0,0,0); // KS 02.03.2012 I-00160411 Сброс даты валютирования
+
+macro ProcessPanel(mode, key, field, panel)
+
+   if (key == 29)
+      msgbox(panel.Fields.Item(field).name);
+   end;
+
+   if (key == 1)
+      msgbox(panel.resourcename);
+   end;
+
+   private var i = 0;
+   if (key == 522)
+
+      while (i < panel.Fields.count)
+         if ((panel.Fields.Item(i).name == "BankFunds") or
+             (panel.Fields.Item(i).name == "NAME_MARKETPLACE") or
+             (panel.Fields.Item(i).name == "LimRate") or
+             (panel.Fields.Item(i).name == "SCALELim") or
+             (panel.Fields.Item(i).name == "CorrCodeKind") or
+             (panel.Fields.Item(i).name == "CorrCode") or
+             (panel.Fields.Item(i).name == "CodeKind") or
+             (panel.Fields.Item(i).name == "BankCode") or
+//             (panel.Fields.Item(i).name == "Cause") or
+//             (panel.Fields.Item(i).name == "CAUSE") or
+             (panel.Fields.Item(i).name == "ReceiverCorrAccNostro") or
+             (panel.Fields.Item(i).name == "BANKCODE_CTBC") or
+             (panel.Fields.Item(i).name == "KINDCODE_CTBC"))
+
+
+              panel.Fields.Item(i).Enabled= false;
+         end;
+         i = i + 1;
+      end;
+      if (bo.Origin == 2000)//по распоряжению к транзитному счету
+         panel.Fields.Item(0).Enabled= false;
+      end;
+   end;
+/*
+   if (panel.Fields.Item(field).name  == "TYPERATE") // KS 02.03.2012 I-00160411 Сброс даты валютирования
+    if (panel.Fields.Item(field+7).value != date(0,0,0)) // дата валютирования
+      globalvaluedate = panel.Fields.Item(field+7).value;
+    else
+      panel.Fields.Item(field+7).value = globalvaluedate;
+    end;
+   end;
+*/
+   if (panel.Fields.Item(24).value != date(0,0,0)) // дата валютирования
+     globalvaluedate = panel.Fields.Item(24).value;
+   else
+     panel.Fields.Item(24).value = globalvaluedate;
+   end;
+
+
+   if( ( field == 31 ) or ( field == 30 ) )
+   //   msgbox ("mode: " + mode, "|key: " + key);
+   end;
+
+   /* EVG 20/04/2012 Доработано */
+   /* EVG 8/03/2012 Разбор спецпеременных в шаблоне основания */
+   if(    ( ( field == 31 )             // Основание - текст
+            or ( field == 30 ) )        // Основание - номер
+       and( mode  == 2 )
+       and( key   == 0 ) )
+
+      //msgbox (mode, " - ", key, "|", panel.Fields.Item(31).value);
+      newGround = prcGround( panel.Fields.Item(31).value );
+      panel.Fields.Item(31).value = newGround;
+   end;
+
+   // Если просто вводится номер основания, выход из поля
+   if( ( field == 30 )                  // Основание - номер
+       and( mode == 2)
+       and( key ==  530) )
+
+      if( valType( newGround ) == V_UNDEF )
+         newGround = prcGround( panel.Fields.Item(31).value );
+      end;
+      panel.Fields.Item(31).value = newGround;
+   end;
+   /* EVG END */
+
+   return key;
+end;

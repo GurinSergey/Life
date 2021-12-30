@@ -1,0 +1,305 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29052 - "Картотека ожидания разрешения"
+// Шаг      : 610    - "Постановка на картотеку ОР"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+// Gurin S. C-17880 05.08.2013
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov 2014-02-25 C-19151 Логгирование массово выполненных шагов
+// LVV 19/05/15 Адаптация клиентской ветки
+
+import  InsCarryDoc, OprInter, FIInter, BankInter, payconst, payinter, catfdoc, 
+        pm_common, pm_setst, cbsttls, "sf_lib.mac", "pm_answerret.mac";
+import oralib; //Jushmanov 2014-02-25 C-19151
+import "fg_Life_parm.mac"; // EVG 2/6/2016
+
+var PaymentObj:RsbPayment;
+
+
+//Получить счет дебета последней проводки по платежу (смотрим только рублевые проводки)
+//если она была внебалансовой (глава 3)
+/* EVG 2/6/2016 Доработал функцию: для ВУЗ-банка счет должен браться не из последней проводки
+   по внебалансу, а из связанного объекта к счёту клиента. Связано с переходом от открытия
+   счетов К2 / КОР в разрезе клиентов к открытию в разрезе лицевых счетов.
+// EVG 3/6/2016 Только для документов, которые в данный момент находятся в картотеке 2.
+private macro GetAccount_PayerDocChapt3(PaymentID, Account_Payer)*/
+private macro GetAccount_PayerDocChapt3(PaymObj, Account_Payer)
+
+    // EVG 2/6/2016 Только для банка ВУЗ
+    var vBank = fg_life_subject( {OurBank} );
+    // EVG 3/6/2016 Только для документов К2
+    if( vBank.is_VUZ and ( PaymObj.PaymStatus == PM_I2PLACED ) )
+
+       // В классе ПД счёт картотеки 2 берется из связанного объекта GetLinkedObject()
+       var vK2Account = PaymIndex2_FirstDoc( PaymObj.PaymentID ).FindAndOpenAccount( "Картотека 2", 0, {curdate} );
+       SetParm( 1, vK2Account );
+       return true;
+
+    else
+
+       var select = "select d.t_account_payer, d.t_chapter "+
+                    "  from dacctrn_dbt d, dpmdocs_dbt pmd "+   
+                    " where pmd.t_paymentid = :PaymentID "+
+                    "   and d.t_acctrnid = pmd.t_acctrnid ";
+
+       // zmp 16.04.2014 R-364544 для старых документов дополнительно поставлена проверка на балановый счет, так в dpmdocs_dbt много кривых записей
+       if (PaymentObj.PaymStatus == PM_I2PLACED)
+          select = select + " and substr(d.t_account_payer, 1, 5) = '90902' ";
+       end;
+       select = select + " order by d.t_acctrnid desc ";          
+                   
+
+       var params:TArray = TArray();
+       params[params.size] = SQLParam( "PaymentID", PaymObj.PaymentID );
+
+       var rset = execSQLselect( select, params, false );
+
+       if( rset and rset.moveNext() and  (rset.value(1) == 3))
+           SetParm(1, rset.value(0));
+           return true;
+       end;
+
+    end;
+
+
+    return false;
+end;
+
+
+private macro УдалитьПроводкуШагаСписаниеИзК1( Payment:RsbPayment, ID_Operation:integer )
+    var carrydocument:TBFile = TBFile("acctrn.dbt",  "R", 0, "acctrn.dbt", "bank.def");
+
+    var query:string = "SELECT DOCS.T_ACCTRNID                             " +
+                       "  FROM DOPRSTEP_DBT STEP,                          " +
+                       "       DOPRDOCS_DBT DOCS                           " +
+                       " WHERE DOCS.T_DOCKIND      = 1                     "/*DLDOC_CARRY*/+
+                       "   AND DOCS.T_ID_OPERATION = :ID_OPERATION         " +
+                       "   AND STEP.T_ID_OPERATION = DOCS.T_ID_OPERATION   " +
+                       "   AND STEP.T_ID_STEP      = DOCS.T_ID_STEP        " +
+                       "   AND STEP.T_ISEXECUTE    = 'X'                   " +
+                       "   AND STEP.T_KIND_ACTION  = 205                   "/*PM_OPR_KA_ACCEPTI1*/+
+                       " ORDER BY DOCS.T_ID_STEP DESC                      ";
+
+    var params:TArray = makeArray( SQLParam( "ID_OPERATION", ID_Operation ) );
+
+    var rs:RsdRecordset = execSQLselect( query, params, true );
+
+    while( rs and rs.moveNext() )
+        if( carrydocument )
+            carrydocument.rec.AccTrnID = rs.value(0);
+            if( carrydocument.GetEQ() and  ( carrydocument.rec.Result_Carry == 48 ) )
+                // Удалить внебалансовую проводку, выполненную на шаге "Списание из картотеки 1"
+                if( not Opr_DeleteCarry( carrydocument.rec.AccTrnID ) )
+                    MsgBox("Ошибка при удалении проводки");
+                    return 1;                             
+                end;
+                return 0;
+            end;
+        end;
+    end;
+    return 0;
+
+ONERROR(x)
+
+    MsgBox( "Ошибка получения шага операции|" + x.Message );
+    return FALSE;
+end;
+
+
+private macro ValueDateForPlaceToIWP(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+    elif( GetParentOrEqualDocKindFromList(DocKind, DLDOC_BANKORDER) )
+        ValueDate = PM_GetOperDay_Balance(Paym.Department);
+    end;
+
+    return ValueDate;
+end;
+
+
+macro ExecuteStep( doc, payorder )
+
+    var ID_Operation = 0;
+    /* EVG */
+    var AccRec = TRecHandler("account.dbt");
+
+    if(PaymentObj.Origin != 10002)
+
+        // Для документов ПЗО вызовем функцию начисления комиссий
+        if( IsSfCommPayment( PaymentObj ) )
+            if( not chargeComission( PaymentObj.PaymentID ) )
+                MsgBox("Ошибка при начислении комиссии");
+                return 1;
+            end;
+        end;
+
+        if( getParm( 3, ID_Operation ) )
+            УдалитьПроводкуШагаСписаниеИзК1( PaymentObj, ID_Operation );
+        end;
+
+        var SfContrID = PM_GetSfContrID(PaymentObj);
+
+        if( SfContrID == 0 )
+            msgbox("Не найден договор обслуживания счета плательщика.");
+            return 1;
+        end;
+
+        PaymentObj.ValueDate = ValueDateForPlaceToIWP(PaymentObj);
+        // Установить дату начала операции равной дате операционного дня пользователя
+        SetOprDate(29000000, PaymentObj.ValueDate);
+
+        //Получим счета для внебалансовой проводки
+        var FD_Index1: PaymIndex1_FirstDoc  = PaymIndex1_FirstDoc (PaymentObj.PaymentID);
+        var СчетДт = TIndexWPPrimDoc(SfContrID, PaymentObj.PaymentID).FindAndOpenSysAccount( "Карт ОР", IsOprMultiExec() );
+        var СчетКт;                                  
+
+debugbreak;
+        /* EVG 2/6/2016 Доработал функцию
+        if( GetAccount_PayerDocChapt3(PaymentObj.PaymentID, СчетКт) )*/
+        if( GetAccount_PayerDocChapt3( PaymentObj, СчетКт ) )
+
+            if( PaymentObj.PaymStatus != PM_I2PLACED ) /* Платеж из К1 */
+                СчетКт = FD_Index1.FindAndOpenAccount( "Картотека 1", 0, PaymentObj.PayerBankEnterDate );
+            end;
+
+        else
+
+            /* EVG 22.10.2010 Если не удалось найти счёт из проводок по платежу, возьмём его из связ. объектов к
+               счёту-плательщику. */
+            AccRec.Clear;
+            AccRec.rec.Account       = PaymentObj.PayerAccount;
+            AccRec.rec.Chapter       = CHAPT1;
+            AccRec.rec.Code_currency = PaymentObj.BaseFiid;
+
+            if (( PaymentObj.PaymStatus == PM_I2PLACED ) and ( GetLinkedObject( OBJROLE_ACC_I2OBACC, OBJTYPE_ACCOUNT, UniID(AccRec, OBJTYPE_ACCOUNT), OBJTYPE_ACCOUNT, СчетКт ) == 0 ))
+                RestoreFromUniID( СчетКт, AccRec, OBJTYPE_ACCOUNT );
+                СчетКт = AccRec.rec.Account;
+            else
+                // Штатный вариант
+                СчетКт = NotBalCorrAcc_FirstDoc( "П" ).FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+            end;
+
+        end;
+
+        // Выполнить проводку по внебалансу
+        var paymtr:RsbAccTransaction = PaymentObj.MakeTransaction();
+
+        if( paymtr == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+
+        paymtr.Chapter         = 3;                                            
+        paymtr.Date_Carry      = {curdate};
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = OBIWPINCARRY;
+        paymtr.Kind_Oper       = " 1";
+        paymtr.Shifr_Oper      = "09";
+        paymtr.Department      = PaymentObj.Department;
+        paymtr.AccountPayer    = СчетДт;
+        paymtr.AccountReceiver = СчетКт;
+        paymtr.FIID            = NATCUR;
+        if( PaymentObj.DocKind == PS_INRQ )
+            paymtr.Sum         = PaymentObj.FutureReceiverAmount;
+        else
+            paymtr.Sum         = PaymentObj.FuturePayerAmount;
+        end;
+
+        //Gurin S. 17.06.2013 C-17880-6
+        var rs = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and (t_fromO = 'X' or t_fromK2 = 'X') and t_flag = 'X'", makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+        if (rs and rs.moveNext ())
+            paymtr.Ground  = "Документ № "                            + string(PaymentObj.Number) + 
+                             " от "                                   + string(PaymentObj.Date)   + 
+                             " к счету "                              + string(PaymentObj.PayerAccount)+","+
+                             " ожидающий разрешение на проведение операций."
+        else
+            paymtr.Ground  = "Постановка в Картотеку ОР документа № " + string(PaymentObj.Number) + 
+                             " от "                                   + string(PaymentObj.Date)   + 
+                             " к счету "                              + string(PaymentObj.PayerAccount);
+        end;
+
+        if( not paymtr.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+
+        //Свяжем счет плательщика и картотеки ОР
+        if(not SetLinkedAccount( PaymentObj.PayerAccount, PaymentObj.PayerFIID, 1, СчетДт, 
+                                 0/*NATCUR*/, 3/*CHAPT3*/, 49/*OBJROLE_ACC_IWPOBACC*/ ))
+            return 1;
+        end;
+    end; 
+    // Установить статус платежа
+    PaymentObj.PaymStatus = PM_IWPPLACED;
+
+    // Установить статус первички
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_IWP );
+
+    if( УстановитьСтатусыПлатежа(OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_WP_MEET) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    return 0;
+end;
+
+
+//Jushmanov 2014-02-25 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Num_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+    var stat = 0;
+
+    if( ( errTrn == 0 ) and ( message == 1 ) )// на выполнении шага
+      if(PaymentObj.DocKind == PS_PAYORDER) 
+        var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+        var Queries : string = "InfoCode:8";
+
+        var Narrative : string = "";
+        var Rec_Account : TRecHandler = TRecHandler("account");
+        PM_GetAccountRecord( PaymentObj.FuturePayerAccount, PaymentObj.FuturePayerFIID, PaymentObj.Chapter, Rec_Account );
+        if( Index( Rec_Account.rec.Type_Account, "Т" ) // Если запрет на дебет
+            or
+           (Rec_Account.rec.DateNoChange >= PaymentObj.ValueDate) // Запрет проводок
+          )
+          Narrative = "На счет плательщика " + PaymentObj.FuturePayerAccount + " " +
+                      "наложен запрет на проведение операций";
+        else
+          Narrative = "К счету плательщика " + PaymentObj.FuturePayerAccount + " " +
+                      "есть картотека ожидающих разрешения";
+        end;
+ 
+        Narrative = 
+          "Положительные результаты всех процедур приема к исполнению " +
+          "(включая положительный результат проверки достаточности денежных средств " +
+          "на счете плательщика), уведомляем о приеме " + 
+          IfThenElse( PsOrder.DocKind == PSPOKIND_REQUEST,
+                      "инкассового поручения", "платежного требования" ) + 
+          " к исполнению. " + Narrative;
+  
+        CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step);
+      end;
+    end;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return stat;
+end;

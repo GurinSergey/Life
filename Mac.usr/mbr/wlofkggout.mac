@@ -1,0 +1,513 @@
+/*
+ $Name:        wlofkggout.mac
+ $Module:      MBR
+ $Description: Экспорт сообщений ОФК для ГИС ГМП
+*/
+
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*                        Экспорт сообщений "ОФК для ГИС ГМП"               */
+/*                                                                          */
+/*  Имя файла: wlofkggout.mac                                               */
+/*  Создан:    17.12.12                                                     */
+/****************************************************************************/
+
+import "wlexport.mac", oralib, likepy, WldInter, MesInter, cryptdlm, BankInter, "wluftool.mac", "wlufsign.mac", "bnk_ptlib.mac";
+  file OutFile("") txt write;
+
+const PTCK_SMEV = 53;
+const PTCK_URN  = 61;
+
+/*Чтение настроек из BLOB*/
+PRIVATE CLASS TBLOB
+  /* порядок хранения настроек в BLOB*/
+  /* данные поля должны соответствать структуре WLGGProcSaveParm(WLINS.H:692)*/
+  const len_ValueDate        = 4;
+  const len_PayerAccount     = 620;
+  const len_BankCode         = 101;
+  const len_ReceiverAccount  = 101;
+  const len_KBK              = 620;
+  const len_Pack             = 101;
+  const len_Ground           = 101;
+  const len_CodeKind         = 2;
+  const len_Code             = 21;
+  const len_Name             = 81;
+  const len_PartyName        = 201; // GISGMP_FLD_PARTNAME         A8
+  const len_TypeCode         = 11;  // GISGMP_FLD_TYPECODE         A9
+  const len_Status           = 11;  // GISGMP_FLD_STATUS           A10
+  const len_ExchangeType     = 11;  // GISGMP_FLD_EXCHANGETYPE     A11
+  const len_SenderRole       = 26;  // GISGMP_FLD_SENDERIDENTIFIER A13
+
+  private macro getPosFromName( valName ):integer
+
+    var props  = GetObjProps(this), 
+        offset = 0,
+        isValidFld = false;
+    for( var item, props )
+      if( StrLwr("len_" + valName) == StrLwr(item) );
+        isValidFld = true;
+        break;
+      end;
+      offset = offset + GenGetProp( this, item );
+    end;
+
+    return IfThenElse( isValidFld, offset+1/*BLOB begin with first symbols*/, 0 );
+  end;
+
+  private macro getPINFPRMID()
+    var rs:RsdRecordSet = execSQLselect( " select t_keyid from dregparm_dbt where t_name = 'PINFPRM' ", NULL, false );
+    if( rs.movenext() )
+      return rs.value(0);
+    end;
+    return 0;
+  end;
+
+  macro getValFromBLOB( valueName ) : string
+
+    var offset = getPosFromName( valueName );
+    if( offset > 0 )
+      var params = makeArray( SQLParam( "LENGTH",  GenGetProp( this, "len_" + valueName ) ),
+                              SQLParam( "OFFSET",  offset ),
+                              SQLParam( "DETAILS", getPINFPRMID() ) );
+                              
+      var rs:RsdRecordSet = execSQLselect( " select DBMS_LOB.SUBSTR(t_fmtblobdata_xxxx, :LENGTH, :OFFSET) "
+                                           "   from dregval_dbt where t_keyid = :DETAILS ", params, false );
+      if( rs.movenext() )
+        return rs.value(0);
+      end;
+    end;
+
+    return "";
+  end;
+
+END;
+
+macro TransTextField( strInit ):string
+   var str="", count, len = strlen(strInit), symb;
+   count = 1;
+   while( count<=len )
+      symb = substr(strInit, count, 1);
+      if( symb=="&" )
+         symb = "&amp;";
+      elif ( symb==">" )
+         symb = "&gt;";
+      elif( symb=="<" )
+         symb = "&lt;"; 
+      elif ( symb=="\"" )
+         symb = "&quot;";
+      elif( symb=="'" )
+         symb = "&apos;";
+      end; 
+      str = str + symb;
+      count = count + 1;
+   end;
+   return str;
+end;
+
+macro TransFieldName( strInit ):string
+   
+  if( strInit == "CorrespondentBankAcc" )
+    return "CorrespondentBankAccount";
+  elif( strInit == "AdressKind" )
+    return "kind";
+  elif( strInit == "UnifoTransferMsgResp" )
+    return "UnifoTransferMsgResponse";
+  elif( strInit == "PaymentIdentificatio" )
+    return "PaymentIdentificationData";
+  elif( strInit == "RecipientServicesIde" )
+    return "RecipientServicesIdentifier";
+  elif( strInit == "PaymentIdentificatio" )
+    return "PaymentIdentificationData";
+  elif( strInit == "Account" )
+    return "AccountNumber";
+  else
+    return strInit;
+  end;
+
+end;
+
+private macro YYYY_MM_DD( dateInit )
+   var day, mon, year, str;
+
+   DateSplit(dateInit, day, mon, year );
+   if ( day < 10 )
+     day = "0"+string(day);
+   else
+     day = string(day);
+  end;
+
+  if ( mon < 10 )
+    mon = "0"+string(mon);
+  else
+    mon = string(mon);
+  end;
+  str = string(year) + "-" + mon + "-" + day ;
+  return str;
+end;
+
+macro GetDateTime():string
+
+  var DateTime:string = "";
+  var query_time = "select to_char(systimestamp, 'HH24:MI:SS.FF3') FROM dual ";
+  var rs_time:RsdRecordset = execSQLselect(query_time);
+  if (rs_time and rs_time.moveNext() )
+    DateTime = string( YYYY_MM_DD(date()), "T", rs_time.value(0) );
+  end;  
+  var query_zone = "select to_char(DBTIMEZONE) from dual";
+  var rs_zone:RsdRecordset = execSQLselect(query_zone);
+  if (rs_zone and rs_zone.moveNext() )
+    DateTime = DateTime + rs_zone.value(0);
+  end;
+  return DateTime;
+end;
+
+/* Ищет дочерний узел в рамках узла. В дочерние входит только в рамках указанного пути */
+private macro FindChildNode( node:object, nodeName, path )   
+   var i, child:object;
+   var result = "", chName;
+
+   if( index( path, "/") == 0 )
+     chName = path;
+   else
+     chName = substr( path, 1, index( path, "/" ) - 1 );
+   end;
+
+   i = 0;
+   while( i < node.childNodes.length )
+     child = node.childNodes.item( i );
+       if( child and ( child.nodeType == CHILD_NODE ) and ( GetNodeName( child.NodeName ) == chName ) )
+         if( index( path, "/" ) == 0 )
+           return FindChildNode( child, nodeName, "" );
+         else
+           return FindChildNode( child, nodeName, substr( path, index( path, "/" ) + 1 ) );
+         end;
+       end;
+     i = i + 1;
+   end;
+   i = 0;
+   return node;
+end;
+
+private macro GetFinalPaymentStr( xmlxml ):string
+
+  var outxml = "";
+  var StartIndex:integer = Index( xmlxml, "<pi:FinalPayment" );
+  var EndIndex:integer = Index( xmlxml, "</pi:FinalPayment>" ) + 18;
+  outxml = SubStr( xmlxml, StartIndex, EndIndex - StartIndex );
+  return outxml;
+
+end;
+
+private macro ReWriteFP( xmlxml, OutStrPm )
+   var outxml = "";
+   var StartIndex:integer = Index( xmlxml, "<pi:FinalPayment" ) - 1;
+   var EndIndex:integer = Index( xmlxml, "</pi:FinalPayment>" ) + 18;
+
+   outxml = SubStr( xmlxml, 1, StartIndex ) + OutStrPm + SubStr( xmlxml, EndIndex );
+   return outxml;
+end;
+
+macro ConvertToUTF8( strconv:string ):string
+  
+  var select = "";
+  var rs;
+  var i = 1;
+  var newxml = "";
+
+  while ( i < StrLen(strconv) )
+    select = "SELECT CONVERT ( '" + SubStr( strconv, i, 3860 ) + "', 'UTF8') FROM DUAL;";
+    rs = execSQLselect( select, /*params*/NULL, FALSE );
+    if( rs.moveNext() )
+      newxml = newxml + rs.Value(0);
+    end;
+    i = i + 3860;                                               
+  end;
+
+  return newxml;
+end;
+
+private macro isLikeFormat( str ):bool // "\d{1,2}\.\d{2}"
+  var pos = 0;
+  if( pos=index(str, ".") ) 
+    if( not IsDigitalNumber(SubStr(str, 1, pos-1)) AND
+        not IsDigitalNumber(SubStr(str, pos+1))    AND
+        InList(pos,2,3)                            AND 
+        (strlen(str)-pos == 2) 
+      )
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+private macro CheckCorrectDataGG( err : @string, name, mnemonic, service ):bool
+  if( (name == "") and ((mnemonic == "") or (service == "")) )
+    err = "Не заданы параметры электронного сервиса ГИС ГМП";
+  elif( service and (isLikeFormat( service ) == false) )
+    err = "Некорректный формат версии электронного сервиса ГИС ГМП";
+  end;
+  SetParm( 0, err ); // если вдруг при вызове не поставили @
+  return IfThenElse( err, false, true );
+end;
+
+private macro CreateAttrib( xml:object, Node:object, Attrib:string, value:string )
+  var Code = xml.createElement(Attrib);
+  Node.AppendChild( Code );
+  Code.text = TransTextField( value );
+end;
+
+private macro CorrectRequestID( ID )
+  var stat = 0, mean = "";
+  GetRegistryValue( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ГИС ГМП\\SymbolPaymentID", V_STRING, mean, stat );
+  if( (stat == 0) AND mean AND (SubStr(ID, 2, 1) != "_") )
+    mean = SubStr( mean, 1, 1 ) + "_" + SubStr( ID, 1,  8 ) + "-" +
+                                        SubStr( ID, 9,  4 ) + "-" +
+                                        SubStr( ID, 13, 4 ) + "-" +
+                                        SubStr( ID, 17, 4 ) + "-" +
+                                        SubStr( ID, 21 ); // + GUID
+  else
+    mean = ID;
+  end;
+  return mean;
+end;
+
+private macro CreateGGTransMsg( xml:object, wlmes, ServiceName, Mnemonic, Version ):object
+  var PartyName    = TBLOB.getValFromBLOB( "PartyName" ),
+      TypeCode     = TBLOB.getValFromBLOB( "TypeCode" ),
+      Status       = TBLOB.getValFromBLOB( "Status" ),
+      //ExchangeType = TBLOB.getValFromBLOB( "ExchangeType" ),
+      ExchangeType = "6",
+      SenderRole   = TBLOB.getValFromBLOB( "SenderRole" );
+
+  var GISGMPTransferMsg:object = xml.createElement("unifo:GISGMPTransferMsg");
+    var Message = xml.createElement("smev:Message");
+    GISGMPTransferMsg.appendChild(Message);
+      var Sender  = xml.createElement("smev:Sender");
+      Message.appendChild( Sender );
+        CreateAttrib( xml, Sender, "smev:Code", GetCodeParty( GetDprtPartyID(wlmes.Department), PTCK_SMEV ) );
+        CreateAttrib( xml, Sender, "smev:Name", GetPartyName( GetDprtPartyID(wlmes.Department) ) );
+      var Recipient = xml.createElement( "smev:Recipient" );
+      Message.appendChild(Recipient);
+        //CreateAttrib( xml, Recipient, "smev:Code", wlmes.OutSideAbonentCode );
+        CreateAttrib( xml, Recipient, "smev:Code", "RKZN35001");
+        CreateAttrib( xml, Recipient, "smev:Name", PartyName );
+
+      if( ServiceName )
+        CreateAttrib( xml, Message, "smev:ServiceName", ServiceName );
+      else
+        var Service = xml.createElement( "smev:Service" );
+        Message.appendChild(Service);
+        CreateAttrib( xml, Service, "smev:Mnemonic", Mnemonic );
+        CreateAttrib( xml, Service, "smev:Version",  Version );
+      end;
+
+      CreateAttrib( xml, Message, "smev:TypeCode", TypeCode ); // GSRV, GFNC, OTHR
+      CreateAttrib( xml, Message, "smev:Status",   Status );   // REQUEST, RESULT, REJECT, INVALID, ACCEPT, PING, GETRESULT, PROCESS, NOTIFY, FAILURE, CANCEL, STATE, PACKET
+      CreateAttrib( xml, Message, "smev:Date",     GetDateTime() );//"Системные дата и время создания сообщения в формате UTC в формата 'yyyy-MM-dd'T'HH:mm:ss.SSSZ'" );
+      CreateAttrib( xml, Message, "smev:ExchangeType", ExchangeType );
+
+      var MessageData    = xml.createElement( "smev:MessageData" );
+        GISGMPTransferMsg.appendChild(MessageData);
+        var AppData        = xml.createElement( "smev:AppData" );
+        MessageData.appendChild(AppData);
+          var RequestMessage = xml.createElement( "msg:RequestMessage" );
+          AppData.appendChild(RequestMessage);
+          RequestMessage.setAttribute( "Id",               CorrectRequestID(execStoredFunc( "sys_guid", V_STRING )) );
+          RequestMessage.setAttribute( "timestamp",        GetDateTime() );//"Системные дата и время создания сообщения в формате UTC в формата 'yyyy-MM-dd'T'HH:mm:ss.SSSZ'" );
+          RequestMessage.setAttribute( "senderIdentifier", GetCodeParty( GetDprtPartyID(wlmes.Department), PTCK_URN ) );
+            var ImportRequest = xml.createElement( "gisgmp:ImportRequest" );
+            RequestMessage.appendChild(ImportRequest);
+              var Package     = xml.createElement( "pirq:Package" );
+              ImportRequest.appendChild(Package);
+
+  return GISGMPTransferMsg;
+end;
+
+private macro CorrectNamespace( parent, field, namespace )
+  if( InList( field, "PayerName", "PayerAccount", "FinalPayment",         "SupplierBillID",   "Narrative", "Amount",   "PaymentDate",  "BudgetIndex", 
+                          "PaymentIdentificatio", "SystemIdentifier", "AccDoc",    "AccDocNo", "AccDocDate",   "Payer", 
+                          "PayeeName",            "payeeINN",         "payeeKPP",  "Payee",    "PayeeBankAcc", "ChangeStatus", 
+                          "KBK",                  "Priority",         "OKTMO", 
+                          "PaytNo", "PartialPayt", "SumResidualPayt" ) AND
+      (InList( field, "PayerIdentifier", "PayerName", "PayerAccount" ) == 0) )
+    namespace = "pi:";
+  elif( InList( field, "Status", "Purpose", "TaxPeriod", "TaxDocNumber", "TaxDocDate", "PaymentType" ) )
+    namespace = "bdi:";
+  elif( InList( field, "PayerIdentifier", "TransKind" ) )
+    namespace = "com:";
+  elif( InList( field, "Name", "BIK", "Account", "CorrespondentBankAcc" ) )
+    namespace = "org:";
+  elif( index(field, "Bank") and index(parent,"PaymentIdentificatio") )
+    namespace = "pi:";
+  elif( index(field, "Bank") and index(parent,"PayeeBankAcc") )
+    namespace = "org:";
+  elif( index(field, "Document") )
+    namespace = "pirq:";
+  end;
+  SetParm( 2, namespace );
+end;
+
+private macro OutCommonProc( fileName, addrSess, isFormat1_16 )
+  debugbreak;
+  var xml:object = ActiveX("Microsoft.XMLDOM");
+  var Envelope:object, Body:object, Head:object;
+  var CurNode:object, FirstNode:object, item:object;
+  var TransferMsg:object;
+  var field, field_value, err:integer, namespace;
+  var RegVal:bool = false, RegErr:integer = 0;
+  var CryptoAPI = RsCryptoAPI();
+  var Error = 0;
+  var FinPMString = "";
+  var ServiceName = "",
+      Mnemonic    = "",
+      Version     = "";
+
+  SetBuff( wlSess, addrSess );
+
+  GetRegistryValue( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ГИС ГМП\\SERVICE\\NAME",     V_STRING, ServiceName, "" );
+  GetRegistryValue( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ГИС ГМП\\SERVICE\\MNEMONIC", V_STRING, Mnemonic,    "" );
+  GetRegistryValue( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ГИС ГМП\\SERVICE\\VERSION",  V_STRING, Version,     "" );
+
+  xml.appendChild( xml.createProcessingInstruction("xml"," version='1.0' encoding='utf-8'") );
+  Envelope = xml.createElement("SOAP-ENV:Envelope");
+  xml.appendChild( Envelope );
+
+  Envelope.setAttribute("xmlns:SOAP-ENV", "http://schemas.xmlsoap.org/soap/envelope/"  );
+  Envelope.setAttribute("xmlns:wsu",      "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"  );
+  Envelope.setAttribute("xmlns:smev",     "http://smev.gosuslugi.ru/rev120315"  );
+  Envelope.setAttribute("xmlns:pirq",     "http://roskazna.ru/gisgmp/xsd/116/PGU_ImportRequest"  );
+  Envelope.setAttribute("xmlns:gisgmp",   "http://roskazna.ru/gisgmp/xsd/116/MessageData"  );
+  Envelope.setAttribute("xmlns:msg",      "http://roskazna.ru/gisgmp/xsd/116/Message"  );
+  Envelope.setAttribute("xmlns:unifo",    "http://roskazna.ru/gisgmp/02000000/SmevGISGMPService/"  );
+
+  Head = xml.createElement("SOAP-ENV:Header");
+  Envelope.appendChild( Head );
+  Head.Text = "";
+
+  Body = xml.createElement("SOAP-ENV:Body");
+  Envelope.appendChild( Body );
+  Body.setAttribute("wsu:Id", "body");
+
+  /* Определяем, есть ли сообщения, подлежащие выгрузке */
+  var isFirstMsg = true;
+  while( СчитатьЗапись( wlmes, err ) )
+    if( isFormat1_16 and isFirstMsg ) // сделаем проверки и добавим узел GISGMPTransferMsg по данным первого сообщения (т.к. данные одинаковые)
+      TransferMsg = CreateGGTransMsg( xml, wlmes, ServiceName, Mnemonic, Version );
+      Body.appendChild( TransferMsg );
+
+      /* CHECK */
+      var codeSMEV = GetCodeParty( GetDprtPartyID(wlmes.Department), PTCK_SMEV );
+      //Chesnokov D.S. 01.07.2015 Адаптация ГИС ГМП 1.16
+      //var codeURN  = GetCodeParty( GetDprtPartyID(wlmes.Department), PTCK_URN );
+      if (codeSMEV == "") //OR (codeURN == "") 
+        ErrExport( "Для отправителя сообщений не задан(ы) код(ы): " + codeSMEV + 
+                   ". Задайте значения код(ов) в справочнике субъектов для " + GetPartyName( GetDprtPartyID(wlmes.Department) ) + " и повторите экспорт сообщений" );
+        return false;
+      end;
+
+      codeSMEV = GetCodeParty( wlmes.OutSideAbonentID, PTCK_SMEV );
+      if( (codeSMEV == "") AND (wlmes.OutsideAbonentCodeKind == 0) )
+        ErrExport( "Для получателя сообщений не задан код ИС в СМЭВ. Задайте значение кода в справочнике субъектов для " +
+                   GetPartyName( wlmes.OutSideAbonentID ) + " и повторите экспорт сообщений" );
+        return false;
+      end;
+
+      var ErrTxt="";
+      if( CheckCorrectDataGG( ErrTxt, ServiceName, Mnemonic, Version ) == false )
+        ErrExport( ErrTxt );
+        return false;
+      end;
+      /* END CHECK */
+      isFirstMsg = false;
+    end;
+    
+    var parent = "";
+    /* Формируем файл экспорта */
+    CurNode = FirstNode = IfThenElse( isFormat1_16, xml.selectSingleNode("//pirq:Package"), Body );
+    while( СчитатьПоле( field, field_value ) )
+      if( (field == "_begin") )
+        CorrectNamespace( parent, field_value, namespace );
+        parent = field_value;
+        item = xml.createElement(pyOR(namespace,"") + TransFieldName(field_value));
+//        if( (not isFormat1_16) or (isFormat1_16 == false) )
+//          if( field_value == "n1:UnifoTransferMsg" )
+//            item.setAttribute("xmlns:n1", "http://roskazna.ru/SmevUnifoService/");
+//          end;
+//        end;
+
+        if( field_value == "FinalPayment" )
+          item.setAttribute("xmlns:pi",  "http://roskazna.ru/gisgmp/xsd/116/PaymentInfo"  );
+          item.setAttribute("xmlns:com", "http://roskazna.ru/gisgmp/xsd/116/Common"  );      
+          item.setAttribute("xmlns:bdi", "http://roskazna.ru/gisgmp/xsd/116/BudgetIndex"  ); 
+          item.setAttribute("xmlns:org", "http://roskazna.ru/gisgmp/xsd/116/Organization"  );
+        end;
+
+        CurNode = CurNode.appendChild(item);
+      elif( field == "_end" )
+        if( index( CurNode.nodename, TransFieldName(field_value) ) == 0 )
+          ErrExport(string("Нарушена структура сообщения ",wlmes.Trn));
+          return false;
+        end;
+        CurNode = CurNode.parentNode;
+      else
+        if( isFormat1_16 and InList( field, "originatorID", "meaning", /*подгон под 5.5*/ "ID" ) )
+          if( field == "ID" ) 
+            field = "Id"; 
+            field_value = CorrectRequestID(field_value);
+          end;
+          CurNode.setAttribute( field, TransTextField(field_value) );
+        elif( ((not isFormat1_16) or (isFormat1_16 == false)) and InList( field, "Date", "TimeStamp" ) )
+          item = xml.createElement(namespace + field);
+          CurNode.appendChild(item);
+          item.Text = GetDateTime();
+        elif( ((not isFormat1_16) or (isFormat1_16 == false)) and InList( field, "Version", "kind" ) )
+          CurNode.setAttribute( field, TransTextField(field_value) );
+        else
+          if( Index( CurNode.nodename, ":" ) != 0 )
+            namespace = substr( CurNode.nodename, 1, Index( CurNode.nodename, ":" ) );
+          else
+            namespace = "";
+          end;
+
+          CorrectNamespace( parent, field, namespace );
+          item = xml.createElement(pyOR(namespace,"") + TransFieldName(field));
+          CurNode.appendChild(item);
+          item.Text = TransTextField(field_value);
+        end;      
+      end;
+    end;    
+    
+    if(CurNode.nodename != FirstNode.nodename)
+      ErrExport(string("Нарушена структура сообщения ",wlmes.Trn));
+      return false;
+    end;
+
+    Error = Open( OutFile, fileName, "utf8" );
+    if((Error == true))
+
+       OutFile.str = xml.xml;
+       insert(OutFile);
+    
+       close(OutFile);
+    end;
+    
+  end;
+
+  return true;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ErrExport(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+end;
+
+/* Экспорт сообщений ГИС ГМП */
+macro OutProc( fileName, addrSess )
+  return OutCommonProc( fileName, addrSess );
+end;
+
+/* Экспорт сообщений ГИС ГМП 1.16 */
+macro OutProc_1_16( fileName, addrSess )
+  return OutCommonProc( fileName, addrSess, true /*use format 1.16*/ );
+end;

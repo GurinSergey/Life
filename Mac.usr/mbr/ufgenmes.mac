@@ -1,0 +1,271 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщений транспорта УФЭБС (общие функции)                     */
+/*                                                                          */
+/*  Имя файла: ufgenmes.mac                                                 */
+/*  Создан:    29.09.04                                       Бабин А.П.    */
+/****************************************************************************/
+
+import "wlmcgm.mac", "globals.mac", "oralib.mac", "wluftool.mac", bnk_ptlib; //TAM 04.09.2014 HF_74
+
+//TAM 18.11.2013 HF_96
+macro GetEDReceiver( RecipientID, RecipientCodeKind, RecipientCode, RelatedRef)
+   var EDReceiver : string = "";
+   var Error = 0;
+   const PTCK_UIS = 47;
+   if (RecipientCodeKind == 47)
+     EDReceiver = RecipientCode;
+   else
+     if (RecipientID > 0)
+       EDReceiver = ПолучитьКодСубъекта( RecipientID, PTCK_UIS, Error );
+     end;
+     if ((EDReceiver == "") and (ValType(RelatedRef) != V_UNDEF))
+       EDReceiver = SubStr(RelatedRef, 7, 10);
+     end;
+   end;
+   if (EDReceiver == "")
+     var Code = "";
+     if (ВидСубъекта(RecipientID, PTK_BANK) and not БанкУБР(RecipientID))
+       Code = ПолучитьКодСубъекта( RecipientID, PTCK_BIC, Error ) ;
+     end;
+     if (Code == "")
+       RunError( "|Не удалось определить уникальный идентификатор получателя ЭД (EDReceiver)" );
+       return "";
+     end;
+     EDReceiver = string(substr(Code, 3, 7),"000");
+   end;
+   //проверок пока нет, так как нет предупреждений
+   return EDReceiver;
+end;
+
+macro GetEDAuthor( AbonentID )
+   var Error, MFO_9;
+   if( (AbonentID == 0) or (AbonentID == {OurBank}) )
+      return string(substr(Свой_МФО, 3, 7),"000");
+   else
+      MFO_9 = ПолучитьКодСубъекта( AbonentID, PTCK_BIC, Error ) ;
+      if (Error)
+         RunError( "|Не найден БИК банка-составителя сообщения" );
+      end;
+      return string(substr(MFO_9, 3, 7),"000");
+   end;
+end;
+
+private var _lastTpShemID:integer = -1,
+            _lastEDAuthor:string  = "";
+macro GetEDAuthorByMes( wlmesrec ):string
+  if( wlmesrec.TpSchemID == _lastTpShemID )
+    return _lastEDAuthor;
+  end;
+  var rs:RsdRecordset = execSQLselect( "SELECT DP.T_PARTYID FROM DWLTPSHEM_DBT TS, DDP_DEP_DBT DP WHERE TS.T_TPSHEMID = :TPSHEMID AND DP.T_CODE = TS.T_DEPARTMENT",
+                                       makeArray( SQLParam( "TPSHEMID", wlmesrec.TpSchemID ) ) );
+  if( rs.moveNext() )
+    _lastEDAuthor = GetEDAuthor( rs.value( 0 ) );
+    _lastTpShemID = wlmesrec.TpSchemID;
+  else
+    RunError( "|Не найден банк-составитель сообщения" );
+  end;
+  return _lastEDAuthor;
+end;
+
+/* Получить признак системы обаботки (01 - непрерывная, 02 - дискретная, 05 - RTGS). */
+macro GetEDSystemCode( TpShemID ):string
+   ClearRecord(f_wltpshem);
+   f_wltpshem.TpShemID = TpShemID;
+   if ( GetEQ(f_wltpshem) and (f_wltpshem.SystemCode!="") )
+     return f_wltpshem.SystemCode;
+   else
+     return "01";
+   end;
+end;
+
+//Gurin S. 26.03.2015 HF2031_19_25_148
+private macro GetPacketType(RlsFormID : integer) : integer
+  var PacketType : integer = 0;
+
+  var rs : RsdRecordset = execSQLselectPrm
+    ( "select frm.t_PacketType "
+      "  from dwlmesrls_dbt rls, dwlmesfrm_dbt frm "
+      " where rls.t_RlsFormID = :RlsFormID "
+      "   and frm.t_FormID = rls.t_FormID ",
+      SQLParam("RlsFormID", RlsFormID)
+    );
+  if(rs and rs.moveNext())
+    PacketType = rs.value(0);
+  end;
+
+  return PacketType;
+end;
+
+/* Используются ли пакеты ЭПД/ЭСИД.
+   определяем по настройке формата транспорта: максимальное число сообщений при экспорте в файл */
+macro GetModePacketEPD_ESID( wlmes, IsPacket : @bool, PacketType : @integer, MaxExpMes : @integer ):bool //DAI Hotfix HF2031_19_25_12
+  var Name:string, FormatFile:integer, GroupSessByPacketType : bool;
+
+  //DAI Hotfix HF2031_19_25_12
+  if( (ОпределитьФорматТранспортаДляТранспортнойСхемы( wlmes.TpSchemID, Name, FormatFile, MaxExpMes, GroupSessByPacketType )) == 0 )
+    std.msg("Не найден формат транспорта УФЭБС для транспортной схемы " + wlmes.TpSchemID);
+    return false;
+  end;
+
+  if( FormatFile != WLD_FORMAT_XML )
+    std.msg("У формата транспорта УФЭБС установлен неверный формат файла обмена (не xml)");
+    return false;
+  end;
+
+  IsPacket = false;
+  PacketType = 0;
+  if( (MaxExpMes != 1) and GroupSessByPacketType )
+    PacketType = GetPacketType(wlmes.RlsFormID);
+
+    if(PacketType)
+      IsPacket = true;
+    end;
+  end;
+ 
+  return true;
+end;
+
+macro TrimNull( value )
+   var result = trim(value);
+   var count = 1;
+
+   while( (count<=strlen(result)) and (substr(result,count,1)=="0") )
+      count = count+1;
+   end;
+   result = substr(result,count);
+   return result;
+end;
+
+macro YYYYMMDD( dateInit )
+   var day, mon, year, str;
+
+   DateSplit(date(dateInit), day, mon, year );//TAM HF_96
+   if ( day < 10 )
+     day = "0"+string(day);
+   else
+     day = string(day);
+   end;
+
+  if ( mon <10 )
+    mon = "0"+string(mon);
+  else
+    mon = string(mon);
+  end;
+  str = string(year) + "-" + mon + "-" + day ;
+  return str;
+end;
+
+//TAM 21.02.2013 HF_64
+macro ДатаДДММГГГГ( dateInit )
+  var day, mon, year;
+  DateSplit(dateInit, day, mon, year );
+  return StrSubst(string(day:2, ".", mon:2, ".", year:4), " ", "0");
+end;
+
+macro TransTextField( strInit )
+   var str="", count, len = strlen(strInit), symb;
+   count = 1;
+   while( count<=len )
+      symb = substr(strInit, count, 1);
+     /* if ( symb=="<" )
+         symb = "&lt;";
+      elif ( symb==">" )
+         symb = "&gt;";
+      elif ( symb=="&" )
+         symb = "&amp;";
+      elif ( symb=="\"" )
+         symb = "&quot;"; */
+      if ( ((symb >= "\x01") and (symb <= "\x08")) or
+           ((symb >= "\x0B") and (symb <= "\x0C")) or 
+           ((symb >= "\x0E") and (symb <= "\x1F")) or
+           ((symb >= "\xB0") and (symb <= "\xDF")) or
+           ((symb >= "\xF8") and (symb <= "\xFB")) or
+           ((symb >= "\xFD") and (symb <= "\xFF")) 
+         )
+         symb = ".";
+      elif( (symb == "\x09") or (symb == "\x0A") or (symb == "\x0D") )
+         symb = " ";
+      elif( symb == "Ё" )
+         symb = "Е";
+      elif( symb == "ё" )
+         symb = "е";
+      elif( symb == "\x7F" )
+         symb = "?";
+      elif( (symb == "Є") or (symb == "є"))
+         symb = "e";
+      elif( symb == "Ї")
+         symb = "I";
+      elif( symb == "ї")
+         symb = "i";
+      elif( symb == "Ў")
+         symb = "Y";
+      elif( symb == "ў")
+         symb = "y";
+      end;
+      str = str + symb;
+      count = count + 1;
+   end;
+   /*return ToANSI(str);*/
+   return str;
+   /* Ничего самим делать не надо.*/
+   /*return strInit;*/
+end;
+
+macro FillEDNoDateAuthorByRef_XMLField(elem : object, Ref : string)
+  var ed_nda = EDNoDateAuthor();
+  ed_nda.ConstructByTrn(Ref);
+
+  elem.setAttribute( "EDNo",       ed_nda.EDNo );
+  elem.setAttribute( "EDDate",     YYYYMMDD(ed_nda.EDDate) );
+  elem.setAttribute( "EDAuthor",   ed_nda.EDAuthor );
+end;
+
+macro FillEDNoDateAuthorByRef_CompoundRls(Ref : string)
+  var ed_nda = EDNoDateAuthor();
+  ed_nda.ConstructByTrn(Ref);
+
+  ЗаписатьПолеЛог( "EDNo",     ed_nda.EDNo );
+  ЗаписатьПолеЛог( "EDDate",   YYYYMMDD(ed_nda.EDDate) );
+  ЗаписатьПолеЛог( "EDAuthor", ed_nda.EDAuthor );
+end;
+
+//TAM HF_81
+private macro GetPaytKindRegVal(form: string, mi: integer, ma: integer, def:string): string
+  var err, val;
+  GetRegistryValue("МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\УФЭБС\\PAYTKIND\\"+form, V_INTEGER, val, err);
+  if (err) 
+    return def; 
+  end;
+  if ((val < mi) or (val > ma)) 
+    return def; 
+  end;
+  return string(val);
+end;
+
+macro GetPaytKind(form: string, PaymentKind: string, TpSchemID: integer): string
+  // Особые случаи
+  if( InList(form, "ED101", "ED103", "ED104")           and
+      ( PaymentKind == "С" ) /* Срочно */               and
+      ( GetEDSystemCode(TpSchemID) == "05" ) /* БЭСП */
+    )
+    return "4";
+  elif( InList(form, "ED110", "ED113", "ED114", "ED111") and
+        InList(PaymentKind, "П", "Т") /* Почтой, Телеграфом */
+      )
+    if(PaymentKind == "П") // Почтой
+      return "2";
+    else                   // Телеграфом
+      return "3";
+    end;
+  elif( InList(form, "ED111") and //TAM 04.09.2014 HF_74
+        ( PaymentKind == "С" ) /* Срочно */
+      )
+    return "4";
+  end;
+
+  // Общий случай
+  return GetPaytKindRegVal(form, 1, 9, "");
+end;

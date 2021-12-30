@@ -1,0 +1,1601 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Общие функции и переменные для макросов платежей
+// Описание  : Общие функции проверки и дозаполнения полей документов
+//-----------------------------------------------------------------------------
+// KS 22.11.2013 Предварительная адаптация под 31ю сборку
+
+IMPORT oralib, likepy, BankInter, PaymInter, OprInter, InsCarryDoc, "pmprops.mac", "cbctuncs.mac",adress, CTInter, globals, FIInter, lib_str, "mc_lib.mac", "cb_sql.mac";
+const ПутьКНастройкамПроверкиИНН:string = "CB\\PAYMENTS\\CHECKINNLEN";
+private const REGPATH_SPECIALACC:string = "АРМ ПОЗИЦИОНЕРА\\ПЕРЕМЕННЫЕ\\SPECIALACC";
+const REGPATH_ALLOW_UNKNOWN_REC_ACC_MCDOC:string     = "BBANK\\MCDOC\\UnknownRecAcc";
+const REGPATH_ALLOW_UNKNOWN_REC_ACC_MEMORDER:string  = "BBANK\\MEMORDER\\UnknownRecAcc";
+const REGPATH_ALLOW_UNKNOWN_REC_ACC_SUMMO:string     = "COMMON\\СВОДНЫЙ МО\\UnknownRecAcc";
+const REGPATH_ALLOW_UNKNOWN_REC_ACC_BANKORDER:string = "BBANK\\BANKORDER\\UnknownRecAcc";
+
+
+const ERR_OK      =  0; // Все ОК
+const ERR_INN     =  1; // Error
+const ERR_UNKNOW  = -1; // Неизвестная ошибка             
+
+// Ошибки
+const PAYMERR_CANNOTFINDDEPFORBANK = 7243; // Не найден узел ТС, соответствующий субъекту
+const PAYMERR_ACCNODE_NOT_IN_CABS  = 7244; // Нельзя работать со счетом МФР, открытым для корреспонденции с филиалом, не входящим в ЦАБС
+const PAYMERR_PAYACC_CORR          = 7245; // Счет плательщика не должен быть корреспондентским
+const PAYMERR_RECACC_CORR          = 7246; // Счет получателя не должен быть корреспондентским
+const PAYMERR_PAYACC_MFR           = 7247; // Счет плательщика не должен быть счетом МФР
+const PAYMERR_RECACC_MFR           = 7248; // Счет получателя не должен быть счетом МФР
+const PAYMERR_CODE_NOT_FOUND       = 7249; // Не найден код банка получателя
+const PAYMERR_CORSCHEM_NOT_FOUND   = 6217; // Не найдена схема расчетов
+const PAYMERR_PAYACC_DEBETLOCK     = 445;  // Запрещено дебетование счета плательщика
+const PAYMERR_PAYACC_DATENOCHANGE  = 2016; // Запрещены движения средств по счету плательщика
+const PAYMERR_RECACC_DATENOCHANGE  = 2017; // Запрещены движения средств по счету получателя
+const PAYMERR_ACC_CREDITLOCK       = 516;  // По счету запрещены операции по кредитованию
+
+// Режимы доступа
+private const DEPARTMENT_ACCESS_NOTCABS = 3; // Другая ЦАБС
+
+/* Проверка на содержание нечисловых символов в строке */
+macro IsDigitStr( Str )
+
+  var stat = 0, i = 1, ch, DigitString = "0123456789";
+
+      while( (not stat) and (i <= strlen(Str)) )
+        ch = SubStr( Str, i, 1 );
+        if( not Index( DigitString, ch ))
+          stat = 1; 
+        end;
+        i = i + 1;
+      end;
+
+  return stat;
+
+end;
+  
+macro RsbGetTrue( DefaultIfVal:bool, DefaultIfValNoDialog:variant, Text:string ):variant
+
+  if( GetDialogFlag() )
+    return GetTrue( DefaultIfVal, Text );
+  end;
+  return DefaultIfValNoDialog;
+end;
+  
+// Проверка допустимости заданного ИНН, вторым параметром можно задавать строку для вывода вида ошибки
+MACRO CheckINN( INN:string ):integer
+
+  var ErrINNStr :string  = "";
+  var pos:integer = StrBrk( INN, "\\/" );
+  var onlyINN   :string  = INN;
+  var onlyKPP   :string  = ""; 
+  var len_string:string  = "";
+  var err:integer = 0; 
+
+  // разделяем ИНН и КПП
+  if( pos )
+    onlyINN = SubStr( INN, 1, pos - 1); 
+    onlyKPP = SubStr( INN, pos + 1); 
+  end;
+
+  // проверка поля ИНН/КПП на задвоение символа '/'
+  if( Index(INN, "\\\\") or Index(INN, "//") )
+      ErrINNStr = "Двойной символ '/' в поле ИНН/КПП ";
+  elif( pos and StrBrk( SubStr( INN, pos + 1 ), "\\/" ) )
+      ErrINNStr = "Неверно заполнено поле ИНН/КПП ";
+
+  // проверка на содержание нецифровых символов в ИНН и КПП
+  elif( isDigitStr(onlyINN) or pos and  
+      isDigitStr(onlyKPP))
+    ErrINNStr = "Недопустимые символы в поле ИНН/КПП ";
+  else
+  // получим настройку допустимых длин ИНН
+  GetRegistryValue( ПутьКНастройкамПроверкиИНН, V_STRING, len_string, err ); 
+
+  // допустимые длины не заданы - возвращаем Ок
+  if( ( not len_string ) or ( len_string == "0" ) )
+    return ERR_OK;
+  end;
+
+  // проверим, входит ли длина нашего ИНН в список допустимых
+  if( find( map( filter( split( len_string, "," ) ), @int ), StrLen( onlyINN ) ) != -1 )
+    return ERR_OK;
+  else
+    ErrINNStr = "Неверная длина ИНН ";
+     end;
+
+  end;
+// Если задана строка для вывода вида ошибки
+  if( ParmCount() == 2 )
+    SetParm(1, ErrINNStr);
+  end;
+  
+  if( ErrINNStr != "" )
+    return ERR_INN;
+  end;
+
+END;
+
+// Является ли счет счетом заданного типа?
+macro PM_CheckAccount_Type( Account:string, Chapter:integer, FIID:integer, AccType:string ):bool
+
+  var SelectStr:string;
+  var params:TArray;
+  var rs:object;
+
+  SelectStr = "select count(1) " +
+              "  from daccount_dbt acc " +
+              "where  acc.t_Account       = :Account " +  
+              "  and  acc.t_Chapter       = :Chapter " + 
+              "  and  acc.t_Code_Currency = :FIID    " +
+              "  and  acc.t_Type_Account like '%" + AccType + "%' ";
+
+  params = makeArray( SQLParam( "Account", Account ),
+                      SQLParam( "Chapter", Chapter ),
+                      SQLParam( "FIID"   , FIID    ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs AND rs.moveNext() )
+    if( rs.value(0) > 0 )
+      return true;
+    end;
+  end;
+
+  return false;
+end;
+
+//Документ порожден транзитным платежом
+macro PM_PaymentIsChildTransit(PaymentID: integer): bool
+  var params:TArray;
+  var rs:object;
+  var SelectStr:string;
+
+  SelectStr = " SELECT 1 "+
+                " FROM dpmpaym_dbt pm, dpmlink_dbt lnk"+
+               " WHERE pm.t_PaymentID = :PAYMENTID"+
+                 " AND pm.t_DocKind IN (:doc1, :doc2, :doc3)"+
+                 " AND lnk.t_PurposePayment = pm.t_PaymentID"+
+                 " AND lnk.t_LinkKind = :KIND";
+  
+  params = makeArray( SQLParam( "PAYMENTID", PaymentID ),
+                      SQLParam( "doc1", DLDOC_BANKPAYMENT ),
+                      SQLParam( "doc2", DLDOC_BANKCLAIM ),
+                      SQLParam( "doc3", BBANK_CPORDER ),
+                      SQLParam( "KIND", PMLINK_KIND_RETREDIR ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+     return true;
+  end;
+  
+  return false;
+end;
+
+macro FindCorschem(rec_cors, Number, FIID, FI_Kind): integer
+  
+  if( ValType(FI_Kind) == V_UNDEF )
+    FI_Kind = FIKIND_CURRENCY; // 1
+  end;
+
+  var ErrNum : integer = 0;
+
+  var cor:TbFile = TbFile("corschem.dbt", "r", 1);
+  cor.rec.Number = Number;
+  cor.rec.FIID = FIID;
+  cor.rec.FI_Kind = FI_Kind;
+  if( cor.GetEQ() )
+    if( rec_cors != null )
+      copy(rec_cors, cor);
+    end;
+  else
+    ErrNum = PAYMERR_CORSCHEM_NOT_FOUND;
+  end;
+
+  return ErrNum;
+end;
+
+// Найти корсхему по корсчету
+private macro PM_FindCorschemByAccount( Account:string, FIID:integer, Number:integer, CorrID:integer ):integer
+
+  var ErrNum   :integer = 0;
+  var SelectStr:string;
+  var params   :TArray;
+  var rs       :object;
+
+  SelectStr = "select cor.t_Number, cor.t_CorrID " +
+              "  from dcorschem_dbt cor          " +
+              "where  cor.t_Account  = :Account  " +  
+              "  and  cor.t_FIID     = :FIID     ";
+
+  params = makeArray( SQLParam( "Account", Account ),
+                      SQLParam( "FIID"   , FIID    ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+    SetParm( 2, rs.value(0) );
+    SetParm( 3, rs.value(1) );
+  else
+    ErrNum = PAYMERR_CORSCHEM_NOT_FOUND;
+  end;
+
+  return ErrNum;
+end;
+
+// Найти код банка по виду кода (или любой, какой попадется)
+private macro PM_FindBankCodeByCodeKind( CorrID:integer, CodeKind:integer ):string
+
+  var SelectStr:string;
+  var params   :TArray;
+  var rs       :object;
+  var Code_Kind:integer = CodeKind;
+  var BankCode :string = "";
+
+  SelectStr = "select code.t_Code " +
+              "  from dobjcode_dbt code " +
+              "where  code.t_CodeKind   = :CodeKind  " +  
+              "  and  code.t_ObjectType = 3          " +
+              "  and  code.t_ObjectID   = :PartyID   " ;
+
+  params = makeArray( SQLParam( "CodeKind", Code_Kind ),
+                      SQLParam( "PartyID" , CorrID    ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+    BankCode = rs.value(0);
+  else
+    SelectStr = "select code.t_Code, code.t_CodeKind " +
+                "  from dobjcode_dbt code " +
+                "where  code.t_ObjectType = 3          " +
+                "  and  code.t_ObjectID   = :PartyID   " +
+                "order by code.t_CodeKind ";
+    params = makeArray( SQLParam( "PartyID" , CorrID ));
+    rs = execSQLselect( SelectStr, params, FALSE );
+    if( rs and rs.moveNext() )
+      BankCode  = rs.value(0);
+      Code_Kind = rs.value(1);
+      SetParm( 1, Code_Kind );
+    end;
+  end;
+
+  return BankCode;
+end;
+
+// Найти наименование вида кода
+//private macro PM_FindCodeKindName( CodeKind:integer ):string TAM 23.01.13 HF_60
+macro PM_FindCodeKindName( CodeKind:integer ):string
+
+var CodeName:string = "";
+
+  var SelectStr:string;
+  var params   :TArray;
+  var rs       :object;
+
+  SelectStr = "select kcode.t_ShortName " +
+              "  from dobjkcode_dbt kcode " +
+              "where  kcode.t_CodeKind   = :CodeKind " +  
+              "  and  kcode.t_ObjectType = 3         " ;
+
+  params = makeArray( SQLParam( "CodeKind", CodeKind ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+    CodeName = rs.value(0);
+  end;
+
+  return CodeName;
+end;
+
+// Найти наименование банка
+private macro PM_GetBankName( BankID:integer ):string
+
+  var BankName:string = "";
+  var SelectStr:string;
+  var params   :TArray;
+  var rs       :object;
+
+  SelectStr = "select pt.t_Name " +
+              "  from dparty_dbt pt " +
+              "where  pt.t_PartyID = :BankID ";
+
+  params = makeArray( SQLParam( "BankID", BankID ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+    BankName = rs.value(0);
+  end;
+
+  return BankName;
+end;
+
+/* #131174
+// Определим внешнее свойство для платежа с корсчетом
+private macro PM_DefineExtPaymProp( pmpaym, credit, pmrmprop ):integer
+
+  var ErrNum    :integer = 0;
+  var CorrNumber:integer = 0;
+  var CorrID    :integer = 0;
+  var CodeKind  :integer = 0;
+  var BankCode  :string  = "";
+ 
+  // Найдем корсхему
+  ErrNum = PM_FindCorschemByAccount( pmpaym.ReceiverAccount, pmpaym.PayFIID, CorrNumber, CorrID );
+
+  if( ErrNum > 0 )
+    return ErrNum;
+  end;
+
+  // Определим вид кода и код банка получателя
+  if( pmpaym.PayFIID == 0 )
+    CodeKind = 3; //БИК
+  else
+    CodeKind = 6; //BIC
+  end;
+
+  BankCode = PM_FindBankCodeByCodeKind( CorrID, CodeKind );
+
+  if( strlen( BankCode ) == 0 )
+    ErrNum = PAYMERR_CODE_NOT_FOUND;
+  end;
+
+  // Заполним поля свойства credit
+  credit.DebetCredit  = 1;
+  credit.CodeKind     = CodeKind;
+  credit.CodeName     = PM_FindCodeKindName( CodeKind );
+  credit.BankCode     = BankCode;
+  credit.Group        = PAYMENTS_GROUP_EXTERNAL;
+  credit.PayFIID      = pmpaym.PayFIID;
+  credit.Corschem     = CorrNumber;
+  credit.TransferDate = pmpaym.ValueDate;
+  credit.CorrID       = -1;
+  credit.OurCorrID    = -1;
+
+  // Заполним поля pmrmprop
+  pmrmprop.ReceiverCorrAccNostro = pmpaym.ReceiverAccount;
+  pmrmprop.ReceiverBankName      = PM_GetBankName( CorrID );
+  pmrmprop.ReceiverName          = "";
+  pmrmprop.ReceiverINN           = "";
+
+  // Заполним поля pmpaym
+  pmpaym.FutureReceiverAccount = pmpaym.ReceiverAccount;
+  pmpaym.ReceiverAccount       = "";
+  pmpaym.Receiver              = -1;
+  pmpaym.ReceiverBankID        = CorrID;
+  pmpaym.ReceiverMesBankID     = 0;
+
+  return ErrNum;
+end;
+*/
+//-----------------------------------------------------------------------------
+// Надо проверить, можно ли сохранять документ с корсчетом и счетом МФР
+//-----------------------------------------------------------------------------
+macro PM_CheckPaymAccounts( pmpaym, debet, credit, pmrmprop, Chapter ):string
+
+  var ErrString:string = "";
+  var ErrNum:integer = 0;
+  var ErrStat:integer = 0;
+  var DebetGroup:integer;
+  var CreditGroup:integer;
+
+  if( debet != NULL )
+    DebetGroup = debet.Group;
+  else
+    DebetGroup = PAYMENTS_GROUP_INTERNAL;
+  end;
+
+  if( credit != NULL )
+    CreditGroup = credit.Group;
+  else
+    CreditGroup = PAYMENTS_GROUP_INTERNAL;
+  end;
+
+  // Проверим счет плательщика
+  if( DebetGroup != PAYMENTS_GROUP_EXTERNAL )
+
+    // Проверим счет плательщика на наличие признака "К"
+    // при условии, что платеж не транзитный
+    if(not InList(pmpaym.DocKind, 16, 27, 70, 440, 445))
+      if( (not PM_PaymentIsChildTransit(pmpaym.PaymentID)) 
+          and PM_CheckAccount_Type( pmpaym.PayerAccount, Chapter, pmpaym.FIID, "К" ) )
+        ErrNum = PAYMERR_PAYACC_CORR;
+      end;
+    end;
+
+    // Проверим счет плательщика на МФР-ность
+    if( ErrNum == 0 )
+      if( InList(pmpaym.DocKind, 201, 202, 16, 27, 400, 410, 420, 430, 445) and
+          PM_AccountIsMFR( pmpaym.PayerAccount, Chapter, pmpaym.FIID ) )
+        ErrNum = PAYMERR_PAYACC_MFR;
+      end;
+    end;
+  end;
+
+  // Проверим счет получателя
+  if( ( ErrNum == 0 ) and ( CreditGroup != PAYMENTS_GROUP_EXTERNAL ) )
+    // Проверим счет получателя на МФР-ность
+    // Для требования банка
+    if( ( (pmpaym.DocKind == 17) or (pmpaym.DocKind == 445 )) and PM_AccountIsMFR( pmpaym.ReceiverAccount, Chapter, pmpaym.PayFIID ) )
+      ErrNum = PAYMERR_RECACC_MFR;
+    end;
+
+  end;
+
+  if( ErrNum > 0 )
+    InitError();
+    MemoryError( ErrNum );
+    ErrString = GetErrMsg();
+  end;
+
+  return ErrString;
+end;
+
+//------------------------------------------------------------------------------
+// Класс ошибок
+//------------------------------------------------------------------------------
+PRIVATE CLASS ErrParam( _name:string, _type:integer )
+  var name:string  = _name, 
+      type:integer = _type;
+END;
+
+//------------------------------------------------------------------------------
+// Соединить тексты ошибок в одну строку
+//------------------------------------------------------------------------------
+MACRO joinErrName( parts:TArray, delim:string ):string
+  var result:string="", i:integer=0;
+  var param:ErrParam = NULL;
+  while(i<parts.Size)
+    param = parts.value(i);
+    if( i )
+      result = result + delim + String(param.name);
+    else
+      result = String(param.name);
+    end;
+    i=i+1;
+  end;
+  return result;
+END;
+
+//------------------------------------------------------------------------------
+// Получить максимальный тип ошибки
+//------------------------------------------------------------------------------
+PRIVATE MACRO maxErrType( result:integer, val:ErrParam ):integer
+  if( result < val.type )
+    return val.type;
+  else
+    return result;
+  end;
+END;
+
+//------------------------------------------------------------------------------
+// Получить bankdprt по коду
+//------------------------------------------------------------------------------
+PRIVATE MACRO getBankDprtByCode( CodeKind:integer, Code:string, bankdprt, ValueDate:date ):bool
+  
+  ClearRecord( bankdprt );
+  
+  VAR query:string = "SELECT BDP.T_PARTYID, BDP.T_REAL, BDP.T_LOCK " +
+                     "FROM DBANKDPRT_DBT BDP              " +
+                     "WHERE BDP.T_PARTYID =               " +
+                     "  ( SELECT OC.T_OBJECTID            " +
+                     "      FROM DOBJCODE_DBT OC          " +
+                     "     WHERE OC.T_CODEKIND = :CODEKIND " +
+                     "       AND OC.T_CODE     = :CODE     " +
+                     "       AND OC.T_OBJECTTYPE = :OBJTYPE "+
+                     "       AND OC.T_BANKDATE <= " + GetSQLDate( ValueDate ) +
+                     "       AND ( OC.T_BANKCLOSEDATE = TO_DATE('01.01.0001', 'DD.MM.YYYY')  OR OC.T_BANKCLOSEDATE > " + GetSQLDate( ValueDate ) + " ) "+
+                     "       AND ROWNUM = 1 )";
+                     
+  VAR params:TArray = makeArray( SQLParam( "CODEKIND", CodeKind  ), SQLParam( "CODE", Code  ), SQLParam( "OBJTYPE" , OBJTYPE_PARTY  ) );
+  VAR rs:RsdRecordset = execSQLselect( query, params, TRUE );
+
+  IF( rs and rs.moveNext() )
+    bankdprt.PARTYID = rs.value(0);
+    bankdprt.REAL    = rs.value(1);
+    bankdprt.LOCK    = rs.value(2);
+    return TRUE;
+  END;
+  return FALSE;
+
+END;
+
+//------------------------------------------------------------------------------
+// Проверка кода банка плательщика/получателя
+//------------------------------------------------------------------------------
+PRIVATE MACRO checkBankCode( pmprop, DebetCredit:integer, errors:TArray, ValueDate:date ):integer
+  record bankdprt(bankdprt);
+  
+  if( pmprop.BankCode == "" )
+    errors[errors.Size] = ErrParam( "Код банка " + IfThenElse(DebetCredit == 0, "плательщика", "получателя") +" должен быть задан.", 2 );
+  else
+    if( NOT getBankDprtByCode( pmprop.CodeKind, pmprop.BankCode, bankdprt, ValueDate ) )
+      //Gurin S. 14.01.2015 R-526909-3
+      //errors[errors.Size] = ErrParam( "Банк " + IfThenElse(DebetCredit == 0, "плательщика", "получателя") +" должен быть в справочнике банков.", 2 );
+    else
+      if( bankdprt.LOCK == "X" )
+        errors[errors.Size] = ErrParam( "Отделение банка-" + IfThenElse(DebetCredit == 0, "плательщика", "получателя") +" закрыто.", 2 );
+      end;
+    end;
+  end;
+
+  return 0;
+END;
+
+// Проверка банка получателя валютного платежа
+private macro CP_CheckBankCode( credit, rm, errors )
+  if(((credit.BankCode == "") or (credit.CodeKind == 0)) and (rm.ReceiverBankName == ""))
+    errors[errors.Size] = ErrParam( "Необходимо заполнить, как минимум, одно из двух: |- вид кода и код банка получателя|- наименование банка получателя", 2 );
+  end;                                                          
+end;
+
+PRIVATE MACRO CheckForIPDL( Payer, errors:TArray):integer
+  var  AttrID;
+  record pt(party);
+  if(ПолучитьСубъекта(Payer, pt))
+    MsgBox("Не найден субъект ID = ",Payer);
+    return 1;
+  end;
+  
+  if( GetMainObjAttr( null, OBJTYPE_PARTY, UniID(pt, OBJTYPE_PARTY), 34/*принадлежность ИПДЛ*/, AttrID, NULL, NULL, NULL ) )
+    if( AttrID == 1)                  
+      errors[errors.Size] = ErrParam( "Внимание! Плательщик  принадлежит к ИПДЛ", 1 );
+    elif( AttrID == 2)
+      errors[errors.Size] = ErrParam( "Внимание! Плательщик  принадлежит к родственникам ИПДЛ", 1 );
+    end;
+  end;
+  return 0;
+END;
+
+macro PM_IsBankInTS( BankID:integer ):bool
+
+  var CABSstr:string = "";
+  var select :string = "select 1 "
+                     + "from ddp_dep_dbt dp "
+                     + "where dp.t_PartyID = :BankID "
+                     +  " and dp.t_Status <> 3 ";
+
+  var params:TArray = TArray();
+  params[params.size] = SQLParam( "BankID" , BankID );
+  var rset:RsdRecordset;
+
+  CABSstr = " and dp.t_ACCESSMODE <> 3 ";
+
+  select = select + CABSstr;
+
+  rset = execSQLselect( select, params, false );
+  return ( rset AND rset.moveNext() );
+end;
+
+//------------------------------------------------------------------------------
+// Платёж является аккредитивом?
+//------------------------------------------------------------------------------
+MACRO PaymentIsLetterOfCredit( PaymentObj:RsbPayment, PaymentID:integer ):bool
+  VAR Payment :object = NULL;
+  VAR PayOrder:object = NULL;
+
+  if( PaymentObj == NULL )
+    Payment = RsbPayment( PaymentID );
+  else
+    Payment = PaymentObj;
+  end; 
+  if( Payment.DocKind == PS_PAYORDER )
+    PayOrder = GenObject( "RsbPSPayOrder", Payment.PaymentID );
+    if( PayOrder.DocKind == PSPOKIND_AKKREDITIV )
+       return TRUE;
+    END;
+  END;
+
+  return FALSE;
+END;
+
+PRIVATE MACRO CheckPayer(pmpaym, pmrmprop, errors:TArray)
+  file acc ("account.dbt" ) key 0;
+  FILE persn(persn) key 0;
+  record adress( adress );
+  record pt(party);
+  var Payer = -1, AttrID;
+
+  //Плательщик не определён. Попробуем определить...
+  if(pmpaym.Payer <= 0)
+  
+    if( ( MFR_BankInCabs(pmpaym.PayerBankID) ) )
+      if ( Pm_IsBankAccount( pmpaym.PayerAccount, pmpaym.FIID, pmpaym.Chapter ) )
+        return 0;
+      end;
+      if( pmpaym.PayerAccount != "" )
+
+        acc.Chapter       = 1;
+        acc.Account       = pmpaym.PayerAccount;
+        acc.Code_Currency = pmpaym.FIID;
+        if( not getEQ( acc ) )    
+          MsgBox( "Плательщик не определен" );
+          return 1;
+        else
+          Payer = acc.Client;
+        end;
+        if( Payer == {OurBank} )
+          return 0;
+        end;
+      end;
+    end;
+    
+  else
+    Payer = pmpaym.Payer;
+  end;
+
+  if( Payer == -1 )
+    if( pmpaym.PayerAccount == "" )
+      MsgBox( "Плательщик не определен" );
+      return 1;
+    end;
+
+  else
+    Payer = pmpaym.Payer;
+  end;
+  //Gurin S. 20.08.2014 R-434615-2 Убрал проверку
+  //  проверка ИПДЛ - кроме аккредитива
+  //if( ( not PaymentIsLetterOfCredit( NULL, pmpaym.PaymentID ) ) and CheckForIPDL( Payer, errors ) )
+  //  return 1;
+  //end; 
+  
+  // проверка реквизитов плательщика
+  if(ПолучитьСубъекта(Payer, pt))
+    MsgBox("Не найден субъект ID = ",Payer);
+    return 1;
+  end;
+
+
+  if(strlen(pmrmprop.PayerINN) != 0)
+    return 0;
+  end;
+
+  if(pt.LegalForm == PTLEGF_PERSN)
+    persn.PersonID = Payer;
+    if(not GetEQ(persn))
+      MsgBox("Не найдено физическое лицо ID = ", Payer);
+    end;
+    if(( not strlen(persn.Name1)) or (not strlen(persn.Name2)))
+      errors[errors.Size] = ErrParam( "Не указана фамилия или имя плательщика", 2 );
+      return 0;
+    end;
+    if( pt.NotResident == "X" )// у нерезидента больше ничего не проверяем
+      return 0;
+    end;
+
+    if( (ПолучитьКодСубъекта( Payer, PTCK_INN ) != "") or
+         НайтиЮридическийАдресСубъекта(Payer, adress) or 
+         НайтиАдресСубъекта(Payer,PTADDR_REAL,adress) or
+        ( (persn.Born != date(0,0,0)) and (strlen(persn.BirsPlase))))
+      return 0;
+    else
+      errors[errors.Size] = ErrParam( "Нет достаточных сведений о плательщике " + persn.Name1+" "+persn.Name2+" "+persn.Name3+" в справочнике физлиц.", 2 );
+      return 0;
+    end;
+  else
+    if( pt.NotResident == "X" )// у нерезидента больше ничего не проверяем
+      return 0;
+    end;
+    if(ПолучитьКодСубъекта( Payer, PTCK_INN ) == "" ) 
+      errors[errors.Size] = ErrParam( "Нет кода ИНН у плательщика", 2 );
+      return 0;
+    end;
+  end;
+ 
+  return 0;
+END;
+
+private macro ПроверитьКорректностьКурса( fromAmount, fromfiid, tofiid, ratetype, rate, scale, point, isinverse, valdate ):bool
+
+  if( ratetype <= 0 )
+    return 0;
+  end;
+  var _rate:double = 0.0, _scale:integer = 0, _point:integer = 0, _isinverse:string = "";
+
+  execStoredFunc( "RSB_FIInstr.ConvSum2", V_STRING, MakeArray( SQLParam( "SumB"       , fromAmount    ),
+                                                               SQLParam( "pFromFI"    , fromfiid      ),
+                                                               SQLParam( "pToFI"      , tofiid        ),
+                                                               SQLParam( "pbdate"     , valdate       ),
+                                                               SQLParam( "pround"     , 0             ),
+                                                               SQLParam( "pRateType"  , ratetype      ),
+                                                               SQLParam( "pRate"      , _rate         ),
+                                                               SQLParam( "pScale"     , _scale        ),
+                                                               SQLParam( "pPoint"     , _point        ),
+                                                               SQLParam( "pIsInverse" , _isinverse    )
+                                                              ) ) ;
+  return ( ( rate == _rate ) and ( scale == _scale ) and ( point == _point ) and ( isinverse == _isinverse ) );
+end;
+
+MACRO CheckCorrectRateTypeOnDate( pmpaym, errors:TArray )
+
+  var   fixFIID   = IfThenElse( pmpaym.IsFixAmount == "X", pmpaym.FIID  , pmpaym.PayFIID   ); /* ФА  */
+  var unfixFIID   = IfThenElse( pmpaym.IsFixAmount == "" , pmpaym.FIID  , pmpaym.PayFIID   ); /* НФА */
+  var   fixAmount = IfThenElse( pmpaym.IsFixAmount == "X", pmpaym.Amount, pmpaym.PayAmount ); /* ФА  */
+  var begSize = errors.Size();
+
+  // Фактический курс
+  if( ПроверитьКорректностьКурса( fixAmount, fixFIID, unfixFIID, pmpaym.RateType, pmpaym.Rate, pmpaym.Scale, pmpaym.Point, pmpaym.IsInverse, pmpaym.ValueDate ) )
+    errors[errors.Size] = ErrParam( "Значение фактического курса не соответствует типу курса", 2 );
+  end;
+
+  if( (   pmpaym.DocKind == PS_CPORDER          ) OR  
+      (   pmpaym.DocKind == BBANK_CPORDER       ) OR  
+      (   pmpaym.DocKind == WL_WIPM             ) OR  
+      ( ( pmpaym.DocKind == DLDOC_BANKCLAIM ) AND     
+        ( ( pmpaym.FIID     != 0/*NATCUR*/ ) OR
+          ( pmpaym.PayFIID  != 0/*NATCUR*/ ) OR
+          ( pmpaym.BaseFIID != 0/*NATCUR*/ ) )  ) OR  
+      ( ( pmpaym.DocKind == DLDOC_BANKORDER ) AND
+        ( pmpaym.Purpose == PM_PURP_CBANKORDER ) ) 
+    )                                                                            
+    // Базовый курс
+    if( ПроверитьКорректностьКурса( fixAmount, fixFIID/*котируемый FI*/, pmpaym.BaseFIID/*базовый FI*/, 
+                                    pmpaym.BaseRateType, pmpaym.BaseRate, pmpaym.BaseScale, pmpaym.BasePoint, pmpaym.IsBaseInverse, pmpaym.ValueDate ) )
+      errors[errors.Size] = ErrParam( "Значение базового курса не соответствует типу курса", 2 );
+    end;
+
+    // Текущий курс дебета
+    if( ПроверитьКорректностьКурса( pmpaym.FuturePayerAmount, pmpaym.FIID_FuturePayAcc/*котируемый FI*/, pmpaym.BaseFIID/*базовый FI*/, 
+                                    pmpaym.FutureDRateType, pmpaym.FutureDRate, pmpaym.FutureDRateScale, pmpaym.FutureDRatePoint, pmpaym.FutureDRateIsInverse, pmpaym.ValueDate ) )
+       errors[errors.Size] = ErrParam( "Значение текущего курса дебета не соответствует типу курса", 2 );
+    end;
+
+    // Текущий курс кредита
+    if( ПроверитьКорректностьКурса( pmpaym.FutureReceiverAmount, pmpaym.FIID_FutureRecAcc/*котируемый FI*/, pmpaym.BaseFIID/*базовый FI*/, 
+                                    pmpaym.FutureCRateType, pmpaym.FutureCRate, pmpaym.FutureCRateScale, pmpaym.FutureCRatePoint, pmpaym.FutureCRateIsInverse, pmpaym.ValueDate ) )
+       errors[errors.Size] = ErrParam( "Значение текущего курса кредита не соответствует типу курса", 2 );
+    end;
+  end;
+  return (errors.Size() - begSize);// вернем количество ошибок
+END;
+
+PRIVATE MACRO checkpayments( pmpaym, debet, credit, pmrmprop, Chapter ):integer
+
+  const LEVELERRORTYPE_ONE = 1;
+  const LEVELERRORTYPE_TWO = 2;
+  var errors:TArray = TArray();
+  
+  // Банк плательщика и Банк получателя
+  if( ( pmpaym.DocKind == PS_PAYORDER ) OR
+      //( pmpaym.DocKind == PS_CPORDER ) OR
+      ( pmpaym.DocKind == DLDOC_BANKPAYMENT  ) OR
+      //( pmpaym.DocKind == BBANK_CPORDER  ) OR
+      ( pmpaym.DocKind == DLDOC_BANKCLAIM  ) OR
+      ( pmpaym.DocKind == PS_INRQ ) )
+
+    if( pmpaym.DocKind == DLDOC_BANKCLAIM )
+      checkBankCode( debet, 0, errors, pmpaym.ValueDate );
+    else
+      checkBankCode( credit, 1, errors, pmpaym.ValueDate );
+    end;
+  
+  end;
+  
+  if((pmpaym.DocKind == PS_CPORDER) or (pmpaym.DocKind == BBANK_CPORDER) or (pmpaym.DocKind == WL_WIPM))
+     CP_CheckBankCode( credit, pmrmprop, errors );
+  end;
+
+  if( ( pmpaym.DocKind == PS_PAYORDER ) OR
+      ( pmpaym.DocKind == PS_CPORDER ) )
+    if(CheckPayer( pmpaym,pmrmprop,errors))
+      return 1;
+    end;
+  end;
+
+  // Проверка корректности курсов
+  if( (   pmpaym.DocKind == PS_CPORDER          ) OR    /* для валютных клиентских              */
+      (   pmpaym.DocKind == BBANK_CPORDER       ) OR    /* и банковских платежных поручений,    */
+      (   pmpaym.DocKind == WL_WIPM             ) OR    /* входящих документов,                 */
+      (   pmpaym.DocKind == PS_INRQ             ) OR    /* ИПВС,                                */
+      ( ( pmpaym.DocKind == DLDOC_BANKCLAIM ) AND       /* валютных банковских требований       */
+        ( ( pmpaym.FIID     != 0/*NATCUR*/ ) OR
+          ( pmpaym.PayFIID  != 0/*NATCUR*/ ) OR
+          ( pmpaym.BaseFIID != 0/*NATCUR*/ ) )  ) 
+    )
+      CheckCorrectRateTypeOnDate( pmpaym, errors );
+  end;
+
+  if( errors.Size )
+    if( ( reduce( errors, @maxErrType, 0 ) != LEVELERRORTYPE_ONE ) or 
+        ( RsbGetTrue( False, False, joinErrName( errors, "|" ) + "|Сохранить?" ) == False ) )
+      msgbox( joinErrName( errors, "|" ) );
+      return 1;
+    end;
+  end;
+
+  return 0;
+END;
+
+//------------------------------------------------------------------------------
+// Стандартные проверки при ручном вводе/редактировании ПД
+//------------------------------------------------------------------------------
+MACRO PM_CheckPayments( pmpaym, debet, credit, pmrmprop, Chapter ):integer
+  record emptyprop( pmprop ); ClearRecord( emptyprop );
+  return checkpayments( pmpaym, IfThenElse( debet != NULL, debet, emptyprop ), IfThenElse( credit != NULL, credit, emptyprop ), pmrmprop, Chapter );
+END;
+
+MACRO needUseKZpm():bool
+  var err:integer = 0;
+  var locale:string = "";
+
+  GetRegistryValue("CB\\PAYMENTS\\PANEL\\LOCALE", V_STRING, locale, err);
+  if( err == 0)
+    if( index(strupr(locale), "KZ") )
+      return true;
+    end;
+  end;  
+  return false;
+END;
+
+macro CheckPassportNumber(Pmco)
+  var ind:TArray = makeArray(9,14,19,21);
+  var i = 0;
+  if( strlen(Pmco.PassportNumber) != 22 )
+    return 1;
+  end;
+  while( i < 4 )
+    if(substr(Pmco.PassportNumber,ind[i],1) != "/")
+      return 1;
+    end;
+    i=i+1;
+  end;
+  if(substr(Pmco.PassportNumber,22,1) != "0")
+     return 1;
+  end;
+  if( ( not StrIsNumber(SubStr(Pmco.PassportNumber,5,4)) ) or ( SubStr(Pmco.PassportNumber,5,4) == "0000" ) )
+    return 1;
+  end;
+end;
+macro CheckPassNameAndDate(Pmco)
+  var  month:string, year:string;
+  DateSplit(Pmco.PassportDate, NULL, month, year);
+  if(strlen(month)<2)
+    month = "0" + month;
+  end;
+  if(year == "0")
+    year = "0000";
+  end;
+  if( (substr(Pmco.PassportNumber,1,2) != substr(year,3,2)) or ( substr(Pmco.PassportNumber,3,2) != month ) )
+    return 1;
+  end;
+end;
+
+macro GetVOCodeFromGround(Ground)
+  var i, vo = "";
+  i = Index(Ground, "{VO");
+  if( i != 0 )
+    vo = substr(Ground, i + 3, 5);
+  end;
+  return vo;
+end;
+
+macro GetPassNumFromGround(Ground)
+  var i, ps = "";
+  i = Index(Ground, "{VO");
+  if( i != 0 )
+    if(substr(Ground,i+8,2) == "PS")
+      ps = substr(Ground, i+10, 22);
+    end;
+  end;
+  return ps;
+end;
+
+private macro CheckPmCO(Pmpaym, Pmrmprop, Pmdebit, Pmcredit, Pmco)
+     
+   // для документа, вставляемого DLM, проверки реквизитов валютной операции не выполняются
+   if( isDLMRuning() )
+     return 0;
+   end;
+
+    //TAM 23.01.13 в HF_60 раскомментировано, но оставлю как у нас.
+    /* EVG Данные проверки не нужны
+     if(Pmco.PassportNumber != "")
+       if(CheckPassportNumber(Pmco))
+         MsgBox("Некорректный номер паспорта сделки");
+         return 1;
+       end;
+       if(CheckPassNameAndDate(Pmco))
+        MsgBox("Проверьте правильность даты или номера паспорта сделки");
+        return 1;
+       end;
+     end;
+    */
+     
+   if(Pmco.PassportDate > Pmrmprop.Date)
+       MsgBox("Некорректная дата паспорта сделки");
+       return 1;
+     end;
+     
+     //if( Pmco.ContractDate > Pmco.PassportDate ) //Gurin S. 13.03.2014 R-344978-2 
+     if( (Pmco.PassportDate > date(0,0,0)) and (Pmco.ContractDate > Pmco.PassportDate) )
+       MsgBox("Дата контракта не может быть больше даты паспорта сделки");
+       return 1;
+     end;
+     if( (Pmco.PassportNumber != "") and (Pmco.PassportDate != date(0,0,0)) and ( (Pmco.ContractNumber == "") or (Pmco.ContractDate == date(0,0,0)) or (Pmco.ContractFIID == -1)))
+       //TAM 04.05.2012 I-00190442-2 - В ПРББ этот момент закомментирован по просьбе Коншиной Н.Ю.
+       //MsgBox("Отсутствуют данные контракта");
+       //return 1;
+     end;
+
+     /* EVG 12/03/2012 Всё-таки убрал эту проверку.
+     /* EVG To 2030 It may happen, that we need to comment the verification below */
+     /*SDA  а счастье было так возможно !*/
+     if( ( ( Pmpaym.PrimDocKind == WL_INDOC ) and ( PM_Check117_NeedToUnknown( Pmpaym.PaymentID, Pmco.VO_Code ) != 0 ) ) or 
+         ( ( Pmpaym.PrimDocKind != WL_INDOC ) and not IsValidVOCode(Pmco.VO_Code, Pmpaym, Pmrmprop, Pmdebit, Pmcredit) ) )
+       MsgBox("Код валютной операции не соответствует параметрам платежа");
+     end;*/
+   
+   return 0;
+end;
+
+macro PM_CheckCO(Pmpaym, Pmrmprop, Pmdebit, Pmcredit)
+      
+  if(needUseKZpm())
+    return 0;
+  end;
+
+  var ObjPayment:RsbPayment = RsbPayment( Pmpaym.PaymentID );
+  var ObjPmCO:RsbPmCO = ObjPayment.PmCO;
+  var IsNext = ObjPmCO.First();
+  RECORD pmco(pmco);
+  var rh_pmco:TRecHandler = TRecHandler("pmco.dbt", "bank.def");
+  var stat = 0;
+
+  while((stat == 0) and (IsNext == 0) and (ObjPmCO.Current( rh_pmco ) == 0))
+    
+    Copy(pmco, rh_pmco);
+    stat = CheckPmCO(Pmpaym, Pmrmprop, Pmdebit, Pmcredit, pmco);
+    
+    if(stat == 0)
+      IsNext = ObjPmCO.Next();
+    end;
+
+  end;
+
+  return stat;
+end;
+
+macro PM_CorrectOutTransferDate( PaymentObj:RsbPayment )
+
+ var DPP : date;
+
+ DPP = PmGetDefaultOutTransferDate( PaymentObj ); 
+
+ if( DPP > RsbPayment.OutTransferDate )
+   PaymentObj.OutTransferDate = DPP;
+ end;
+
+ return 0; 
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить необходимость помещения документа на счёт незавершённых расчётов
+//-----------------------------------------------------------------------------
+macro CheckUnFin( Payment:RsbPayment, ShowError:bool )
+
+  // На СНР можно помещать:
+  //  - внешние платежи (исходящие, входящие, транзитные, созданные по исполнению транзитного), 
+  //    кроме предъявленных платежных требований
+  //  - платежи, полученные из других филиалов по МФР
+  if( ( Payment.PayerGroup == PAYMENTS_GROUP_EXTERNAL ) or ( Payment.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) )
+    if( PM_IsClaim2( Payment ) )
+      if( ShowError )
+        MsgBox( "Требование не может быть помещено на счёт незавершённых расчётов" );
+      end;
+      return 1;
+    end;
+  elif( Payment.Department == Payment.StartDepartment )
+    if( ShowError )
+      MsgBox( "Документ не может быть помещён на счёт незавершённых расчётов" );
+    end;
+    return 1;
+  end;
+
+  if( PM_IsMFRProcessing( Payment.PaymentID, Payment.DocKind ) and ( Payment.Department != Payment.EndDepartment ) )
+
+    var NextDep:integer = MFR_GetNextDepartment( Payment.Department, Payment.EndDepartment );
+
+    // Находим максимальный операционный день в следующем филиале платежа
+    var select:string = " select max(t_CurDate) " +
+                          " from dcurdate_dbt " +
+                         " where t_Branch = :NextDepartment ";
+                          
+    var params:TArray = makeArray( SQLParam( "NextDepartment", NextDep ) );
+    var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+    if( rset and rset.moveNext() and (rset.value(0) < Payment.ValueDate) )
+      if( ShowError == true )
+        MsgBox("Платеж будет проведен после открытия в филиале " + NextDep + " операционного дня " + Payment.ValueDate + 
+               ". |Помещение на незавершённые не требуется."); 
+      end;
+      return 1;
+    end;
+
+  end;
+
+  return 0;
+ 
+end;
+
+//-----------------------------------------------------------------------------
+// Платёж зачислен на СНР
+//-----------------------------------------------------------------------------
+macro ПлатежЗачисленНаСНР(PaymentObj:RsbPayment):bool
+  var select = " select 1 " +
+                 " from dmcaccdoc_dbt doc, dmccateg_dbt cat " +
+                " where doc.t_Chapter = 1 " +
+                  " and doc.t_Currency = :FIID_FuturePayAcc " +
+                  " and doc.t_Account = :FuturePayerAccount " +
+                  " and doc.t_CatID  = cat.t_ID " +
+                  " and cat.t_Number = 103 ";
+
+  var params = makeArray( SQLParam( "FIID_FuturePayAcc", PaymentObj.FuturePayerFIID ), 
+                          SQLParam( "FuturePayerAccount", PaymentObj.FuturePayerAccount ) );
+  var rs = execSQLselect( select, params, TRUE );
+  
+  if( rs and rs.moveNext() )
+    return true;
+  else
+    return false;
+  end;
+end;
+
+//Клиент юр.лицо или физ.лицо
+PRIVATE MACRO GetClientLegalForm( ClientID:integer ):integer
+  var select:string = "select t_LegalForm "
+                    + "from dparty_dbt pt "
+                    + "where pt.t_partyid = :ID";
+  var params:TArray = makeArray( SQLParam( "ID" , ClientID ) );
+  var rset:RsdRecordset = execSQLselect( select, params, false );
+  if( rset AND rset.moveNext() )
+    return rset.Value(0);
+  end;    
+END;
+
+//Получить тип корсхемы
+// 1 - ЛОРО
+// 2 - НОСТРО
+// 0 - не найдена
+PRIVATE MACRO GetCorschemType( outProp:TPaymentProps ):integer
+  var select:string = "select t_IsNostro "
+                    + "from dcorschem_dbt cs "
+                    + "where cs.t_Number = :Corschem and "
+                    + "cs.t_FI_Kind = 1 and "
+                    + "cs.t_FIID = :FIID";             
+  var params:TArray = makeArray( SQLParam( "Corschem" , outProp.CorschemNum() ),
+                                 SQLParam( "FIID" ,     outProp.FIID()        ) );
+  var rset:RsdRecordset = execSQLselect( select, params, false );
+  if( rset AND rset.moveNext() )
+    if( rset.Value(0) == "" )
+      return 1;
+    else
+      return 2;
+    end;
+  end;
+  return 0;  
+END;
+
+
+//------------------------------------------------------------------------------
+// Поиск типа сообщения по номеру счета
+//------------------------------------------------------------------------------
+MACRO Found_Type_Clir(Pm_paym, Rm_prop, Debet, Credit, outProp):string
+    
+    var PayLegalForm = GetClientLegalForm(Pm_paym.Payer);
+    var RecLegalForm = GetClientLegalForm(Pm_paym.Receiver);
+    
+    if(Rm_prop.Instancy and Rm_prop.NeedNotify)
+      return("139");                  
+    elif(Rm_prop.Instancy)
+      return("137");                  
+    elif (Rm_prop.Priority==1)
+      return("195");                  
+    elif (Rm_prop.Priority==2)
+      return("196");
+    elif (Rm_prop.Priority==3)
+      if (substr(Pm_paym.ReceiverAccount,1,5)=="40401")
+        return("199");
+      elif (substr(Pm_paym.ReceiverAccount,1,5)=="40402")
+        return("200");
+      else
+        return("198");
+      end;    
+    elif (Rm_prop.Priority==4)
+      return("141");
+    elif (Rm_prop.Priority==5)
+      return("197");
+    elif (Rm_prop.Priority==6)
+      //если банки плательщика и получателя - СБ РФ       
+      if( BankIsSB(Pm_paym.PayerBankID) and BankIsSB(Pm_paym.ReceiverBankID) )
+        //проверка на физ. или юр.лицо
+        if( (PayLegalForm == 1) and (RecLegalForm == 1) )
+          return "104";
+        elif( (PayLegalForm == 2) and (RecLegalForm == 1) )
+          return "102";
+        elif( (PayLegalForm == 1) and (RecLegalForm == 2) )
+          return "103";
+        else
+          return "101";
+        end;
+      //если исходящая коррсхема платежа имеет вид "НОСТРО" 
+      elif( outProp and (GetCorschemType( outProp ) == 2) )
+        if( PayLegalForm == 1 )
+          return "122";
+        end;
+        if( PayLegalForm == 2 )
+          return "121";
+        end;
+      elif( outProp and (GetCorschemType( outProp ) == 1) )
+        if( PayLegalForm == 1 )
+          return "114";
+        end;
+        if( PayLegalForm == 2 )
+          return "113";
+        end;      
+      end;                                         
+    end;
+  return "";
+END;
+
+macro Found_Type_Clir_ObjPaym(ObjPayment:RsbPayment):string
+  
+  record Pm_paym(pmpaym);
+  record Rm_prop(pmrmprop);
+  record Debet(pmprop);
+  record Credit(pmprop);
+  var outProp :TPaymentProps = NULL;
+    
+  Copy(Pm_paym, ObjPayment.GetPM_PAYM());
+  Copy(Rm_prop, ObjPayment.GetPMRMPROP());
+  Copy(Debet,   ObjPayment.GetDEBET());
+  Copy(Credit,  ObjPayment.GetCREDIT());
+
+  if((Debet.Group == PAYMENTS_GROUP_EXTERNAL) AND (not Debet.IsSender))
+    outProp = TPaymentProps( Pm_paym, Rm_prop, Debet, Credit, PRT_Debet);
+  elif((Credit.Group == PAYMENTS_GROUP_EXTERNAL) AND (not Credit.IsSender))
+    outProp = TPaymentProps(Pm_paym, Rm_prop, Debet, Credit, PRT_Credit);
+  end;
+  
+  return Found_Type_Clir(Pm_paym, Rm_prop, Debet, Credit, outProp);
+end;
+
+// Копирование кассовых символов
+// Копирование кассовых символов из платежа в проводку
+macro CopyInCarryCashSymbol( In_paymtr:RsbPaymTransaction, From_PaymentObj:RsbPayment, Kind )
+ 
+  var FromCash = From_PaymentObj.CashSymbols;
+
+  var sc = TRecHandler("symbcash.dbt", "bank.def");
+  var stat = FromCash.First(sc);
+
+  while(not stat)                                                      
+
+    if( ( sc.rec.Kind == Kind ) or ( Kind == CASHSYMB_TYPE_NONE ) )
+      stat = IfThenElse( In_paymtr.AddCashSymbol( sc.rec.Symbol, sc.rec.Sum, sc.rec.Kind ), 0, 1 );
+    end;
+    if( stat == 0 )
+      stat = FromCash.Next(sc);
+    end;
+  end;
+  return true;
+end;
+
+macro CopyCarryCashSymbol( In_paymtr:RsbPaymTransaction, From_acctrnID:integer )
+
+  var select = " select t_Symbol, t_Sum, t_Kind "
+             + " from   dsymbcash_dbt "
+             + " where t_AccTrnID = :AccTrnId ";
+
+  var params = makeArray( SQLParam( "AccTrnID" , From_acctrnID ) );
+
+  var rs = execSQLselect( select, params, FALSE );
+
+  var stat:bool;
+  if( rs )
+    stat = rs.moveFirst();
+    while( stat )
+      stat = In_paymtr.AddCashSymbol( rs.value(0), rs.value(1), rs.value(2) );
+      if( stat )
+        stat = rs.moveNext();
+      else
+        return false;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+
+// Проверки отчетов по ВО
+macro AddCheckVOForReport(PaymentID, IsOK_VO_Code, IsOK_PassportNumber)
+  
+  var PaymentObj:RsbPayment = RsbPayment(PaymentID);
+  var PmCOObj:RsbPmCO;
+  var pmco:TRecHandler = TRecHandler("pmco.dbt", "bank.def");
+  FILE llval(llvalues) key 1;
+  var PassportNumberGround = ""; 
+
+  IsOK_VO_Code = false;
+  IsOK_PassportNumber = false;
+  
+  var IsPassportNumberInPMCO = false;
+
+
+  var IsNext = 0;
+
+  if((PaymentObj.BaseFIID == 0))
+
+    PmCOObj = PaymentObj.PmCO;
+    PassportNumberGround = GetPassNumFromGround(PaymentObj.Ground);
+
+    llval.List = 1805;
+    llval.Code = GetVOCodeFromGround(PaymentObj.Ground);
+
+    if((llval.Code == "") or (not getEQ(llval)))
+      llval.Element = -1;
+    end;
+    
+    IsNext = PmCOObj.First();
+
+    while((IsNext == 0) and (PmCOObj.Current(pmco) == 0))
+      
+      //  Проверка кода валютной операции
+      if(llval.Element == pmco.rec.VO_Code)
+        IsOK_VO_Code = true;
+      end;
+      
+      // Проверка паспорта
+      if((PassportNumberGround != "") and (pmco.rec.PassportNumber != ""))
+        IsPassportNumberInPMCO = true;
+        if(pmco.rec.PassportNumber == PassportNumberGround)
+          IsOK_PassportNumber = true;
+        end;
+      end;
+      
+
+      IsNext = PmCOObj.Next();
+    end;
+
+    // Проверяем паспорт если он задан в основании и хоть один есть в pmco
+    if((PassportNumberGround == "") or (not IsPassportNumberInPMCO))
+      IsOK_PassportNumber = true;
+    end;
+  else
+    IsOK_PassportNumber = true;
+    IsOK_VO_Code = true;
+  end;
+
+  SetParm(1, IsOK_VO_Code);
+  SetParm(2, IsOK_PassportNumber);
+  return IsOK_VO_Code and IsOK_PassportNumber;
+end;
+
+// Сравнение двух записий по перечисленым полям
+// Поля передаются после двух записей (отдельной строчкой каждое поле).
+macro IsEqualField(rec1, rec2)
+  var parm = "", 
+      i = 2,
+      num_fld = 0; 
+
+  while(GetParm(i, parm))
+    num_fld = FldIndex(rec1, parm);
+    if(num_fld >= 0)
+      if(rec1(num_fld) != rec2(num_fld))
+        return false;
+      end;                             
+    else
+      msgbox("Ошибка выполнения процедуры IsEqualField. |Не найдено поле <" + parm +"> в таблице " + FileName(rec1)+".");
+    end;
+    i = i + 1;
+  end;
+
+  return true;
+end;
+
+MACRO AccountExistOpen( FIID:integer, Account:string, Chapter:integer, Department:integer ):bool
+  VAR select:string = " select acc.t_department " +
+                      " from daccount_dbt acc " +
+                      " where acc.T_CHAPTER = :chapter " +
+                      "   and acc.T_CODE_CURRENCY = :fiid " +
+                      "   and acc.T_ACCOUNT = :account "+
+                      "   and acc.T_Open_Close = chr(0)";
+  VAR params:TArray = makeArray(SQLParam( "chapter", Chapter ),     
+                                SQLParam( "fiid", FIID ),     
+                                SQLParam( "account", Account ));
+  
+  VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+  if( rset and rset.moveNext() )
+    SetParm( 3, rset.value(0) );
+    return true;
+  end;     
+  return false;
+ONERROR(x)
+  MsgBox( x.Message );
+  return false;
+end;
+
+/* функция определяет претензию, резервирующую средства для данной проводки со счетом Дт {Account,Chapter,FIID} */
+macro GetClaimID( Payment:RsbPayment, Account:string, Chapter:integer, FIID:integer ):integer
+
+  var ClaimID    :integer =  0; /* ID претензии      */
+  var ClaimAmount:money   = $0; /* сумма претензии   */
+  var ClaimStatus:integer =  0; /* статус претензии  */
+  
+  if( GetReserveInfo( Payment.DocKind, Payment.PaymentID, Payment.ValueDate, @ClaimID, @ClaimAmount, @ClaimStatus, 
+                      Account, Chapter, FIID ) == 0 )
+    return ClaimID;
+  elif( Payment.PayerAccount == Account )
+    return Payment.ClaimID;    
+  end;
+  return 0;
+end;
+
+/* определение вида проводки по платежу */
+macro GetPaymentCarryKind( Payment:RsbPayment ):integer
+
+   /* если внешний и несквитованный, то планируемая */
+  if( ( ( Payment.PayerGroup    == PAYMENTS_GROUP_EXTERNAL ) and ( GetOprStatus(OPR_PAYM_IN_KVIT ) == OPR_PM_ST_UNKVIT ) ) or    
+      ( ( Payment.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) and ( GetOprStatus(OPR_PAYM_OUT_KVIT) == OPR_PM_ST_UNKVIT ) )  )
+    return ACCTRN_STATUS_PLAN;
+  end;
+  return ACCTRN_STATUS_DOCUMENT;  
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить валюту документа
+//-----------------------------------------------------------------------------
+MACRO CheckFIID( FIID:integer ):integer
+
+  if( (FIID == ALLFININSTR) or (ПолучитьФинИн( FIID ) != 0))
+    return 1;
+  end;
+
+  return 0;
+END;
+
+//-----------------------------------------------------------------------------
+// Проверить валюту каждой строки разноски
+//-----------------------------------------------------------------------------
+MACRO CheckFIIDonSide( Payment:RsbPayment, side:integer ):integer
+
+  var AddPI:RsbPIPayment    = Payment.PIList(side);
+  var IsNext                = AddPI.First(side);
+  var CurrAddPI:TRecHandler = TRecHandler( "pmaddpi.dbt" );
+  var err = 0;
+  if( Payment.PIList(side).Size > 0 )
+    while( ( err == 0 ) and (IsNext == 0) and (AddPI.Current( CurrAddPI ) == 0) )
+      err    = IfThenElse( CheckFIID(CurrAddPI.rec.FIID) == 0, 0, 1 );
+      IsNext = AddPI.Next();
+    end;
+    return err;
+  end;
+
+  var FIID = IfThenElse( side == PRT_Debet, Payment.PayerFIID, Payment.ReceiverFIID );
+  return CheckFIID( FIID );
+END;
+
+//-----------------------------------------------------------------------------
+// Проверить наличие курса валюты на заданную дату
+//-----------------------------------------------------------------------------
+macro CheckRateForDate( FIID : integer, RateDate : Date )
+  var SumOut : money;
+    
+  if( ( FIID == NATCUR ) or ( FIID == ALLFININSTR ) )
+    return 0;
+  elif( ConvSum(SumOut, $1000000, RateDate, NATCUR, FIID) )
+    return 1;
+  end;
+
+  return 0;
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить очередность платежа
+//-----------------------------------------------------------------------------
+macro CheckPriority( Priority:integer, DocKind:integer ):integer
+
+  if( ( DocKind == CASH_BOF_ADDORDER   ) or
+      ( DocKind == CASH_BOF_INCORDER   ) or
+      ( DocKind == CASH_BOF_OUTORDER   ) or
+      ( DocKind == DLDOC_INOUTORDER    ) or 
+      ( DocKind == CB_MULTYDOC         ) or
+      ( DocKind == BBANK_CPORDER       ) or
+      ( DocKind == DLDOC_MEMORIALORDER ))
+    return 0;
+  end;
+
+  if( ( Priority < 0 ) or ( Priority > 6 ) )
+    return 1;
+  end;
+
+  return 0;
+end;
+
+//-----------------------------------------------------------------------------
+//  Счет является маской
+//-----------------------------------------------------------------------------
+macro AccountIsMask( Account ):bool
+  if( Index( Account, "*" ) or
+      Index( Account, "?" ) )
+    return true;
+  else
+    return false;
+  end;
+end;
+
+//Является ли счет непериацениваемым счетом покрытия и является ли документ кассовым ордером, платежом или требованием банка
+private macro IsRubBB( DocKind, Type_Account )
+  if( (DocKind == DLDOC_BANKPAYMENT) or
+      (DocKind == DLDOC_BANKCLAIM  ) or
+      (DocKind == CASH_BOF_ADDORDER) or
+      (DocKind == CASH_BOF_INCORDER) or
+      (DocKind == CASH_BOF_OUTORDER) or
+      (DocKind == DLDOC_SUMMARY_MEMORDER) or
+      (DocKind == CB_MULTYDOC)       or
+      (DocKind == DLDOC_MEMORIALORDER) or
+      (DocKind == DLDOC_BANKORDER)
+    )
+    if(Index(Type_Account,"Н") and Index(Type_Account,"П"))
+      return 1;
+    end;
+  end;
+  return 0;
+end;
+
+// Базовый класс - параметр для передачи в функцию ExecFunForEachPIInList
+// в которой для каждой уточ. записи из платежа для Д/К вызывается функиця
+// при каждом вызове функции-параметра в pi копируется порядковая уточняющая запись платежа
+// в stat сохраняем ошибку, а в err_mes текстовое сообщение о ней
+
+class TExecFunPIParm( )
+
+  var pi      :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+  var stat    :integer     = 0;
+  var err_mes :string      = "";
+  
+end;
+
+
+/**
+ * Вызывает для каждой записи функицию func 
+ * @param Payment Платёж
+ * @param DC      Сторона платежа
+ * @param NotUsed Не используется (раньше это было имя модуля, но это жутко медленно)
+ * @param func    Функция для вызова
+ * @param parm    Параметры
+ */
+MACRO ExecFunForEachPIInList( Payment:RsbPayment, DC:integer, NotUsed:variant, func:variant, parm:TExecFunPIParm ):integer
+   var stat:integer = 0;
+   var piList:RsbPIPayment = Payment.PIList( DC );
+   if( piList.Size )
+   var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+     var ok:bool = ( piList.First( pi ) == 0 );
+     while( (not stat) and ok )
+           copy( parm.pi, pi );
+       stat = ExecMacro2( func, parm );
+       if( not stat )
+         ok = ( piList.Next( pi ) == 0 );
+         end;
+       end;
+     end;
+   return stat;
+END;
+
+macro SetErrorOprTemp( PaymentID, ErrorStatus, ErrorMessage )
+  /* и исключаем документ из дальнейшей обработки */
+  execSQL( "update doprtemp_tmp "
+              "set t_ErrorStatus = :ErrorStatus, "
+                  "t_ErrorMessage = :ErrorMessage "
+            "where t_OrderID = :PaymentID",
+           makeArray( SQLParam( "ErrorStatus",  ErrorStatus  ),
+                      SQLParam( "ErrorMessage", ErrorMessage ),
+                      SQLParam( "PaymentID",    PaymentID    ) ) );
+end;
+
+//---------------------------------------------------------------------------------------
+// Проверить идентичность записей, с возможностью исключения из проверки нескольких полей 
+//---------------------------------------------------------------------------------------
+MACRO ПроверкаИдентичности(Запись1, Запись2)
+
+    var i = 0;
+    var k = 2, val;
+
+    while(i < FldNumber(Запись1))
+      while( (getparm(k,val)) and (i != FldIndex(Запись1,val)) )
+        k = k + 1;
+      end;
+      if( (not getparm(k,val)) and (Запись1(i) != Запись2(i)) ) 
+        return false; 
+      end;
+      i = i + 1;
+      k = 2;
+    end;
+    return true;
+END;
+
+// Класс изменяет возможность интерфейсной работы в макросе
+class TSetDialogFlag( flag:integer )
+
+  private var m_oldflag:integer = SetDialogFlag( flag );
+
+  macro destructor()
+  debugbreak;
+    SetDialogFlag( m_oldflag );
+  end;
+
+  macro set( flag:integer )
+    if( GetDialogFlag() != flag )
+      SetDialogFlag( flag );
+    end;
+  end;
+
+  macro reset()
+    SetDialogFlag( m_oldflag );
+  end;
+
+end;
+
+/**
+ * Счёт (другого банка) является спецбанковским по маске
+ */
+MACRO PM_ExternalAccountIsSpecial( account:string ):bool
+  var specAccMask:string = "",
+      err:integer;
+  if( account )
+    GetRegistryValue( REGPATH_SPECIALACC, V_STRING, specAccMask, err ); 
+    if( not err )
+      return ( not CompareStrWithMasks( specAccMask, account ) );
+    end;
+  end;
+  return false;
+END;
+
+macro ДокументПорожденВходящимЭСИД( PaymentID:integer ):bool
+
+  return existsSQLselect( "select pmlink.t_PurposePayment " +
+                          " from  dpmlink_dbt pmlink      " +
+                          "where  pmlink.t_PurposePayment  = :PaymID " +
+                          "  and  pmlink.t_InitialPayment != pmlink.t_PurposePayment " +
+                          "  and  pmlink.t_LinkKind        = :LinkKind ", 
+                          makeArray( SQLParam( "PaymID" , PaymentID ), SQLParam( "LinkKindID" , PMLINK_KIND_EXECORDER ) ) );
+end;
+
+// Допустимо ли вводить неправильный номер счёта в качестве счёта получателя в платеже
+MACRO PM_AllowUnknownReceiverAccount( pmpaym:TRecHandler ):bool
+
+  var allow : bool = false;
+  var RegPath = "";
+
+  if( pmpaym.rec.DocKind == DLDOC_MEMORIALORDER )
+      RegPath = REGPATH_ALLOW_UNKNOWN_REC_ACC_MEMORDER;
+  elif( pmpaym.rec.DocKind == CB_MULTYDOC )
+      RegPath = REGPATH_ALLOW_UNKNOWN_REC_ACC_MCDOC;
+  elif( pmpaym.rec.DocKind == DLDOC_SUMMARY_MEMORDER )
+      RegPath = REGPATH_ALLOW_UNKNOWN_REC_ACC_SUMMO;
+  elif( pmpaym.rec.DocKind == DLDOC_BANKORDER )
+      RegPath = REGPATH_ALLOW_UNKNOWN_REC_ACC_BANKORDER;
+  end;
+
+  if( RegPath )
+    var err:integer = 0;
+    GetRegistryValue( RegPath, V_BOOL, allow, err );
+    if( err )
+      allow = false;
+    end;
+  end;
+
+  return allow;
+END;
+
+macro IsNotFormat302P( Account ):bool
+  
+  if( Index( Account, " " ) )
+    return true;
+  elif( StrLen( Account ) != 20 )
+    return true;
+  elif( (not StrIsNumber( SubStr(Account,1,5) )) and (not StrIsNumber( SubStr(Account,9,12) )) )
+    return true;
+  end;
+  return false; 
+end;

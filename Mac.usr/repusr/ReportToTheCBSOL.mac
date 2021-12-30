@@ -1,0 +1,709 @@
+/***************************************************************************************************************
+   Имя файла..:       ReportToTheCBSOL.mac
+   Назначение.:       Предоставление отчетной информации для ЦБ (Банк Солидарность)
+   Заявка.....:       от Вараксина Евгения
+   Дата.......:       21.04.2015
+   Автор......:       Ващенко Дмитрий 
+*/
+
+import RSD, "ldmklbr.mac", "KeyCodes.mac", globals, activeX, lib_sqltools;
+FILE f_rep_out() txt;  
+
+Array rep;
+rep(0) = "ЖУРНАЛ ОТКРЫТЫХ И ЗАКРЫТЫХ СЧЕТОВ";
+rep(1) = "ПРОВОДКИ_1";
+rep(2) = "ПРОВОДКИ_2";
+rep(3) = "ОСТАТКИ";
+var StatusBar  = "F2 Отчет F3 Выбор ESC Выход", f_rep_changeCB, f_rep_change;
+
+Private Class Reports(date1, date2)
+   var SQL,
+       i = 1, symb = "~~~",
+       param1 = date(date1), 
+       param2 = date(date2),
+       ctn = 0;
+
+  Macro IfElse(p_value)
+    if ( (ValType(p_value) == 26) or (p_value == " ")) return ""; end;
+    return StrSubst(StrSubst(p_value, StrFor(10), " "), StrFor(13), " ");   
+  End;
+
+  Macro CreateFile()
+    return TStreamDoc(f_rep_changeCB, "c", "lcansi");
+  End;
+
+  /*Отчет ЖУРНАЛ ОТКРЫТЫХ И ЗАКРЫТЫХ СЧЕТОВ*/
+  Macro SQLAccounts()     
+    startQueryCapture ();
+    [
+       SELECT acc.t_account t_account,
+              TRIM(CONCAT (acc.t_nameaccount, '; ') || 
+                   CONCAT (DECODE( party.t_legalform, 1, NVL (party.t_shortname, party.t_name), 2, persn.t_name1 || ' ' || persn.t_name2 || ' ' || persn.t_name3), '; ') ||
+                   dog.t_number) t_name,
+              TO_CHAR (acc.t_open_date, 'dd.mm.yyyy') t_open_date,
+              DECODE (TO_CHAR (acc.t_close_date, 'dd.mm.yyyy'), '01.01.0001', '', TO_CHAR (acc.t_close_date, 'dd.mm.yyyy')) t_close_date,
+              dog.t_number t_number_dog,
+              TO_CHAR (dog.t_dateconc, 'dd.mm.yyyy') t_date_dog,
+              usr_get_inn(code.t_code) t_inn,
+              usr_get_kpp(code.t_code) t_kpp,
+             (SELECT DISTINCT code.t_code
+              FROM dobjcode_dbt code
+              WHERE     code.t_codekind = 27
+                    AND code.t_objectid = acc.t_client 
+                    AND code.t_state = 0
+                    AND t_bankclosedate != '01.01.2001')  t_ogrn
+       FROM daccount_dbt acc, dsfcontr_dbt dog, dparty_dbt party, dpersn_dbt persn, dobjcode_dbt code
+       WHERE (acc.t_client = dog.t_partyid(+) AND acc.t_account = dog.t_object(+))
+         AND (party.t_partyid = code.t_objectid(+)
+           AND code.t_codekind(+) = 16
+           AND code.t_state(+) = 0)
+         AND party.t_partyid = acc.t_client
+         AND persn.t_personid(+) = acc.t_client
+         AND acc.t_usertypeaccount NOT LIKE '%Ю%?%'
+         AND acc.t_type_account NOT LIKE '%Щ%'
+         AND acc.t_account NOT LIKE '%ОВП%'  
+         AND EXISTS (
+           SELECT 1 FROM drestdate_dbt rest WHERE acc.t_accountid = rest.t_accountid AND rest.t_restdate
+             BETWEEN :START_DATE AND :END_DATE) 
+         AND party.t_partyid not in (SELECT t_objectid FROM dobjcode_dbt WHERE t_codekind in (27) AND t_state = 0 GROUP BY t_objectid HAVING COUNT (t_code) > 1)
+         AND SUBSTR(acc.t_account, 1, 5) <> '00000'
+       ORDER BY acc.t_account
+    ];
+
+    SQL = endQueryCapture ();      
+    return true;
+           
+  OnError
+    return false;
+  End;
+
+  /*Отчет ПРОВОДКИ_1*/
+  Macro SQLAcctrnOne()
+    startQueryCapture ();
+    [  
+       SELECT * FROM 
+       (SELECT TO_CHAR (arh.t_date_carry, 'dd.mm.yyyy') data,
+               NVL (TO_CHAR (prop.t_date, 'dd.mm.yyyy'), TO_CHAR (arh.t_date_carry, 'dd.mm.yyyy')) data_d,
+               NVL (prop.t_number, ' ') nmb,
+               TO_CHAR (arh.t_account_payer) dt,
+               TO_CHAR (arh.t_account_receiver) kt,
+               LTRIM (TO_CHAR (arh.t_sum_natcur, '9999999999999990.99')) SUM,
+               CASE
+                  WHEN arh.t_fiid_receiver = 0 AND arh.t_fiid_payer = 0 THEN '0.00'
+                  WHEN arh.t_fiid_receiver = 0                          THEN  LTRIM (TO_CHAR (arh.t_sum_payer, '9999999999999990.99'))
+                  ELSE                                                  LTRIM (TO_CHAR (arh.t_sum_receiver, '9999999999999990.99'))
+               END sumc,
+               TRANSLATE (SUBSTR (arh.t_ground, 1, 253),  CHR (10) || CHR (13) || '~', CHR (9)) appoint,
+               CASE
+                  WHEN LENGTH (arh.t_ground) > 254  THEN TRANSLATE (SUBSTR (arh.t_ground, 1, 253), CHR (10) || CHR (13) || '~', CHR (9))
+                  ELSE                              ''
+               END appoint2,
+               NVL (get_syblol_arh_line (arh.t_acctrnid), '') sco,
+               arh.t_acctrnid ucoddoc
+        FROM dacctrn_dbt arh,
+             dpmrmprop_dbt prop,
+             (SELECT arh.t_acctrnid trn_id, docs.t_paymentid payment_id
+              FROM dacctrn_dbt arh, dpmdocs_dbt docs
+              WHERE docs.t_acctrnid(+) = arh.t_acctrnid
+                AND arh.t_state = 1
+                AND t_chapter = 1
+                AND '00000' NOT IN (SUBSTR(arh.t_account_payer, 1, 5), SUBSTR(arh.t_account_receiver, 1, 5) )
+                AND arh.t_date_carry BETWEEN :START_DATE AND :END_DATE
+              GROUP BY arh.t_acctrnid, docs.t_paymentid) arh2
+        WHERE arh2.payment_id = prop.t_paymentid(+)
+          AND arh.t_acctrnid = arh2.trn_id) d
+      ORDER BY d.data, d.ucoddoc
+    ];
+
+    SQL = endQueryCapture ();     
+    return true;
+           
+  OnError
+    return false;
+
+  End;
+
+  /*Отчет ПРОВОДКИ_2*/
+  Macro SQLAcctrnTwo()
+    startQueryCapture ();
+    [ 
+      SELECT arh.t_acctrnid ucoddoc,
+              paym.t_payeraccount account_a,
+              NVL ( (SELECT code.t_code FROM dobjcode_dbt code  WHERE code.t_codekind = 3 AND code.t_objectid = paym.t_payerbankid AND code.t_state = 0), '111111111') bik_a,
+              usr_get_inn (TO_CHAR (prop.t_payerinn)) inn_a,
+              usr_get_kpp (TO_CHAR (prop.t_payerinn)) kpp_a,
+              SUBSTR (NVL (REPLACE (prop.t_payername, '~', ' '), '0'), 1, 253) t_name_a1,
+              CASE 
+                WHEN LENGTH (prop.t_payername) > 254 THEN REPLACE (SUBSTR (NVL (prop.t_payername, '0'), 254), '~', ' ')
+                ELSE                                 ''
+              END  t_name_a2,
+              paym.t_receiveraccount account_b,
+              NVL ( (SELECT code.t_code FROM dobjcode_dbt code WHERE code.t_codekind = 3 AND code.t_objectid = paym.t_receiverbankid AND code.t_state = 0), '111111111') bik_b,
+              usr_get_inn (TO_CHAR (prop.t_receiverinn)) inn_b,
+              usr_get_kpp (TO_CHAR (prop.t_receiverinn)) kpp_b,
+              SUBSTR (NVL (REPLACE (prop.t_receivername, '~', ' '), ''), 1, 253) t_name_b1,
+              CASE
+                WHEN LENGTH (prop.t_receivername) > 254 THEN REPLACE (SUBSTR (NVL (prop.t_receivername, ''), 254), '~', ' ')
+                ELSE                                    ''
+              END  t_name_b2
+       FROM dacctrn_dbt arh, dpmdocs_dbt docs, dpmrmprop_dbt prop, dpmpaym_dbt paym
+       WHERE arh.t_acctrnid = docs.t_acctrnid
+         AND docs.t_paymentid = prop.t_paymentid
+         AND paym.t_paymentid = prop.t_paymentid
+         AND t_date_carry BETWEEN :START_DATE AND  :END_DATE
+         AND (SUBSTR (arh.t_account_payer, 1, 3) IN ('301', '302', '303')
+           OR SUBSTR (arh.t_account_receiver, 1, 3) IN ('301', '302', '303'))
+         AND '00000' NOT IN (SUBSTR(arh.t_account_payer, 1, 5), SUBSTR(arh.t_account_receiver, 1, 5) )
+         AND paym.t_payerbankid != paym.t_receiverbankid
+    ];
+
+    SQL = endQueryCapture ();     
+    return true;
+           
+  OnError
+    return false;
+
+  End;
+
+  private Macro SQLRestDate()
+    startQueryCapture ();
+    [ 
+      SELECT * FROM (
+        SELECT TO_CHAR (TO_DATE (data, 'dd.mm.yyyy'), 'dd.mm.yyyy') data,
+               t_account account,
+               indt,
+               indtc,
+               inkt,
+               inktc,
+               obdt,
+               obdtc,
+               obkt,
+               obktc,
+               outdt,
+               outdtc,
+               outkt,
+               outktc,
+               ROW_NUMBER () OVER ( PARTITION BY data, t_account ORDER BY obdt DESC, obkt DESC ) cnt1
+        FROM (
+          SELECT DECODE (data, TO_CHAR(:START_DATE, 'dd.mm.yyyy'), data, TO_CHAR(:START_DATE, 'dd.mm.yyyy')) data,
+                 t_account,
+                 indt,
+                 indtc,
+                 inkt,
+                 inktc,
+                 obdt,
+                 obdtc,
+                 obkt,
+                 obktc,
+                 outdt,
+                 outdtc,
+                 outkt,
+                 outktc
+          FROM (
+            SELECT /*+FIRST_ROWS */
+                   TO_CHAR (rest.t_restdate, 'dd.mm.yyyy') data,
+                   CASE WHEN LENGTH (acc.t_account) < 20 THEN RPAD (acc.t_account, 20, ' ')
+                        ELSE                                  acc.t_account
+                   END  t_account,
+                   CASE acc.t_kind_account 
+                     WHEN 'А' THEN LTRIM(TO_CHAR ( (rest.t_rest + (rest.t_debet + rest.t_debetspod) - (rest.t_credit + rest.t_creditspod)) * -1, '9999999999999990.99'))
+                     ELSE         '0.00'
+                   END indt,
+                   CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'А')
+                      WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR ( (t_rest + (t_debet + t_debetspod) - (t_credit + t_creditspod)) * -1, '9999999999999990.99')), '0.00')
+                                   FROM drestdate_dbt
+                                   WHERE t_accountid = rest.t_accountid
+                                     AND t_restdate = rest.t_restdate
+                                     AND t_restcurrency = acc.t_code_currency
+                                     AND t_restcurrency != 0
+                                     AND acc.t_kind_account = 'А')
+                      ELSE '0.00'
+                    END indtc,
+                    CASE acc.t_kind_account
+                      WHEN 'П' THEN LTRIM(TO_CHAR (rest.t_rest + (rest.t_debet + rest.t_debetspod) - (rest.t_credit + rest.t_creditspod), '9999999999999990.99'))
+                      ELSE          '0.00'
+                    END inkt,
+                    CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0  AND acc.t_kind_account = 'П')
+                      WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest + (t_debet + t_debetspod) - (t_credit + t_creditspod), '9999999999999990.99')), '0.00')   
+                                   FROM drestdate_dbt
+                                   WHERE t_accountid = rest.t_accountid
+                                     AND t_restdate = rest.t_restdate
+                                     AND t_restcurrency = acc.t_code_currency
+                                     AND t_restcurrency != 0
+                                     AND acc.t_kind_account = 'П')
+                      ELSE '0.00'
+                    END inktc,
+                    NVL (LTRIM(TO_CHAR ( (rest.t_debet + rest.t_debetspod),  '9999999999999990.99')), '0.00') obdt,
+                    NVL ( (SELECT LTRIM(TO_CHAR ( (t_debet + t_debetspod),   '9999999999999990.99')) FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0), '0.00') obdtc,
+                    NVL (LTRIM(TO_CHAR ( (rest.t_credit + rest.t_creditspod),'9999999999999990.99')), '0.00') obkt,
+                    NVL ( (SELECT LTRIM(TO_CHAR ( (t_credit + t_creditspod), '9999999999999990.99')) FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0),'0.00') obktc,
+                    CASE acc.t_kind_account  
+                      WHEN 'А' THEN LTRIM(TO_CHAR (rest.t_rest * -1, '9999999999999990.99'))
+                      ELSE          '0.00'
+                    END outdt,
+                    CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'А')
+                      WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest * -1, '9999999999999990.99')), '0.00')
+                                   FROM drestdate_dbt
+                                   WHERE t_accountid = rest.t_accountid
+                                     AND t_restdate = rest.t_restdate
+                                     AND t_restcurrency = acc.t_code_currency
+                                     AND t_restcurrency != 0
+                                     AND acc.t_kind_account = 'А')
+                      ELSE '0.00'
+                    END outdtc,
+                    CASE acc.t_kind_account
+                      WHEN 'П' THEN LTRIM(TO_CHAR (rest.t_rest, '9999999999999990.99'))
+                      ELSE         '0.00'
+                    END outkt,
+                    CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'П')
+                      WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest, '9999999999999990.99')), '0.00')
+                                   FROM drestdate_dbt
+                                   WHERE t_accountid = rest.t_accountid
+                                     AND t_restdate = rest.t_restdate
+                                     AND t_restcurrency = acc.t_code_currency
+                                     AND t_restcurrency != 0
+                                     AND acc.t_kind_account = 'П')
+                      ELSE '0.00'
+                    END outktc
+                  FROM drestdate_dbt rest, daccount_dbt acc
+                  WHERE rest.t_accountid = acc.t_accountid
+                    AND acc.t_account NOT LIKE '%ОВП%'
+                    AND rest.t_restdate = :START_DATE
+                    AND (rest.t_accountid, t_restcurrency) IN
+                      (SELECT DISTINCT acc.t_accountid acc_id, 0
+                         FROM daccount_dbt acc
+                         WHERE EXISTS (SELECT 1 FROM drestdate_dbt rest
+                                       WHERE rest.t_accountid = acc.t_accountid 
+                                         AND (rest.t_rest != 0 OR (rest.t_debet  != 0 OR rest.t_debetspod  != 0)
+                                                               OR (rest.t_credit != 0 OR rest.t_creditspod != 0)))
+                                         /*AND (t_close_date >= TO_DATE ('01.08.2012','dd.mm.yyyy') OR t_close_date = '01.01.0001')*/)
+                  ORDER BY rest.t_restdate, acc.t_account)
+          WHERE (obdt != '0.00' OR obdtc != '0.00')
+             OR (obkt != '0.00' OR obktc != '0.00')
+             OR (indt != '0.00' OR indtc != '0.00')
+             OR (inkt != '0.00' OR inktc != '0.00')
+             OR (outdt != '0.00' OR outdtc != '0.00')
+             OR (outkt != '0.00' OR outktc != '0.00')
+          UNION ALL
+          SELECT *
+          FROM (SELECT DECODE (data, TO_CHAR(:START_DATE, 'dd.mm.yyyy'), data, TO_CHAR(:START_DATE, 'dd.mm.yyyy')) data,
+                       t_account,
+                       CASE WHEN indt != '0.00' AND outdt = '0.00' THEN '0.00'
+                            ELSE outdt
+                       END indt,
+                       CASE WHEN indtc != '0.00' AND outdtc = '0.00' THEN '0.00'
+                            ELSE outdtc
+                       END indtc,
+                       CASE WHEN inkt != '0.00' AND outkt = '0.00' THEN '0.00'
+                            ELSE outkt
+                       END inkt,
+                       CASE WHEN inktc != '0.00' AND outktc = '0.00' THEN '0.00'
+                            ELSE outktc
+                       END inktc,
+                       '0.00' obdt,
+                       '0.00' obdtc,
+                       '0.00' obkt,
+                       '0.00' obktc,
+                       outdt,
+                       outdtc,
+                       outkt,
+                       outktc
+                  FROM (SELECT /*+FIRST_ROWS */
+                              TO_CHAR (rest.t_restdate, 'dd.mm.yyyy') data,
+                              CASE WHEN LENGTH (acc.t_account) < 20 THEN RPAD (acc.t_account, 20, ' ')
+                                   ELSE acc.t_account
+                               END t_account,
+                               CASE acc.t_kind_account
+                                 WHEN 'А' THEN LTRIM(TO_CHAR ( (rest.t_rest + (rest.t_debet + rest.t_debetspod) - (rest.t_credit + rest.t_creditspod)) * -1, '9999999999999990.99'))
+                                 ELSE '0.00'
+                               END indt,
+                               CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'А')
+                                 WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR ( (t_rest + (t_debet + t_debetspod) - (t_credit + t_creditspod)) * -1, '9999999999999990.99')), '0.00')
+                                              FROM drestdate_dbt
+                                              WHERE t_accountid = rest.t_accountid
+                                                AND t_restdate = rest.t_restdate
+                                                AND t_restcurrency = acc.t_code_currency
+                                                AND t_restcurrency != 0
+                                                AND acc.t_kind_account = 'А')
+                                 ELSE '0.00'
+                               END indtc,
+                               CASE acc.t_kind_account
+                                 WHEN 'П' THEN LTRIM(TO_CHAR (rest.t_rest + (rest.t_debet + rest.t_debetspod) - (rest.t_credit + rest.t_creditspod), '9999999999999990.99'))
+                                 ELSE          '0.00'
+                               END inkt,
+                               CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'П')
+                                 WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest + (t_debet + t_debetspod)- (t_credit + t_creditspod), '9999999999999990.99')),'0.00')
+                                              FROM drestdate_dbt
+                                              WHERE t_accountid = rest.t_accountid
+                                                AND t_restdate = rest.t_restdate
+                                                AND t_restcurrency = acc.t_code_currency
+                                                AND t_restcurrency != 0
+                                                AND acc.t_kind_account = 'П')
+                                  ELSE '0.00'
+                               END inktc,
+                               NVL (LTRIM(TO_CHAR ( (rest.t_debet + rest.t_debetspod),   '9999999999999990.99')), '0.00') obdt,
+                               NVL ( (SELECT LTRIM(TO_CHAR ( (t_debet + t_debetspod),    '9999999999999990.99')) FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0), '0.00' ) obdtc,
+                               NVL (LTRIM(TO_CHAR ( (rest.t_credit + rest.t_creditspod), '9999999999999990.99')), '0.00') obkt,
+                               NVL ( (SELECT LTRIM(TO_CHAR ( (t_credit + t_creditspod),  '9999999999999990.99')) FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0), '0.00' ) obktc,
+                               CASE acc.t_kind_account 
+                                 WHEN 'А' THEN LTRIM(TO_CHAR (rest.t_rest * -1, '9999999999999990.99'))
+                                 ELSE          '0.00'
+                               END outdt,
+                               CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'А')
+                                 WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest * -1, '9999999999999990.99')), '0.00')
+                                              FROM drestdate_dbt
+                                              WHERE t_accountid = rest.t_accountid
+                                                AND t_restdate = rest.t_restdate
+                                                AND t_restcurrency = acc.t_code_currency
+                                                AND t_restcurrency != 0
+                                                AND acc.t_kind_account = 'А')
+                                 ELSE '0.00'
+                               END outdtc,
+                               CASE acc.t_kind_account 
+                                 WHEN 'П' THEN LTRIM(TO_CHAR (rest.t_rest, '9999999999999990.99'))
+                                 ELSE          '0.00'
+                               END outkt,
+                               CASE (SELECT 1 FROM drestdate_dbt WHERE t_accountid = rest.t_accountid AND t_restdate = rest.t_restdate AND t_restcurrency = acc.t_code_currency AND t_restcurrency != 0 AND acc.t_kind_account = 'П')
+                                 WHEN 1 THEN (SELECT NVL (LTRIM(TO_CHAR (t_rest, '9999999999999990.99')), '0.00')
+                                              FROM drestdate_dbt
+                                              WHERE t_accountid = rest.t_accountid
+                                                AND t_restdate = rest.t_restdate
+                                                AND t_restcurrency = acc.t_code_currency
+                                                AND t_restcurrency != 0
+                                                AND acc.t_kind_account = 'П')
+                                 ELSE '0.00'
+                               END outktc
+                        FROM drestdate_dbt rest, daccount_dbt acc
+                        WHERE rest.t_accountid = acc.t_accountid
+                          AND acc.t_account NOT LIKE '%ОВП%'
+                          AND (rest.t_accountid, rest.t_restcurrency) IN
+                            (SELECT DISTINCT acc.t_accountid acc_id, 0
+                             FROM daccount_dbt acc
+                             WHERE EXISTS (SELECT 1 FROM drestdate_dbt rest 
+                                           WHERE ( (rest.t_accountid = acc.t_accountid AND t_restcurrency = acc.t_code_currency)
+                                                OR (rest.t_accountid = acc.t_accountid AND t_restcurrency = 0))
+                                             AND (rest.t_rest != 0 OR (rest.t_debet  != 0 OR rest.t_debetspod  != 0)
+                                                                   OR (rest.t_credit != 0 OR rest.t_creditspod != 0)))
+                                             /*AND (t_close_date >= TO_DATE ('01.08.2012', 'dd.mm.yyyy') OR t_close_date ='01.01.0001')*/)
+                               AND rest.t_restdate = (SELECT MAX (t_restdate)
+                                                      FROM drestdate_dbt
+                                                      WHERE t_restdate <= :START_DATE
+                                                        AND (t_accountid = rest.t_accountid)))
+          WHERE (obdt != '0.00' OR obdtc != '0.00')
+             OR (obkt != '0.00' OR obktc != '0.00')
+             OR (indt != '0.00' OR indtc != '0.00')
+             OR (inkt != '0.00' OR inktc != '0.00')
+             OR (outdt != '0.00' OR outdtc != '0.00')
+             OR (outkt != '0.00' OR outktc != '0.00'))))
+      WHERE ( (obdt != '0.00' OR obdtc != '0.00')
+           OR (obkt != '0.00' OR obktc != '0.00')
+           OR (indt != '0.00' OR indtc != '0.00')
+           OR (inkt != '0.00' OR inktc != '0.00')
+           OR (outdt != '0.00' OR outdtc != '0.00')
+           OR (outkt != '0.00' OR outktc != '0.00'))
+        AND (cnt1 = 1) /*and t_account like '90902%'*/
+        AND SUBSTR(account, 1, 5) <> '00000'
+    ];
+
+    SQL = endQueryCapture ();     
+    return true;
+           
+  OnError
+    return false;
+
+  End;
+
+  Macro ExecSql()
+    initprogress(-1, "Выполнение сбора данных", "Ожидайте, идет сбор данных");
+    SQL = execSqlSelect (SQL, makeArray (SqlParam ("START_DATE", param1),
+                                         SqlParam ("END_DATE",   param2)                                              
+                                         ));
+    remprogress;
+
+  OnError(r)
+    msgbox(r.Message + ", " + r.Err);
+
+  End;
+
+  Macro ExecSqlRest()     
+    SQL = execSqlSelect (SQL, makeArray (SqlParam ("START_DATE", param1)                                               
+                                        )); 
+  OnError(r)
+    msgbox(r.Message + ", " + r.Err);
+
+  End;
+
+  Macro WriteAccounts() 
+    initprogress(-1, "Выгрузка данных", "Ожидайте, идет выгрузка данных");
+    i = 1;
+    var ob = CreateFile();
+    ob.WriteLine(String("ACCOUNT" + symb + "NAME1" + symb + "NAME2" + symb + "OPEN" + symb + "CLOSE" + symb + "AGREE_NUM" + symb + "AGREE_DATE" + symb + "INN" + symb + "KPP" + symb + "OGRN"));
+    while (SQL.movenext())
+      useprogress(i);
+      ob.WriteLine(IfElse(SQL.Value("T_ACCOUNT"))    + symb +
+                   IfElse(SQL.Value("T_NAME"))       + symb +
+                   ""                        + symb +  
+                   IfElse(SQL.Value("T_OPEN_DATE"))  + symb +
+                   IfElse(SQL.Value("T_CLOSE_DATE")) + symb +
+                   IfElse(SQL.Value("T_NUMBER_DOG")) + symb +
+                   IfElse(SQL.Value("T_DATE_DOG"))   + symb +
+                   IfElse(SQL.Value("T_INN"))        + symb +
+                   IfElse(SQL.Value("T_KPP"))        + symb +
+                   IfElse(SQL.Value("T_OGRN"))
+                   );  
+
+      i = i + 1;        
+      ctn = i;
+    end;
+    remprogress;
+    return true;
+  OnError(r)
+      MsgBox("При выгрузке данных произошла ошибка: " + r.message + "| Обработано только " + i + " записей!");
+      return false;
+  End;
+
+  Macro WriteAcctrnOne()
+    initprogress(-1, "Выгрузка данных", "Ожидайте, идет выгрузка данных");
+    i = 1;
+    var ob = CreateFile();
+    ob.WriteLine(String("DATA" + symb + "DATA_D" + symb + "NMB" + symb + "DT" + symb + "KT" + symb + "SUM" + symb + "SUMC" + symb + "APPOINT" + symb + "APPOINT2" + symb + "SCO" + symb + "UCODDOC"));
+    while (SQL.movenext())
+      useprogress(i);
+      ob.WriteLine(String(IfElse(SQL.Value("DATA")) + symb +
+                   IfElse(SQL.Value("DATA_D"))      + symb +
+                   IfElse(SQL.Value("NMB"))         + symb +  
+                   IfElse(SQL.Value("DT"))          + symb +
+                   IfElse(SQL.Value("KT"))          + symb +
+                   IfElse(SQL.Value("SUM"))         + symb +
+                   IfElse(SQL.Value("SUMC"))        + symb +
+                   IfElse(SQL.Value("APPOINT"))     + symb +
+                   IfElse(SQL.Value("APPOINT2"))    + symb +
+                   IfElse(SQL.Value("SCO"))         + symb +
+                         (SQL.Value("UCODDOC")))
+                   );
+
+      i = i + 1;        
+      ctn = i;
+    end;
+    remprogress;
+    return true;
+  OnError(r)
+      MsgBox("При выгрузке данных произошла ошибка: " + r.message + "| Обработано только " + i + " записей!");
+      return false;
+  End;
+
+  Macro WriteAcctrnTwo()
+    initprogress(-1, "Выгрузка данных", "Ожидайте, идет выгрузка данных");
+    i = 1;
+    var ob = CreateFile();
+    ob.WriteLine(String("UCODDOC" + symb + "ACCOUNT_A" + symb + "BIK_A" + symb + "INN_A" + symb + "KPP_A" + symb + "T_NAME_A1" + symb + "T_NAME_A2" + symb + "ACCOUNT_B" + symb + "BIK_B" + symb + "INN_B" + symb + "KPP_B" + symb + "T_NAME_B1" + symb + "T_NAME_B2"));
+    while (SQL.movenext())
+      useprogress(i);
+      ob.WriteLine(String(SQL.Value("UCODDOC")    + symb +
+                   IfElse(SQL.Value("ACCOUNT_A")) + symb +
+                   IfElse(SQL.Value("BIK_A"))     + symb +  
+                   IfElse(SQL.Value("INN_A"))     + symb +
+                   IfElse(SQL.Value("KPP_A"))     + symb +
+                   IfElse(SQL.Value("T_NAME_A1")) + symb +
+                   IfElse(SQL.Value("T_NAME_A2")) + symb +
+                   IfElse(SQL.Value("ACCOUNT_B")) + symb +
+                   IfElse(SQL.Value("BIK_B"))     + symb +
+                   IfElse(SQL.Value("INN_B"))     + symb +
+                   IfElse(SQL.Value("KPP_B"))     + symb +
+                   IfElse(SQL.Value("T_NAME_B1")) + symb + 
+                   IfElse(SQL.Value("T_NAME_B2")))
+                   );
+
+      i = i + 1;        
+      ctn = i;
+    end;
+    remprogress;
+    return true;
+  OnError(r)
+      MsgBox("При выгрузке данных произошла ошибка: " + r.message + "| Обработано только " + i + " записей!");
+      return false;
+  End;
+ 
+  Macro WriteRestDate()
+    initprogress(-1, "Выгрузка данных", "Ожидайте, идет выгрузка данных");
+    i = 1;
+    var ob = CreateFile();
+    ob.WriteLine("DATA" + symb + "ACCOUNT" + symb + "INDT" + symb + "INDTC" + symb + "INKT" + symb + "INKTC" + symb + "OBDT" + symb + "OBDTC" + symb + "OBKT" + symb + "OBKTC" + symb + "OUTDT" + symb + "OUTDTC" + symb + "OUTKT" + symb + "OUTKTC");
+
+    var diff = date(param2) - date(param1), c, t_date = param1;    
+    for (c, 1, diff + 1)
+      SQLRestDate();
+      ExecSqlRest();       
+
+      while (SQL.movenext())
+        useprogress(i);
+        ob.WriteLine(IfElse(SQL.Value("DATA"))    + symb +
+                     IfElse(SQL.Value("ACCOUNT")) + symb +
+                     IfElse(SQL.Value("INDT"))    + symb +  
+                     IfElse(SQL.Value("INDTC"))   + symb +
+                     IfElse(SQL.Value("INKT"))    + symb +
+                     IfElse(SQL.Value("INKTC"))   + symb +
+                     IfElse(SQL.Value("OBDT"))    + symb +
+                     IfElse(SQL.Value("OBDTC"))   + symb +
+                     IfElse(SQL.Value("OBKT"))    + symb +
+                     IfElse(SQL.Value("OBKTC"))   + symb +
+                     IfElse(SQL.Value("OUTDT"))   + symb +
+                     IfElse(SQL.Value("OUTDTC"))  + symb + 
+                     IfElse(SQL.Value("OUTKT"))   + symb + 
+                     IfElse(SQL.Value("OUTKTC"))
+                    );
+        i = i + 1;        
+        ctn = i;
+      end;
+      param1 = date(param1) + 1; 
+    end;   
+    remprogress;
+  End;
+END;  
+
+/*Обработка формы*/
+Class (TRecHandler) STParm(LbrName)    
+  InitTRecHandler ("stat_acc", (LbrName), true); 
+
+  Macro CreateReport (name_report, date1, date2) 
+    f_rep_changeCB = "..\\txtfile\\" + rec.FileName + ".txt";
+    f_rep_change = f_rep_changeCB;
+    var time_st = time();
+
+    var rep = Reports(date1, date2);     
+    debugbreak;
+    if   ((name_report == "ЖУРНАЛ ОТКРЫТЫХ И ЗАКРЫТЫХ СЧЕТОВ"))
+      rep.SQLAccounts();
+      rep.ExecSql();
+      rep.WriteAccounts();  
+    elif ((name_report == "ПРОВОДКИ_1")) 
+      rep.SQLAcctrnOne();
+      rep.ExecSql();
+      rep.WriteAcctrnOne();      
+    elif ((name_report == "ПРОВОДКИ_2")) 
+      rep.SQLAcctrnTwo();
+      rep.ExecSql();
+      rep.WriteAcctrnTwo();  
+    elif ((name_report == "ОСТАТКИ")) 
+      rep.WriteRestDate();  
+    end;
+    MsgBox("Обработано записей: " + rep.ctn + "| Время обработки: " + String(time() - time_st));
+
+    SetOutput (null, false);  
+    if ((ExistFile(f_rep_change, 0)) and (open(f_rep_out, f_rep_change)))
+      viewFile(f_rep_change);
+      close(f_rep_out);
+    end;            
+ 
+  OnError(r)
+    msgbox(r.Message + ", " + r.Err);
+  End;
+
+  Macro Handler (dlg, cmd, id, key) 
+    if (cmd == DLG_KEY)	
+      if (KEY == KEY_F2)
+
+        if (date(dlg.rec.EndDate) < date(dlg.rec.BeginDate)) 
+          MsgBox("Дата начала периода не может быть больше даты его окончания! | Необходимо изменить настройки!");
+        else 
+          CreateReport(dlg.rec.ReportFormat, dlg.rec.BeginDate, dlg.rec.EndDate);
+        end;
+
+      elif (KEY == KEY_F3)      
+ 
+        if (id == FldIndex("ReportFormat"))
+          dlg.("ReportFormat") = rep(Menu(rep, "Формат", "Формат"));                      
+        end;                                                                                                                  	
+      end;
+    end;
+  End;         
+
+  Macro Run 
+    return RunDialog (this, R2M (this, "Handler"));  
+  End;
+End;
+
+Macro SMyPanel( lbr )    
+    var rc = lbr.AddPanel( "stat_acc", 40, 14, 30, 9, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+    rc.Title = "Настройка отчета для проверяющих из ЦБ (Солидарность)";
+    rc.StatusLine = StatusBar;
+    
+    elem = rc.AddFrame(0, 0, 30, 11, 2);
+    elem = rc.AddLabel( 1, 1, "Отчет: ");
+    elem = rc.AddField( 12, 1,lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ReportFormat", 17, 2, 250);
+    elem = rc.AddLabel( 1, 3, "Начало периода: ");
+    elem = rc.AddField( 19, 3,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "BeginDate", 10, 1);
+    elem = rc.AddLabel( 1, 4, "Конец периода: "); 
+    elem = rc.AddField( 19, 4,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "EndDate", 10, 1);
+    elem = rc.AddLabel( 1, 9, "Имя файла: ");
+    elem = rc.AddField( 12, 9,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_STRING, "FileName", 17, 1, 50);     
+end;
+
+Macro SMyLbr
+    private var Fulloutputlbr, outputlbr = "AccStatSLD.lbr", outlbr, lbr;
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",V_STRING, outlbr);
+    Fulloutputlbr = outlbr + "\\" + outputlbr;
+    lbr = TLbrFile( Fulloutputlbr, "C" );
+    SMyPanel( lbr );
+
+    lbr.Save(); 
+    lbr = NULL;
+    return Fulloutputlbr;
+end;
+
+private var MyLbrName, Parm;
+MyLbrName = SMyLbr();
+
+Parm = STParm(MyLbrName); 
+
+/*Метод форматирования даты*/
+Macro GetFormatDate
+    var thisDate = Trim(String(Date())), i = 0, thisValue, newValue = "";
+    while (i <= StrLen(thisDate))
+        thisValue = SubStr(thisDate, i, 1);
+        if (thisValue == ".") 
+            newValue = newValue + "_";
+        else                  
+            newValue = newValue + thisValue 
+        end;
+        i = i + 1;
+    end;
+    return newValue;
+End;
+
+Parm.rec.ReportFormat = trim(rep(0));
+Parm.rec.FileName = "EXPCB_1_" + GetFormatDate();
+Parm.rec.BeginDate = Date() - 365;
+Parm.rec.EndDate = Date();
+
+if ( not Parm.Run () )
+    Parm = null;
+    DelFile(MyLbrName);
+    Exit (1);
+end;
+end;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 

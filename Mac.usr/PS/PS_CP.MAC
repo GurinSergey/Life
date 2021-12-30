@@ -1,0 +1,459 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Макрос скроллинга
+// Описание  : Макрос скроллинга валютных платежных документов в РКО
+// SDA       07.06.2012 - фиксим null из Фронта в реквизиты банка - посредника 
+// KS       13.06.2012 I-00198430
+// Gurin S.  30.10.2012 I-00277005-2
+// joy       19.02.2012 Жаворонкова Н. C-17206 + рефакторинг кода
+// KS       22.11.2013 Перенесены доработки из 30й сборки
+// VV       25.06.2014 C-30318 
+//-----------------------------------------------------------------------------
+import globals, PaymInter, PTInter, lnpaym, check117, "pmchoper.mac","pm_tools.mac", "pm_opr.mac";
+import FIInter; 
+/*SDA*/
+import "cb_FillFactura.mac","copyPayment.mac";
+/* EVG */
+import "GenNumber.mac", rsbdataset, "pm_note.mac";
+import "diver.mac"; //Diver
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+import "ChangeReason.mac";
+//TAM 9.11.11 I-00101757-1
+import "NUMBERPACK.mac";
+//joy 19.02.2012 
+import "lib_const.mac";
+
+// VV C-30318    >>
+import "SetVOStaff.mac";
+import keycodes;
+private var path;
+private var pathfile;
+var  select_kat, cmd_kat,kat_record,depChoice="";
+var filen = "kat.lbr";
+import "fg_Life_parm.mac";
+//private const fgBank = fg_life_subject( {SelfID} );
+private const fgBank = fg_life_subject({OurBank});
+//VV C-30318 <<
+
+import psrqdoc, pscpdoc, bbbodoc;
+
+import "cb_FillFactura.mac";
+
+//Gurin S. 11.12.2013
+record  r_pmprop ( pmprop );
+
+/*
+Обращаемся к полям структур, используемых в макросах выполнения шагов операций, 
+для ускорения работы макросов.
+*/
+var field_finit;
+field_finit = r_pscpord.OrderID;
+field_finit = r_pmpaym.PaymentID;
+field_finit = r_credit.PaymentID;
+field_finit = r_pmrmprop.PaymentID;
+//field_finit = b1.AutoKey;
+
+/* Установка подсказки для скролингов из макроса */
+private const Hint_ByValueDate:string = "/*+FIRST_ROWS(200) LEADING(t pscpord pmprop pmrmprop oproper oprcurst) INDEX(t dpmpaym_dbt_idx11) USE_NL(t pscpord pmprop pmrmprop oproper oprcurst)*/";
+private const Hint_ByCloseDate:string = "/*+FIRST_ROWS(200) LEADING(t pscpord pmprop pmrmprop oproper oprcurst) INDEX(t dpmpaym_dbt_idx15) USE_NL(t pscpord pmprop pmrmprop oproper oprcurst)*/";
+private const Hint_ByStatus   :string = "/*+FIRST_ROWS(200) LEADING(t pscpord  pmprop pmrmprop oproper oprcurst) INDEX(t dpmpaym_dbt_idx16) INDEX(pscpord DPSCPORD_DBT_IDX0) USE_NL(t pscpord pmprop pmrmprop oproper oprcurst)*/";
+private const Hint_ByStep     :string = "/*+FIRST_ROWS(200) LEADING(oprstep oproper t pscpord pmprop pmrmprop oprcurst) INDEX(oprstep doprstep_dbt_idx10) INDEX(pscpord dpscpord_dbt_idx0) INDEX(t dpmpaym_dbt_idx0) USE_NL(oprstep oproper t pscpord pmprop pmrmprop oprcurst)*/";
+private const Hint_ForUnknown :string = "/*+FIRST_ROWS(200) LEADING(oprstep oproper t pmrmprop rminprop debet credit) INDEX(oprstep doprstep_dbt_idx10) INDEX(oproper doproper_dbt_idx0) INDEX(t dpmpaym_dbt_idx0) INDEX(rminprop drminprop_dbt_idx8) INDEX(debet dpmprop_dbt_idx0) INDEX(credit dpmprop_dbt_idx0) USE_NL(oprstep oproper t pmrmprop rminprop debet credit)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+  
+  /* Все, Закрытые */
+  if( ( ScrolStates == PSSK_ALL ) or 
+      ( ScrolStates == PSSK_CLOSED ) ) 
+
+    var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+    if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+      return Hint_ByCloseDate;
+    elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+      return Hint_ByValueDate;
+    else
+      return Hint_ByStatus;
+    end;
+
+  /* Отложенные, Открытые, Отвергнутые */
+  elif( ( ScrolStates == PSSK_DEFER ) or 
+        ( ScrolStates == PSSK_OPEN ) or 
+        ( ScrolStates == PSSK_REJECTED_WORK ) )
+  
+    return Hint_ByStatus;
+
+  /* Подготовленные к шагу */
+  elif( ScrolStates == PSSK_STEP )
+    
+    return Hint_ByStep;
+
+  /* Невыясненные */
+  elif( ScrolStates == PSSK_INDEX_UNKNOWN )
+  
+    return Hint_ForUnknown;
+
+  end;
+
+  return DefaultHint;
+
+END;
+
+macro Новый_Документ( )
+
+  /* EVG Ввод документа: автоматическое формирование номера по референсу */
+  if( StrLen( r_pmrmprop.Number ) == 0 )
+      r_pmrmprop.Number = GenNumberDocument();
+  end;
+  
+  if( r_pmpaym.DocKind == PS_CPORDER )
+    return PS_CurPayOrderNewDoc();
+  elif( r_pmpaym.DocKind == PS_INRQ )
+    return PS_ReqOrderNewDoc();
+  end;
+
+  msgbox("Неизвестный вид документа");
+  return 1;
+end;
+
+macro Проверить_Документ( Режим )
+ 
+  //Gurin S. 26.03.2015 R-562447-2 (исправлении ошибки в рамках проекта интеграции ИК)
+  if ( Режим == 3 ) //Редактирование
+     if (r_pmrmprop.RECEIVERCORRBANKNAME != "")
+        execSql("update dpmrmprop_dbt set t_RECEIVERCORRBANKNAME = chr(1) where t_paymentid =" + r_pmrmprop.paymentid);
+     elif (r_pmrmprop.RECEIVERCORRBANKNAME == "")
+        execSql("update dpmrmprop_dbt set t_RECEIVERCORRBANKNAME = chr(0) where t_paymentid =" + r_pmrmprop.paymentid);
+        r_pmrmprop.RECEIVERCORRBANKNAME == StrFor(0);
+     end;
+  end;
+  
+  if( r_pmpaym.DocKind == PS_CPORDER )
+    return PS_CurPayOrderCheckDoc( Режим );
+  elif( r_pmpaym.DocKind == PS_INRQ )
+    return PS_ReqOrderCheckDoc( Режим );
+  elif( r_pmpaym.DocKind == DLDOC_BANKORDER )
+    return BB_BankOrderCheckDoc( Режим );
+  end;
+
+
+  msgbox("Неизвестный вид документа");
+  return 1;
+end;
+
+
+macro    Функция_Пользователя( Режим:integer )
+ 
+    var PaymentObj:Rsbpayment=Rsbpayment(r_pmpaym.paymentId);
+    var m;
+    array mn;
+   
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+    mn(asize(mn)) = "Изменение платежа ФМ";
+   //TAM 9.11.11 I-00101757-1
+    mn(asize(mn)) = "Сменить номер пачки";
+    mn(asize(mn)) = "Правка примечаний платежа";
+
+   /* EVG 12/03/2012 Добавлена возможность ввода дополнительной информация (поле 72) */
+    mn(asize(mn)) = "Редактировать доп. информацию (поле 72)";
+    mn(asize(mn)) = "Копирование документа";
+   //Gurin S. 30.10.2012 I-00277005-2
+    if (ВходитВГруппу({oper}, ACS_GRP_PM_DELETE)) //189 - "Удалять документы ЭДО"
+        mn(asize(mn)) = "Удалить записи об операции";
+    end;
+   /*05-02-2012 Жаворонкова Н. (joy) C-17206*/
+    mn(asize(mn)) = "Изменить вид хранения";
+    if (ВходитВГруппу({oper},170))   //VV 24.06.2014
+        if ((fgBank.is_GEB) or (fgBank.is_VUZ))
+              mn(asize(mn)) = "Код страны банка нерезидента";    
+        end;
+    end; 
+
+    //Gurin S. 12.11.2015 R-627539-2
+    if (ВходитВГруппу({oper}, ACS_GRP_CLOSE_DOC))
+      mn(asize(mn)) = "Закрыть документ без проводок";
+    end;
+
+    m=menu(mn,null, "Выберите действие");
+
+    if ((Режим == UFN_PANEL_INPUT) or (Режим == UFN_SCROL_FMASS))
+        msgbox("Не предназначено для правки примечаний в массовых режимах, а так же при первоначальном вводе платежа");
+        return 0;
+    end;
+
+    /*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+    if (m == -2) 
+        return 0; // Обработка ESC
+    elif(mn(m) == "Изменение платежа ФМ")
+        ChangeReason(PaymentObj);
+        return 0;
+    //TAM 9.11.11 I-00101757-1
+    elif (mn(m)=="Сменить номер пачки")
+        if (ВходитВГруппу({oper}, ACS_GRP_CHANGE_NUMBERPACK))
+            NUMBERPACK(paymentObj.paymentID,PaymentObj.NumberPack);
+        else
+            msgbox("Вы не включены в группу \"107 - Право исправлять номер пачки в закрытых документах\"");
+        end;
+        return 0;
+
+    elif(mn(m) == "Правка примечаний платежа") 
+        if (ВходитВГруппу({oper}, ACS_GRP_NOTE407_EDIT)) //170 - "Правка примечаний платежа"
+            ВывестиПримечанияНаРедактирование(paymentObj.paymentID); 
+        else
+            msgbox("Вы не включены в группу \"Правка примечаний платежа\" ");
+            return 1;
+        end;
+      /*2012-09-26 zmp C-12487>*/
+    elif(mn(m) == "Копирование документа")
+        var CopyPaymentID, errorMesCP;
+        if (copyPayment(PaymentObj,CopyPaymentID,errorMesCP) == 0)
+           msgBox("Платеж успешно скопирован в список отложенных документов.\n ID платежа: "+CopyPaymentID);
+        else
+           msgBox(errorMesCP);
+        end;  
+        return 0;
+      /*<2012-09-26 zmp C-12487*/
+
+      //Gurin S. 30.10.2012 I-00277005-2
+    elif(mn(m) == "Удалить записи об операции")
+        var rss = rsdcommand(" UPDATE   dpscpord_dbt " +
+                             "    SET   t_currentstate = 1 " +
+                             "  WHERE   t_currentstate = 0 AND t_orderid = :id ");
+        rss.AddParam("id", RSDBP_IN, paymentObj.paymentID);
+        rss.execute;
+        msgbox("Выполнено. Поместите документ в отложенные || и повторите операцию над документом");
+        return 0;
+      //Gurin S. 30.10.2012 I-00277005-2 end
+      /*05-02-2012 Жаворонкова Н. (joy) C-17206*/
+      elif(mn(m) == "Изменить вид хранения")
+        if (r_pmpaym.PaymStatus == PM_FINISHED) // Только для закрытых, если открыт\отложен - хоть обменяйтесь :)
+            execMacroFile ("ea_checks.mac", "CheckEAGroup", r_pmpaym); 
+        else
+            execMacroFile ("ea_checks.mac","SetEAStoreKind", r_pmpaym);
+        end;
+        return 0;
+        /*--- end joy*/
+      /* EVG 12/03/2012 Добавлена возможность ввода дополнительной информация (поле 72) */
+    elif( mn(m) == "Редактировать доп. информацию (поле 72)" )
+
+         GetString( PaymentObj.AdditionalInfo, "Редактировать доп. информацию (поле 72)" );
+         if( PaymentObj.AdditionalInfo != r_pmrmprop.AdditionalInfo )
+            var cmd = RSDCommand( " Update dpmrmprop_dbt Set t_AdditionalInfo = ? Where t_PaymentId = ? " );
+                cmd.AddParam("aInf", RSDBP_IN, PaymentObj.AdditionalInfo);
+                cmd.AddParam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+                cmd.execute();
+         end;
+//VV >>>>>
+    elif( mn(m) == "Код страны банка нерезидента")
+         debugbreak;
+         GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path); 
+         pathfile = FindPath(filen,path);
+          if (not pathfile)
+             msgbox("Не найдена LBR");
+             exit();
+          end;   
+         var dlg = TRecHandler("kat",pathfile,true);
+          if (RunDialog(dlg,"HandleEvent")) 
+            //UpdateNRCountryInPaymetnCat( PaymentObj,dlg.rec.num, 117);
+          //  PaymentObj.Categories.ConnectAttr(117, dlg.rec.num, NULL, NULL, {curdate});
+             
+              var ss="select AJ.T_OBJECT from dobjatcor_dbt aj    where AJ.T_OBJECTTYPE=501  and AJ.T_GROUPID=117  and  AJ.T_OBJECT= LPAD ('"+r_PmPaym.PaymentID+"', 10, '0')"  ;
+              var dr = TRsbDataSet(ss);
+
+             if (not dr.movenext()) 
+               var sel=RSDCommand("INSERT INTO dobjatcor_dbt at (AT.T_ATTRID, AT.T_GENERAL,AT.T_GROUPID,AT.T_ISAUTO,AT.T_OBJECT,AT.T_OBJECTTYPE,AT.T_OPER,AT.T_SYSDATE,AT.T_SYSTIME,AT.T_VALIDFROMDATE,AT.T_VALIDTODATE)  "+
+                   "   SELECT   AJ.T_ATTRID,'X',AJ.T_GROUPID,'X',LPAD ('"+r_PmPaym.PaymentID+"', 10, '0'),AJ.T_OBJECTTYPE,"+{oper}+",SYSDATE,SYSDATE,SYSDATE, '31.12.9999'   FROM   dobjattr_dbt aj  "+
+                   "  WHERE   AJ.T_OBJECTTYPE = 501 AND AJ.T_GROUPID = 117 AND aj.t_attrid ="+dlg.rec.num+" ")  ;
+               sel.execute;
+               msgbox("Категория платежа 'Код страны банка нерезидента' установлена.");  
+
+             else   
+                var sl= RSDCommand("UPDATE   dobjatcor_dbt bj    SET   BJ.T_ATTRID="+dlg.rec.num+" ,BJ.T_OPER="+{oper}+", BJ.T_SYSDATE=SYSDATE, BJ.T_SYSTIME=SYSDATE, BJ.T_VALIDFROMDATE=SYSDATE "+
+                                   " WHERE    bJ.T_OBJECTTYPE=501  and bJ.T_GROUPID=117  and  bJ.T_OBJECT=LPAD ('"+r_PmPaym.PaymentID+"', 10, '0')")  ;
+                    sl.execute;
+               msgbox("Категория платежа 'Код страны банка нерезидента' изменена.");  
+
+             end;
+                     end;
+    elif (mn(m) == "Закрыть документ без проводок")
+       execMacroFile ("lib_menu_common.mac","UsrCloseDoc", PaymentObj);
+       return UPDTPAGE;
+
+    end;      // if
+//VV <<<<
+
+//end;  //
+
+ /*
+ Возможные значения Режим:
+  UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+  UFN_PANEL_EDIT(2) - функция вызвана из панели корректировки объекта;
+  UFN_SCROL(3) - функция вызвана из панели скролинга, единичный вызов, любая корректировка объекта запрещена;
+  UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, вызов до начала обработки, любая корректировка объекта запрещена;
+ 
+// Пример работы: 
+ if( Режим == UFN_SCROL )
+   return UPDTPAGE;    // Обновить страницу записей и область скролинга
+   //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+ end;
+ */
+ return 1;
+END;
+
+//VV C-30318 >>
+MACRO HandleEvent (dlg, cmd, id, key)
+      macro addCol (ar, ind, fld, head, width, rdonly)
+        ar.value (ind * 6) = fld;
+        ar.value (ind * 6 + 1) = head;
+        ar.value (ind * 6 + 2) = width;
+        ar.value (ind * 6 + 3 ) = 2;  // fldType
+        ar.value (ind * 6 + 4 ) = -1; // decPoint
+        ar.value (ind * 6 + 5 ) = 0;  // reserv
+      end;
+    
+    macro EvProc (kat_record, cmd_kat, id, key)
+       if(( cmd == DLG_KEY ) and ( KEY==KEY_Enter ))
+          return CM_SELECT;
+       end;
+    end;
+
+    macro EventHandler (rs, cmd, id, key )
+         if (cmd == DLG_INIT)
+             if (not AddMultiAction (rs, 316)) 
+               msgbox ("Не удалось выполнить AddMultiAction ()");
+             end;
+         end;
+         if(depChoice)
+            if ((cmd == DLG_KEY) and ((key == 13) or (KEY==KEY_ESC)))
+             return CM_SELECT;
+            end;
+         else 
+            if ((cmd == DLG_KEY) and (key == 13))
+              return CM_SELECT;
+            end; 
+         end;
+         if (cmd == DLG_MSELEND)// and (key == 316)) // F2
+            return CM_MSEL_STOP_CLEARALL;
+        end;
+    end; 
+    
+    if(cmd == DLG_INIT)
+       message("~F2~ выполнить, ~F3~ справочник, ~ESC~ выход ");
+       UpdateFields(dlg);
+    end;
+    if (cmd==DLG_KEY)
+       if (KEY==KEY_ESC)
+           return  exit(1);           
+       elif (KEY==KEY_F3)
+          var col = TArray();
+           if (FldName(dlg,id) == "num")
+                addCol(col, 0, "Номер", "Номер", 4, true);
+                addCol(col, 1, "Код", "Код", 5, true);
+                addCol(col, 2, "Наименование", "Код", 15, true);
+                addCol(col, 3, "ID", "ID", 5, true);
+
+               depChoice="";
+                
+	        select_kat = "select AJ.T_NAMEOBJECT,AJ.T_CODELIST,AJ.T_NAME,AJ.T_ATTRID from dobjattr_dbt aj where AJ.T_OBJECTTYPE=501 and AJ.T_GROUPID=117 ";
+               cmd_kat = RSDCommand(select_kat);
+               kat_record = RSDRecordset( cmd_kat, RSDVAL_CLIENT, RSDVAL_STATIC );
+                 if (RunScroll(kat_record,col,4,"Код страны банка нерезидента",@EventHandler,true))
+                      dlg.rec.num= kat_record.value(3);
+                 end;  
+                UpdateFields(dlg);
+          end;
+       elif ( KEY == KEY_F2 )  
+           Return CM_SAVE;
+       else
+           Return CM_IGNORE;
+       end; //esc           
+  
+   end; //dlg key   
+end;  //macro HandleEvent
+
+macro ProcessPanel(mode, key, field, panel)
+   var i=0,str ="";
+
+    debugbreak;
+    MACRO getISOName( FIID:integer )
+        var str;
+        record fi( "fininstr.dbt", "bank.def" );
+        if( FIID >= 0 )
+            if( ПолучитьФинИн( FIID, fi ) == 0 )
+                str = fi.Name;
+                return str;
+            end;
+        end;
+        return "";
+    END;
+
+
+    if ((Panel.ResourceName=="PSPCPORD") and (key == 522));
+        if( r_pscpord.Origin == USR_PAYMENT_OR_TRANSIT_ACC )//по распоряжению к транзитному счету - 2000
+            while (i < panel.Fields.count)
+                IF(panel.Fields.Item(i).name == "CP_NUMDOC")
+                    panel.Fields.Item(i).Enabled = false;
+                END;
+                i=i+1;
+            end;
+        End;
+    End;
+
+//SDA 13.06.2012 - обращения только к полям панели валютного платежа
+    if (Panel.ResourceName=="PCPORD");
+        if (r_pmpaym.BaseFIID == -1)
+            r_pmpaym.BaseFIID = r_pmpaym.FIID;
+        end;
+
+        if( r_pscpord.Origin != CP_OR_CLB )
+            if (panel.Fields.Item(3).value == 0)
+                panel.Fields.Item(3).value = r_pmpaym.amount; 
+                r_pmpaym.orderamount =  r_pmpaym.amount; 
+                panel.Fields.Item(4).value = panel.Fields.Item(9).value; 
+   
+                r_pmpaym.FIID = ПолучитьКодФинИН(panel.Fields.Item(9).value);  
+                r_pmpaym.PAYFIID = r_pmpaym.FIID;
+                r_pmpaym.BASEFIID = r_pmpaym.FIID;
+                r_pmpaym.orderFIID = r_pmpaym.FIID; 
+                str = getISOName(r_pmpaym.FIID); panel.Fields.Item(5).value = str; 
+            end;
+        else
+            r_pmpaym.PAYFIID = r_pmpaym.BASEFIID;
+            r_pmpaym.orderFIID = r_pmpaym.PAYFIID; 
+            panel.Fields.Item(4).value = ПолучитьКодФинИН(r_pmpaym.PAYFIID);   
+            panel.Fields.Item(26).value = panel.Fields.Item(4).value;   
+            str = getISOName(r_pmpaym.PAYFIID); panel.Fields.Item(5).value = str; 
+
+        end;
+//SDA 13.06.2012 I-00207798-1  
+        if (panel.Fields.Item(35).value == 0)
+            r_pmpaym.ComissFIID = r_pmpaym.FIID;
+            panel.Fields.Item(35).value = panel.Fields.Item(9).value;  
+        end;
+        if ( panel.Fields.Item(13).value == 0)  
+            RSDCommand("update dpmprop_dbt set T_CORRCODEKIND = 6, T_CORRCODENAME = 'BIC' where t_paymentid="+ r_pmpaym.paymentid + " and T_DEBETCREDIT = 1 and T_CORRCODEKIND IS null").Execute();
+            //Gurin S. 11.12.2013 (до адаптации было "так")
+            //r_pmpaym.CORRCODEKIND = 6;
+            r_pmprop.CORRCODEKIND = 6;
+            panel.Fields.Item(13).value = 6; panel.Fields.Item(14).value = "BIC ISO (SWIFT)"; 
+        end;
+  
+        if (panel.Fields.Item(23).value == 0) 
+            RSDCommand("update dpmprop_dbt set T_CODEKIND = 6, T_CODENAME = 'BIC' where t_paymentid="+ r_pmpaym.paymentid + " and T_DEBETCREDIT = 1 and T_CODEKIND IS null").Execute();
+            panel.Fields.Item(23).value = 6; panel.Fields.Item(24).value = "BIC ISO (SWIFT)"; 
+        end;
+
+        if (panel.Fields.Item(33).value == "") 
+            RSDCommand("update dpmrmprop_dbt set T_GROUND = ' ' where t_paymentid="+ r_pmpaym.paymentid + "and T_GROUND IS null").Execute();
+            r_pmrmprop.ground = " ";
+            panel.Fields.Item(33).value =  " "; 
+        end;
+    End;
+   return key;
+/*
+onerror(x);
+  return key;
+*/
+END;
+

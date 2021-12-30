@@ -1,0 +1,361 @@
+// -------------------------------------------------------------------------------------------------
+// @filename : fns_process.mac
+// @author   : Зленко М.П. 
+// @desc     : Загрузка сообщений ФНС
+// @request  : C-8598 
+// @revision : 1.01 
+//             14.03.2012 Chesnokov D. Добавил интерактивное меню для выбора вида загружаемых 
+//                        сообщений, заявка С-9530
+// Lavrenov: 25.06.2012 C-12040-6 Для каждой сессии создается своя папка
+// Lavrenov: 02.07.2012 C-12402-6 Логгирование
+// Lavrenov: 06.07.2012 I-00216000-1 Не нужен нам глючный градусник на каждый файл, сделал один на все.
+// Chesnokov: 08.10.2012 I-00259111 Директория из которой происходит фактическая загрузка создается из макроса
+//                       поддерживается 1 уровень вложенности.
+// -------------------------------------------------------------------------------------------------
+                                                                                                      
+import BankInter, rsexts, WldInter, globals, CTInter, rsd, oralib, rsbdataset;
+import "diver.mac","fns_lib.mac","fns_const.mac";
+
+private const TP_NAME = "ФНС_365-П";
+
+private var PATH_FNS, FNS_MASK_ZNO = "", FNS_MASK_PNO = "", FNS_MASK_ROO_RPO = "", SERVER_TMP_DIR, ARCHIVE_PATH, cnum;
+private var SERVER_TMP_DIR_NASTR; //Директория из настройки без преобразований I-00259111
+
+/*zmp 17.09.2013 I-00425453 записываю ошибки в таблицу*/
+private macro LogError(Category, Message)
+   println(Category, ": ", Message);
+   execSQL("insert into usr_fix_log_error values(?, ?, ?)", 
+            makeArray(SQLParam("", {curdate}),
+                      SQLParam("", {oper}),
+                      SQLParam("", Substr(String(Category, ": ", Message),1, 320))));
+   onError()                   
+end;
+
+private macro normalizePath(path)
+    if (SubStr(path, StrLen(path), 1)!="\\")
+      path = path + "\\";
+    end;
+    return path;
+end;
+
+private macro ClearTmp(_TmpFolder);
+   var  DirList, i:integer = 0; 
+    DirList = TDirList(_TmpFolder + "*","F");    
+    while (i < DirList.Count)
+       run(Getenv("windir")+"\\system32\\attrib.exe","-r "+_TmpFolder + DirList.Name(i));
+       if (not RemoveFile(_TmpFolder+DirList.Name(i)))
+         LogError("Предупреждение", "Файл "+_TmpFolder + DirList.Name(i)+ " не удалён!");
+       end;   
+       i = i + 1;
+    end;
+end;
+
+private macro readSettings()  /* Считать параметры из реестра */
+var  errCode,errCode_ZNO, errCode_PNO,errCode_ROO_RPO;
+var rs;
+
+  if ((not ВходитВГруппу({oper},195)) and (not ВходитВГруппу({oper},196)) and (not ВходитВГруппу({oper},197)) )
+    msgBox("Для обработки сообщений вы не включены не в одну из групп:|| \"195 - Обработка информационных сообщений\" ||\"196 - Обработка Инкассовых сообщений\" || \"197 - Oбработка приостановлений по счетам\" ");
+    exit(); 
+  end;
+
+  GetRegistryValue("PRBB\\FNS\\BASE_PATH", V_STRING, PATH_FNS, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PRBB\\FNS\\BASE_PATH");
+    exit();
+  end;
+
+  GetRegistryValue("PRBB\\FNS\\SERVER_DIR", V_STRING, SERVER_TMP_DIR, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PRBB\\FNS\\SERVER_DIR");
+    exit();
+  end;  
+  GetRegistryValue("PRBB\\FNS\\FILE_MASK_ZNO", V_STRING, FNS_MASK_ZNO, errCode_ZNO);
+  GetRegistryValue("PRBB\\FNS\\FILE_MASK_PNO", V_STRING, FNS_MASK_PNO, errCode_PNO);
+  GetRegistryValue("PRBB\\FNS\\FILE_MASK_ROO_RPO", V_STRING, FNS_MASK_ROO_RPO, errCode_ROO_RPO);
+  if ((errCode_ZNO > 0) and (errCode_PNO > 0) and (errCode_ROO_RPO > 0) )
+    msgbox("Проверьте наличие настроек PRBB\\FNS\\FILE_MASK_*");
+    exit();
+  end; 
+
+  GetRegistryValue("PRBB\\FNS\\ARCHIVE_PATH", V_STRING, ARCHIVE_PATH, errCode);
+  if ( errCode > 0 )
+     ARCHIVE_PATH = "";
+  end;  
+
+  //Lavrenov: 25.06.2012 C-12040-6 Определяем номер сессии
+  rs = trsbdataset("select RSBSESSIONDATA.CNUM  from dual ");
+  if (rs and rs.movenext)
+     cnum = int(rs.cnum);
+  else
+     cnum = {oper};
+  end;
+
+  PATH_FNS   = normalizePath(PATH_FNS); 
+
+  SERVER_TMP_DIR_NASTR = normalizePath(SERVER_TMP_DIR);//Сохраним значение из настройки I-00259111
+  //Lavrenov: 25.06.2012 C-12040-6 формируем имя папки 
+  SERVER_TMP_DIR = normalizePath(SERVER_TMP_DIR+"\\"+cnum);
+
+  //Lavrenov: 25.06.2012 C-12040-6 На всякий случай сначала удаляем все что свазанно с папкой
+  ClearTmp(SERVER_TMP_DIR);
+  RemoveDir(SERVER_TMP_DIR);
+  //Lavrenov: 25.06.2012 C-12040-6 и только потом создаем
+  if (not MakeDir (SERVER_TMP_DIR))
+    if (not MakeDir (SERVER_TMP_DIR_NASTR)) // попробуем создать каталог указанный в настройке I-00259111
+      msgbox ("Не получилось создать каталог: " + SERVER_TMP_DIR_NASTR);
+      exit();
+    else
+      if (not MakeDir (SERVER_TMP_DIR)) // Если удалось создать каталог из настройки, попробуем еще раз создать персонализированный каталог
+        msgbox ("Не получилось создать каталог: " + SERVER_TMP_DIR);
+        exit();
+      end;
+    end;
+  end;
+end;
+
+macro ПолучитьяИДТранспортаПоИмени(_name)
+ var rs,str;
+  str = "  SELECT t.t_tpid " +
+        "  FROM dwltransp_dbt t " +
+        "  WHERE t.t_name = '" + _name +"'";
+  rs =  trsbdataset(str);
+  if(rs and rs.movenext)
+     return rs.t_tpid;
+  end;
+  return "";
+end;
+
+private var FileNamesArray, FileTmpArray;
+
+macro getFiles(_FileMask,_SourceFilesPath)
+  var i = 0, DirList;
+  if (_FileMask != "")
+    DirList = TDirList(_SourceFilesPath + _FileMask,"F");    
+    while (i < DirList.Count)
+      run(Getenv("windir")+"\\system32\\attrib.exe","-r "+DirList.Name(i));
+      FileNamesArray(FileNamesArray.Size()) = DirList.Name(i);
+      i = i + 1;
+    end;
+  end;
+end;
+
+private macro CreateFileList(FileNamesArray:TArray, SourceFilesPath:string, Flag:bool);
+  
+  var Group_195 = False, Group_196 = False, Group_197 = False;
+  array m;
+  var change;
+  
+  if (ВходитВГруппу({oper},195))
+    Group_195 = True;
+  end;
+  if (ВходитВГруппу({oper},196))
+    Group_196 = True;
+  end;
+  if (ВходитВГруппу({oper},197))
+    Group_197 = True;
+  end;
+  /*Выбрать тип загружаемого сообщения*/
+  if (Flag)
+    if ((Group_195) and (Group_196) and (Group_197))
+      m(0) = "Загрузить информационные сообщения";
+      m(1) = "Загрузить инкассовые сообщения";
+      m(2) = "Загрузить приостановления по счетам";
+    elif ((Group_195) and (Group_196))
+      m(0) = "Загрузить информационные сообщения";
+      m(1) = "Загрузить инкассовые сообщения";
+    elif ((Group_195) and (Group_197))
+      m(0) = "Загрузить информационные сообщения";
+      m(1) = "Загрузить приостановления по счетам";  
+    elif ((Group_196) and (Group_197))
+      m(0) = "Загрузить инкассовые сообщения";
+      m(1) = "Загрузить приостановления по счетам"
+    elif(Group_195)
+      m(0) = "Загрузить информационные сообщения";
+    elif(Group_196)
+      m(0) = "Загрузить инкассовые сообщения";
+    elif(Group_197)
+      m(0) = "Загрузить приостановления по счетам";
+    end;
+  
+    change = menu(m, "~Enter~ Выбор пункта меню", "Выберите тип загружаемых файлов");
+  
+    if ((Group_195) and (Group_196) and (Group_197) and (change == 0))
+      getFiles(FNS_MASK_ZNO,SourceFilesPath);
+    elif ((Group_195) and (Group_196) and (Group_197) and (change == 1))
+      getFiles(FNS_MASK_PNO,SourceFilesPath);
+    elif ((Group_195) and (Group_196) and (Group_197) and (change == 2))
+      getFiles(FNS_MASK_ROO_RPO,SourceFilesPath);
+    elif ((Group_195) and (Group_196) and (change == 0))
+      getFiles(FNS_MASK_ZNO,SourceFilesPath);
+    elif ((Group_195) and (Group_196) and (change == 1))
+      getFiles(FNS_MASK_PNO,SourceFilesPath);
+    elif ((Group_195) and (Group_197) and (change == 0))
+      getFiles(FNS_MASK_ZNO,SourceFilesPath);
+    elif ((Group_195) and (Group_197) and (change == 1))
+      getFiles(FNS_MASK_ROO_RPO,SourceFilesPath);
+    elif ((Group_196) and (Group_197) and (change == 0))
+      getFiles(FNS_MASK_PNO,SourceFilesPath);
+    elif ((Group_196) and (Group_197) and (change == 1))
+      getFiles(FNS_MASK_ROO_RPO,SourceFilesPath);
+    elif ((Group_195) and (change == 0))
+      getFiles(FNS_MASK_ZNO,SourceFilesPath);
+    elif ((Group_196) and (change == 0))
+      getFiles(FNS_MASK_PNO,SourceFilesPath);
+    elif ((Group_197) and (change == 0))
+      getFiles(FNS_MASK_ROO_RPO,SourceFilesPath);
+    else
+      msgbox("Вы отказались от загрузки сообщений");
+    end;
+  else
+    if (Group_195)
+      getFiles(FNS_MASK_ZNO,SourceFilesPath);
+    end;
+    if (Group_196)
+      getFiles(FNS_MASK_PNO,SourceFilesPath);
+    end;
+    if (Group_197)
+      getFiles(FNS_MASK_ROO_RPO,SourceFilesPath);
+    end; 
+  end;
+  
+end;
+
+/* Проверить наличие файлов в папке */
+private macro isFilesExist(Folder, Flag)
+  FileNamesArray = null;
+  FileNamesArray = TArray();
+
+  CreateFileList(FileNamesArray, Folder, Flag);
+  return (FileNamesArray.Size() > 0)
+end;
+
+/* передать все файлы  из локальной папки во временную папку на сервере */
+private macro copyAllFiles(From, To)
+  var i = 0, SrcFileName, TmpFileName;
+
+  //Lavrenov: 06.07.2012 I-00216000-1 Не нужен нам глючный градусник на каждый файл, сделал один на все.
+  initprogress(FileNamesArray.Size(),"Копирование файлов...","Копирование файлов...");
+  while (i < FileNamesArray.Size())
+    useProgress(i);
+    SrcFileName = From + FileNamesArray(i);
+    TmpFileName = To + FileNamesArray(i);
+    if (not CopyFile(SrcFileName, TmpFileName))//, true, FileNamesArray(i)))
+      LogError("!!!ОШИБКА", "Ошибка копирования файла " + SrcFileName + " в " + TmpFileName);
+    end;
+  i = i + 1;
+  end;
+  remProgress();
+end;
+
+private macro deleteAllFiles(From)
+  var i = 0, SrcFileName;
+  while (i < FileNamesArray.Size())
+
+    SrcFileName = From + FileNamesArray(i);  
+    run(Getenv("windir")+"\\system32\\attrib.exe","-r "+SrcFileName);         
+    if (not RemoveFile(SrcFileName))
+      LogError("Предупреждение", "Файл "+SrcFileName+" не удалён!");
+    end;
+  i = i + 1;
+  end;
+end;
+
+//Lavrenov: 02.07.2012 C-12402-6 печать лога
+macro print_log(cnumber)
+    
+  var rs, str, outfilename, print = false;
+  var cnt, glob_cnt;
+  file src () txt;
+  
+  outfilename  = SERVER_TMP_DIR+"copyfile.log";
+  //Lavrenov: Хочешь знять где заполняется эта таблица? Отправть СМС на кототкий номер 4343 с текстом "Хочу все знать". 
+  str = " select t_filename, t_directory from Dwllogfile_usr "+
+        " where t_num = "+cnumber+
+        " order by t_directory";
+
+  setoutput(outfilename, true);  
+  //Пишем гадости в шапку
+  [       Сообщения, загруженные в RS-Bank
+   Операционистом: #####  за дату: ########## 
+     
+   =====                                             ]
+  ({oper}, date);
+
+  glob_cnt = 0; 
+  rs = trsbdataset(str);
+  //Бежим по всем созданным за сеанс импорта папкам
+  while (rs and rs.movenext)
+    //Открываем созданные логи
+    if(not open(Src, rs.t_filename))
+      Msgbox("Не открыт файл ", rs.t_filename);
+    end;
+    println("\n Папка: " + rs.t_directory);
+    rewind(Src);
+    print = false;
+    cnt = 0;
+    while(next(src))
+       if(print) //перепечатываем содержимое
+          println(src.str);
+          cnt = cnt +1;
+       end;
+       if(trim(src.str) == "=====")
+          print = true;
+       end;
+    end;
+    close(Src);
+    println("Итого по папке: "+ cnt);
+    glob_cnt = glob_cnt + cnt;
+  end;
+  println("\nВсего файлов загружено: "+ glob_cnt);
+  setoutput(null, true);  
+  //показываем итоговый лог
+  viewfile(outfilename);
+end;
+
+private macro process(Folder)
+  var cmd;
+  cmd = rsdcommand("truncate table Dwllogfile_usr; ");
+  cmd.execute;
+  
+  if (isFilesExist(Folder, True))
+    if (GetTrue(true, "В папке "+Folder+" найдены входящие сообщения. Загрузить?"))        
+      /* Очищаем папку Темп */
+      //  message("Очистка временной папки...");  
+      ClearTmp(SERVER_TMP_DIR);
+
+      /* 2.1. Скопировать файлы на терминал */
+      message("Передача файлов на сервер...");
+      copyAllFiles(Folder, SERVER_TMP_DIR);
+      //Lavrenov: 28.06.2012 Удаляем скопированные файлы.
+      deleteAllFiles(Folder);
+      /* 2.2. Запустить загрузку сообщений */
+      message("Загрузка сообщений...");
+      if (not ImportFileDir (SERVER_TMP_DIR, getTpIDbyName(TP_NAME)))
+        LogError("Ошибка обработки сообщений");
+      end; 
+      // Если вдруг неудастся обработать сообщения возвращаем их опять в импорт.
+      if (isFilesExist(SERVER_TMP_DIR, False))
+        copyAllFiles(SERVER_TMP_DIR,Folder);
+      end;
+    end;
+  end;
+
+  //Lavrenov: 02.07.2012 C-12402-6 Если есть архивиорвание, то выводим лог
+  if(ARCHIVE_PATH != "")
+    print_log(cnum);
+  end;
+
+  //Lavrenov: 25.06.2012 C-12040-6 Удаляем все файлы, если что-то осталось, и папку.
+  ClearTmp(SERVER_TMP_DIR);
+  RemoveDir(SERVER_TMP_DIR);
+end;
+
+macro start()
+  readSettings();   /* Считать параметры из реестра */
+  process(PATH_FNS); 
+  exit(1);
+end;
+
+//START
+start();

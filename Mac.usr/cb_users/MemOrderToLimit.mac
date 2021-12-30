@@ -1,0 +1,289 @@
+// KS 09.06.2011 C-761 Выгрузка проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+// Макрос процедур, реализующих заявку
+
+import pm_chkrst, cbsttls;
+import "AccountTest.mac";
+
+// Проверка мемориального ордера.
+// Устанавливается подходит ли корреспонденция
+// под технологию выгрузки проводок на установку_увеличение лимита овердрафта на СКС в UBS из RS-Bank V6
+macro ПроверкаМОЛимитОвердрафта( PaymentObj )
+
+  private var rs,cmd,sql,errorCode;
+
+  var mask_debet;  // PRBB\UBS\OVERDRAFT_DEBET
+  var mask_credit; // PRBB\UBS\OVERDRAFT_CREDIT
+
+  getRegistryValue("PRBB\\UBS\\OVERDRAFT_DEBET",  V_STRING, mask_debet,  errorCode);
+  if ( errorCode > 0 )
+    mask_debet  = "91317????092????????"; // Из ТЗ
+  end;
+
+  getRegistryValue("PRBB\\UBS\\OVERDRAFT_CREDIT", V_STRING, mask_credit, errorCode);
+  if ( errorCode > 0 )
+    mask_credit = "99998????092????????"; // Из ТЗ
+  end;
+
+  if ((CompareStrWithMasks(mask_debet,  PaymentObj.PayerAccount)==0)and
+      (CompareStrWithMasks(mask_credit, PaymentObj.ReceiverAccount)==0))
+
+    // Если маски подходящие, то проверим пользовательский тип счета
+    SQL = "select count(1) cnt\n" +
+          "  from daccount_dbt acc\n" +
+          " where acc.t_account in (?,?)\n" +
+          "   and acc.t_usertypeaccount like '%G%'";
+
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("p_a", RSDBP_IN, PaymentObj.PayerAccount);
+    cmd.AddParam("r_a", RSDBP_IN, PaymentObj.ReceiverAccount);
+    cmd.Execute();
+
+    rs = RsdRecordSet(cmd);
+
+    if(rs.moveNext)
+      if(rs.value("cnt") == 2) // Подходят оба счета
+        return 1;
+      end;
+    end;
+
+  end;
+
+  return 0;
+end;
+
+macro getAccountByClient(blnc,clientid)
+
+  private var rs,cmd,sql;
+
+  SQL = "select acc.t_account\n" +
+        "  from daccount_dbt acc\n" +
+        " where substr(acc.t_account,1,5) = ?\n" +
+        "   and acc.t_client = ?";
+
+  if (blnc=="40702")
+/*
+- 40702 баланс
+- Пользовательский тип - буква <G> (признак таможенной карты <Зеленый коридор>)
+- Числовой признак 09 в 10-11 символах в номере счета
+*/
+    SQL = SQL + "   and acc.t_usertypeaccount like '%G%'" +
+                "   and substr(acc.t_account,10,11) = ?";
+  end;
+
+  cmd = RsdCommand(SQL);
+  cmd.AddParam("blnc",   RSDBP_IN, blnc);
+  cmd.AddParam("client", RSDBP_IN, clientid);
+  if (blnc=="40702")
+    cmd.AddParam("infix_sks", RSDBP_IN, "09");
+  end;
+  cmd.Execute();
+
+  rs = RsdRecordSet(cmd);
+
+  if(rs.moveNext)
+    if(ValType(rs.value("t_account")) != 26)
+      return rs.value("t_account");
+    end;
+  end;
+
+  return "";
+
+end;
+
+macro get40702(clientid)
+
+  return getAccountByClient("40702",clientid);
+
+end;
+
+macro get45201(clientid)
+
+  return getAccountByClient("45201",clientid);
+
+end;
+/*
+Тестовый вариант с открытием счета из РС-Банка
+macro get45201(clientid)
+
+  private var rs,cmd,sql;
+  private var bln = "45201";
+  private var acc = getAccountByClient(bln,clientid);
+  private var stat;
+
+  record accrec("account.dbt");
+  record accblncrec("accblnc.dbt");
+
+  File pt ( "party.dbt"   );
+  File ac ( "account.dbt" );
+
+  clearrecord(accrec);
+  clearrecord(accblncrec);
+
+  if (acc == "")
+
+        acc = bln + "810009";
+
+        SQL = "select '" + acc + "'||lpad(t.t_code," + (20-strlen(acc)) + ",'0') t_account\n" +
+              "  from dobjcode_dbt t\n" +
+              " where t.t_objecttype = 3\n" +
+              "   and t.t_codekind = 101\n" +
+              "   and t.t_objectid = ?";
+
+        cmd = RsdCommand(SQL);
+        cmd.AddParam("client", RSDBP_IN, clientid);
+        cmd.Execute();
+
+        rs = RsdRecordSet(cmd);
+
+        if(rs.moveNext)
+          if(ValType(rs.value("t_account")) != 26)
+            acc = rs.value("t_account");
+          else
+            return "";
+          end;
+        else
+          return "";
+        end;
+
+        pt.PartyID = clientid;
+        if ( not GetEQ(pt) )
+          return "";
+        end;
+
+        ac.Chapter       = 1;
+        ac.Code_Currency = 0;
+        ac.Account       = get40702(clientid);
+
+        if ( not GetEQ(ac) )
+          return "";
+        end;
+
+        acc = GetKey(acc,{MFO_BANK});
+
+        accrec.Account         = acc;
+        accrec.Code_Currency   = 0;
+        accrec.Chapter         = 1;
+        accrec.Oper            = {oper};
+        accrec.Department      = ac.Department;
+        accrec.Branch          = ac.Branch;
+        accrec.Balance         = bln; 
+        accrec.Client          = clientid;
+        accrec.Kind_Account    = "А";
+        accrec.Type_Account    = "";
+        accrec.UserTypeAccount = "G";
+        accrec.NameAccount     = pt.name + ". Технический счет.";
+
+        if(accrec.Department == 0)
+          accrec.Department = DepartmentByOper({oper});
+        end;
+
+        accrec.Open_Date       = {curdate};
+
+        accblncrec.Account     = acc;
+        accblncrec.Chapter     = 1;
+        accblncrec.Balance0    = bln;
+
+        stat = Create_Account(accrec, accblncrec);
+        
+        if (stat != 0)
+            acc = "";
+        end;
+
+  end;
+
+  return acc;
+
+end;
+*/
+
+// Порождаем платеж
+macro LimCreatePayment(BO_Payment)
+
+    var paymtr:RsbPaymTransaction = BO_Payment.MakeTransaction();
+
+    var Memorial                = RsbMemorialOrder ( );
+    var Payment                 = Memorial.Payment ( );
+
+    var pPayerAccount,pReceiverAccount;
+
+    // Дт Технич. Счет (45201)
+    pPayerAccount    = get45201(BO_Payment.payer);
+    // Кт СКС ЗК (40702)
+    pReceiverAccount = get40702(BO_Payment.payer);
+
+    Memorial.State          = 0;
+    Memorial.Oper           = BO_Payment.Oper;
+    Memorial.Chapter        = 1;
+    Memorial.Code_Currency  = 0;
+    Memorial.Kind_Oper      = " 1";
+    Memorial.Origin         = 1;
+    Memorial.LaunchOper     = false;
+
+    Payment.DocKind         = 70;
+    Payment.Purpose         = PM_PURP_MEMORDER;
+    Payment.ShifrOper       = "09";
+
+    Payment.BaseFIID            = 0;
+    Payment.Number              = BO_Payment.Number;
+    Payment.Ground              = BO_Payment.Ground;
+    Payment.PayerAmount         = 
+    Payment.ReceiverAmount      = 
+    Payment.BaseAmount          = BO_Payment.PayerAmount;
+    Payment.ValueDate           = 
+    Payment.Date                = 
+    Payment.PayerBankEnterDate  = 
+    Payment.ClientDate          = {curdate};
+    Payment.IsPlanPaym          = "X";
+    Payment.PaymentKind         = "Э";
+    Payment.Priority            = BO_Payment.Priority;
+    Payment.NumberPack          = BO_Payment.NumberPack;
+
+    Payment.ReceiverMesBankID = BO_Payment.PayerMesBankID;
+    Payment.PayerMesBankID    = BO_Payment.ReceiverMesBankID;
+
+     //Заполняем поля документа
+   
+     paymtr.Chapter = 1;
+     paymtr.FIIDPayer = BO_Payment.PayerFIID;
+     paymtr.Sum = BO_Payment.PayerAmount;
+     paymtr.Number_Pack = BO_Payment.NumberPack;
+   
+     paymtr.Kind_Oper  = " 6";
+
+     paymtr.Shifr_Oper = "09";
+
+     paymtr.AccountPayer      = pPayerAccount;    // Дт Технич. Счет (45201)
+     paymtr.AccountReceiver   = pReceiverAccount; // Кт СКС ЗК (40702)
+
+     paymtr.Date_Carry    = {curdate};
+     paymtr.Date_Value    = {curdate};
+
+     paymtr.Department    = BO_Payment.Department;
+   
+     paymtr.Ground        = BO_Payment.Ground;
+     paymtr.Numb_Document = BO_Payment.Number;     
+
+
+    Payment.SetPayerPI ( PAYMENTS_GROUP_INTERNAL,          
+                         {OurBank},                        
+                         3,                                
+                         {MFO_BANK},                       
+                         {NAME_BANK},                      
+                         {CORAC_BANK},                     
+                         0,                                
+                         1,                                
+                         pPayerAccount);        // Дт Технич. Счет (45201)
+
+    Payment.SetReceiverPI ( PAYMENTS_GROUP_INTERNAL,       
+                            {OurBank},                     
+                            3,                             
+                            {MFO_BANK},                    
+                            {NAME_BANK},                   
+                            {CORAC_BANK},                  
+                            0,                             
+                            1,                             
+                            pReceiverAccount);  // Кт СКС ЗК (40702)
+                               
+    Memorial.Update();
+
+end;

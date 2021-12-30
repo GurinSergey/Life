@@ -1,0 +1,834 @@
+//-------------------------------------------------------------------------------------------------
+// Описание: проверки документа для отбора на шаг согласования
+// Изменения: Gurin S.  07.03.2012 I-00157268-2 
+//            Lavrenov: 22.05.2012 - I-00197024 перенес наработки Телешовой из 2029.
+//            KS        24.01.2012 ОТПРАВКА ПИСЕМ-УВЕДОМЛЕНИЙ В LOTUS
+//            KS        07.08.2012 I-00232873 Отправку писем оставлю только в ПРББ
+//            Gurin S.  02.01.2013 C-16705 
+//            Gurin S.  30.04.2013 C-19372
+//            Gurin S.  07.05.2013 R-188239-2
+//            TAM       07.05.2013 C-19427
+//            VV        17.06.13   C-19270 Внести изменения в алгоритм согласования п\п в ПРББ
+//            VV        09.09.2013 C-22956
+//            Gurin S.  08.10.2013 R-262671-2 Добавил проверку признака J на ВАЛЮТНОМ счете.
+//            Gurin S.  30.10.2013 C-24723 Добавил условие на согласование
+//            KS 22.11.2013 Предварительная адаптация под 31ю сборку
+//            VV 28.01.2014 C-24133, C-23389
+//            TAM       12.11.2013 R-282601 На счет получателя 40704* платежи идут через согласование
+//            TAM       14.01.2014 R-313123 Перенос на все банки С-19427
+//            Vaschenko 17.02.2014 C-27072
+//            Vaschenko 28.02.2014 C-27072 изненения
+//            Vaschenko 14.05.2014 R-373705-2
+//            Vaschenko 04.09.2014 C-32938 постановка на согласование для СКС счетов с проверкой остальных условий
+//            Vaschenko 15.09.2014 C-33024 Убрал проверку
+//            VV        19.03.2014 C-27922
+//            VV        03.04.2014 C-28439
+//            VV        08.04.2014 C-23389
+//            VV        09.04.2014 C-28590
+//            VV        28.04.2014 C-29142
+//            TAM       09.02.2015 C-35064
+//-------------------------------------------------------------------------------------------------
+
+import RSD, globals, lib_const, lib_account, lib_pm_check, lib_fg, lib_compare;
+import "rmcmptl.mac";
+import "fg_Life_parm.mac", "FS.mac";
+
+// KS 24.01.2012 ОТПРАВКА ПИСЕМ-УВЕДОМЛЕНИЙ В LOTUS
+import "send_claim.mac";
+// Gurin S. 02.01.2013 C-16705 
+import "likepy.mac";
+
+private const fdBank = fg_life_subject({OurBank});
+// KS 06.08.2012 C-12598 введу удобную константу
+const err_payacc_J = "Счет-плательщика имеет тип J";
+var state_sogl = false;
+
+//VV C-22956 09.09.13
+var CONTROL_SUM_PAYM, errCode;
+GetRegistryValue("COMMON\\CONTROL_SUM_PAYM", V_INTEGER, CONTROL_SUM_PAYM, errCode);
+if(fdBank.is_VUZ)
+    if (errCode > 0)
+        msgbox("Проверьте значение настройки COMMON\\CONTROL_SUM_PAYM");
+        return false;
+    end;
+end;
+
+//VV C-24133
+var CONT_SUM_PRBB;
+GetRegistryValue("COMMON\\CONT_SUM_PRBB", V_INTEGER, CONT_SUM_PRBB, errCode);
+if(fdBank.is_PRBB) 
+   if (errCode > 0)
+      msgbox("Проверьте значение настройки COMMON\\CONT_SUM_PRBB");
+      return false;
+   end;
+end;
+
+private macro catch(x)
+    var err_count = 0;
+    var lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message;
+    while( err_count < RSLDefEnv.ErrorCount )
+        lasterror = lasterror + "|"+RSLDefEnv.error(err_count).descr;
+        err_count = err_count + 1;
+    end;
+
+    if (RSLDefCon.IsinTrans)
+        RSLDefCon.RollbackTrans;
+    end;
+    msgbox(lasterror);
+end;
+
+//Gurin S. 07.05.2013 R-188239-2
+private macro USR_Get_Rest( Acc, OperDate )
+    var  sql;
+    sql = "SELECT USR_GET_REST (:acc, :operdate) rest from dual";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("acc"      , Acc      ),
+                                         SqlParam ("operdate" , OperDate )));
+    if (sql and sql.movenext())
+        return money(sql.value("rest"));
+    end;
+end;
+
+// Gurin S. 02.01.2013 C-16705 убираем повторяющиеся "причины для согласования" с sogl_reason
+private macro TestLine(str)
+    var i = 0, k;
+    var f:TArray = TArray();
+    f = split(trim(str),"|");
+    while ( i< f.size(f))
+        k = 0;
+        while((k < f.size(f)) and (k!=i))
+            if (trim(f(i)) == trim(f(k)))
+                f(i) = "";
+            end;
+            k = k + 1;
+        end;
+        i = i + 1;      
+    end;
+    i = 0; str = "";
+    while ( i< f.size(f))
+        if (f(i) != "") 
+            str = str + f(i) + "|";
+        end;                   
+        i = i + 1;      
+    end;
+    return substr(str,1,strlen(str)-1);
+end;
+
+Macro NaSogl (Pr, PaymentObj, originDoc, Pr153)
+    debugbreak;
+    var cmd,rs,err,NerezMask, str, str1;
+    //TAM 10.05.2012 I-00182165-2
+    var sogl_reason = "", go_sogl = 0, noteValue = "";
+    const CheckAccMask = "'40501'40502'40503'40504'40505'40601'40602'40603'40701'40702'40703'40704'40801'40802'40803'40804'40805'40806'40807'40809'40810'40811'40812'40813'40814'40815'40818'40819'40821'";
+
+    //Gurin S. 03.06.2016 R-647756-2
+    if ( (PaymentObj.DocKind == PS_PAYORDER) and inList(originDoc, 1, 2, 2100) and (substr(PaymentObj.Receiveraccount, 1, 5) == "40101") and (substr(PaymentObj.BttTICode, 1, 3) == "188") )
+       if (fdBank.is_EXV)
+          setparm(0,"При оплате штрафа в ГИБДД должно быть заполнено поле КОД. Поле <Код> не равно полю <КБК>");
+          return 1;
+       end;
+       if (trim(PaymentObj.UIN) == "")
+          setparm(0,"При оплате штрафа в ГИБДД должно быть заполнено поле КОД.");
+          return 1;
+       end;
+    end;
+
+   /*VDN 11.08.2015 Операция запрещения*/
+    if ( ( fdBank.is_PRBB ) and
+         (CompareStrWithMasks( "405*,406*,407*,40802*,40807*,40821*",PaymentObj.PayerAccount ) == 0) and
+         (CompareStrWithMasks( "423*,426*,40817*,40820*",PaymentObj.ReceiverAccount )          == 0) )
+         setparm (0,"Операция запрещения");
+         return 1;
+    end;
+
+    //VDN 04.09.2014 С-32938 Проверка, на согласование в конце процедуры для сохранения остальных условий
+    if ( fdBank.is_VUZ )
+        if ( ( Substr(PaymentObj.PayerAccount, 1, 3) == "405")   or
+             ( Substr(PaymentObj.PayerAccount, 1, 3) == "406")   or
+             ( Substr(PaymentObj.PayerAccount, 1, 3) == "407")   or
+             ( Substr(PaymentObj.PayerAccount, 1, 5) == "40807") or
+             ( Substr(PaymentObj.PayerAccount, 1, 5) == "40821") )
+            //VDN 09.09.2014 в рамках С-32938 изменение с 5 млн. на 3 млн.
+            var slesh = "";
+            if ( PaymentObj.BaseAmount >= 3000000 ) noteValue = "Согласование с Шевцовой Еленой Алексеевной"; end;
+            setparm (3, noteValue);
+            if ( noteValue != "" ) PaymentObj.Notes.AddNote ( 153, noteValue ); end;
+        end;
+    end;
+    
+    if (PaymentObj.Dockind == 420) //Gurin
+        cmd = RSDCommand(
+            "select 1" +
+            "  from daccount_dbt ac, dparty_dbt pt" +
+            " where ac.t_account = ?" +
+            "   and ac.t_chapter = 1" +
+            "   and ac.t_client = pt.t_partyid" +
+            "   and ac.t_usertypeaccount like '%J%'" 
+            );
+        cmd.addParam("acc",RSDBP_IN,  PaymentObj.PayerAccount);
+        rs = RSDRecordset(cmd);
+        if (rs.movenext)
+        // KS 06.08.2012 C-12598 введу удобную константу
+            setparm(0,err_payacc_J);
+            return 1;
+        end;
+    else // Gurin
+        // EVG 9/12/2010 Для документов оплаты ПЗО доп. контроль/согласование не требуется 
+        if ((originDoc == PSPO_OR_SF) or (originDoc == CP_OR_SF))
+            return 0;
+        end;
+        if (originDoc == PSPO_OR_CLB)
+            cmd = RSDCommand(
+                "select 1" +    
+                "  from daccount_dbt ac, dparty_dbt pt" +
+                " where ac.t_account = ?" +
+                "   and ac.t_chapter = 1" +
+                "   and ac.t_client = pt.t_partyid" +
+                "   and exists" +
+                "       (select 1" +
+                "          from dobjatcor_dbt ob, dobjattr_dbt att" +
+                "         where ob.t_objecttype = 3" +
+                "           and ob.t_objecttype = att.t_objecttype" +
+                "           and ob.t_groupid = 110" +
+                "           and ob.t_groupid = att.t_groupid" +
+                "           and ob.t_attrid = att.t_attrid" +
+                "           and ob.t_object = lpad(ac.t_client,10,'0')" +
+                "           and att.t_nameobject = 'Р')" 
+                );
+            cmd.addParam("acc",RSDBP_IN,  PaymentObj.PayerAccount);
+            rs = RSDRecordset(cmd);
+            if (rs.movenext)
+                setparm(0,"Клиент тип P");
+                return 1;
+            end;
+         
+            //TAM 07.05.2013 C-19427
+            //TAM 14.01.2014 R-313123
+            if((PaymentObj.DocKind == PS_PAYORDER) and ((PaymentObj.Origin == PSPO_OR_CLB) or (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC)))
+                var min_i2_prior =  Acc_GetMinPriorityI2(PaymentObj.PayerAccount);
+                //если есть К2 и очередность платежа меньше чем в К2 и клиент банкрот
+                if( (min_i2_prior != -1) and 
+                    (PaymentObj.priority < min_i2_prior) and Acc_IsBankrupt(PaymentObj.PayerAccount))
+                    setparm (0,"Требуется контроль очередности платежа. Клиент банкрот.");
+                    return 1; //ош - в отвергнутые
+                end;
+            end; // end C-19427
+
+            //Тихомиров Перенес.   PaymentObj.Origin ==  2 Это комиссия
+            if((PaymentObj.priority == 1) or (PaymentObj.priority == 2))
+                setparm (0,"Требуется контроль очередности платежа");
+                return 1; //ош - в отвергнутые
+            end;
+
+            // EVG 04.02.2011 Также для документов клиент-банка: требуется согласование в случае, если дата документа по погашению кредита отстаёт от текущей (инцидент I-00004097)
+            cmd = RSDCommand(
+                " Select t_AttrID " +
+                "   From dobjatcor_dbt " +
+                "  Where t_objecttype = 501 " +           // Платеж
+                "    and t_groupid    = 121 " +           // Внешняя система
+                "    and t_object     = lpad(?, 10, '0')"
+                );
+            cmd.addParam( "", RSDBP_IN, PaymentObj.PaymentID );
+            rs = RSDRecordset(cmd);
+            if ( rs and rs.movenext )
+                // Документ запланирован к отправке во Фронт, условие 10 
+                if ( ( rs.Value(0, null, V_INTEGER) == 10 ) or // Условия для платежей по кредитам ЮЛ на клиентские счета
+                     ( rs.Value(0, null, V_INTEGER) == 9 ) )   // Условия для платежей по кредитам ЮЛ на счета КЭУ
+                    //Gurin S. 29.04.2013 C-19372 добавил проверку на остаток 
+                    if (( PaymentObj.Date < {CurDate} ) and 
+                        //Gurin S. 07.05.2013 R-188239-2
+                        //zmp 28.10.2013 I-00436144 убрал USR_Get_Rest, сделал Cash_for_period
+                        ((Cash_for_period(PaymentObj.PayerAccount, PaymentObj.Date) >= PaymentObj.BaseAmount) and 
+                        not fdBank.is_VUZ))
+                        setparm( 0,"Возможно погашение кредита в архиве" );
+                        return 1;
+                    end;
+                end;
+            end;
+        end;
+        
+        //Для всех видов происхождения
+        //1 TAM 12.11.2013 R-282601 - если счет получателя 40704* документ идет на согласование
+        if(Substr(PaymentObj.ReceiverAccount, 1, 5) == "40704")
+           setparm (0,"Специальный избирательный счет"); 
+           return 1;
+        end;
+        //2
+        cmd = RSDCommand(
+                "select 1" +
+                "  from daccount_dbt ac, dparty_dbt pt" +
+                " where ac.t_account = ?" +
+                "   and ac.t_chapter = 1" +
+                "   and ac.t_client = pt.t_partyid" +
+                "   and ac.t_usertypeaccount like '%J%'" 
+                );
+        cmd.addParam("acc",RSDBP_IN,  PaymentObj.PayerAccount);
+        rs = RSDRecordset(cmd);
+        if (rs.movenext)
+            // KS 06.08.2012 C-12598 введу удобную константу
+            sogl_reason = err_payacc_J;
+            go_sogl = 1;
+            // KS 24.01.2012 C-7970
+            if ((originDoc == PSPO_OR_CLB) and ( fdBank.is_PRBB ) ) //KS 07.08.2012 I-00232873 Отправка писем только в ПРББ
+                sendClaimMails(0,
+                             PaymentObj.PayerAccount,
+                             "Согласование платежа по клиенту " +
+                             PaymentObj.payerName +
+                             " (" + Substr(PaymentObj.payeraccount,16,5) + ")",
+                             strsubst(
+                               "Плательщик " + PaymentObj.payerName +
+                               " осуществляет платеж № " + PaymentObj.Number + " от " + PaymentObj.Valuedate +
+                               " на " + PaymentObj.baseamount + " руб" +
+                               " в адрес " + PaymentObj.receivername + " в " + PaymentObj.receiverbankCorrName + ".\n" +
+                               PaymentObj.ground,
+                              strfor(1)," "));
+            end;
+        end;
+        
+        //3 VV C-28590 09.04.14 >>>>>
+        if((fdBank.is_EXV_Volgograd) or (fdBank.is_EXV_Voronezh) or (fdBank.is_EXV_Stavropol) )
+            if(((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or 
+                (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40820")) and 
+               (PaymentObj.Origin == 2) and 
+               (PaymentObj.ShifrOper == "01") and
+               (PaymentObj.NumberPack ==603) and
+               (not(PaymentObj.IsExternal)))
+                return 0;
+            end;
+        end;
+        
+        //4 VV C-27922 19.03.2014
+        if(fdBank.is_EXV_Volgograd)      
+            if( ((PaymentObj.ReceiverAccount == "40817810901000000001") or 
+                 (PaymentObj.ReceiverAccount == "40820810901000000001")) and 
+                (PaymentObj.Origin == 2) and
+                (PaymentObj.ShifrOper == "01"))
+                return 0;               
+            end;  
+        end;  
+     
+        //5 VV 28.04.14 C-29142 >>>  
+        if((fdBank.is_EXV) and (PaymentObj.ReceiverBankCode == "046311808"))
+            debugbreak;   
+            if ( (PaymentObj.ShifrOper == "01") and 
+                 (PaymentObj.ReceiverAccount == "40817810200000000706") and
+                 (not(PaymentObj.IsExternal)) and
+                 (PaymentObj.Origin == 2))
+                return 0;                      
+            elif(((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or 
+                 (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40820")) and 
+                 (not(PaymentObj.IsExternal)))   
+                if (PaymentObj.Origin == 2100)
+                    sogl_reason = sogl_reason + " | Происхождение ABBYY";
+                    go_sogl = 1;
+                else                      
+                    return 0; //ош - в отвергнутые
+                end;                      
+            end;                              
+        end; // if ( fdBank.is_ )    
+        
+        //6 VV 17.06.13 C-19270 Внести изменения в алгоритм согласования п\п в ПРББ >>>>       
+        if ( fdBank.is_PRBB )            
+            //Gurin S. 16.01.2013 закомментировал по C-26223 
+            //   if ((originDoc == PSPO_OR_CLB) and (PaymentObj.NumberPack ==603))
+            //      if((PaymentObj.ShifrOper == "01") and
+            //         ((PaymentObj.ReceiverAccount == "40817810809000060164") or 
+            //          (PaymentObj.ReceiverAccount == "40820810809000060164")) and
+            //          (not(PaymentObj.IsExternal)) )
+            //         setparm (0,"Счет получателя "+PaymentObj.ReceiverAccount+" - СВОД.СКС по пластиковым картам физ.лиц нерезидентов "); 
+            //         return 1; //ош - в отвергнутые   
+            //      end;
+            //   end;    
+            if(((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or 
+                (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40820")) and               
+                (not(PaymentObj.IsExternal)))
+                if (PaymentObj.Origin == 2100)
+                    sogl_reason = sogl_reason + " | Счет получателя СКС";
+                    go_sogl = 1;  
+                elif(originDoc == PSPO_OR_CLB) 
+                    if (not (PaymentObj.NumberPack == 603))  
+                        setparm (0,"Счет получателя СКС");
+                        return 1; //ош - в отвергнутые
+                    end;   
+                else
+                    setparm (0,"Счет получателя СКС");
+                    return 1; //ош - в отвергнутые 
+                end; 
+            end;
+        end;
+
+        //7 VV 03.04.2014 C-28439 >>>
+        if(((fdBank.is_EXV) and (PaymentObj.ReceiverBankCode == "046311808")) or 
+           (fdBank.is_EXV_Volgograd) or 
+           (fdBank.is_EXV_Voronezh) or 
+           (fdBank.is_EXV_Ulyanovsk) or 
+           (fdBank.is_EXV_Stavropol))
+            if ( index(Substr(PaymentObj.receiverAccount,11,1),"9") and 
+                 (originDoc == PSPO_OR_CLB) and 
+                 (PaymentObj.NumberPack == 603) and
+                 (not PaymentObj.IsExternal) ) 
+                return 0;
+            elif ( index(Substr(PaymentObj.receiverAccount,11,1),"9") and (not PaymentObj.IsExternal))
+                // Gurin S. 02.01.2013 C-16705
+                if (PaymentObj.Origin == 2100)
+                    sogl_reason = sogl_reason + " | Счет получателя СКС";
+                    go_sogl = 1;
+                else
+                    setparm (0,"Счет получателя СКС");      
+                    return 1; //ош - в отвергнутые
+                end;
+            end;
+        end;  
+ 
+        //8 VV C-24133   >> 
+        if( (fdBank.is_PRBB) and
+            (PaymentObj.PayerAmount >= CONT_SUM_PRBB) and
+            ( (PaymentObj.NumberPack == 7005) or
+              (PaymentObj.NumberPack == 3005) or
+              (PaymentObj.NumberPack == 1002) or
+              (PaymentObj.NumberPack == 1003) or
+              (PaymentObj.NumberPack == 8002)))
+            if(PaymentObj.ShifrOper=="02")
+                setparm (0,"Сумма платежа с шифром "+PaymentObj.ShifrOper+"  в пачке "+PaymentObj.NumberPack+" больше или равна сумме "+CONT_SUM_PRBB+" рублей.");      
+                return 1; //ош - в отвергнутые
+            end;   
+            if(PaymentObj.ShifrOper=="06")
+                setparm (0,"Сумма платежа с шифром "+PaymentObj.ShifrOper+"  в пачке "+PaymentObj.NumberPack+" больше или равна сумме "+CONT_SUM_PRBB+" рублей.");     
+                return 1; //ош - в отвергнутые
+            end; 
+        end;
+
+        //9 TAM 13.06.2013 C-21077
+        if (not  fdBank.is_PRBB )
+            if ( fdBank.is_GEB or fdBank.is_VUZ )
+            //TAM С-5164 01,09,2011  ------------------------begin
+            //Зачисление на СКС  - согласованию нет!            
+                if(((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or 
+                    (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40820")) and 
+                    (not(PaymentObj.IsExternal)))
+                    //Vaschenko D. 17.02.2014 C-27072
+                    if(((PaymentObj.ReceiverAccount == "40817810701088880007") or 
+                        (PaymentObj.ReceiverAccount == "40820810701088880007")) and //Vaschenko D. 28.02.2014 изменения под C-27072
+                        (PaymentObj.Origin == 2) and 
+                        (fdBank.is_VUZ))
+                        //return 0;
+                        state_sogl = true; // VDN 14.05.2014 R-373705-2
+                    else
+                        // Gurin S. 02.01.2013 C-16705
+                        if (PaymentObj.Origin == 2100)
+                            sogl_reason = sogl_reason + " | Счет-получателя СКС";
+                            go_sogl = 1;
+                        else
+                            setparm (0,"Счет-получателя СКС");
+                            return 1; //ош - в отвергнутые
+                        end;
+                    end;
+                end;
+            else         
+                if( ( index(Substr(PaymentObj.receiverAccount,11,1),"9") or 
+                    (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or 
+                    (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40820")) and not PaymentObj.IsExternal  )
+                    // Gurin S. 02.01.2013 C-16705
+                    if (PaymentObj.Origin == 2100)
+                        sogl_reason = sogl_reason + " | Счет получателя СКС";
+                        go_sogl = 1;
+                    else
+                        setparm (0,"Счет получателя СКС");      
+                        return 1; //ош - в отвергнутые
+                    end;
+                end;
+            end;
+        end;  //if (not  fdBank.is_PRBB )  
+
+        //10 TAM 13.06.2013 C-21077 - списание с СКС выносим отдельно для ПРББ
+        if ( fdBank.is_PRBB ) 
+            //Списание с СКС  - согласованию да!
+            if((index(Substr(PaymentObj.PayerAccount,11,1),"9") or 
+               (Substr(PaymentObj.PayerAccount, 1, 5) == "40817") or 
+                (Substr(PaymentObj.PayerAccount, 1, 5) == "40820")) and 
+                (not(PaymentObj.IsExternal)))
+                //TAM С-5164 01,09,2011   
+                cmd = RSDCommand( "select 1 "
+                                + "\n" + "from daccount_dbt ac, dparty_dbt pt"
+                                + "\n" + "where ac.t_account = ?"
+                                + "\n" + "and ac.t_chapter = 1"
+                                + "\n" + "and ac.t_client = pt.t_partyid"
+                            + "\n" + "and ac.t_usertypeaccount like '%G%';" );
+                cmd.addParam("acc", RSDBP_IN, PaymentObj.PayerAccount);
+                rs = RSDRecordset(cmd);
+                if(rs.movenext)
+                    // Gurin S. 02.01.2013 C-16705
+                    if (PaymentObj.Origin == 2100)
+                       sogl_reason = sogl_reason + " | Счет плательщика СКС";
+                       go_sogl = 1;
+                    else
+                       setparm (0,"Счет плательщика СКС");
+                       return 1; //ош - в отвергнутые
+                    end;
+                end;
+            end;
+        end;
+        
+        //11
+        if((Substr(PaymentObj.ReceiverAccount, 1, 5) == "40821") and // KS 02.03.2012 40821 на согласование
+           (PaymentObj.IsExternal))
+            setparm (0,"Согласование с Палагиной Еленой (тел.99-30-52) - счет платежного агента/субагента/поставщика");
+            return 1;
+        end;
+        
+        //12 TAM I-00200787-2
+        var sum = 0;
+        if (fdBank.is_PRBB)
+            sum = $90000;
+        else
+            sum = $50000;
+        end;
+        //Тихомиров - I-023381
+        //Lavrenov: 22.05.2012 - I-00197024 перенес наработки Телешовой из 2029. 
+        //begin TAM 16.01.2012 I-00141792-2 + разговор по телефону с Фоменко О.Л.
+        if ((   (subStr(PaymentObj.PayerAccount, 1, 3) == "405") or
+                (subStr(PaymentObj.PayerAccount, 1, 3) == "406") or
+                (subStr(PaymentObj.PayerAccount, 1, 3) == "407") or
+                (subStr(PaymentObj.PayerAccount, 1, 5) == "40802") or
+                (subStr(PaymentObj.PayerAccount, 1, 5) == "40807") ) and 
+              ( (subStr(PaymentObj.ReceiverAccount, 1, 3) == "423") or
+                (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or
+                (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30232") or
+                (subStr(PaymentObj.ReceiverAccount, 1, 3) == "426") or
+                (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30102") or /*zmp 25.03.2014 R-351902*/
+                (subStr(PaymentObj.ReceiverAccount, 1, 5) == "47422") or
+                (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30301") ) and
+                (PaymentObj.Baseamount >= sum) and
+                PaymentObj.IsExternal)
+            // Gurin S. 02.01.2013 C-16705
+            if (PaymentObj.Origin == 2100)
+                sogl_reason = sogl_reason + " | Документ на ручной обработке,  необходимо согласование";
+                go_sogl = 1;
+            else    
+                setparm (0,"Документ на ручной обработке,  необходимо согласование");      
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+
+        //13 27.11.2012 TAM R-128797-3
+        if(fdBank.is_EXV or fdBank.is_VUZ or fdBank.is_GEB)
+            if((subStr(PaymentObj.ReceiverAccount, 1, 5) == "30232") and
+               (originDoc == PSPO_OR_CLB) and
+                PaymentObj.IsExternal) // 27.11.2012 TAM R-128797-3
+                setparm (0,"Документ на ручной обработке,  необходимо согласование с Палагиной Еленой!!!");      
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+
+        //14 Gurin S. 30.10.2013 C-24723
+        if ((fdBank.is_EXV) and 
+            (PaymentObj.DocKind == PS_PAYORDER) and 
+            (PaymentObj.Baseamount >= $200000) and 
+            (originDoc == PSPO_OR_CLB) and 
+            (PaymentObj.ReceiverBankCode == "044525986"))
+            setparm(0,"Документ требует согласования");
+            return 1;
+        end;
+            
+        //15 31.05.2012 TAM I-00202421-2 405-407,40802,40807 
+        if(fdBank.is_EXV)
+            if (  ((subStr(PaymentObj.PayerAccount, 1, 3) == "405") or
+                   (subStr(PaymentObj.PayerAccount, 1, 3) == "406") or
+                   (subStr(PaymentObj.PayerAccount, 1, 3) == "407") or
+                   (subStr(PaymentObj.PayerAccount, 1, 5) == "40802") or
+                   (subStr(PaymentObj.PayerAccount, 1, 5) == "40807") ) and 
+               ( (subStr(PaymentObj.ReceiverAccount, 1, 3) == "405") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 3) == "406") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 3) == "407") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40802") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40807") ) and
+                  PaymentObj.IsExternal and
+                  (PaymentObj.Baseamount >= $1000000) and
+                  (originDoc == PSPO_OR_CLB)
+               ) 
+                setparm (0,"Документ на ручной обработке,  необходимо согласование с Герман. Е., Ивановой И.К.");      
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+            
+        //16
+        if(not fdBank.is_PRBB)
+            /* EVG 8.12.2010 Скорректированы условия отправки документов на доп. контроль для банков гнруппы:
+              предельная сумма уменьшена со 100'000 до 50'000. */
+            if ( ( (index(trim(PaymentObj.ReceiverName),"40817810") > 0) or
+                   (index(trim(PaymentObj.ground),"40817810")       > 0) or
+                   (Substr(PaymentObj.ReceiverAccount, 1, 5) == "40817")) and
+                   (PaymentObj.Baseamount > $50000) and PaymentObj.IsExternal )
+                // Gurin S. 02.01.2013 C-16705
+                if (PaymentObj.Origin == 2100)
+                    sogl_reason = sogl_reason + " | Документ на ручной обработке,  необходимо согласование";
+                    go_sogl = 1;
+                else
+                    setparm (0,"Документ на ручной обработке,  требуется согласование  ");      
+                    return 1; //ош - в отвергнутые
+                end;
+            end;
+        end;
+        
+        //17 TAM 28.06.2012 R-78963-2
+        if((PaymentObj.IsExternal) and (originDoc == PSPO_OR_CLB))
+            if( ((subStr(PaymentObj.ReceiverAccount, 1, 3) == "423") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 3) == "426") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40817") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30232") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30301") or
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "47422")) and
+                 (PaymentObj.Baseamount >= $1000) and
+                 (PaymentObj.ReceiverBankCodeKind == 3) and
+                 (PaymentObj.ReceiverBankCode == "044525201"))
+                setparm (0,"Документ на ручной обработке");
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+        
+        //18 26.07.12 TAM  рублевые платежные поручения, принятые по ИК с Кт = 40911 и суммой >= 1000. Для ЭВ.
+        if(fdBank.is_EXV)
+            if ( (PaymentObj.Dockind == 201) and
+                 (PaymentObj.BaseFIID == 0) and
+                 (originDoc == PSPO_OR_CLB) and
+                 (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40911") and
+                 (PaymentObj.Baseamount >= $1000) )
+                setparm (0,"Документ требует дополнительного контроля!");      
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+        
+        //19
+        if ((originDoc == PSPO_OR_CLB) and 
+            ((subStr(PaymentObj.PayerAccount, 1, 3) == "405")
+            or (subStr(PaymentObj.PayerAccount, 1, 3) == "406")
+            or (subStr(PaymentObj.PayerAccount, 1, 3) == "407")
+            or (subStr(PaymentObj.PayerAccount, 1, 3) == "408"))
+            and ((subStr(PaymentObj.ReceiverAccount, 1, 3) == "423")
+            or (subStr(PaymentObj.ReceiverAccount, 1, 3) == "426")
+            or (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40817")
+            or (subStr(PaymentObj.ReceiverAccount, 1, 5) == "40820")
+            or (subStr(PaymentObj.ReceiverAccount, 1, 5) == "30232")
+            or (subStr(PaymentObj.ReceiverAccount, 1, 5) == "47422"))
+            and ((PaymentObj.priority == 3) or (PaymentObj.priority == 4))                  
+           ) 
+            cmd = RSDCommand( " select 1 from dacclaim_dbt claim, dacclaimstate_dbt state   "
+                        + "\n" + "where claim.t_account =  ?"
+                        + "\n" + "and claim.t_claimkind = 1 "
+                        + "\n" + "and claim.t_chapter = ?"
+                        + "\n" + "AND claim.t_startdate <= ?"
+                        + "\n" + "and (claim.t_finishdate > ? or claim.t_finishdate = to_date ('01.01.0001','DD-MM-YYYY')) "
+                        + "\n" + "and CLAIM.T_CLAIMID = STATE.T_CLAIMID "
+                        + "\n" + "and STATE.T_STATE = 1 "
+                        /* EVG 31/03/2011 Необходимо проверять состояние с максимальной датой на момент выполнения операции,
+                            т.к. в случае отмены претензии в dacclaimstate_dbt остаются оба состояния (в т.ч. и с T_STATE = 1).*/
+                        + "\n" + "and STATE.T_STATEDATE = (SELECT   MAX (T_STATEDATE) "
+                        + "\n" + "                           FROM   dacclaimstate_dbt "
+                        + "\n" + "                          WHERE   T_CLAIMID = STATE.T_CLAIMID "
+                        + "\n" + "                            AND   T_STATEDATE <= ?) "
+                        + "\n" + "union "
+                        + "\n" + "select 1 from dacclaim_dbt claim, dacclaimstate_dbt state   "
+                        + "\n" + "where claim.t_account = ? "
+                        + "\n" + "and claim.t_claimkind = 1 "
+                        + "\n" + "and claim.t_chapter = ?"
+                        + "\n" + "AND claim.t_startdate <= ? "
+                        + "\n" + "and (claim.t_finishdate > ? or claim.t_finishdate = to_date ('01.01.0001','DD-MM-YYYY')) "
+                        + "\n" + "and CLAIM.T_CLAIMID = STATE.T_CLAIMID "
+                        + "\n" + "and STATE.T_STATE = 1 "
+                        + "\n" + "and STATE.T_STATEDATE = (SELECT   MAX (T_STATEDATE) "
+                        + "\n" + "                           FROM   dacclaimstate_dbt "
+                        + "\n" + "                          WHERE   T_CLAIMID = STATE.T_CLAIMID "
+                        + "\n" + "                            AND   T_STATEDATE <= ?) "
+                    );
+            cmd.addParam("acc1", RSDBP_IN, PaymentObj.PayerAccount);
+            cmd.addParam("chapter1", RSDBP_IN, PaymentObj.chapter);
+            cmd.addParam("date1", RSDBP_IN, {curdate});
+            cmd.addParam("date2", RSDBP_IN, {curdate});
+            cmd.addParam("date5", RSDBP_IN, {curdate});
+            cmd.addParam("acc2", RSDBP_IN, PaymentObj.ReceiverAccount);
+            cmd.addParam("chapter2", RSDBP_IN, PaymentObj.chapter);
+            cmd.addParam("date3", RSDBP_IN, {curdate});
+            cmd.addParam("date4", RSDBP_IN, {curdate});
+            cmd.addParam("date6", RSDBP_IN, {curdate});
+            rs = RSDRecordset(cmd);
+            if (rs.movenext)
+                setparm (0,"На счете есть арест. Требуется Доп. контроль");      
+                return 1;
+            end;
+        end;
+        
+        //20
+        if (not fdBank.is_PRBB )
+        // KS 19.01.2011 Огромная просьба, предусмотреть, при выполнении процедуры массовой проводки документов
+        //               Клиент-Банка, исполнение платежных поручений клиентов согласно дате,
+        //               указанной в поле "СРОК ПЛАТЕЖА".
+        //               I-114307
+            if ((PaymentObj.PayDate > {curDate}) and (PaymentObj.Origin==3))
+                setparm (0,"Срок платежа данного документа больше даты текущего операционного дня. Происхождение \"Интербанк\"");
+                return 1; //ош - в отвергнутые
+            end;
+            // KS 07.02.2011 Если в назначении платежа есть код валютной операции
+            //               Не валютный
+            //               С обеих сторон резиденты
+            //               То отправляю на согласование
+            GetRegistryValue("PRBB\PS\СЧЕТА НЕРЕЗИДЕНТОВ",2,NerezMask,err);
+            if ( err == 0 )
+                if ( ( not CompareStrWithMasks(NerezMask, PaymentObj.ReceiverAccount) ) and
+                ( not CompareStrWithMasks(NerezMask, PaymentObj.PayerAccount) ) and
+                ( PaymentObj.FIID == 0) and
+                ( substr(PaymentObj.Ground,1,3) == "{VO" ))
+                    setparm (0,"Срок платежа данного документа больше даты текущего операционного дня. Происхождение \"Интербанк\"");
+                    return 1; //ош - в отвергнутые
+                end;
+            end;
+        end;
+      
+        //21
+        //TAM 110.05.2012 I-00182165-2
+        if ( ( (originDoc == PSPO_OR_CLB) or (originDoc == 1)) and ( not PaymentObj.isexternal ) and 
+             ( Index( CheckAccMask, "'" + substr( PaymentObj.ReceiverAccount,1,5) + "'") > 0 ) )
+            if ( not СравнитьНаименования( PaymentObj.PaymentId))
+                if (go_sogl == 1)
+                    sogl_reason = sogl_reason + "|Наименование получателя не соответсвует наименованию клиента по счету";
+                    setparm(0,sogl_reason);
+                    return 1;                
+                else
+                    setparm (0,"Наименование получателя не соответствует наименованию клиента по счету");      
+                    return 1;
+                end;
+            end;
+        end;
+        
+        //22 TAM 09.02.2015 C-35064
+        if(fdBank.is_EXV)
+            if (( CompareStrWithMasks( "405*,406*,407*,40802*,40807*",PaymentObj.PayerAccount ) == 0 ) and
+                ( CompareStrWithMasks( "40203*,40204*,40205*,40206*,403*,405*,406*",PaymentObj.ReceiverAccount ) == 0 ) and
+                (PaymentObj.Baseamount >= $10000000))
+                setparm (0,"Согласование с Управлением Финансового Мониторинга");
+                return 1; //ош - в отвергнутые
+            end;
+        end;
+        
+        //TAM 10.05.12
+        if(go_sogl == 1)
+            setparm(0,TestLine(sogl_reason)); // Gurin S. 02.01.2013 C-16705
+            return 1;
+        end;
+    end; // Gurin
+   
+    //zmp 20.11.2013 C-24639  >>> 
+    if ((PaymentObj.dockind == 202) and inList(true, _bank.is_PRBB(), _bank.is_VUZ(), _bank.is_GEB(), _bank.is_EXV()))
+        var groundCurMask = RSL_GetRegistryValue("PRBB/ЦЕЛЕВОЕ ИСПОЛЬЗОВАНИЕ/ОСНОВАНИЕ ВАЛЮТНЫХ ПЕРЕВОДОВ", false);
+        if ((groundCurMask != null) and (trim(groundCurMask) != ""))
+            var CurPrimobj = GenObject( "RsbPsCpOrder", PaymentObj.DocumentID ); 
+            if (inList(CurPrimobj.origin, 1, 2))
+                if(regexp_like(strUpr(PaymentObj.ground), strUpr(strSubSt(groundCurMask, ",", "|"))))
+                    setparm(0, "Нецелевой платеж. Проверьте наличие собственных средств.");
+                    return 1;                
+                end;
+            end;    
+        end;  
+    end;    
+    //<<< zmp 20.11.2013 C-24639    
+   
+    /*VDN C-32938 04.09.2014 Ставим на согласование при наличии 153 примичания, если до этого не вылетел*/
+    if ( noteValue != "" )
+        setparm (0, "");
+        return 1;
+    end;
+
+    // VDN 14.05.2014 R-373705-2
+    if (state_sogl)
+        return 0;
+    end;  
+
+    return 0; //не пойдет на согласование    
+End;//macro
+
+macro NaSogl_unkvit(Pr,PaymentObj)
+    var rs, cmd;
+    if (PaymentObj.Dockind == 201)
+        cmd = RSDCommand(
+                        "select   /*+LEADING(st)*/ 1 " +
+                        "  from   dpmpaym_dbt pm,          " +
+                        "         dpmrmprop_dbt pr, " +
+                        "         doproper_dbt op, " +
+                        "         doprstep_dbt st " +
+                        " where       op.t_dockind = pm.t_dockind " +
+                        "         and op.t_documentid = pm.t_paymentid " +
+                        "         and st.t_id_operation = op.t_id_operation " +
+                        "         and st.t_symbol = 'W' " +
+                        "         and st.t_isexecute = 'R' " +
+                        "         and pm.t_payeraccount = ? " +
+                        "         and pr.t_priority < ?"+
+                        "         and pr.t_paymentid = pm.t_paymentid "
+                    );
+        cmd.addparam("acc",RSDBP_IN,PaymentObj.PayerAccount);
+        cmd.addparam("pr" ,RSDBP_IN,int(PaymentObj.Priority));
+        rs = RSDRecordset(cmd);
+        if (rs.MoveNext)
+            setparm(0,"К счету плательщика есть несквитованные документы с более приоритетной очередностью");
+            return 1;
+        end;
+    end;
+    return 0;
+    onerror(x)
+    catch(x);
+end;
+
+/*25.03.2013 zmp C-17511 добавлена ф-я naSoglERC*/
+macro naSoglERC(pr,PaymentObj, origin)
+    var cmd, rs;
+    // 07.11.2013 zmp R-278382 
+    // 20.11.2013 zmp к этойже заявке, для ЭВ исключено конкурсное производство(банкрот)
+    if(not fdBank.is_EXV) 
+        if(trim(ReadNoteForObject(4/*Лицевой счет*/,"010000000" + PaymentObj.PayerAccount, ACC_USR_NOTEKIND_JAY_REASON)) != "")
+            setparm(0,"Заполнено 153 примечание на счете плательщика");
+            return RSL_EXIT_FAILURE;
+        end;    
+        cmd = RsdCommand("SELECT 1 FROM dacclaim_dbt acc where acc.T_INITIATOR = 100  and ACC.T_ACCOUNT = ?");
+        cmd.AddParam ("0", RSDBP_IN,PaymentObj.PayerAccount);
+        rs  = RsdRecordset(cmd);
+        if (rs and rs.moveNext()) 
+            setparm(0,"Конкурсное производство (банкрот)"); 
+            return RSL_EXIT_FAILURE; 
+        end;               
+    end;
+   
+    var PayerAccount :RSL_Account = RSL_Account(PaymentObj.PayerAccount, 0) ;
+    // VV C-22956 09.09.13
+    if( ( (fdBank.is_VUZ)  and  
+          ( (PaymentObj.Origin == 3300)   or
+            (PaymentObj.Origin == 2100  ) or
+            (PaymentObj.Origin == 19  ) ) and
+        (  (PaymentObj.ShifrOper=="02") or 
+           (PaymentObj.ShifrOper=="06") ) )  and
+        ((PayerAccount.check_type_account("О")) and 
+        (PaymentObj.PayerAmount> CONTROL_SUM_PAYM) and
+        ((Acc_GetFreeAmountWithOverClaim(PaymentObj) - Acc_GetLimit(PaymentObj.PayerAccount))  < PaymentObj.PayerAmount) and
+        (Acc_GetFreeAmountWithOverClaim(PaymentObj) >= PaymentObj.PayerAmount)
+      ))
+        setparm(0,"Сумма платежа больше "+CONTROL_SUM_PAYM+" рублей. Платеж проводится за счет овердрафта.");
+        return RSL_EXIT_FAILURE; 
+    elif((PayerAccount.check_type_account("О")) and 
+         ((Acc_GetFreeAmountWithOverClaim(PaymentObj) - Acc_GetLimit(PaymentObj.PayerAccount))  < PaymentObj.PayerAmount) and
+         ( (Acc_GetFreeAmountWithOverClaim(PaymentObj) >= PaymentObj.PayerAmount)
+           or //Gurin S. 01.06.2016 313511 (совком) на случай если собственных средств нет
+           ( (Acc_GetKindByAccount(PaymentObj.PayerAccount) == "П") and ((Acc_GetFreeAmountWithOverClaim(PaymentObj) - Acc_GetLimit(PaymentObj.PayerAccount)) < 0) )
+         )
+        )
+        setparm(0,"Платеж проводится за счет овердрафта");
+        return RSL_EXIT_FAILURE; 
+    end;
+    
+    if(PayerAccount.check_usertypeaccount("J"))
+        setparm(0,"Счет-плательщика имеет тип J");
+        return RSL_EXIT_FAILURE; 
+    end;     
+    if(fdBank.is_EXV) 
+        if(PayerAccount.check_usertypeaccount("<"))
+            setparm(0,"Счет-плательщика имеет тип <");
+            return RSL_EXIT_FAILURE; 
+        end;
+    end;      
+    return RSL_EXIT_SUCCESS;
+end;

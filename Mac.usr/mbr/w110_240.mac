@@ -1,0 +1,220 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29002  - "Картотека НОСТРО-счета"
+// Шаг       : 240    - "Учет документа на картотеке"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+//-----------------------------------------------------------------------------
+import InsCarryDoc, OprInter, BankInter, RMInter, "rmconst.mac", "wldoc.mac" ;
+import "rmtools.mac", "pm_categ.mac", "pm_common.mac", pm_setst, "pmcarfun.mac",
+       "WLTOOLS.MAC", "cor_acc.mac", "pm_answerret.mac";
+import oralib; //Jushmanov 2014-02-24 C-19151
+import lib_registry;
+
+RECORD Corschem( corschem );
+private var _mask  = RSL_GetRegistryValue ("АРМ ПОЗИЦИОНЕРА/ДОПОЛНИТЕЛЬНЫЙ КОНТРОЛЬ/МАСКИ СЧЕТОВ БАНКА");
+
+var PaymentObj:RsbPayment;
+
+private macro GetInitialPaymentExecOrder()
+
+    var rs:RsdRecordset = execSQLselect( "select t_initialpayment from dpmlink_dbt where t_linkkind = :execord and t_purposepayment = :pmid", 
+                                          makeArray( SQLParam( "execord", PMLINK_KIND_EXECORDER ), SQLParam( "pmid", PaymentObj.PaymentID ) ), TRUE );
+    if( rs and rs.moveNext() )
+        return rs.value(0);
+    end;
+    return 0;
+end;
+
+private macro ValueDateForCalcDocIndexNOSTRO(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        if( Paym.StartDepartment == Paym.Department )
+            ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+        else
+            ValueDate = PM_GetOperDay_Balance(Paym.Department);
+        end;
+    end;
+
+    return ValueDate;
+end;
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first )
+
+    // Актуализируем проводки
+    if( not CarryPlanDocuments(PaymentObj.PaymentID) ) 
+        MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+        return 1;
+    end;
+
+    // Отсекаем валюту
+    if( ( PaymentObj.PayerFIID != 0 ) or ( PaymentObj.ReceiverFIID != 0 ) )
+        msgBox( "Валютные платежи не ставятся на картотеку корсчета" );
+        return 1;
+    end;
+
+    // Отсекаем дебетовые
+    if( not PaymentObj.IsCredit() )
+        msgBox( "Дебетовые платежи не ставятся на картотеку корсчета" );
+        return 1;
+    end;
+
+    // Если платеж является банковским - то пролетает
+    if( PaymentObj.Payer
+    and ВидСубъекта( PaymentObj.Payer, PTK_BANK )
+    and ( not IsClientPayerAccount( PaymentObj ) ) )
+        //Gurin S. 13.08.2015
+        if (CompareStrWithMasks(_mask,  PaymentObj.PayerAccount)!=0)
+           msgBox( "Платежи банка не ставятся на картотеку корсчета" );
+           return 1;
+        end;
+    end;
+
+    // Проводки
+    var paymtr1:RsbPaymTransaction = NULL;
+
+    //Если последняя проводка по платежу была на корсчет, удаляем последнюю проводку по платежу
+    if( (PaymentObj.FuturePayerAccount == PaymentObj.FutureReceiverAccount)
+    and (PaymentObj.FuturePayerFIID == PaymentObj.FutureReceiverFIID) )
+        if(DeleteLastCarry(PaymentObj))
+            msgbox("Ошибка при удалении проводки");
+            return 1;
+        end;
+    end;
+
+    PaymentObj.ValueDate = ValueDateForCalcDocIndexNOSTRO(PaymentObj);
+
+    if( not IsPlacedInUnclosed( PaymentObj.PaymentID ) )
+        // Балансовая проводка
+        paymtr1 = PaymentObj.MakeTransaction();
+        paymtr1.Chapter         = 1;
+        paymtr1.FIIDPayer       = PaymentObj.ReceiverFIID;
+        paymtr1.Sum             = PaymentObj.ReceiverAmount;
+        paymtr1.ResultCarry     = 1;
+        paymtr1.Kind_Oper       = " 1";
+
+        if (PaymentObj.ShifrOper != "")
+            paymtr1.Shifr_Oper  = PaymentObj.ShifrOper;
+        else
+            paymtr1.Shifr_Oper  = "09";
+        end;
+
+        paymtr1.AccountPayer    = PaymentObj.FuturePayerAccount;
+        paymtr1.AccountReceiver = Wl_AccNostroFD( PaymentObj.Payer ).FindAndOpenAccount( "БалКартотекаНОСТРО", 0, {curdate} );
+        paymtr1.Date_Carry      = PaymentObj.ValueDate;
+        paymtr1.Department      = PaymentObj.Department;
+        paymtr1.Ground          = substr( "Постановка в картотеку документа/"+PaymentObj.Ground, 1, 210 );
+        paymtr1.Numb_Document   = PaymentObj.Number;
+        paymtr1.ClaimID         = GetClaimID( PaymentObj, paymtr1.AccountPayer, paymtr1.Chapter, paymtr1.FIIDPayer );
+        if( not paymtr1.Carry() )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+    else
+        // А вдруг он в невыясненных был?!
+        if( not ChangePaymentObjDocuments( PaymentObj.PaymentID, 1, paymtr1.AccountPayer, paymtr1.AccountReceiver ) )
+            return 1;
+        end;
+    end;
+
+    // Внебалансовая проводка
+    var paymtr3:RsbPaymTransaction = PaymentObj.MakeTransaction();
+    paymtr3.Chapter         = 3;
+    paymtr3.FIIDPayer       = PaymentObj.ReceiverFIID;
+    paymtr3.Sum             = PaymentObj.ReceiverAmount;
+    paymtr3.ResultCarry     = 1;
+    paymtr3.Kind_Oper       = " 1";
+    paymtr3.Shifr_Oper      = "09";
+    paymtr3.AccountPayer    = Corr_Acc(PaymentObj).FindAndOpenSysAccount( "ВнебалКартотекаКорсчета", 0, {curdate} );
+    paymtr3.AccountReceiver = NotBalCorrAcc_FirstDoc("П").FindAndOpenSysAccount( "ВнебалСчетКорресп",     0, {curdate} );
+    paymtr3.Date_Carry      = PaymentObj.ValueDate;
+    paymtr3.Department      = PaymentObj.Department;
+    paymtr3.Ground          = substr( "Постановка в картотеку документа/"+wlpmrmprop.Ground, 1, 210 );
+    paymtr3.Numb_Document   = PaymentObj.Number;
+    if( not paymtr3.Carry() )
+        MsgBox("Ошибка при актуализации платежа");
+        return 1;
+    end;
+
+    // Освободить все претензии по платежу
+    PaymentObj.FreeReserve( PaymentObj.PayerAccount, PaymentObj.Chapter, PaymentObj.PayerFIID );
+
+    PaymentObj.PropStatus     = PM_PROP_CARDFILE;
+
+    PaymentObj.CardFileKind   = WLD_CARD_OUT_CORSCH;
+    PaymentObj.CardFileDateIn = {curdate};  
+    /* если платеж создан по ЭСИД ФНС, сформируем по нему подтверждение для ФНС */
+    var InitialPaymentID = GetInitialPaymentExecOrder();
+
+    if( InitialPaymentID > 0 )
+
+        var ErrList = RsbWlError(0);
+        var wlerr_buf = TRecHandler("wlerror.dbt");
+        wlerr_buf.rec.Code         = "34";
+        wlerr_buf.rec.Description  = "Поручение налогового органа № "+ PaymentObj.Number + " от " + PaymentObj.Date + " на сумму " + PaymentObj.BaseAmount + 
+                                     " не может быть исполнено в установленный срок в связи с отсутствием (недостаточностью) денежных средств на корреспондентском счете банка (филиала банка)";
+        ErrList.Insert( wlerr_buf );
+
+        /* Связанное входящее сообщение платежа */
+        if( not ПолучитьСообщение( InitialPaymentID, OBJTYPE_PAYMENT, 1/*WLD_MES_IN*/, wlmes, NULL ) )
+            ClearRecord( wlmes );
+        end;
+
+        /* Параметры создаваемого УО */
+        var ResultID = 0;
+        var ErrCode = 9; /*Электронный документ налогового органа не может быть исполнен банком*/
+        var ErrDescription; GetElementAndNoteLLVALUES( OBJTYPE_WLRESCODE_MNS, ErrCode, NULL, ErrDescription );
+        /* Вставка подтверждения банка в базу данных */
+        if( not ВставитьПодтверждениеБанкаФНС( wlmes, ErrCode, ErrDescription, ErrList, "", -1, 0, "", "", -1, 0, "", "", ResultID ) )
+            std.msg( "Ошибка при вставке подтверждения банка" );
+            return 1;
+        end;
+    end;
+    return 0;
+end;
+
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+    var stat = 0;
+
+    //Gurin S. 26.03.2015 HF2031_19_25_148
+    if( ( errTrn == 0 ) and ( message == 1 ) )// на выполнении шага
+      if (PaymentObj.DocKind == PS_PAYORDER)
+        var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+        var Narrative : string = 
+          "Невозможность завершить перевод денежных средств на основании распоряжения " +
+          "в установленный срок по причине недостаточности денежных средств " +
+          "на корреспондентском счете (субсчете) кредитной организации (ее филиала), " +
+          "открытом в Банке России, кредитная организация уведомляет о помещении " +
+          "инкассового поручения Банком России в очередь неисполненных в срок " +
+          "распоряжений и о приеме инкассового поручения к исполнению";
+        var Queries : string = "InfoCode:9";
+        CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step);
+      end;
+    end;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

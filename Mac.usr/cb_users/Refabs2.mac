@@ -1,0 +1,579 @@
+
+/************************************************************************/
+/*          Автоматизированная банковская система RS-Bank v6.0          */
+/*                                                                      */
+/*               Copyright (c) R-Style Ukraine                          */
+/*                                                                      */
+/*  Имя файла        : Refabs2.mac                                      */
+/*                                                                      */
+/*  Описание         : Макрос печати справки об отсутствии картотеки2   */
+/*                                                                      */
+/*  Программист      : Новиков С. С.                                    */
+/*                                                                      */
+/*  Создан           : 29.07.2008                                       */
+/*                                                                      */
+/*  Модифицирован1   : 30.07.2008                                       */
+/*                                                                      */
+/*  Модифицирован2   : 31.07.2008                                       */
+/*                                                                      */
+/*  Модифицирован3:  VV  10.04.2013 C-18454 - Доработка справки о К2    */
+// KS  25.11.2013 Адаптация под 31ю сборку
+// EVG 09.06.2015 Справка доработана для банков группы
+/************************************************************************/
+
+import globals, oralib, likepy, repforms, KeyCodes, WordIntf, PTInter, rsexts, FIInter, CurrInter, RsbDataset, "fg_Life_parm.mac";
+
+// EVG 10/6/2015
+import "Pm_Common.mac";
+
+import "or_tools.mac"; // KS 03.12.2010 I-097083 Макрос с функцией получения имени месяца в родительном падеже
+
+private macro CreateWordApplication()
+
+var startAX, WordApplication;
+
+  if (isStandAlone())
+     return ActiveX("Word.Application");
+  else
+     startAX = CreateObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone());
+     WordApplication = startAX.CreateComObject("Word.Application");
+     WordApplication.Visible = false;
+     return WordApplication;
+  end;
+
+end;
+
+private macro ShowReportOnTerminal( WordApp, WordDoc )
+  
+  var DocFileName : string, TermFileName : string;
+
+  DocFileName = SplitFile( GetTxtFileName("") );
+
+  DocFileName = MergeFile( DocFileName, "fm_prn_" + string(UserNumber), ".doc" );
+
+  DocFileName = MergeFile( GetCurDir(), DocFileName );
+
+  WordApp.visible = true; 
+end;
+
+/* EVG Ранее была описана в repforms.mac, но потом закомментирована там из-за переопределения
+   в АРМ. */
+private MACRO GetClientByAccount(account,chapter,code)
+private var rsc:object = Null, str="";
+
+    str=string(" select t.* from daccount_dbt t where t.t_chapter=",chapter," and t.t_account='",account,"' and t.t_code_currency=",code);    
+    rsc=execSQLselect(str);
+    if( rsc.moveNext())
+      return rsc.value("t_client");
+    else
+        msgbox ("Счет ",account," по главе ",chapter," не найден ");
+        return 0;
+    end;
+
+END;
+
+
+/* EVG 10/6/2015 Функция получает остаток счёта процедурой rsi_rsb_account.restall() */
+MACRO GetRest_rsi( pAccount, pChapter, pCur, pDate )
+   var cmd, rs;
+
+   cmd = RsdCommand( " SELECT rsi_rsb_account.restall( ?, ?, ?, ? ) FROM dual " );
+   cmd.AddParam( "", RSDBP_IN, pAccount );
+   cmd.AddParam( "", RSDBP_IN, pChapter );
+   cmd.AddParam( "", RSDBP_IN, pCur     );
+   cmd.AddParam( "", RSDBP_IN, pDate    );
+
+   rs = RsdRecordSet( cmd );
+   if( rs and rs.MoveNext() )
+      return ABS( rs.value( 0, null, V_MONEY ) );
+   end;
+
+   return 0;
+END;
+
+
+/*Главный макрос по созданию отчета Справка об отсутствии картотеки 2*/
+MACRO Ref2AccDialog(Acc,Branch, Client, accdate, accclose,acbalance,chapter,code, NumOper) 
+   var data_report = "";
+   var Templ:string = "";
+   var Account = "";
+
+   var path = "",
+    pathfile = "",
+    filen = "RSU.lbr";
+
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+    pathfile = FindPath(filen,path);
+        if (not pathfile)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+    var dlg = TRecHandler("Sprabs2",pathfile,True);
+
+/*
+   record office(ptoffice);
+   record superior(ptoffice);
+*/
+   
+   /*Процедура заполнения данными шаблона MSWord*/
+   MACRO PrintSprAcc()
+      
+      var WordApp, WordDoc, tbl;
+
+      const RSL_Bank_name   = "Bank_name";
+      const RSL_Client_name = "Client_name";
+      const RSL_Client_INN  = "Client_INN";
+      const RSL_Date_report = "Date_report"; 
+      const RSL_Depart_name = "Depart_name";
+      const RSL_Chief_name  = "Chief_name";
+      const RSL_Day         =  "day";
+      const RSL_Mon         =  "mon";
+      const RSL_Year        =  "year";
+      const RSL_Account="Account";   //VV  10.04.2013 C-18454 - Доработка справки о К2  
+          
+      var RegParam:string = "";
+      var rsc:object = null;
+      var select:string = "";
+      var flagstat = false;
+      var temppath = "";
+      var ClientName:string = "";
+      var DepartName:string = "";
+      var OfficerName:string = "";
+      var  rsc1:object = Null, str="";
+      var chset;
+
+      var day = "",mon = "",year = "";
+
+      ClientName = GetClientName(Client);
+      DepartName = GetOfficerPost(Branch);
+      OfficerName= GetOfficerName(Branch);
+
+      // EVG 11/6/2015 Функция проверяет, обрабатывался ли уже этот счёт
+      var ProcessedAccounts = TArray();
+      MACRO CheckProcAccounts( pAcc )
+         var i = 0;
+         while( i < ProcessedAccounts.Size() )
+            if( ProcessedAccounts(i) == pAcc )
+               return false;
+            end;
+            i = i + 1;
+         end;
+
+         ProcessedAccounts( ProcessedAccounts.Size() ) = pAcc;
+         return true;
+      END;
+
+
+      /* Если не получили данных по основным значениям - то не печатаем ничего вообще */
+      if ( (ClientName != 0) and (DepartName != 0) and (OfficerName != 0) )
+
+         /* EVG 9/6/2015 Не совсем понятен смысл такого решения. Сделал запросы, возвращающие сумму К2 и КОР по 
+            всем счетам клиента (специально так сделал, потому что такова постановка).
+
+         str = string(" select t.t_account from daccount_dbt t where t.t_chapter='",chapter,"'"+ "and t.t_client = '"+Client+"'"+"and t.t_account='"+account+"'");   //R-213847 VV 04.07.2013 
+         rsc = execSQLselect(str);
+         while (rsc.moveNext())
+            if (valtype(rsc.value("t_account")) != V_UNDEF) 
+               chset = rsc.value("t_account");
+               str=string(" select t.t_account, t.t_placedate from dpsinprop_dbt t where t.t_chapter=",chapter," and t.t_account='",chset,"'","and t.t_placedate <='",data_report,"'");    
+               rsc1=execSQLselect(str);
+               while (rsc1.moveNext())
+                  if ((valtype(rsc1.value("t_account")) != V_UNDEF) and (valtype(rsc1.value("t_placedate")) != V_UNDEF))
+                     if ((rsc1.value("t_account") != "") and (rsc1.value("t_placedate") != ""))
+                        flagstat = true;
+                     end;
+                  end;
+               end;
+            end; 
+         end;*/
+
+         var rs, cmd;
+         var RestI2   = $0,
+             RestIWP  = $0,
+             RestICur = $0;
+         var CurTemplate = "", first = true;
+
+         /* EVG 10/6/2015 Такой вариант не подходит, т.к. позволяет получить только текущий
+            остаток по картотекам. Для того, чтобы получать правильный остаток на дату, необходимо
+            брать остаток по лицевому счёту 90901 и 90902.
+
+         // K2
+         cmd = RsdCommand( " SELECT NVL(SUM( pm.t_futurebaseamount ), 0)                "
+                           "   FROM dpsinprop_dbt ind, dpmpaym_dbt pm, daccount_dbt acc "
+                           "  WHERE acc.t_chapter       = ?                             "
+                           "    AND acc.t_code_currency = ?                             "
+                           "    AND acc.t_client        = ?                             "
+                           "    AND ind.t_chapter       = acc.t_chapter                 "
+                           "    AND ind.t_fiid          = acc.t_code_currency           "
+                           "    AND ind.t_account       = acc.t_account                 "
+                           "    AND ind.t_paymentid     = pm.t_paymentid                " );
+         cmd.AddParam( "", RSDBP_IN, chapter );
+         cmd.AddParam( "", RSDBP_IN, code    );
+         cmd.AddParam( "", RSDBP_IN, client  );
+         rs = RsdRecordSet( cmd );
+         if( rs and rs.MoveNext() )
+            RestI2 = rs.Value( 0, null, V_MONEY );
+         end;
+
+         // КОР
+         cmd = RsdCommand( " SELECT NVL(SUM( iwp.t_sum ), 0)                  "
+                           "   FROM dpsiwpacc_dbt iwp, daccount_dbt acc       "
+                           "  WHERE acc.t_chapter       = ?                   "
+                           "    AND acc.t_code_currency = ?                   "
+                           "    AND acc.t_client        = ?                   "
+                           "    AND iwp.t_chapter       = acc.t_chapter       "
+                           "    AND iwp.t_fiid          = acc.t_code_currency "
+                           "    AND iwp.t_account       = acc.t_account       " );
+         cmd.AddParam( "", RSDBP_IN, chapter );
+         cmd.AddParam( "", RSDBP_IN, code    );
+         cmd.AddParam( "", RSDBP_IN, client  );
+         rs = RsdRecordSet( cmd );
+         if( rs and rs.MoveNext() )
+            RestIWP = rs.Value( 0, null, V_MONEY );
+         end;
+
+         if( ( RestI2 > $0 ) or ( RestIWP > $0 ) )
+            flagstat = true;
+         end;
+         */
+
+         var AccRec    = TRecHandler( "account.dbt" ),
+             AccI2Rec  = TRecHandler( "account.dbt" ),
+             AccIWPRec = TRecHandler( "account.dbt" );
+
+         /* EVG 11/6/2015 Неправильно брать только связанный со счётом под курсором счёт. Нужно проверять все счета клиента.
+         AccRec.Clear();
+         AccRec.rec.Account       = Acc;
+         AccRec.rec.Code_Currency = Code;
+         AccRec.rec.Chapter       = Chapter;*/
+         cmd = RsdCommand( " SELECT t_account, t_code_currency, t_chapter "
+                           "   FROM daccount_dbt                          "
+                           "  WHERE t_client       = ?                    "
+                           "    AND t_chapter      = 1                    "
+                           "    AND t_account like '40%'                  " // Анализируем только расчётные счета
+                           "    AND t_open_close  <> 'З'                  " );
+         cmd.AddParam( "", RSDBP_IN, Client );
+         rs = RsdRecordSet( cmd );
+         while( rs and rs.MoveNext() )
+            // Для удобства сохраним параметры счёта в структуре AccRec
+            AccRec.Clear();
+            AccRec.rec.Account       = rs.value( 0, null, V_STRING  );
+            AccRec.rec.Code_Currency = rs.value( 1, null, V_INTEGER );
+            AccRec.rec.Chapter       = rs.value( 2, null, V_INTEGER );
+
+            if( GetLinkedObject( OBJROLE_ACC_I2OBACC, OBJTYPE_ACCOUNT, UniID( AccRec, OBJTYPE_ACCOUNT ), OBJTYPE_ACCOUNT, AccI2Rec ) == 0 )
+               /* RestA() использовать невозможно, т.к. из-за него портится номер счёта в скроллинге (подставляет 90902).
+               RestI2 = ABS( RestA( AccI2Rec.rec.Account, Data_Report, NULL, AccI2Rec.rec.Chapter ) );*/
+
+               // Если счёт ещё не обработан
+               if( CheckProcAccounts( AccI2Rec.rec.Account ) )
+                  RestI2 = RestI2 + GetRest_rsi( AccI2Rec.rec.Account, AccI2Rec.rec.Chapter, AccI2Rec.rec.Code_Currency, Data_Report );
+               end;
+            end;
+
+            if( GetLinkedObject( OBJROLE_ACC_IWPOBACC, OBJTYPE_ACCOUNT, UniID( AccRec, OBJTYPE_ACCOUNT ), OBJTYPE_ACCOUNT, AccIWPRec ) == 0 )
+               //RestIWP = ABS( RestA( AccIWPRec.rec.Account, Data_Report, NULL, AccIWPRec.rec.Chapter ) );
+
+               // Если счёт ещё не обработан
+               if( CheckProcAccounts( AccIWPRec.rec.Account ) )
+                  RestIWP = RestIWP + GetRest_rsi( AccIWPRec.rec.Account, AccIWPRec.rec.Chapter, AccIWPRec.rec.Code_Currency, Data_Report );
+               end;
+            end;
+
+         end;
+
+
+
+         /* EVG 11/6/2015 Обработка счетов валютной картотеки 2 */
+
+         // Набираем коды валют для маски REGEXP
+         rs = RsdRecordSet( " select distinct( fi.t_iso_number )                     "
+                            "   from dfininstr_dbt fi                                "
+                            "  where exists( select 1 from daccount_dbt ac           "
+                            "                 where ac.t_code_currency = fi.t_fiid ) "
+                            "    and fi.t_fiid > 0                                   " );
+         while( rs and rs.MoveNext() )
+            if( first )
+               CurTemplate = rs.value( 0, null, V_STRING );
+            else
+               CurTemplate = CurTemplate + "|" + rs.value( 0, null, V_STRING );
+            end;
+
+            first = false;
+         end;
+
+         if( CurTemplate > "" )
+            cmd = RsdCommand( " SELECT t_account, t_code_currency, t_chapter                                   "
+                              "   FROM daccount_dbt                                                            "
+                              "  WHERE t_client = ?                                                            "
+                              "    AND t_open_close <> 'З'                                                     "
+                              "    AND regexp_like( t_account, '^90902810(\\d{1})1(" + CurTemplate + ")\\d' )  " );
+
+            cmd.AddParam( "", RSDBP_IN, Client );
+            rs = RsdRecordSet( cmd );
+            while( rs and rs.MoveNext() )
+               // Для удобства сохраним параметры счёта в структуре AccRec
+               AccRec.Clear();
+               AccRec.rec.Account       = rs.value( 0, null, V_STRING  );
+               AccRec.rec.Code_Currency = rs.value( 1, null, V_INTEGER );
+               AccRec.rec.Chapter       = rs.value( 2, null, V_INTEGER );
+
+               RestICur = RestICur + GetRest_rsi( AccRec.rec.Account, AccRec.rec.Chapter, AccRec.rec.Code_Currency, Data_Report );
+            end;
+
+         end;
+         // EVG 11/6/2015 end
+
+
+         // Валютная картотека учитывается вместе с обычной
+         RestI2 = RestI2 + RestICur;
+
+
+
+         if( ( RestI2 > $0 ) or ( RestIWP > $0 ) )
+            flagstat = true;
+         end;
+
+         // EVG 9/6/2015 END
+
+
+         
+         GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+
+         if (flagstat) 
+            //VV  10.04.2013 C-18454 - Доработка справки о К2 >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            var fgBank = fg_life_subject({OurBank});
+
+            /* EVG 9/6/2015 Теперь справка о наличии К2 / КОР формируется для всех банков, кроме Пробы.
+            if( (fgBank.is_EXV_Voronezh) or (fgBank.is_EXV_Volgograd) or (fgBank.is_EXV_Stavropol)or (fgBank.is_EXV_Ulyanovsk)or (fgBank.is_EXV) )*/
+            if( not fgBank.is_PRBB )
+
+               if ((fgBank.is_EXV_Voronezh) and (fgBank.is_EXV))
+                  Templ= "RefAbs2_zadol_vor.dot";
+               elif ((fgBank.is_EXV_Volgograd) and (fgBank.is_EXV))
+                  Templ = "RefAbs2_zadol_volg.dot";
+               elif ((fgBank.is_EXV_Stavropol) and (fgBank.is_EXV))
+                  Templ = "RefAbs2_zadol_stav.dot"; 
+               elif ((fgBank.is_EXV_Ulyanovsk)and (fgBank.is_EXV))
+                  Templ = "RefAbs2_zadol_ul.dot";
+               elif (fgBank.is_EXV)            
+                  Templ ="RefAbs2_zadol_sar.dot"; 
+               // EVG 9/6/2015 Добавлено для ВУЗ, ГЭБ, Пойдём, НБС и Солидарности
+               elif (fgBank.is_VUZ)
+                  Templ ="Ind2IWPExist.dot"; 
+               elif (fgBank.is_GEB)
+                  Templ ="Ind2IWPExist_geb.dot"; 
+               elif (fgBank.is_GO)
+                  Templ ="Ind2IWPExist_go.dot"; 
+               elif (fgBank.is_NBS)
+                  Templ ="Ind2IWPExist_nbs.dot"; 
+               elif (fgBank.is_SLD)
+                  Templ ="Ind2IWPExist_sld.dot"; 
+               end;
+
+               DateSplit({curDate},day,mon,year);
+               temppath = findpath(Templ,RegParam);
+               WordApp = CreateWordApplication();  
+           
+               if( WordApp )
+                  WordDoc = WordApp.Documents.Add( temppath );
+                  if( WordDoc )
+
+                     // EVG 10/6/2015 Добавил для вывода в шапку (дата в шапке есть во всех шаблонах, кроме ЭВ (всех ЭВ))
+                     //WordApp.Visible = TRUE;
+                     if( not fgBank.is_EXV )
+                        WordDoc.Bookmarks("day").Range.Text       =  mkstr( "0", 2 - strlen(string(day)) ) + day;
+                        WordDoc.Bookmarks("mon").Range.Text       =  mkstr( "0", 2 - strlen(string(mon)) ) + mon;
+                        WordDoc.Bookmarks("year").Range.Text      =  year;
+                     end;
+
+                     WordDoc.Bookmarks("Client_name").Range.Text  =  ClientName;
+
+                     // EVG 10/6/2015 Oper_name только для ГЭБ, ЭВ и ВУЗ. Аналогично и дата в конце
+                     if( fgBank.is_GEB or fgBank.is_EXV or fgBank.is_VUZ )
+                        WordDoc.Bookmarks("Oper_name").Range.Text    =  GetOperName({oper});
+                        WordDoc.Bookmarks("day_b").Range.Text        =  mkstr( "0", 2 - strlen(string(day)) ) + day;
+                        WordDoc.Bookmarks("mon_b").Range.Text        =  mkstr( "0", 2 - strlen(string(mon)) ) + mon;
+                        WordDoc.Bookmarks("year_b").Range.Text       =  year;
+                     end;
+
+                     /* EVG 9/6/2015 Убрал вывод счёта, справка выводится по информации со всех счетов клиента.
+                     WordDoc.Bookmarks("Account").Range.Text      =  Acc; */
+                     WordDoc.Bookmarks("Bank_name").Range.Text    =  {Name_Bank};
+                     WordDoc.Bookmarks("Date_report").Range.Text  =  data_report;
+                     WordDoc.Bookmarks("Client_INN").Range.Text   =  GetPartyINN(Client, 0);
+
+                     // EVG 9/6/2015 Добавлено
+                     //debugbreak;
+                     WordDoc.Bookmarks("Amount_i2").Range.Text    =  RestI2 + GetFICode( AccI2Rec.rec.Code_Currency, null, FICK_ISOSTRING );
+                     WordDoc.Bookmarks("Amount_iwp").Range.Text   =  RestIWP + GetFICode( AccIWPRec.rec.Code_Currency, null, FICK_ISOSTRING );
+
+                     // EVG 10/6/2015 Для Пойдём, НБС и Солидарности внизу печатаются Chief_name и Depart_name
+                     if( fgBank.is_GO or fgBank.is_NBS or fgBank.is_SLD )
+                        WordDoc.Bookmarks("Chief_name").Range.Text   =  OfficerName; 
+                        WordDoc.Bookmarks("Depart_name").Range.Text  =  DepartName;
+                     end;
+
+                     if( IsStandAlone() )
+                         WordApp.Visible = TRUE;
+                     else
+                         ShowReportOnTerminal( WordApp, WordDoc );
+                     end; 
+
+                  end; /*if( WordDoc )*/
+               end;/*if( WordApp )*/    
+            else
+               msgbox ("По cчетам клиента ",ClientName," по состоянию на ",date(rsc1.value("t_placedate")) ," есть расчетные документы в картотеке №2 (расчетные документы, не оплаченные в срок)! ");                  
+            end; //if эв или филиалы эв
+            //VV  10.04.2013 C-18454 - Доработка справки о К2 <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<           
+
+         else
+
+            /* Разбиение даты текущего операционного дня на день, месяц, год */
+            DateSplit({curDate},day,mon,year);
+            // GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+            var fgBank_1=fg_life_subject({OurBank});
+            if ((dlg.rec.button == "X") and ((fgBank_1.is_PRBB) or (fgBank_1.is_GEB)))
+                Templ = "RefAbs2Dkb.dot";
+            else
+                Templ = "RefAbs2.dot";   
+            end;
+            temppath = findpath(Templ,RegParam);
+            
+            WordApp = CreateWordApplication();
+            //debugbreak;
+
+            if( WordApp )
+                   WordDoc = WordApp.Documents.Add( temppath );
+                   if( WordDoc )
+                       var fgBank11 = fg_life_subject({OurBank}); // KS 10.08.2010 Для разных банков немного по разному надо работать с шаблоном
+                       WordDoc.Bookmarks("Client_name").Range.Text  =  ClientName;
+                            if (( fgBank11.is_GEB ) or ( fgBank11.is_VUZ ) or ( fgBank11.is_EXV )) // KS 10.08.2010 14.09.2010 I-065231 Нижняя дата для ГЭБ и ВУЗ
+                                  WordDoc.Bookmarks("Oper_name").Range.Text    =  GetOperName({oper});
+                                  WordDoc.Bookmarks("day_b").Range.Text        =  mkstr( "0", 2 - strlen(string(day)) ) + day;
+                                  WordDoc.Bookmarks("mon_b").Range.Text        =  mkstr( "0", 2 - strlen(string(mon)) ) + mon;
+                                  WordDoc.Bookmarks("year_b").Range.Text       =  year;
+                            else  // KS 10.08.2010 Для ГЭБ и ВУЗ не требуется
+                                  WordDoc.Bookmarks("Chief_name").Range.Text   =  OfficerName; 
+                                  WordDoc.Bookmarks("Depart_name").Range.Text  =  DepartName;
+                            end;
+                       WordDoc.Bookmarks("Bank_name").Range.Text    =  {Name_Bank};
+                       WordDoc.Bookmarks("Date_report").Range.Text  =  data_report;
+                       WordDoc.Bookmarks("Client_INN").Range.Text   =  GetPartyINN(Client, 0);
+                            if (not fgBank11.is_EXV ) 
+                                   if(fgBank11.is_PRBB )
+                                        WordDoc.Bookmarks("day").Range.Text          =  day;
+                                    else
+                                        WordDoc.Bookmarks("day").Range.Text          =  mkstr( "0", 2 - strlen(string(day)) ) + day; // KS 03.12.2010 I-097083 День с нулем
+                                    end;
+                               WordDoc.Bookmarks("mon").Range.Text          =  MonNameR(mon);                               // KS 03.12.2010 I-097083 Месяц в родительном падеже
+                               WordDoc.Bookmarks("year").Range.Text         =  year;
+                            end;
+
+                           if( IsStandAlone() )
+                               WordApp.Visible = TRUE;
+                           else
+                               ShowReportOnTerminal( WordApp, WordDoc );
+                           end; 
+
+                   end; /*if( WordDoc )*/
+            end;/*if( WordApp )*/
+
+         end;
+      end;
+
+       OnError(Err)
+          MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module,
+                "ActiveX Err:",Err.AXMes);     
+
+   END;
+
+      /*Обработчик диалоговой панели ввода исходных данных для печати*/
+   MACRO Event (dlg, cmd, id, key)
+  
+              
+   var mess = "~F2~ Продолжить  ~ESC~ Выход ";
+        if (cmd == DLG_INIT)
+         dlg.rec.Acc       = Acc;   
+         dlg.rec.date_report = {curdate};
+         UpdateFields(dlg); 
+      end;
+      
+      if (cmd==DLG_SETFOCUS)
+        message(mess);        
+      end;
+      
+      if (cmd == DLG_REMFOCUS)
+        if (FldName(dlg,id)=="Acc")
+           if (StrLen(dlg.rec.acc) < 20)
+              MsgBox("Длина счета менее 20 символов");
+              return CM_CANCEL;
+           elif (not GetAccount(StrSubst(dlg.rec.acc, "'", "")))
+              MsgBox("Счет отсутствует в справочнике лицевых счетов");
+              return CM_CANCEL;
+           else
+              Client = GetClientByAccount(dlg.rec.acc, Chapter, Code);
+              Branch = GetBranchByAccount(dlg.rec.acc, Chapter, Code);
+           end;
+        elif (FldName(dlg,id)=="date_report")
+           if ( dlg.rec.date_report > {curdate} )
+              MsgBox("Дата отчета больше даты текущего операционного дня"); 
+              return CM_CANCEL;
+           end;
+        end;
+        UpdateFields(dlg); 
+      end; 
+
+      if (cmd==DLG_KEY)
+        if (KEY==KEY_ESC)
+           return CM_CANCEL;
+                                   
+        elif ( KEY==KEY_F2 )
+           Account = dlg.rec.acc;
+           data_report = dlg.rec.date_report;             
+        /*   var fgBank = fg_life_subject({OurBank}); // KS 10.08.2010 I-058375 Шаблон ДБК нужен только для ПРББ  
+  
+             
+           if ((dlg.rec.button == "X") and ((fgBank.is_PRBB) or (fgBank.is_GEB)))
+                Templ = "RefAbs2Dkb.dot";
+            else
+                Templ = "RefAbs2.dot" ;   
+                end;*/
+              
+           if (strlen(string(data_report)) == 0)
+             MsgBox("Не указана дата отчета");
+             Setfocus(dlg,1);
+             return CM_IGNORE;
+           end;
+
+           /*Отчет печатается при корректных параметрах*/
+           if ((strlen(Account) == 20) and (GetAccount(StrSubst(dlg.rec.acc, "'", ""))) 
+              and (strlen(string(data_report)) != 0) and ( dlg.rec.date_report <= {curdate} ))
+             
+             Return CM_SAVE;
+           else
+             
+             MsgBox("Не все поля заполнены или корректны!");
+           end;
+
+       elif (KEY==KEY_SPACE)
+            if(FldName(dlg,id)=="button")
+                if (dlg.rec.button == "")
+                    dlg.rec.button = "X";
+                else
+                    dlg.rec.button = "";
+                end;
+            end;
+        elif ( (KEY==KEY_ENTER) and (FldName(dlg,id)=="date_report") )
+           SetFocus(dlg, 0);
+           Return CM_IGNORE;
+        end;
+      end;
+   END;
+
+  if ( RunDialog(dlg, "Event"))
+     PrintSprAcc();
+  end;
+exit(1);
+
+END;

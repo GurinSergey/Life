@@ -1,0 +1,400 @@
+
+import sfcommon, InsCarryDoc, OprInter, PaymInter, SFInter, CurrInter, pm_opr, sfgetcat;
+
+const BankNameLen = 140;
+
+
+/* EVG 28/11/2013 Перенесено сюда из sfpaym.mac, т.к. сюда переехала функция SfFillPayment() */
+var InsolventState;
+//RR Проверка на наличие признака банкротства(<) в пользовательском типе счета
+//24.07.2014 Добавлена проверка на признак №
+//29.07.2014 Убрал проверку на признак №
+Macro CheckInsolvent (account)
+ var rs,cmd,sqwyrt;
+ debugbreak;
+ sqwyrt = "    SELECT   1 "
++"\n             FROM   daccount_dbt acc "
++"\n            WHERE       ACC.T_CHAPTER = 1 "
++"\n                    AND INSTR (ACC.T_USERTYPEACCOUNT, '<') != 0 "
+//+"\n                    AND (INSTR (ACC.T_USERTYPEACCOUNT, '<') != 0 "
+//+"\n                         OR INSTR (ACC.T_USERTYPEACCOUNT, '№') != 0 )"
++"\n                    AND ACC.T_ACCOUNT = :acc";
+ cmd = RSDCommand(sqwyrt);
+ cmd.AddParam("acc", RSDBP_IN, account);
+ rs  = RSDRecordSet (cmd);
+ if (rs and rs.movenext())
+   return true;
+ else
+   return false;
+ end
+end;
+/* EVG 28/11/2013 end */
+
+class TSfPayParams
+  var payDate; //дата оплаты
+  var ground = "";  //основание
+  var paySum = $0;  //сумма в валюте FIID
+  var taxSum = $0;  //НДС в валюте FIID
+  var FIID = -1; 
+  var primKind = 0; //тип первички KIND_OF_DOC
+  var primID = 0;   //ID первички
+  var objectType = 0; //вид объекта
+  var objectBuf = null;  //объект
+  var payMethod;
+  var SfComPD = null;    // для единовременных и период объект класса SfConComPrimDoc, для разовых - SfSingDfPrimDoc
+  var IsIncluded = null;
+  var isNVPI = false;
+  var FacturaID = 0;
+  
+  var payFIID = -1;
+  var feeType = 0;
+  var objectID = 0;
+  var PlusCalc_Account = null;
+  var PlusCalcNDS_Account = null;
+  var MinusNdsAcrual_Account = null;
+  var MinusNDS_Account = null;
+  var PreAcptID = 0;
+
+  macro correctSums( sfcomiss )
+    var rateType = sfcomiss.Ratetype;
+    payFIID = FIID;
+    if( objectType == OBJTYPE_SFINVOICE )
+      objectID = objectBuf.InvoiceID;
+      rateType = objectBuf.PayRateID;
+      payFIID = objectBuf.payFIID;
+    else
+      objectID = objectBuf.ID;
+      if( sfcomiss.FIID_paySum != -1 )
+        payFIID = sfcomiss.FIID_paySum;
+      end;
+    end;
+
+    if( FIID != payFIID )
+      ConvSum( paySum, paySum, payDate, FIID, payFIID, Ratetype );
+      ConvSum( taxSum, taxSum, payDate, FIID, payFIID, Ratetype );
+    end;
+  end;
+
+  macro getPlusCalcAccounts( sicredit )
+    var CalcCatCode:string, CalcNDSCatCode:string;
+
+    if( (IsIncluded != NULL) AND (IsIncluded == "X") )
+      if((SfComPD != NULL) AND (isNVPI != NULL))
+        if( isNVPI == true )
+          CalcCatCode = PlusCalcNVPI_CatCode;
+          CalcNDSCatCode = PlusCalcNDS_NVPI_CatCode;
+        else
+          CalcCatCode = PlusCalc_CatCode;
+          CalcNDSCatCode = PlusCalcNDS_CatCode;
+        end;
+
+        if((feeType == SF_FEE_TYPE_PERIOD) AND (objectID > 0))
+          PlusCalc_Account = SfComPD.GetDefComSfSiAccount( objectID, CALC_SFSI_KIND, CalcCatCode, date, payFIID );
+          PlusCalcNDS_Account = SfComPD.GetDefComSfSiAccount( objectID, CALCNDS_SFSI_KIND, CalcNDSCatCode, date, payFIID );
+        else
+          PlusCalc_Account = SfComPD.FindAndOpenAccount( CalcCatCode, payDate, payFIID );
+          PlusCalcNDS_Account = SfComPD.FindAndOpenAccount( CalcNDSCatCode, payDate, payFIID );
+        end;
+      end;
+
+      /*Если счета начисления НДС "+Расчеты НДС, НВПИ"/"+Расчеты НДС" и комиссии "+Расчеты, НВПИ"/"+Расчеты" совпадают 
+      и комиссия облагается НДС (DOPRSFCOM_DBT.T_SUMNDS > 0),*/
+      if( (PlusCalcNDS_Account == PlusCalc_Account) AND (taxSum > 0) )
+        sicredit.Rec.Account = PlusCalc_Account;
+        sicredit.Rec.FIID = payFIID;        
+      else
+        if( taxSum > 0 )
+          sicredit.Rec.Account = PlusCalc_Account;
+          sicredit.Rec.FIID = payFIID;
+          sicredit.Rec.ReceiverNDSAccount = PlusCalcNDS_Account;
+        else
+          sicredit.Rec.Account = PlusCalc_Account;
+          sicredit.Rec.FIID = payFIID;
+        end;
+      end;
+    end;
+  end;
+
+end;
+
+private macro getMinusNDSAccount( sfcomiss, payParams:TSfPayParams, DprtID:@integer )
+
+  var MinusNDSAccount:string = "";
+  DprtID = {OperDprt};
+  record AccountRec( account );
+  file SfContr( "sfcontr.dbt") key 0;
+
+  if((payParams.MinusNds_Account == NULL) OR ((payParams.MinusNds_Account == "")) )
+    if( (payParams.primKind == SFCONTR_DOC) AND (payParams.primID > 0) )
+      SfContr.Id = payParams.primID;
+      if( getEQ( SfContr ) )
+        DprtID = SfContr.Department;
+        MinusNDSAccount = SfGetCatAccount( SfContr, NATCUR, "-НДС", null, true );
+      end;
+    end;
+
+    if( MinusNDSAccount == "" )
+      SfGetCategoryAccount( sfcomiss, OBJROLE_SFCOMISS_TAX_ACC, AccountRec, DprtID );
+      MinusNDSAccount = AccountRec.Account;
+    end;
+  else
+    MinusNDSAccount = payParams.MinusNds_Account;
+  end;
+
+  return MinusNDSAccount;
+end;
+
+private macro SfPayConvSum( SumTo:@money, SumFrom, convDate, FIID_From, FIID_To )
+  if( ConvSum( SumTo, SumFrom, convDate, FIID_From, FIID_To, 0 ) != 0 )
+    MsgBox( "Не найден основной курс ",ПолучитьКодФинИн(FIID_From), " относительно ",ПолучитьКодФинИн(FIID_To), " за ", convDate );
+    return 1;
+  else
+    return 0;
+  end;
+end;
+
+private macro GetAccountDprtParm( Account, Chapter, FIID, DprtID:@integer, Branch:@integer )
+  record AccountRec ("account");
+  if( SfCommon_GetAccount(AccountRec, Account, FIID, Chapter) == true )
+    DprtID = AccountRec.Department;
+    if( Branch )
+      Branch = AccountRec.Branch;
+    end;
+  end;
+end;
+
+private macro InsertPmAddPI( Paym, sidebet, sicredit, sfcomiss, payParams:TSfPayParams, paySumInPmFIID, taxSumInPmFIID )
+  
+  var pmaddpi    = TRecHandler("pmaddpi.dbt");
+  var pmaddpiNDS = TRecHandler("pmaddpi.dbt");
+  ClearRecord( pmaddpi    );
+  ClearRecord( pmaddpiNDS );    
+
+  pmaddpi.Rec.DebetCredit = PRT_Credit;
+  pmaddpi.Rec.PMFIID      = sidebet.Rec.FIID;
+  pmaddpi.Rec.PMAmount    = paySumInPmFIID;
+
+  pmaddpi.Rec.FIID        = sicredit.rec.FIID;
+
+  if( SfPayConvSum( @pmaddpi.Rec.Amount, payParams.paySum, payParams.PayDate, payParams.payFIID, pmaddpi.Rec.FIID ) != 0 )
+    return 1;
+  end;
+ 
+  pmaddpi.Rec.Account     = sicredit.Rec.Account;
+  pmaddpi.Rec.Chapter     = 1/*CHAPT1*/;
+
+  /* EVG 28/11/2013 Из старого макроса: назначение проводок оплаты комиссии берётся из платежа.
+  pmaddpi.Rec.Ground      = "Оплата комиссии " + sfcomiss.Code;*/
+  pmaddpi.Rec.Ground      = Paym.Ground;
+  // Корректировка назначения платежа комиссии
+  if( index( strUpr(Paym.Ground), strUpr("В том числе НДС") ) > 0 )
+     pmaddpi.Rec.Ground   = SubStr( Paym.Ground, 1, index(StrLwr(Paym.Ground), "в том числе ндс") - 3 );
+  elif( index( strUpr(Paym.Ground), "НДС") > 0 )
+     pmaddpi.Rec.Ground   = SubStr( Paym.Ground, 1, index(Paym.Ground, "НДС") - 1 );
+  end;
+  /* EVG 28/11/2013 end */
+
+  pmaddpi.Rec.Kind        = PMADDPI_KIND_SF;
+
+  Paym.Department = sicredit.Rec.Department;
+
+//  GetAccountDprtParm( pmaddpi.Rec.Account, pmaddpi.Rec.Chapter, pmaddpi.Rec.FIID, @Paym.Department );
+  pmaddpi.Rec.Department = Paym.StartDepartment = Paym.EndDepartment = Paym.Department;
+
+  pmaddpiNDS.Rec.DebetCredit = PRT_Credit;
+  pmaddpiNDS.Rec.PMFIID      = sidebet.Rec.FIID;
+  pmaddpiNDS.Rec.PMAmount    = taxSumInPmFIID;
+
+  var MinusNDSAccount:string = getMinusNDSAccount( sfcomiss, payParams, @pmaddpiNDS.Rec.Department );
+
+  if( sicredit.Rec.ReceiverNDSAccount == MinusNDSAccount )
+    pmaddpiNDS.Rec.FIID        = NATCUR;
+    if( SfPayConvSum(@pmaddpiNDS.Rec.Amount, payParams.taxSum, payParams.PayDate, payParams.payFIID, NATCUR) != 0 )    
+      return 1;
+    end;
+  else
+    pmaddpiNDS.Rec.FIID        = sicredit.rec.FIID;
+    if( SfPayConvSum( @pmaddpiNDS.Rec.Amount, payParams.taxSum, payParams.PayDate, payParams.payFIID, pmaddpiNDS.Rec.FIID ) != 0 )
+      return 1;
+    end;
+  end;
+  
+  pmaddpiNDS.Rec.Account     = sicredit.Rec.ReceiverNDSAccount;
+  pmaddpiNDS.Rec.Chapter     = 1/*CHAPT1*/;
+
+  /* EVG 28/11/2013 Из старого макроса: назначение проводок оплаты комиссии берётся из платежа.
+  pmaddpiNDS.Rec.Ground      = "НДС по комиссии " + sfcomiss.Code;*/
+  pmaddpiNDS.Rec.Ground      = Paym.Ground;
+  // Корректировка назначения платежа НДС
+  if( (index( strUpr(Paym.Ground), strUpr("В том числе НДС") ) == 0)
+       or( index(strUpr(Paym.Ground), "НДС") == 0) )
+     pmaddpiNDS.Rec.Ground   = "НДС. " + Paym.Ground;
+  end;
+  /* EVG 28/11/2013 end */
+
+  pmaddpiNDS.Rec.Kind        = PMADDPI_KIND_NDS;
+
+  if( Paym.PIList( PRT_Credit ).Insert( pmaddpi ) != 0 ) 
+    MsgBox( "Ошибка при вставке разноски по счету комиссии" );
+    return 1;
+  end;
+  
+  if( Paym.PIList( PRT_Credit ).Insert( pmaddpiNDS ) != 0 ) 
+    MsgBox( "Ошибка при вставке разноски по счету НДС" );
+    return 1;
+  end;
+
+  return 0;
+end;
+
+
+macro SfFillPaymentExt( Paym, sidebet, sicredit, sfcomiss, payParams:TSfPayParams, PmAmount )
+  
+  var taxSumInPmFIID = $0;
+  var paySumInPmFIID = $0;
+  var PayerAmount = $0;
+
+  /* EVG 28/11/2013 Перенесено из старого sfpaym.mac */
+  InsolventState = CheckInsolvent( sidebet.Rec.Account );
+
+
+  //PmAmount - not used?
+  if( sidebet.Rec.FIID != payParams.payFIID )
+    if( ConvSum( PayerAmount, payParams.paySum + payParams.taxSum, payParams.PayDate, payParams.payFIID, sidebet.Rec.FIID ) != 0 )
+      MsgBox( "Ошибка конвертации суммы" );
+      return 1;
+    end;
+
+    if( SfPayConvSum( @taxSumInPmFIID, payParams.taxSum, payParams.PayDate, payParams.payFIID, sidebet.Rec.FIID ) != 0 )
+      return 1;
+    end;
+
+    paySumInPmFIID = PayerAmount - taxSumInPmFIID;
+    /*
+    if( ConvSum( paySumInPmFIID, PmAmount, payParams.PayDate, payParams.payFIID, sidebet.Rec.FIID, 0 ) != 0 )
+      MsgBox("Не найден основной курс ",ПолучитьКодФинИн(FIID), " относительно ",ПолучитьКодФинИн(sidebet.Rec.FIID), " за ", PayDate);
+      return 1;
+    end;
+    */
+  else
+    PayerAmount = payParams.paySum + payParams.taxSum;
+    taxSumInPmFIID = payParams.taxSum;
+    paySumInPmFIID = payParams.paySum;
+  end;
+
+debugbreak;
+
+  Paym.SetPayerPI
+  ( 
+    PAYMENTS_GROUP_UNDEF,
+    sidebet.Rec.BankID,
+    sidebet.Rec.BankCodeKind,
+    sidebet.Rec.BankCode,
+    "", /*substr( sidebet.Rec.BankName, 1, BankNameLen ),*/
+    sidebet.Rec.CorrAcc,
+    sidebet.Rec.FIID,
+    1/*CHAPT1*/,
+    sidebet.Rec.Account,
+    sidebet.Rec.PartyID,
+    substr( sidebet.Rec.PartyName, 1, BankNameLen ),
+    sidebet.Rec.PartyINN,
+    sidebet.Rec.PartyCodeKind,
+    sidebet.Rec.PartyCode
+  );
+
+  if( (payParams.taxSum == 0) 
+    OR( (payParams.taxSum > 0) 
+        AND(payParams.PlusCalc_Account != NULL) AND (payParams.PlusCalcNDS_Account != NULL) 
+        AND(payParams.PlusCalc_Account != "") AND (payParams.PlusCalcNDS_Account != "") 
+        AND(payParams.PlusCalc_Account == payParams.PlusCalcNDS_Account) 
+      ) 
+    )
+    Paym.SetReceiverPI
+    ( 
+      PAYMENTS_GROUP_UNDEF,
+      sicredit.Rec.BankID,
+      sicredit.Rec.BankCodeKind,
+      sicredit.Rec.BankCode,
+      "", /*substr( sicredit.Rec.BankName, 1, BankNameLen ),*/
+      sicredit.Rec.CorrAcc,
+      sicredit.Rec.FIID,
+      1/*CHAPT1*/,
+      sicredit.Rec.Account);
+    Paym.SetReceiverAccount( sicredit.Rec.FIID, 1, sicredit.Rec.Account);
+  else
+    if( InsertPmAddPI(Paym, sidebet, sicredit, sfcomiss, payParams, paySumInPmFIID, taxSumInPmFIID) != 0 )
+      return 1;
+    end;
+  end;
+  
+  debugbreak;
+  //Paym.ReceiverCodeKind = sicredit.rec.bankcodekind;
+  
+  Paym.CryptoAction( string("Автоматическое_формирование_платежей") ); 
+  Paym.BaseFIID       = payParams.payFIID;
+
+  Paym.PayerAmount    = PayerAmount;
+  if( sicredit.Rec.FIID == payParams.payFIID )
+    Paym.ReceiverAmount = payParams.paySum + payParams.taxSum;
+  else
+    if( ConvSum( Paym.ReceiverAmount, payParams.paySum + payParams.taxSum, payParams.PayDate, payParams.payFIID, sicredit.Rec.FIID ) != 0 )
+      MsgBox( "Ошибка конвертации суммы" );
+      return 1;
+    end;
+  end;
+  
+  Paym.BaseAmount     = payParams.paySum + payParams.taxSum;
+  Paym.ValueDate      = 
+  Paym.Date           = payParams.PayDate;
+  Paym.PayerBankEnterDate = 
+  Paym.ClientDate         = {curdate};
+  Paym.IsPlanPaym     = "X";
+  Paym.PaymentKind    = "Э";
+  // 14.01.2015 joy R-527492 заполняем имя получателя даже если есть разноска
+  if (( (paym.receivername == "") or (paym.receivername == null) ) and (sicredit.Rec.partyid == {OurBank}) and (payParams.taxSum > 0) ) 
+        paym.receivername = {Name_Bank};
+        paym.receiverinn = {INN_Bank};
+  end;
+    
+
+  /* EVG 23/1/2014 С 14/12/2013 очередность по умолчанию 5 (R-302184).
+  Paym.Priority       = 6;*/
+  Paym.Priority       = 5;
+
+  /* EVG 28/11/2013 Перенесено из старого sfpaym.mac */
+  if( InsolventState )
+    Paym.Priority       = 4;
+  end;
+
+  return 0;
+end;
+
+macro SfFillPayment( Paym, sidebet, sicredit, sfcomiss, PayDate, paySum, taxSum, payFIID, 
+                     PlusCalc_Account, PlusCalcNDS_Account, PmAmount )
+  var payParams = TSfPayParams;
+  payParams.payDate = payDate;
+  payParams.paySum = paySum; 
+  payParams.taxSum = taxSum;
+  payParams.payFIID = payFIID;
+
+  payParams.PlusCalc_Account = PlusCalc_Account;
+  payParams.PlusCalcNDS_Account = PlusCalcNDS_Account;
+
+  return SfFillPaymentExt( Paym, sidebet, sicredit, sfcomiss, payParams, PmAmount );
+end;
+
+macro SfPayDocConnectToOperation( PayDoc, IsBatchMode, oprchild )
+  if( (IsBatchMode != null) AND (IsBatchMode == true) )
+
+    PayDoc.ConnectToOperation( oprchild.ID_Operation, oprchild.ID_Step );
+
+    if( PayDoc.Update() != 0 )
+      return 1;
+    end;
+
+    oprchild.Child_DocKind    = PayDoc.Payment.DocKind;
+    oprchild.Child_DocumentID = PM_MakeDocumentID( PayDoc.Payment.DocKind, PayDoc.Payment.DocumentID );
+  end;
+
+  return 0;
+end;

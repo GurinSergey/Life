@@ -1,0 +1,730 @@
+/*
+   Единый способ формирования документов оплаты удержанных комиссий и ТО. ДЛЯ Экспресс-Волги
+*/
+
+/*                                                                                                        */
+/*  Имя файла: sfpay.mac                                                                                  */
+/*  Создан: 23.07.2001                                        Стасевич В.                                 */
+/*  Переработан: 22.01.2010                                   SolAN                                       */
+/*  joy 22.10.2014 Адаптация для 2031. Определяем NDS_Account                                             */
+/*  RR 07.11.2014 Адаптация для 2031. Перенес доработки Мефеда в SfFormPayDoc                             */
+/****************************************************************************/
+import sfcommon, sfpaym, sfpayord, sfpaydoc, sfbnkclm, sfpaycor, sfpaycash;
+import "sf_prbb.mac", "CommissLib.mac";
+import "sfconpaym.mac";
+
+
+/* EVG 2/12/2013 Перенесена доработка Алексея Киселёва по методу начислений для комиссий Экспресс-Волги */
+//А.Киселев 13.04.2011
+private const NOTEKIND_COMISS_PARTYCODE = 101;  //корректировать при внедрении
+private const OBJLINK_ACC60312_PARTYCODE = 502;  //корректировать при внедрении
+private var ExistsMemOrd = false; // joy Флаг, чтобы понять, надо ли формировать б\о
+
+private macro GetAccountClient( Account, FIID_, Amount ) :string //получить счет клиента с обслуживанием РКО c которого можно списать сумму комиссии
+  
+Var 
+   cmd, 
+   rs,
+   isEnoughRest;
+
+
+  cmd = RsdCommand( " SELECT A.T_ACCOUNT,C.T_FIID FROM daccount_dbt A,daccount_dbt B,dsfcontr_dbt C " +
+                    " WHERE B.T_CHAPTER = 1 AND B.T_ACCOUNT = ? " +
+                    "  AND A.T_CLIENT = B.T_CLIENT AND  A.T_DEPARTMENT = B.T_DEPARTMENT " +
+                    "  AND A.T_CHAPTER = B.T_CHAPTER AND A.T_OPEN_CLOSE <> CHR(88) " +
+                    "  AND A.T_R0 > 0 " +
+                    "  AND C.T_SERVKIND = 3 AND C.T_OBJECTTYPE = 1 AND C.T_OBJECT = A.T_ACCOUNT " +
+                    " ORDER BY A.T_R0 DESC " );
+  cmd.addParam( "Acc", RSDBP_IN, Account );
+     
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )
+   isEnoughRest = ExecMacroFile("commisslib.mac", "ПроверитьОстатокСумм", rs.value(0), 
+                                                                          rs.value(1), 
+                                                                          {CurDate}, 
+                                                                          Amount );
+   if ( isEnoughRest )
+    setparm(1, rs.value(1));
+    return rs.value(0);
+   end;
+
+  end;
+    
+  return "";
+end;
+
+private macro GetAccountName (Chapter, Acc) :string
+Var 
+   cmd, 
+   DataSet;
+
+  cmd = RsdCommand( " SELECT T_NAMEACCOUNT FROM daccount_dbt " +
+                    " WHERE T_CHAPTER = ? AND T_ACCOUNT = ? AND T_OPEN_CLOSE = CHR(0) " );
+  cmd.addParam( "Chapter", RSDBP_IN, Chapter );
+  cmd.addParam( "Acc", RSDBP_IN, Acc );
+     
+  DataSet = RsdRecordset( cmd );
+  if ( DataSet.moveNext() )
+    return DataSet.value(0);
+  end;
+    
+  return "";
+
+end;
+//А.Киселев 13.04.2011
+
+
+
+private macro IsOurBank( BankID )
+  if( (BankID == {HeadBankID}) OR (BankID == {OurBank}) )
+    return true;
+  else
+    return false;
+  end;
+end;
+
+private macro CheckIfCashDocPossible( objectType, objectBuf, sfcomiss, sidebet, sicredit, IsCashDoc:@bool )
+  
+  IsCashDoc = false;
+  
+  if( (objectType == OBJTYPE_SFSINGDF) AND (sfcomiss.InstantPayment == "X") AND IsOurBank(sicredit.rec.BankID) )
+    return SfCheckCashAccountType( sidebet.Rec.Account, sidebet.Rec.FIID, @IsCashDoc );
+  else
+    return 0;
+  end;
+
+end;
+
+private macro SfFormPayDoc( sidebet, sicredit, sfcomiss, payParams:TSfPayParams,
+                            sfinvlnk, SumInInvFIID, IsBatchMode,  
+                            bilfDocArray:@TArray,  oprchild)
+  var sum = $0;
+  var converted_sum = $0;
+
+  var paymStatus = null;
+
+  var bSayError = true;
+  
+  /* EVG */
+  var NDS_Account = "";
+
+  var ExtPaymId = 0,
+      PairAcc = "",
+      MinusNDSAccrual_Account = "", //А.Киселев 13.04.2011 для метода начисление
+      PlusCalcNDSAccountLinked = "",//А.Киселев 13.04.2011 для метода начисление
+      PartyCodeOne = ""; //А.Киселев 13.04.2011 для метода начисление
+
+
+  if( IsOprMultiExec() )
+    bSayError = false;
+  end;
+  
+  payParams.correctSums( sfcomiss );
+  payParams.getPlusCalcAccounts( sicredit );
+      
+  var IsCashDoc = false;
+  var stat = CheckIfCashDocPossible( payParams.objectType, payParams.objectBuf, sfcomiss, sidebet, sicredit, @IsCashDoc );
+  if( stat != 0 )
+    return SfPayErrorTreat( stat, bSayError );
+  end;
+
+  if( IsCashDoc == true )
+    stat = SfCheckCashDocParams( sicredit, sidebet );
+    if( stat )
+      return SfPayErrorTreat( stat, bSayError );
+    else
+      return SfFormCashOrderExt( sidebet, sicredit, sfcomiss, payParams, IsBatchMode, oprchild );
+    end;
+  elif( (IsOurBank(sidebet.rec.PartyID)) OR (sidebet.rec.PartyID == 0) )   //Если направление комиссии (ТО) к банку
+    if( sidebet.rec.Department == 0)       
+      return SfPayErrorTreat( SFPAY_ERROR_PAYERACC_NOTAINOURBANK, bSayError );
+    end;
+
+    if( sicredit.rec.Department == 0 )
+      paymStatus = PM_READY_TO_SEND;
+    end;
+
+    return SfFormBankPaymentExt( sidebet, sicredit, sfcomiss, payParams, paymStatus, sfinvlnk, null, IsBatchMode, oprchild );
+  else /*Если направление комиссии (ТО) к клиенту*/
+
+    /* joy 22.10.2014 Раскомментировала и добавила проверку на то, определен ли уже счет НДС. NDS_Account используется ниже из-за особенностей оплаты комиссий в ЭВ*/
+    if( (payParams.SfComPD != NULL) and ((payParams.feeType == SF_FEE_TYPE_ONCE) or (payParams.feeType == SF_FEE_TYPE_SINGLE)) )
+    DebugBreak;
+    /* EVG 28/11/2013 Перенёс из старого макроса, но пока оставил в камменте, до тестирования.*/
+DebugBreak;
+        /* EVG Определение категории -НДС */
+        if ( (payParams.taxSum > 0) and (sicredit.Rec.ReceiverNDSAccount == ""))
+           /*
+           PlusCalc_Account    = payParams.SfComPD.FindAndOpenAccount( PlusCalc_CatCode, payDate, payParams.FIID );
+           PlusCalcNDS_Account = payParams.SfComPD.FindAndOpenAccount( PlusCalcNDS_CatCode, payDate, payParams.FIID );
+           */
+           NDS_Account         = payParams.SfComPD.FindAndOpenAccount( "-НДС", payParams.payDate, payParams.FIID );
+           sicredit.Rec.ReceiverNDSAccount = NDS_Account;
+           //msgbox (sidebet.Rec.Account, " - ", sidebet.Rec.ReceiverNDSAccount, "|", sicredit.Rec.Account, " - ", sicredit.Rec.ReceiverNDSAccount);
+        end;
+
+        /* EVG 2/12/2013 Перенесена доработка Алексея Киселёва по методу начислений для комиссий Экспресс-Волги */
+        // А.Киселев 13.04.2011 для метода начисления КУ -НДС начисленный или определяем по связанным объектам и из реестра
+        var PlusCalc_Account, PlusCalcNDS_Account;
+        if( payParams.taxSum > 0 )
+
+            MinusNDSAccrual_Account = payParams.SfComPD.GetDefComSfSiAccount( payParams.objectBuf.ID, NDSACRUAL_SFSI_KIND, "-НДС начисленный", payParams.payDate, payParams.FIID );
+            if( (payParams.payMethod == 88) or (payParams.payMethod == 98))
+
+    //         sidebet.Rec.ReceiverNDSAccount = PlusCalcNDS_Account;
+           //Получить код стороннего субъекта из примечания к разовой комиссии 
+             PartyCodeOne = readNoteForObject_SQL( OBJTYPE_SFSINGDF, payParams.objectBuf.Id, NOTEKIND_COMISS_PARTYCODE );
+             if( PartyCodeOne == "" )
+              MsgBox("Не найден код стороннего субъекта в примечании");
+              return 1;
+             end;
+           //Получить код стороннего субъекта из примечания к разовой комиссии
+           //Получить связанный счет стороннего субъекта 60312
+             PlusCalcNDSAccountLinked = GetAccPartyLinked(PartyCodeOne,"60312",OBJLINK_ACC60312_PARTYCODE);
+             if( PlusCalcNDSAccountLinked == "" )
+              MsgBox("Не найден связанный счет 60312 стороннего субъекта");
+              return 1;
+             end;
+           //Получить связанный счет стороннего субъекта 60312
+             sidebet.Rec.ReceiverNDSAccount = PlusCalcNDSAccountLinked;
+             sicredit.Rec.ReceiverNDSAccount = MinusNDSAccrual_Account;
+            elif( (payParams.payMethod == 89) or (payParams.payMethod == 99) )
+           //Получить код стороннего субъекта из примечания к разовой комиссии 
+             PartyCodeOne = readNoteForObject_SQL( OBJTYPE_SFSINGDF, payParams.objectBuf.Id, NOTEKIND_COMISS_PARTYCODE );
+             if( PartyCodeOne == "" )
+              MsgBox("Не найден код стороннего субъекта в примечании");
+              return 1;
+             end;
+           //Получить код стороннего субъекта из примечания к разовой комиссии
+           //Получить связанный счет стороннего субъекта 60312
+             PlusCalcNDSAccountLinked = GetAccPartyLinked(PartyCodeOne,"60312",OBJLINK_ACC60312_PARTYCODE);
+             if( PlusCalcNDSAccountLinked == "" )
+              MsgBox("Не найден связанный счет 60312 стороннего субъекта");
+              return 1;
+             end;
+           //Получить связанный счет стороннего субъекта 60312
+
+             sidebet.Rec.ReceiverNDSAccount = MinusNDSAccrual_Account;
+             if (sicredit.Rec.ReceiverNDSAccount == "") // 31.10.2014 joy Только если не нашли
+               sicredit.Rec.ReceiverNDSAccount = NDS_Account;
+             end;
+             
+            else
+             PlusCalc_Account = payParams.SfComPD.GetDefComSfSiAccount( payParams.objectBuf.ID, CALC_SFSI_KIND, "+Расчеты", payParams.payDate, payParams.FIID );
+             PlusCalcNDS_Account = payParams.SfComPD.GetDefComSfSiAccount( payParams.objectBuf.ID, CALCNDS_SFSI_KIND, "+Расчеты НДС", payParams.payDate, payParams.FIID );
+             if (sicredit.Rec.ReceiverNDSAccount == "") // 31.10.2014 joy Только если не нашли
+               sicredit.Rec.ReceiverNDSAccount = NDS_Account;
+             end;
+            end;
+            //фиксируем параметры СПИ по умолчанию
+            var ParamDebet = TSi (@sidebet,@sicredit);
+            var ParamCredit = TSi (@sicredit,@sidebet);
+        end;
+
+        if( payParams.payMethod == 88 ) // А.Киселев 13.04.2011 Ветка для формирования мем. ордера начисления суммы комисси без НДС и мем. ордера начисления суммы НДС
+
+             if( sidebet.Rec.BankCode != "" )
+               MsgBox("Плательщик должен быть в нашем банке");
+               return 1;
+             end;
+           
+
+             if( sicredit.rec.FIID != payParams.FIID )
+               if( ConvSum( payParams.paySum, payParams.paySum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               if( ConvSum( payParams.taxSum, payParams.taxSum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               payParams.FIID = sicredit.rec.FIID;
+             end;
+             // мем. ордер начисления суммы комиссии без НДС
+             //изменяем СПИ если нужно
+       //      ParamDebet.ExchangeParamS_F;
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.rec.Account);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.Account);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, payParams.FIID, null, // начислять клиенту на счет из комиссии
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+             // мем. ордер начисления суммы НДС
+             //изменяем СПИ если нужно
+       //      ParamDebet.ExchangeParamS_F;
+             sidebet.rec.PartyName = GetAccountName (1, PlusCalcNDSAccountLinked);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.ReceiverNDSAccount);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(true, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+
+             
+        elif( payParams.payMethod == 89 ) // А.Киселев 13.04.2011 Ветка для формирования мем. ордера оплаты суммы комисси без НДС и мем. ордера оплаты суммы НДС
+         
+             //карежим ПИ только в части счетов и ФИ, в ПИ для комисси первоначально Д Клиент К Банк
+             if( sidebet.Rec.BankCode != "" )
+               MsgBox("Плательщик должен быть в нашем банке");
+               return 1;
+             end;
+
+
+             if( sicredit.rec.FIID != payParams.FIID )
+               if( ConvSum( payParams.paySum, payParams.paySum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               if( ConvSum( payParams.taxSum, payParams.taxSum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               payParams.FIID = sicredit.rec.FIID;
+             end;
+
+
+            //Выбрать из закрытых платежей оплаты комиссии на дату оплаты, не привязанных к комиссии иначе формируем мем.ордер оплаты
+             ExtPaymId = SelAndJoinPaymforPay(sidebet.Rec.Account, sidebet.Rec.BankID, {Curdate},payParams.objectBuf.ID,payParams.objectBuf.FeeType);
+             if(ExtPaymId==0)
+              //MsgBox("Не найден документ оплаты");
+              return 1;
+              // мем. ордер оплаты суммы комиссии + НДС
+       /*       sicredit.Rec.Account = sidebet.Rec.Account;
+              sicredit.Rec.FIID = sidebet.Rec.FIID;
+              sidebet.Rec.Account = GetAccountClient( sidebet.Rec.Account, sidebet.rec.FIID, payParams.paySum + payParams.taxSum );
+              if (sicredit.Rec.Account == "")
+               MsgBox("Не найден счет клиента с которого можно произвести оплату СФ");
+               return 1;
+              end;
+              //изменяем СПИ если нужно
+              ParamCredit.SetParamFByS( @sicredit, @sidebet ); //дебет party Клиент кредит party Клиент
+              //изменяем СПИ если нужно
+              if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum + payParams.taxSum, payParams.taxSum, payParams.FIID, null, //оплата комиссия + НДС
+                                PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Клиент К Клиент
+                return 1;
+              end;
+              //восстанавливаем параметры СПИ по умолчанию
+              ParamDebet.SetDefaultParam(@sidebet);
+              ParamCredit.SetDefaultParam(@sicredit);*/
+             elif( not CreateBilBookEntryforPaym( ExtPaymId, {Curdate} ) ) //заносим запись в книгу продаж если оплата внешним платежом
+              MsgBox("Ошибка при при добавлении записи в книгу продаж");
+              return 1;
+             end;
+            //Выбрать из закрытых платежей оплаты комиссии на дату оплаты, не привязанных к комиссии иначе формируем мем.ордер оплаты
+
+             // 1й мем. ордер учета оплаты суммы НДС
+             //изменяем СПИ если нужно
+             ParamDebet.SetParamFByS(  @sidebet, @sicredit ); //дебет party Банк кредит  party Банк
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.rec.ReceiverNDSAccount);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.ReceiverNDSAccount);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(true, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Банк К Банк
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+             // 2й мем. ордер учета оплаты суммы НДС
+
+             //изменяем СПИ если нужно
+             sicredit.Rec.Account = PlusCalcNDSAccountLinked;
+             sicredit.Rec.FIID = payParams.FIID;
+             ParamCredit.SetParamFByS( @sicredit, @sidebet ); //дебет party Клиент кредит party Клиент
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.rec.Account);
+             sicredit.rec.PartyName = GetAccountName (1, PlusCalcNDSAccountLinked);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, "НДС " + payParams.ground, /*payParams.paySum*/ payParams.taxSum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Клиент К Клиент
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+
+             
+        elif( payParams.payMethod == 98 ) // А.Киселев 13.04.2011 Ветка для формирования мем. ордера начисления суммы аренды без НДС и мем. ордера начисления суммы НДС
+
+             if( sidebet.Rec.BankCode != "" )
+               MsgBox("Плательщик должен быть в нашем банке");
+               return 1;
+             end;
+
+             if( sicredit.rec.FIID != payParams.FIID )
+               if( ConvSum( payParams.paySum, payParams.paySum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               if( ConvSum( payParams.taxSum, payParams.taxSum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               payParams.FIID = sicredit.rec.FIID;
+             end;
+             // мем. ордер начисления суммы аренды без НДС
+
+             //изменяем СПИ если нужно
+       //      ParamDebet.ExchangeParamS_F;
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.rec.Account);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.Account);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum /*payParams.paySum + payParams.taxSum*/, payParams.taxSum, payParams.FIID, null, // начислять клиенту на счет из комиссии
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+             // мем. ордер начисления суммы НДС
+             //изменяем СПИ если нужно
+       //      ParamDebet.ExchangeParamS_F;
+             sidebet.rec.PartyName = GetAccountName (1, PlusCalcNDSAccountLinked);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.ReceiverNDSAccount);
+             //изменяем СПИ если нужно
+
+             if( SfFormMemorialOrder_ForEXV(true, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+
+        elif( payParams.payMethod == 99 ) // А.Киселев 13.04.2011 Ветка для формирования мем. ордера оплаты суммы аренды без НДС и мем. ордера оплаты суммы НДС
+             //карежим ПИ только в части счетов и ФИ, в ПИ для комисси первоначально Д Клиент К Банк
+             if( sidebet.Rec.BankCode != "" )
+               MsgBox("Плательщик должен быть в нашем банке");
+               return 1;
+             end;
+           
+
+             if( sicredit.rec.FIID != payParams.FIID )
+               if( ConvSum( payParams.paySum, payParams.paySum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               if( ConvSum( payParams.taxSum, payParams.taxSum, payParams.payDate, payParams.FIID, sicredit.rec.FIID ) != 0 )
+                 MsgBox("Невозможно конвертировать сумму из валюты ", payParams.FIID, "в валюту ", sicredit.rec.FIID );
+                 return 1;
+               end;
+               payParams.FIID = sicredit.rec.FIID;
+             end;
+
+
+             //Выбрать из закрытых платежей оплаты аренды на дату оплаты, не привязанных к комиссии иначе формируем мем.ордер оплаты
+             PairAcc = GetPairAcc(1, sidebet.Rec.Account );
+             if (PairAcc == "")
+               MsgBox("Не найден парный счет к счету ", sidebet.Rec.Account );
+               return 1;
+             end;
+             ExtPaymId = SelAndJoinPaymforPay(PairAcc, sidebet.Rec.BankID, {Curdate},payParams.objectBuf.ID,payParams.objectBuf.FeeType);
+             if(ExtPaymId==0)
+              //MsgBox("Не найден документ оплаты");
+              return 1;
+              // мем. ордер оплаты суммы комиссии + НДС
+       /*       sicredit.Rec.Account = sidebet.Rec.Account;
+              sicredit.Rec.FIID = sidebet.Rec.FIID;
+              sidebet.Rec.Account = GetAccountClient( sidebet.Rec.Account, sidebet.rec.FIID, payParams.paySum + payParams.taxSum );
+              if (sicredit.Rec.Account == "")
+               MsgBox("Не найден счет клиента с которого можно произвести оплату СФ");
+               return 1;
+              end;
+              //изменяем СПИ если нужно
+              ParamCredit.SetParamFByS( @sicredit, @sidebet ); //дебет party Клиент кредит party Клиент
+              //изменяем СПИ если нужно
+              if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum + payParams.taxSum, payParams.taxSum, payParams.FIID, null, //оплата комиссия + НДС
+                                PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Клиент К Клиент
+                return 1;
+              end;
+              //восстанавливаем параметры СПИ по умолчанию
+              ParamDebet.SetDefaultParam(@sidebet);
+              ParamCredit.SetDefaultParam(@sicredit);*/
+             elif( not CreateBilBookEntryforPaym( ExtPaymId, {Curdate} ) ) //заносим запись в книгу продаж если оплата внешним платежом
+              MsgBox("Ошибка при при добавлении записи в книгу продаж");
+              return 1;
+             end;
+            //Выбрать из закрытых платежей оплаты аренды на дату оплаты, не привязанных к комиссии иначе формируем мем.ордер оплаты
+             // 1й мем. ордер учета оплаты суммы НДС
+             
+             //изменяем СПИ если нужно
+             sicredit.Rec.Account = PlusCalcNDSAccountLinked;
+             sicredit.Rec.FIID = payParams.FIID;
+             ParamCredit.SetParamFByS( @sicredit, @sidebet ); //дебет party Клиент кредит party Клиент
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.Rec.Account);
+             sidebet.Rec.Account = PairAcc;
+             sicredit.rec.PartyName = GetAccountName (1, PlusCalcNDSAccountLinked);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(false, sidebet, sicredit, sfcomiss, payParams.payDate, "НДС " + payParams.ground, /*payParams.paySum*/ payParams.taxSum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Клиент К Клиент
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+
+             // 2й мем. ордер учета оплаты суммы НДС
+             //изменяем СПИ если нужно
+             ParamDebet.SetParamFByS(  @sidebet, @sicredit ); //дебет party Банк кредит  party Банк
+             sidebet.rec.PartyName = GetAccountName (1, sidebet.rec.ReceiverNDSAccount);
+             sicredit.rec.PartyName = GetAccountName (1, sicredit.rec.ReceiverNDSAccount);
+             //изменяем СПИ если нужно
+             if( SfFormMemorialOrder_ForEXV(true, sidebet, sicredit, sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, payParams.FIID, null, 
+                               PlusCalc_Account, PlusCalcNDS_Account, payParams.objectBuf.ID, null) != 0 )  //Д Банк К Банк
+               return 1;
+             end;
+             //восстанавливаем параметры СПИ по умолчанию
+             ParamDebet.SetDefaultParam(@sidebet);
+             ParamCredit.SetDefaultParam(@sicredit);
+
+        end;
+        // А.Киселев 13.04.2011 для метода начисления КУ -НДС начисленный или определяем по связанным объектам и из реестра
+    end;// joy
+    
+    if( ((payParams.payMethod == 88) or (payParams.payMethod == 89) or (payParams.payMethod == 98) or (payParams.payMethod == 99) ) and (payParams.feeType == SF_FEE_TYPE_ONCE ) )
+        ExistsMemOrd = true; // joy формируем б\о только если не был сформирован мемрик, а он формируется при таких методах оплаты
+    end; 
+
+    if( sicredit.rec.Department == 0 )
+      return SfPayErrorTreat( SFPAY_ERROR_RECEIVERACC_NOTAINOURBANK, bSayError );
+    end;
+        
+    if( sidebet.rec.Department == 0 )
+      return SfPayErrorTreat( SFPAY_ERROR_CLAIM_IMPOSSIBLE, bSayError );
+    end;
+    
+    if (ExistsMemOrd == false) // joy формируем б\о только если не был сформирован мемрик
+    
+     /* RR 07/11/2014 Перенесено определение счёта из старого макроса */
+     /*{MEV: Обновить СПИ - проверить достаточность средств на счёте из договора */
+     var Acc;
+     if( sfcomiss.FeeType == SF_FEE_TYPE_SINGLE )    /* для единовременных комиссий */
+
+        /* EVG В процедуру Мефёда идём только в случае, если 
+           счёт оплаты комиссии не удалось получить из платежа
+           (счёт и валюта счёта сразу сохраняются в sidebet). */
+        if ( not GetComissAccountFromPayment( payParams.objectBuf.id_operation, @sidebet.rec.Account, @sidebet.rec.Fiid ) )
+
+           DebugBreak;
+           selectAccountForSfPay( payParams.paySum+payParams.taxSum, payParams.Fiid, payParams.payDate, sidebet.rec.partyid, SF_FEE_TYPE_SINGLE, -1, 
+                                  payParams.objectBuf.SfContrID );
+        
+           Acc = null;
+           Acc = getFoundedAcc();
+
+           //DebugBreak;
+           if (Acc!=null)
+             /* 1. Сохранить информацию для обновления комиссии в макросе постобработки */
+             prepareSingleCommSi( payParams.objectBuf.id_operation, payParams.objectBuf.id_step, payParams.objectBuf.oprcommnumber, Acc.account, Acc.Fiid );
+             /* 2. Обновить структуры для корректного формирования документов оплаты */
+             sidebet.rec.Account = Acc.account;
+             sidebet.rec.Fiid = Acc.Fiid;
+           end;
+
+        end;
+
+        //msgbox (sidebet.rec.Account);
+     end;
+     /*MEV}*/
+    
+    //Если счет плательщика и счет получателя в нашем филиале и настройка "CB\BANKORDERFORCOMM" = YES, то
+        if( (bBankorderForComm_Setting()) AND bSfRightFilial(sidebet, sicredit) )
+            return SfFormBankOrderExt( sidebet, sicredit, sfcomiss, payParams, sfinvlnk, null,
+                                     IsBatchMode, oprchild );
+        else                                      
+          /* Иначе (счет плательщика и счет получателя открыты в разных on-line филиалах),
+             1. Если счет плательщика и счет получателя рублевые, то*/
+            if( (sidebet.rec.FIID == NATCUR) AND (sicredit.rec.FIID == NATCUR) )
+            /*2. Формируем рублевое клиентское требование. Параметры акцепта берем согласно СПИ ДО. 
+            Если комиссия взимается без ДО, то формируется безакцептное требование. 
+            3. Сформированное требование выгружаем в РКО в том филиале, в котором открыт счет плательщика. */
+                return SfFormClientOrderExt( sidebet, sicredit, sfcomiss, payParams, sfinvlnk, null, 
+                                         IsBatchMode, oprchild );
+
+            else/*4. Иначе (счета плательщика или счет получателя не рубли). 
+            Создаем валютный клиентский платеж и вставляем его в РКО в том филиале, где открыт счет плательщика.*/
+                return SfFormClientPaymExt( sidebet, sicredit, sfcomiss, payParams, sfinvlnk, null,
+                                      IsBatchMode, oprchild );
+            end;
+        end;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro SfFormDocsCommon
+( 
+   OutBuffer, 
+   sidebet,                 // Дт. - СПИ по счету плательщика                   
+   sicredit,                // Кт. - СПИ по счет получателя                     
+   sfcomiss,                // буфер вида комиссии                              
+   payParams:TSfPayParams,  // параметры оплаты ПЗО - объект класса TSfPayParams
+   sfinvlnk,                // параметр связи ТО с платежом                     
+   SumInInvFIID,            // сумма оплтаты в валюте ТО                       
+   bilfDocArray:@TArray,    // массив параметров ЗК СФ                          
+   IsBatchMode,             // пакетный режим формирования РДД                  
+   oprchild                 // буфер записи таблицы oprchild.dbt                
+)
+  var retval = 0;
+
+  payParams.feeType = SF_FEE_TYPE_PERIOD; /*objectType == OBJTYPE_SFDEFCOM или */
+  if( payParams.objectType == OBJTYPE_OPRSFCOM )
+    payParams.feeType = SF_FEE_TYPE_SINGLE;
+  elif( payParams.objectType == OBJTYPE_SFSINGDF )
+    payParams.feeType = SF_FEE_TYPE_ONCE;
+  elif( payParams.objectType == OBJTYPE_SFINVOICE )
+    payParams.feeType = SF_FEE_TYPE_INVOICE;
+  end;    
+
+  if( payParams.ground == "" )
+      payParams.ground = "Оплата комиссии " + sfcomiss.Code;
+  end;  
+
+  if( OutBuffer != null )
+    if( SfPayCorrect(sfcomiss, payParams.payDate, payParams.ground, payParams.paySum, payParams.taxSum, 
+                     payParams.FIID, payParams.primKind, payParams.primID, payParams.feeType, payParams.objectBuf,
+                     payParams.payMethod, sidebet, sicredit, OutBuffer) )
+      return 1;
+    end;
+  end;
+
+  if( (not Sf_IsInstalledRKO()) OR (payParams.payMethod == SF_PAY_METHOD_DOCUMENT) )
+
+    retval = SfFormDocuments( sidebet, sicredit, sfcomiss, payParams.payDate, payParams.paySum, payParams.taxSum, 
+                              payParams.FIID, payParams.SfComPD, payParams.IsIncluded, payParams.isNVPI,
+                              payParams.FacturaID, @bilfDocArray, payParams.objectType, payParams.objectBuf, oprchild.ID_Operation, oprchild.ID_Step );
+
+  else
+    retval = SfFormPayDoc( sidebet, sicredit, sfcomiss, payParams, sfinvlnk, SumInInvFIID,
+                           isBatchMode, @bilfDocArray, oprchild );
+  end;
+
+  return retval;
+
+end;
+
+/*Универсальная функция формирования документов(   
+  Из sfcontr берется 
+    FIID    -- валюта сумм
+    FIIDPayer
+    AccountPayer
+    payMethod)*/
+
+macro SfFormDocs
+(
+  OutBuffer,   /* буфер для формирования выходного документа для Insert...Document */
+  sidebet,
+  sicredit,
+  sfcomiss,    /* запись sfcomiss.dbt */
+  payDate,     /* дата оплаты */
+  ground,      /* основание   */
+  paySum,      /* сумма в валюте FIID */
+  taxSum,      /* НДС в валюте FIID   */
+  FIID,
+  primKind,    /* тип первички KIND_OF_DOC */
+  primID,      /* ID первички */
+  objectType,  /* вид объекта   */
+  objectBuf,   /* объект */
+  payMethod,
+  SfComPD,     /* для единовременных и период объект класса SfConComPrimDoc, для разовых - SfSingDfPrimDoc */
+  IsIncluded,
+  isNVPI,
+  FacturaID,
+  bilfDocArray:@TArray,
+  sfinvlnk,
+  IsBatchMode, ID_Operation, ID_Step, ChildDocKind:@integer, ChildDocID:@string, PreAcptID
+   
+)
+  var payParams = TSfPayParams;
+  var stat = 0;
+
+  payParams.payDate = payDate; 
+  payParams.ground = ground; 
+  payParams.paySum = paySum; 
+  payParams.taxSum = taxSum; 
+  payParams.FIID = FIID;
+  payParams.primKind = primKind; 
+  payParams.primID = primID; 
+  payParams.objectType = objectType; 
+  payParams.objectBuf = objectBuf; 
+  payParams.payMethod = payMethod; 
+  payParams.SfComPD = SfComPD; 
+  payParams.IsIncluded = IsIncluded; 
+  payParams.isNVPI = isNVPI; 
+  payParams.FacturaID = FacturaID;
+  payParams.PreAcptID = PreAcptID;
+
+  if(PreAcptID != null)
+    payParams.PreAcptID = PreAcptID
+  end;
+
+  var oprchild = TRecHandler("oprchild.tmp");
+  ClearRecord( oprchild );
+  if(ID_Operation != null)
+    oprchild.rec.ID_Operation = ID_Operation;
+    oprchild.rec.ID_Step      = ID_Step;     
+  end;
+
+  /* EVG 28/11/2013 Перенесено определение счёта из старого макроса */
+  /*{MEV: Обновить СПИ - проверить достаточность средств на счёте из договора */
+  var Acc;
+  if( sfcomiss.FeeType == SF_FEE_TYPE_SINGLE )    /* для единовременных комиссий */
+
+     /* EVG В процедуру Мефёда идём только в случае, если 
+        счёт оплаты комиссии не удалось получить из платежа
+        (счёт и валюта счёта сразу сохраняются в sidebet). */
+     if ( not GetComissAccountFromPayment( objectBuf.id_operation, @sidebet.rec.Account, @sidebet.rec.Fiid ) )
+
+        DebugBreak;
+        selectAccountForSfPay( paySum+taxSum, Fiid, payDate, sidebet.rec.partyid, SF_FEE_TYPE_SINGLE, -1, 
+                               objectBuf.SfContrID );
+        
+        Acc = null;
+        Acc = getFoundedAcc();
+
+        //DebugBreak;
+        if (Acc!=null)
+          /* 1. Сохранить информацию для обновления комиссии в макросе постобработки */
+          prepareSingleCommSi( objectBuf.id_operation, objectBuf.id_step, objectBuf.oprcommnumber, Acc.account, Acc.Fiid );
+          /* 2. Обновить структуры для корректного формирования документов оплаты */
+          sidebet.rec.Account = Acc.account;
+          sidebet.rec.Fiid = Acc.Fiid;
+        end;
+
+     end;
+
+     //msgbox (sidebet.rec.Account);
+  end;
+  /*MEV}*/
+
+  stat = SfFormDocsCommon( OutBuffer, sidebet, sicredit, sfcomiss, 
+    payParams, sfinvlnk, null, @bilfDocArray, IsBatchMode, oprchild.rec );
+
+  ChildDocKind = oprchild.rec.Child_DocKind   ;
+  ChildDocID   = oprchild.rec.Child_DocumentID;
+
+  /* EVG 28/11/2013 Пришло из старого макроса */
+  if (stat != 0)
+      InitError();
+      MemoryError(null,GetSfPay_ErrMsg()); /* Golovkin 07.02.2013 Сохраняем ошибку для обработчика */
+  end;
+
+  return stat;
+end;
+
+macro SfInvFormDocs( OutBuffer, sidebet, sicredit, sfcomiss, payParams:TSfPayParams, sfinvlnk, SumInInvFIID, bilfDocArray:@TArray )
+
+  var oprchild = TRecHandler("oprchild.tmp");
+  ClearRecord( oprchild );
+ 
+  return SfFormDocsCommon( OutBuffer, sidebet, sicredit, sfcomiss, payParams, sfinvlnk, SumInInvFIID, @bilfDocArray, null, oprchild.rec );
+
+end;
+

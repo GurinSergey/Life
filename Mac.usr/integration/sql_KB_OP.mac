@@ -1,0 +1,656 @@
+/***************************************************************************************************************
+   Имя файла..:       sql_KB_new_OP.mac
+   Назначение.:       Хранение скриптов для выборки документов ожидающих поступления, надоело пазл собирать
+   Заявка.....:       от Палагиной Елены C-19164-6
+   Дата.......:       06.06.2013
+   Автор......:       Лисименко Антон
+   
+   Vaschenko D. 04.03.2014 Изменения под 2031
+   Vaschenko D. 22.07.2014 Добавил условие для исключие платежей со счетами овердрафта С-29828
+****************************************************************************************************************/
+import Globals,"fg_Life_parm.mac";
+import календарь;
+import "opr_engine.mac";
+import "timestat.mac";
+import lib_sqltools;
+
+/*Пишу для себя
+Этапы роботы макроса:
+1. Формируем динамическую диалоговую форму через MkLbrFileAgentKB 
+ название "monitorpmdocsKB + СИД пользователя"
+2. Добавляем к созданной библиотеки панель MkDatePanelAgentKB с названием "mon_kb" ! Внимание название панели не может быть более 8-ми символов!
+ все эти действия возможны с помощью "ldmklbr.mac"
+3. У нас есть класс TParmAgentKB в нем описаны методы назначаем Parm = TParmAgentKB(LbrName);
+   и стартуем Parm.Run  - RunDialog (this, R2M (this, "Event")) где this мы, this, "Event" -- в нашем макросе обработка событий
+4. Форма запущена, далее все как обычно, при событии ф2 вызывается метод StartAgent(dlg)
+   - проверяет отложенные, собирает их с учетом времени
+   - проводит на предобработку - отдает обработчикам
+   - каждые 10 секунд проверяет пайп на ответы от обработчиков
+   - если сообщения отрпавлены(обработчики активны), но в течение 1 минуты не были обработаны, при след. опросе проверяется пайп, выводится результат
+   если ответа от обработчиков нет, отсылает опоывещения в Лотус
+   - при ошибках компиляции больше 10 за пять минут робот отключается, отправляет сообщение в лотус
+   - если обработчиков нет. отправляет сообщение в лотус
+   - каждые 40 секунд анализирует шаги обработанных платежей, если есть "зависшие", добавляет их в журнал платежей с ошибками
+*******************************************************************/
+
+
+private var fgBank = fg_life_subject({OurBank});
+        var opr = opr_engine;
+        var err;
+        var BIC_BANK;
+        var no_empty  = false;
+
+GetRegistryValue("PRBB\\MASS_EXEC\\BIC_BANK", V_STRING, BIC_BANK, err);
+
+if(err > 0)
+    BIC_BANK = "";
+end;    
+
+//Внесем параметры для инициализации операции
+opr.oper          = {oper};
+opr.kindoperation = 24001;
+opr.dockind       = 201;
+
+//Ловим ошибки
+macro catch(x)
+    var err_count = 0, is_no_wait = 0;
+    var lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message;
+ 
+    setdialogflag(1);
+    while( err_count < RSLDefEnv.ErrorCount )
+        if(RSLDefEnv.error(err_count).nativeerror == 54)
+            setdialogflag(0);
+            is_no_wait = RSLDefEnv.error(err_count).nativeerror;
+        end;
+        lasterror = lasterror + "|"+RSLDefEnv.error(err_count).descr;
+        err_count = err_count + 1;
+    end;
+
+    if (RSLDefCon.IsinTrans)
+        RSLDefCon.RollbackTrans;
+    end;
+    if(is_no_wait == 54)
+        println(lasterror);
+        setdialogflag(1);
+    else
+        msgbox (lasterror);
+    end;
+end;
+    
+//очищаем временную таблицу
+macro ClearTmp
+    private var cmd;
+    cmd = RSDCommand("truncate table usr_dpmpaym_tmp");
+    cmd.execute;
+end;
+    
+//очищаем логирование, 
+macro ClearLOG
+    private var cmd;
+    cmd = RSDCommand("delete  from USR_ROBOTS_IK_LOG where TIME_START< sysdate - interval '5' day ");
+    cmd.execute;
+end;
+    
+macro ClearDoprtemp
+    private var cmd;
+    cmd = RSDCommand("truncate table doprtemp_tmp");
+    cmd.execute;
+end;
+    
+macro ClearUsr_Doprtemp
+    private var cmd;
+    cmd=RSDCommand("truncate table usr_doprtemp_op_tmp");
+    cmd.Execute();
+end;    
+    
+// Конвертируем время
+macro SecToTime(t) // Перевод секунд во время
+    return time(0,int(t/60),(t-60*int(t/60)),0);
+end;
+
+macro MinToTime(t) // Перевод минут во время
+    return time(int(t/60),(t-60*int(t/60)),0,0);
+end;
+
+// Перемещаем полученные данные в  pmpaym_op_tmp
+macro Remove_OP()
+    private var cmd;
+    
+    cmd = RSDCommand("BEGIN"                                                       + "\n" +
+                     "--чистим неактуальную информацию"                            + "\n" +
+                     " DELETE FROM   pmpaym_op_tmp "                               + "\n" +
+                     "     WHERE   T_PAYMENTID IN (SELECT   T_PAYMENTID"           + "\n" +
+                     "                                 FROM   usr_dpmpaym_tmp"     + "\n" +
+                     "                               WHERE   T_INITMACRO = 'OP');" + "\n" +
+                     "-- обновляем "                                               + "\n" +
+                     " INSERT INTO pmpaym_op_tmp"                                  + "\n" +
+                     "  (SELECT   * "                                              + "\n" +
+                     "     FROM   usr_dpmpaym_tmp"                                 + "\n" +
+                     "    WHERE   T_INITMACRO = 'OP' AND T_ERRORSTATUS = 1);"      + "\n" +
+                     " delete from usr_dpmpaym_tmp where  T_INITMACRO = 'OP'"      + "\n" +
+                     "  AND T_ERRORSTATUS = 1;"                                    + "\n" +
+                     " END;");
+    cmd.execute;
+end;
+
+macro scroll_err();
+     return "SELECT /*+ Leading(tmp)*/   pmpaym.T_PAYMENTID,"
+           +"          prop.t_date,"
+           +"          prop.T_NUMBER,"
+           +"          pmpaym.T_PAYER,"
+           +"          party_p.T_SHORTNAME PAYER,"
+           +"          pmpaym.T_PAYERACCOUNT,"
+           +"          decode(pmpaym.T_Receiver,-1,'Внешний',pmpaym.T_Receiver) T_Receiver,"
+           +"          nvl(party_r.T_SHORTNAME,chr(1)) RECEIVER,"
+           +"          pmpaym.T_RECEIVERACCOUNT,"
+           +"          pmpaym.T_AMOUNT,"
+           +"          NVL ("
+           +"             (SELECT   BL.T_NAME stlist"
+           +"                FROM   doprstep_dbt st, doprblock_dbt bl"
+           +"               WHERE   st.t_id_operation = OPER.T_ID_OPERATION"
+           +"                AND st.T_BLOCKID = BL.T_BLOCKID"
+           +"                       AND st.t_id_step ="
+           +"                             (SELECT   MAX (t_id_step)"
+           +"                                FROM   doprstep_dbt t"
+           +"                               WHERE   t_id_operation = st.t_id_operation"
+           +"                                       AND t_isexecute <> CHR (0))),"
+           +"             'в отложенных'"
+           +"          )"
+           +"             step,tmp.T_ERRORMESSAGE,to_char(tmp.T_START_DATE,'dd.mm.yyyy hh24:mi:ss:mm')  stdate"
+           +"   FROM   usr_dpmpaym_tmp tmp,"
+           +"          dpmrmprop_dbt prop,"
+           +"          dpmpaym_dbt pmpaym,"
+           +"          doproper_dbt oper,"
+           +"          dparty_dbt party_p,"
+           +"          dparty_dbt party_r"
+           +"  WHERE       pmpaym.t_dockind = OPER.T_DOCKIND"
+           +"          AND OPER.T_DOCUMENTID = LPAD (pmpaym.t_paymentid, 34, 0)"
+           +"          AND pmpaym.t_paymentid = tmp.T_PAYMENTID"
+           +"          AND pmpaym.t_paymentid = prop.T_PAYMENTID"
+           +"          AND pmpaym.T_PAYER = PARTY_P.T_PARTYID"
+           +"          AND (tmp.t_errormessage LIKE '%компиляции%'"
+           +"          OR tmp.t_errormessage LIKE '%ORA%'" 
+           +"          OR tmp.t_errormessage LIKE '%застрял%'"
+           +"          OR tmp.t_errormessage LIKE '%Неверный тип значения%'"
+           +"          OR tmp.t_errormessage LIKE '%Невозможно зарезервировать%'"
+           +"          OR tmp.t_errormessage like '%доступ к свойству%' )"
+           +"          AND pmpaym.T_Receiver = PARTY_R.T_PARTYID(+) and tmp.T_ERRORSTATUS =1  order by tmp.T_START_DATE";
+end;
+    
+//Проверка платежей на некорректные финальные шаги
+macro CHECK_ERR_STEP();
+    var err_step, err_step_rs;
+        err_step = RSDCommand(  "DECLARE "+"\n"+
+                                " step   NUMBER;" +"\n"+
+                                " BEGIN" +"\n"+
+                                "   FOR err_step" +"\n"+
+                                "    IN (SELECT   pmpaym.t_paymentid," +"\n"+
+                                "         OPER.T_ID_OPERATION," +"\n"+
+                                "         ST.T_BLOCKID," +"\n"+
+                                "         ST.T_ISEXECUTE" +"\n"+
+                                "        FROM            usr_dpmpaym_tmp tmp"+"\n"+
+                                "         LEFT OUTER JOIN"+"\n"+
+                                "           dpmpaym_dbt pmpaym"+"\n"+
+                                "                    ON pmpaym.t_paymentid = tmp.T_PAYMENTID"+"\n"+
+                                "                 LEFT OUTER JOIN"+"\n"+
+                                "                    doproper_dbt oper"+"\n"+
+                                "                 ON OPER.T_DOCUMENTID = LPAD (pmpaym.t_paymentid, 34, 0) and OPER.T_DOCKIND =pmpaym.T_DOCKIND "+"\n"+
+                                "              LEFT OUTER JOIN"+"\n"+
+                                "                 doprstep_dbt st"+"\n"+
+                                "              ON st.t_id_operation = OPER.T_ID_OPERATION"+"\n"+
+                                "      WHERE   TMP.T_SKIPDOCUMENT in (1,2) /*AND TMP.T_ERRORSTATUS IS NULL*/"+"\n"+
+                                "              AND (st.t_id_step IS NULL" +"\n"+
+                                "                   OR st.t_id_step ="+"\n"+
+                                "                        (SELECT   MAX (t_id_step)"+"\n"+
+                                "                           FROM   doprstep_dbt t"+"\n"+
+                                "                          WHERE   t_id_operation = st.t_id_operation))" +"\n"+ 
+                                "              AND NOT  EXISTS" +"\n"+
+                                "                      (SELECT   1 " +"\n"+
+                                "                        FROM   doprstep_dbt sst " +"\n"+
+                                "                        WHERE   sst.t_id_operation = st.t_id_operation" +"\n"+
+                                "                        AND sst.t_oper != '20001' and sst.t_oper != '0' and TMP.T_SKIPDOCUMENT =1))" +"\n"+
+                                "  LOOP" +"\n"+
+                                "    IF err_step.t_blockid IS NOT NULL" +"\n"+
+                                "    THEN" +"\n"+
+                                "       CASE err_step.t_blockid" +"\n"+
+                                "          WHEN 10000130" +"\n"+
+                                "          THEN" +"\n"+
+                                "             IF err_step.T_ISEXECUTE != 'X'" +"\n"+
+                                "             THEN" +"\n"+
+                                "                UPDATE   usr_dpmpaym_tmp"+"\n"+ 
+                                "                   SET   T_ERRORSTATUS = 1,T_SKIPDOCUMENT=2,"+"\n"+ 
+                                "                         T_ERRORMESSAGE ='платеж застрял на шаге зачисления: '||err_step.t_paymentid "+"\n"+ 
+                                "                 WHERE   T_PAYMENTID = err_step.t_paymentid and T_SKIPDOCUMENT=1;" +"\n"+ 
+                                "             END IF;" +"\n"+
+                                "          WHEN 10000122" +"\n"+
+                                "          THEN" +"\n"+
+                                "             UPDATE   usr_dpmpaym_tmp" +"\n"+
+                                "                SET   T_ERRORSTATUS = 1,T_SKIPDOCUMENT=2,"+"\n"+
+                                "                      T_ERRORMESSAGE = 'платеж застрял на предобработке: '||err_step.t_paymentid "+"\n"+
+                                "              WHERE   T_PAYMENTID = err_step.t_paymentid and T_SKIPDOCUMENT=1;"+"\n"+
+                                "          WHEN 10000137 " +"\n"+
+                                "          THEN" +"\n"+
+                                "             UPDATE   usr_dpmpaym_tmp"+"\n"+
+                                "                SET   T_ERRORSTATUS = 1,T_SKIPDOCUMENT=2,"+"\n"+
+                                "                      T_ERRORMESSAGE = 'платеж застрял на ед. комиссии: '||err_step.t_paymentid "+"\n"+
+                                "              WHERE   T_PAYMENTID = err_step.t_paymentid and T_SKIPDOCUMENT=1;"+"\n"+
+                                "          ELSE"+"\n"+
+                                "            DELETE FROM   usr_dpmpaym_tmp"+"\n"+
+                                "                  WHERE   T_PAYMENTID = err_step.t_paymentid;" +"\n"+
+                                "       END CASE;" +"\n"+
+                                "    END IF;" +"\n"+
+                                "  END LOOP;" +"\n"+
+                                " Commit;"+"\n"+
+                                "  DELETE FROM   usr_dpmpaym_tmp"+"\n"+
+                                "      WHERE   T_ERRORSTATUS IS NULL AND T_SKIPDOCUMENT = 1;"+"\n"+
+                                " COMMIT;" +"\n"+
+                                " END;");
+    err_step.execute();
+    err_step_rs= rsdrecordset ("select nvl(sum(case when t_purpose = 1 then 1 else 0 end),0) cnt_in,"+
+                               "       nvl(sum(case when t_purpose = 0 then 1 else 0 end),0) cnt_out,nvl(sum(T_ERRORSTATUS),0) cnt_err from usr_dpmpaym_tmp");
+    if (err_step_rs.movenext())
+        return err_step_rs.value(2);
+    else
+        return 0;
+    end;  
+end;
+
+/*Все платежи*/
+macro get_all_op
+    private var sql   = "",
+                evs_f = "";
+
+    /* 
+       Перечисляю условие
+       1. Все платежи, которые есть в Ожидающие поступления
+       2. Планируемая дата не больше открытого опердня
+       3. На платеже не стоит признак ручной обработки
+       4. На счете не стоит признак автомат. обработка - "нет"
+       5. Если это внешний платеж, реальное время не должно быть больше чем указано в Тарифном плане по счету
+    */
+
+    //LAO 07.05.2013 заявка от Палагиной
+    if((time() >= time(16,00,00,00)) and (time() <= time(20,00,00,00))) 
+        if(fgBank.is_EXV)//
+            evs_f = evs_f + " and not (pmpaym.T_PAYERBANKID != pmpaym.T_RECEIVERBANKID and pmpaym.t_amount >= 50000000.01) ";
+        end;
+    end; 
+   
+    SQL = "  SELECT /*+FIRST_ROWS LEADING(t oproper pspayord pmpaym pmprop pmrmprop oprcurst) INDEX(t doprstep_dbt_idx10) INDEX(pspayord dpspayord_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(pmprop dpmprop_dbt_idx0) USE_NL(t oproper pspayord pmpaym pmprop pmrmprop oprcurst)*/"
+        + "       t.t_id_operation,null,"
+        + "       pmpaym.t_DocKind,"
+        + "       lpad (to_char (pmpaym.t_paymentid), 34, '0'),"
+        + "       pmpaym.t_paymentid,"
+        + "      decode (oproper.t_kind_operation, " 
+        + "                    0, (select   min (t_kind_operation) " 
+        + "                          from   doprkoper_dbt " 
+        + "                         where   t_dockind = 29 and t_notinuse = chr (0) and t_kind_operation > 0), " 
+        + "                    oproper.t_kind_operation) oper_kind /*если операция не определена то определяется*/, " 
+        + "      rsbsessiondata.curdate, " 
+        + "      chr (88), " 
+        + "      null " 
+        + " FROM   doprstep_dbt t,"
+        + "       doprcurst_dbt oprcurst,"
+        + "       doproper_dbt oproper,"
+        + "       dpmpaym_dbt pmpaym,"
+        + "       dpmprop_dbt pmprop,"
+        + "       dpmrmprop_dbt pmrmprop,"
+        + "       dpspayord_dbt pspayord"
+        + " WHERE   (    t.t_dockind BETWEEN 201 AND 201"
+        //1.Все платежи, которые есть в Ожидающие поступления
+        + "        AND t.t_symbol =chr(137)"
+        + "        AND t.t_isexecute = CHR (82)"
+        //2. Планируемая дата не больше открытого опердня
+        + "       AND t.t_plan_date <=  TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy'))"
+        + "       AND (    oproper.t_ID_Operation = t.t_ID_Operation"
+        + "            AND pspayord.t_OrderID = TO_NUMBER (oproper.t_DocumentID)"
+        + "            AND pmpaym.t_PaymentID = pspayord.t_OrderID"
+        + "            AND pmpaym.t_DocKind = 201"
+        + "            AND pmprop.t_PaymentID = pmpaym.t_PaymentID"
+        + "            AND pmprop.t_DebetCredit = 1"
+        + "            AND pmrmprop.t_PaymentID = pmpaym.t_PaymentID"
+        + "            AND oprcurst.t_ID_Operation(+) = oproper.t_ID_Operation"
+        + "            AND oprcurst.t_StatusKindId(+) = 292"
+        + "            AND ( ( ( (1 = 1))))"
+        + "                                )"
+        + "       AND (t.t_ID_Operation <> 0)"
+        + "            and pspayord.t_origin = 2 " 
+        + evs_f
+        //3. На платеже не стоит признак ручной обработки
+        + "        AND NOT EXISTS ( SELECT 1 "
+        + "  FROM dobjatcor_dbt "
+        + " WHERE t_objecttype = 501 "
+        + "   AND t_groupid = 1003 "
+        + "   AND t_attrid = 1 "
+        + "   AND t_object = LPAD (pmpaym.t_paymentid, 10, '0'))  "
+        //4. На счете не стоит признак автомат. обработка - "нет"
+        + "        AND NOT EXISTS ( SELECT 1 "
+        + "  FROM dobjatcor_dbt "
+        + " WHERE t_objecttype = 4 "
+        + "   AND t_groupid = 107 "
+        + "   AND t_attrid = 1 "
+        + "   AND t_object = '010000000'||pmpaym.t_payeraccount)";
+               
+    return SQL;
+end;   
+
+// LAO оставляем до лучших времен, все ОП должны ходить независимо от каких-либо временных интервалов кроме nothing
+// есть лишь один нюанс, что делать с платежами которые пришли после 16-00 но вручную были поставлены на ОП?
+macro get_in_op /*внутренние платежи*/ 
+    private var sql="", evs_f="", cond="";
+    
+    // определяем правила подстановки в зависимости от Банка
+    // ДЛЯ САРАТОВА и ВУЗа однозначно
+    if(BIC_BANK == "")
+        cond = " AND pmpaym.T_PAYERBANKID = pmpaym.T_RECEIVERBANKID ";
+    else
+        cond = " AND (pmpaym.T_PAYERBANKID = pmpaym.T_RECEIVERBANKID or pmprop.t_bankcode in ("+BIC_BANK+")) ";
+    end;
+
+    cond = cond + " AND (REGEXP_LIKE(pmpaym.t_payeraccount, '^407|^406|^405|^40802') AND (REGEXP_LIKE(pmpaym.t_receiveraccount, '^407|^406|^405|^40802|^423'))) ";
+
+    /* 
+        Перечисляю условие
+        1. Все платежи, которые есть в Ожидающие поступления
+        2. Планируемая дата не больше открытого опердня
+        3. На платеже не стоит признак ручной обработки
+        4. На счете не стоит признак автомат. обработка - "нет"
+        5. Если это внешний платеж, реальное время не должно быть больше чем указано в Тарифном плане по счету
+    */
+
+    SQL = "  SELECT /*+FIRST_ROWS LEADING(t oproper pspayord pmpaym pmprop pmrmprop oprcurst) INDEX(t doprstep_dbt_idx10) INDEX(pspayord dpspayord_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(pmprop dpmprop_dbt_idx0) USE_NL(t oproper pspayord pmpaym pmprop pmrmprop oprcurst)*/"
+        + "       t.t_id_operation,null,"
+        + "       pmpaym.t_DocKind,"
+        + "       lpad (to_char (pmpaym.t_paymentid), 34, '0'),"
+        + "       pmpaym.t_paymentid,"
+        + "       decode (oproper.t_kind_operation, " 
+        + "                    0, (select   min (t_kind_operation) " 
+        + "                          from   doprkoper_dbt " 
+        + "                         where   t_dockind = 29 and t_notinuse = chr (0) and t_kind_operation > 0), " 
+        + "                    oproper.t_kind_operation) oper_kind /*если операция не определена то определяется*/, " 
+        + "      rsbsessiondata.curdate, " 
+        + "      chr (88), " 
+        + "      null " 
+        + " FROM   doprstep_dbt t,"
+        + "       doprcurst_dbt oprcurst,"
+        + "       doproper_dbt oproper,"
+        + "       dpmpaym_dbt pmpaym,"
+        + "       dpmprop_dbt pmprop,"
+        + "       dpmrmprop_dbt pmrmprop,"
+        + "       dpspayord_dbt pspayord"
+        + " WHERE   (    t.t_dockind BETWEEN 201 AND 201"
+        + "        AND t.t_symbol =chr(137)"
+        + "        AND t.t_isexecute = CHR (82)"
+        + "        AND t.t_plan_date <=  TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy'))"
+        + "        AND pspayord.t_origin = 2 "
+        + "       AND (    oproper.t_ID_Operation = t.t_ID_Operation"
+        + "            AND pspayord.t_OrderID = TO_NUMBER (oproper.t_DocumentID)"
+        + "            AND pmpaym.t_PaymentID = pspayord.t_OrderID"
+        + "            AND pmpaym.t_DocKind = 201"
+        + "            AND pmprop.t_PaymentID = pmpaym.t_PaymentID"
+        + "            AND pmprop.t_DebetCredit = 1"
+        + "            AND pmrmprop.t_PaymentID = pmpaym.t_PaymentID"
+        + "            AND oprcurst.t_ID_Operation(+) = oproper.t_ID_Operation"
+        + "            AND oprcurst.t_StatusKindId(+) = 292"
+        + "            AND ( ( ( (1 = 1))))"
+        + "                                )"
+        + "       AND (t.t_ID_Operation <> 0)"
+        //. На платеже не стоит признак ручной обработки
+        + "        AND NOT EXISTS ( SELECT 1 "
+        + "  FROM dobjatcor_dbt "
+        + " WHERE t_objecttype = 501 "
+        + "   AND t_groupid = 1003 "
+        + "   AND t_attrid = 1 "
+        + "   AND t_object = LPAD (pmpaym.t_paymentid, 10, '0'))  "
+        // 4. На счете не стоит признак автомат. обработка - "нет"
+        + "        AND NOT EXISTS ( SELECT 1 "
+        + "  FROM dobjatcor_dbt "
+        + " WHERE t_objecttype = 4 "
+        + "   AND t_groupid = 107 "
+        + "   AND t_attrid = 1 "
+        + "   AND t_object = '010000000'||pmpaym.t_payeraccount)"
+        // Если это внешний платеж(ВУЗ), реальное время не должно быть больше чем указано в Тарифном плане по счету
+        + cond;
+               
+    return SQL;
+end;
+
+// Golovkin C-37074 расписание для робота ОП
+macro get_action_op
+    private var sql = " WITH curtime AS (SELECT   TO_TIMESTAMP (TO_CHAR (:curtime, 'hh24:mi:ss'),'hh24:mi:ss') time,                              " +
+                      "                           NVL(:isHoliday, CHR (0))                                     isHoliday                          " +
+                      "                    FROM   DUAL)                                                                                           " +
+                      " SELECT   CASE  WHEN t_action NOT IN ('m_nothing','m_all','m_vnutren') THEN 'm_nothing'                                    " +
+                      "                ELSE t_action                                                                                              " +
+                      "          END action                                                                                                       " +
+                      "   FROM   usr_me_time_op_dbt, curtime ctime                                                                                " +
+                      "  WHERE       1 = (CASE WHEN t_tb_include  = CHR (88) AND ctime.time >= TO_TIMESTAMP (t_timebegin, 'hh24:mi:ss.ff') THEN 1 " +
+                      "                        WHEN t_tb_include != CHR (88) AND ctime.time >  TO_TIMESTAMP (t_timebegin, 'hh24:mi:ss.ff') THEN 1 " +
+                      "                        ELSE 0                                                                                             " +
+                      "                   END)                                                                                                    " +
+                      "          AND 1 = (CASE WHEN t_te_include  = CHR (88) AND ctime.time <= TO_TIMESTAMP (t_timeend,   'hh24:mi:ss.ff') THEN 1 " +
+                      "                        WHEN t_te_include != CHR (88) AND ctime.time <  TO_TIMESTAMP (t_timeend,   'hh24:mi:ss.ff') THEN 1 " +
+                      "                        ELSE 0                                                                                             " +
+                      "                   END)                                                                                                    " +
+                      "          AND 1 = (CASE WHEN ctime.isHoliday  = CHR (88) AND t_is_holiday  = CHR (88) THEN 1                               " +
+                      "                        WHEN ctime.isHoliday != CHR (88) AND t_is_holiday != CHR (88) THEN 1                               " +
+                      "                        ELSE 0                                                                                             " +
+                      "                   END)                                                                                                    " +
+                      " ORDER BY T_ID                                                                                                             ";
+debugbreak;
+    var holiday = strFor(0);
+
+    // Golovkin R-550880 по умолчанию функция isholiday проверяет текущий опер. день
+    if(isholiday(date)) holiday = strFor(88); end;
+
+    private var cmd = rsdCommand(sql);
+                cmd.addParam("curtime",   RSDBP_IN, time() );  
+                cmd.addParam("isHoliday", RSDBP_IN, holiday);  
+
+    private var rs = rsdRecordset(cmd);
+
+    if(rs.movenext)
+        return rs.value("action");
+    end;
+
+    return "m_nothing";
+end;  
+
+macro StartOP(add_clause)
+    var from = "", condition = "", cmd, r, op;
+    var z:integer = 0;
+    var i:integer = 0;
+    var scr;
+
+    // Golovkin C-37074 расписание для робота ОП
+    var action = get_action_op;
+
+    if  (action == "m_nothing")  return;
+    elif(action == "m_all"    )  condition = get_all_op;
+    elif(action == "m_vnutren")  condition = get_in_op;
+    end;
+
+    opr.kindoperation = 24001;
+    opr.dockind       = 201;
+   
+    ClearDoprtemp();
+    
+    SaveBeginTime(); //Старт
+
+    rsldefcon.BeginTrans;
+
+/*
+    if(fgBank.is_EXV)
+        if((time() >= time(19,00,00,00)) and (time() <= TIME(23,30,00,00))) 
+            condition = get_IN_OP();
+        else  
+            condition = get_ALL_OP();
+        end; 
+    elif(fgBank.is_VUZ)
+        if((time() >= time(20,00,00,00)) and (time() <= TIME(21,30,00,00))) 
+            condition = get_IN_OP();
+        else  
+            condition = get_ALL_OP();
+        end; 
+    elif(fgBank.is_GEB)
+        if((time() >= time(20,00,00,00)) and (time() <= TIME(23,30,00,00))) 
+            condition = get_IN_OP();
+        else  
+            condition = get_ALL_OP();
+        end; 
+    elif((fgBank.is_PRBB) or (fgBank.is_SLD))
+        if ((time() >= time(20,30,00,00)) and (time() <= TIME(09,00,00,00))) 
+            condition = get_IN_OP();
+        else  
+            condition = get_ALL_OP();
+        end; 
+    else
+        if((time() >= time(19,00,00,00)) and (time() <= TIME(09,00,00,00))) 
+            condition = get_IN_OP();
+        else      
+            condition = get_ALL_OP();
+        end;     
+    end;
+*/
+    cmd = rsdCommand("insert into doprtemp_tmp (t_id_operation, " +
+                     "                          t_sort, " +
+                     "                          t_dockind, " +
+                     "                          t_documentid, " +
+                     "                          t_orderid, " +
+                     "                          t_kind_operation, " +
+                     "                          t_start_date, " +
+                     "                          t_isnew, " +
+                     "                          t_id_step) " +
+                     condition+
+                     "and pmpaym.t_paymentid not in(select t_paymentid from  USR_DPMPAYM_TMP) " + add_clause);
+    
+    debugbreak;
+    cmd.execute;
+    
+    // Если есть стоп платежи связанные с удалением
+    cmd = rsdCommand(" delete from doprtemp_tmp op where t_orderid in (SELECT   T_PAYMENTID"
+                    +" FROM   USR_Nightly_TMP"
+                    +" WHERE   TO_DATE (T_START_DATE, 'dd.mm.yyyy hh24:mi:ss') >="
+                    +" TO_DATE (SYSDATE, 'dd.mm.yyyy hh24:mi:ss'))");
+    cmd.execute;
+
+    // Чистим таблицу 
+    cmd = rsdCommand("delete from USR_Nightly_TMP WHERE   TO_DATE (T_START_DATE, 'dd.mm.yyyy hh24:mi:ss') <="
+                    +" TO_DATE (SYSDATE, 'dd.mm.yyyy hh24:mi:ss')");
+    cmd.execute;
+
+    r = rsdrecordset("select count(1) from doprtemp_tmp ");
+
+    if (r.movenext())
+        SaveAmount (r.value(0)); //Количество
+    end;
+
+    cmd = rsdCommand("select * from dpmpaym_dbt where t_paymentid in (select t_orderid from doprtemp_tmp) for update nowait");
+
+    setdialogflag(0);
+    cmd.execute;
+    setdialogflag(1);
+    
+    //Vaschenko 04.03.2014 Изменения под 20.31
+    cmd = rsdCommand(" INSERT INTO usr_doprtemp_op_tmp "
+                     " (SELECT tmp.t_sort, "+
+                     " tmp.t_dockind, "+
+                     " tmp.t_documentid, "+
+                     " tmp.t_id_operation, "+
+                     " tmp.t_orderid, "+
+                     " tmp.t_kind_operation, "+
+                     " tmp.t_isnew, "+
+                     " tmp.t_id_step, "+
+                     " tmp.t_start_date, "+
+                     " tmp.t_errorstatus, "+
+                     " tmp.t_errormessage, "+
+                     " tmp.t_skipdocument, "+
+                     " tmp.t_massoprstart, "+
+                     " tmp.t_initmacro, "+
+                     " tmp.t_newoper, "+
+                     " tmp.t_oprcompleted, "+
+                     " tmp.t_parent_id_operation, "+
+                     " tmp.t_parent_id_step, "+
+                     " paym.t_creationdate, "+
+                     " paym.t_creationtime, "+
+                     " prop.t_priority, "+
+                     " paym.t_payeraccount "+
+                     " FROM doprtemp_tmp tmp, dpmpaym_dbt paym, dpmrmprop_dbt prop "+
+                     " WHERE tmp.t_orderid = paym.t_paymentid "+
+                     " AND paym.t_paymentid = prop.t_paymentid)");
+    cmd.execute();
+
+    cmd = rsdCommand("update   dpspayord_dbt t " +
+                     "   set   t_oper = ? " +
+                     " where   exists (select   1 " +
+                     "                   from   doprtemp_tmp " +
+                     "                  where   t_orderid = t.t_orderid) ");
+    cmd.addparam("oper", RSDBP_IN, {oper});
+    cmd.execute();
+
+    cmd = rsdCommand("update   dpmpaym_dbt t " +
+                     "   set   t_oper = ? " +
+                     " where   exists (select   1 " +
+                     "                   from   doprtemp_tmp " +
+                     "                  where   t_orderid = t.t_paymentid) ");
+    cmd.addparam("oper", RSDBP_IN, {oper});
+    cmd.execute();
+    
+    cmd = rsdCommand("begin ? := wld_common.definemessagereleaseforpmmass (false); end;");
+    cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+    cmd.execute();
+   
+    cmd = rsdCommand("declare " +
+                     "   v_cnt   number; " +
+                     "   v_rng   number; " +
+                     "begin " +
+                     "   select   count (1) into v_cnt from doprtemp_tmp; " +
+                     "   update   doprtemp_tmp " +
+                     "      set   t_sort = null; " +
+                     "   for i " +
+                     "   in (  select   pmpaym.t_payeraccount, count (1) acc_cnt, rownum ac_num " +
+                     "           from   doprtemp_tmp op, dpmrmprop_dbt prop, dpmpaym_dbt pmpaym " +
+                     "          where       op.t_orderid = pmpaym.t_paymentid " +
+                     "                  and op.t_dockind = pmpaym.t_dockind                   " +
+                     "                  and pmpaym.t_paymentid = prop.t_paymentid                   " +
+                     "       group by   pmpaym.t_payeraccount, rownum " +
+                     "       order by   count (1) desc) " +
+                     "   loop " +
+                     "      for j in (  select   pmpaym.t_documentid, rownum n " +
+                     "                    from   doprtemp_tmp op, dpmpaym_dbt pmpaym " +
+                     "                   where   op.t_documentid = pmpaym.t_paymentid and pmpaym.t_payeraccount = i.t_payeraccount " +
+                     "                order by   t_paymentid) " +
+                     "      loop " +
+                     "         v_rng := round (v_cnt / i.acc_cnt); " +
+                     "         update   doprtemp_tmp " +
+                     "            set   t_sort = v_rng * j.n + i.ac_num " +
+                     "          where   t_orderid = j.t_documentid; " +
+                     "      end loop; " +
+                     "   end loop; " +
+                     "end; "
+                    );
+    cmd.execute;
+
+    rsldefcon.CommitTrans;
+
+    // Делаем условную разбивку на приоритеты 1-6. дату создания и время.
+    z = 6;
+    for(i, 1, z)
+        cmd = rsdCommand("begin ?:=usr_check_amount (?,?); end;");
+        cmd.addParam("st",    RSDBP_RETVAL,v_integer);  
+        cmd.addParam("prior", RSDBP_IN,    i        );  
+        cmd.addParam("date",  RSDBP_IN,    {curdate});  
+        cmd.execute;
+    end;    
+
+    ClearDoprtemp();
+    SaveEndTime(10); // Закончили
+
+onerror(er);
+    catch(er);
+end; 
+
+  //для того что бы выбрать запрос, вставляем время если оно нужно и саму процедуру.
+  //  get_ALL_OP();
+  //  get_IN_OP();
+  //  StartOP(); 

@@ -1,0 +1,165 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Макрос пользовательского алгоритма расчёта базовых сумм по комиссии 3.6.0 
+       "Перевод денежных средств, поступивших в составе рейсов МЦИ текущего дня"
+
+       Тип комиссии - периодическая.
+   ChangeLog:
+   //RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+   //RR 20.60.2014 Доадаптирую под Солидарность
+   //RR 24.06.2014 Добавил исключение документов оплаты К2
+   //joy 14.11.2014 I-00532241 в 2031 обязательно надо проверять, что t_state в проводках = 1
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+
+import sfinter, ptinter, cb_sql;/*InsertSumList*/
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+
+
+
+macro CalculateExternalPaymentCoverage(PaymValueDate, PayerAccount)
+
+    var stat:integer; 
+    var query, rs;
+    var OurBIC    = "",
+        error,
+        PrevRest,
+        InternalIncome,
+        PaySum,
+        ExternalPaymentCoverage;
+    
+
+    PrevRest = InternalIncome = PaySum = ExternalPaymentCoverage = $0;
+
+
+    /* Получим остаток по счёту на конец дня, предшествующего дате документа */
+    PrevRest = RestA( PayerAccount, (PaymValueDate - 1) );
+        //msgbox (PrevRest, "|", PayerAccount, "|", (PaymValueDate - 1));
+    
+    /* Рассчитаем сумму внутреннего прихода счёта за день проводки документа */
+    /* EVG 2.11.2009 Cумму внутр. прихода считаем проводками */
+    query = " Select nvl(sum( doc.t_Sum_Natcur ), 0) " +
+            "   From dacctrn_dbt doc " +
+            "  Where doc.t_Account_Receiver = " + GetSQLString(PayerAccount) +
+            "    and doc.t_Date_carry       = " + GetSQLDate(PaymValueDate) +
+            "    and doc.t_state = 1" +
+            "    and doc.t_Account_Payer not like '3%' " ;           // Внутренние платежи
+
+    rs = rsdRecordSet(query);
+    if (rs and rs.moveNext())
+       InternalIncome = rs.Value(0, null, V_MONEY);
+    end;
+
+
+    /* Определим сумму платежей за дату документа */
+    /* Cумму платежей считаем проводками */
+    query = " Select nvl(sum( doc.t_Sum_natcur ), 0) " +
+            "   From dacctrn_dbt doc, dpmdocs_dbt pmd, dpmpaym_dbt paym " +
+            "  Where doc.t_Account_Payer = " + GetSQLString(PayerAccount) +
+            "    and doc.t_Date_Carry    = " + GetSQLDate(PaymValueDate) +
+            "    AND doc.t_Account_Receiver NOT LIKE '45%' " + 
+            "    AND doc.t_Account_Receiver NOT LIKE '706%' " + 
+            "    AND DOC.T_ACCOUNT_RECEIVER NOT LIKE '47423%' " +
+            "    AND DOC.T_ACCOUNT_RECEIVER NOT LIKE '603%' " +
+            "    and doc.t_Shifr_Oper   not like '02' " +               // Исключается погашение кредитов
+            "    and doc.t_Shifr_Oper   not like '06' " +               // Исключается погашение кредитов
+            "    and doc.t_Shifr_Oper   not like '16' " +               // Кроме оплаты картотек
+            "    and not (doc.t_Shifr_Oper like '09' and doc.t_Kind_Oper like '%6') " +
+            "    AND DOC.T_ACCTRNID = PMD.T_ACCTRNID" +
+            "    and doc.t_state = 1" +
+            "    AND PMD.T_PAYMENTID = PAYM.T_PAYMENTID " +
+            "    AND PAYM.T_RECEIVERACCOUNT not like '47423%' " + // К2 исключается
+            "    AND SUBSTR (paym.t_ReceiverAccount, 1, 3) NOT BETWEEN '401' AND '404' ";
+
+    rs = rsdRecordSet(query);
+    if (rs and rs.moveNext())
+       PaySum = rs.Value(0, null, V_MONEY);
+    end;
+    //msgbox (query);
+
+    /* Определим, производится ли оплата за счёт сумм, поступивших внешним платежом */
+    ExternalPaymentCoverage = PaySum - (PrevRest + InternalIncome);
+        //msgbox (ExternalPaymentCoverage, "|", PaySum, " - ", PrevRest, " - ", InternalIncome);
+
+    if (ExternalPaymentCoverage > $0)
+       return ExternalPaymentCoverage;
+    end;
+
+    return $0;
+end; /*CalculateExternalPaymentCoverage()*/
+
+
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sAddr /* EVG Какой-то ещё адрес */, sfcontrStruc /*Cтруктура sfcontr*/ )
+
+    record sfcontr( sfcontr );
+    var query, rs, stat;
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var retVal, Attrid, Code, Num;
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+    else
+       Copy ( sfcontr, sfcontrStruc );
+    end;
+debugbreak;
+    query = " Select distinct(paym.t_ValueDate) dt " +
+            "   From DPmPaym_dbt paym " +
+            "  Where paym.t_PayerAccount    = " + GetSQLString(sfcontr.Object) +
+            "    and paym.t_PaymStatus      = 32000 " +                                 // Только закрытые
+            "    AND PAYM.T_RECEIVERACCOUNT not like '47423%' " + // К2 исключается
+            "    and paym.t_ValueDate between " + GetSQLDate(BeginDate) +
+            "                             and " + GetSQLDate(BeginDate) +
+            "  Order by dt ";
+    rs = rsdRecordSet(query);
+    while (rs and rs.moveNext())
+
+       CommSum   = CommSum + CalculateExternalPaymentCoverage( rs.value(0, null, V_DATE), sfcontr.Object );
+
+    end;
+
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType    = SF_BASETYPE_SUM;
+    sfbassum.baseSum     = CommSum;
+
+    sfbassum.baseType2   = SF_BASETYPE_SUM;
+    sfbassum.baseSum2    = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/

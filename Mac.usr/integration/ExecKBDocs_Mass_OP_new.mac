@@ -1,0 +1,728 @@
+/***************************************************************************************************************
+   Имя файла..:       ExecKBDocs_Mass_new.mac
+   Назначение.:       работа круглосуточного робота в асинхронном режиме без использования exec_step_for_temp
+   Заявка.....:       от Палагиной Елены  C-17283-6
+   Дата.......:       01.02.2013
+   Автор......:       Лисименко Антон -      за основу взята логика из Робота/Планировщика Котова С.
+   Комментарий: 
+   1. механизм работы с ИК платежами  кардинально отличается от старого робота
+   2. Добавлена система раннего оповещения, робот перестал быть зависимым от обработчиков
+   3. Добавлена рассылка писем в лотус,переделана диалоговая форма временных интервалов
+   4. Добавлен механизм  "+ 1" :  при переходе на другой временной интервал, происходит финальный сбор платежей с фильтром по дате создания
+   5. Добавлен онлайн монитор "Последние две ошибки"
+   6. Добавлен  мониотор  всех актуальных ошибок, в идеале на нем будет кнопка с возможностью перепровдения платежей.
+   7. Еще раз переделан монитор, теперь робот после 40 сек. паузы делает анализ проведенных платежей,если они
+   застряли на шагах, об этом формируется запись, время жизни записи по ошибкам 600 минут или до рестарта робота
+   8. Если платеж был помещен опером в отложенные, робот не проводит его 5-ть минут.
+   9. Робот ВУЗа и Саратова объеденены в один
+   10. Добавлено логирование запуска
+   11. Добавляем ПрББ
+   12. C-20812 Interbank RS   Конверсия/покупка/продажа валюты  
+   13. Добавляем ОП C-19164-6
+   14. 10.09.2013 LAO рефакторинг
+   15. А очередность то не работает!!! Большое исправление, механизм отправки платежей на обработку становится каскадным...
+     ____1 очередность 
+        |___2 очередность
+            |___3 очередность
+                |____4 очередность и до 6-ой.
+                проверка очередности происходит в макросе psprepro.mac, если на момент выполнения на предобработке есть платежи с 
+                очередностью и временм  приоритетнее, тогда платеж попадает в таблицу отложенного старта USR_DEFFERED_START
+    doprtemp_tmp    -- Основная таблица (global temporary), используется для сбора платежей, сортировки и отправки обработчику
+    usr_dpmpaym_tmp -- Таблица (global temporary), хранит платежи которые находятся в обработке роботом, в неее записывается статус обработки по платежам
+    usr_doprtemp_tmp-- глобальная таблица, использовалась для проверки на захват платежа роботом, а сейчас хз...
+    USR_Nightly_TMP -- записываются платежи по которым был откат, робот не подбирает такие платежи 5 минут
+    USR_ROBOTS_IK_LOG -- таблица логирования шагов робота, кол-во документов пока еще не сохраняет нормально.
+    USR_DEFFERED_START  -- глобальная таблица, в нее записываются платежи с предобработки , у которых отложеный старт из за очередностиили времени создания
+
+    22.07.2014 Vaschenko D. Исключить платежи со счетами овердрафта для всех банков, кроме НБС и Пойдема С-29828
+****************************************************************************************************************/
+import RSD, Календарь, BankInter, globals;
+import "KeyCodes.mac", 
+       "OperationsProc.mac", 
+       "pmreport_mass.mac", 
+       "ldmklbr.mac", 
+       "CurDateProc.mac",
+       "acs_func.mac", 
+       "Send_lotus.mac",
+       "fg_Life_parm.mac",
+       "sql_KB_OP.mac";
+
+//При активном кр. роботе
+private const DefStatusLineActive  = "F2 Проводка документов F3 Стоп для всех F6 Список платежей с ошибками  F9 Выход";
+
+//При не активном кругл. роботе
+private const DefStatusLinePassive = "F2 Старт для всех F3 Стоп для всех F6 Список платежей с ошибками F7 Расписание F9 Выход";
+private var fgBank = fg_life_subject({OurBank});
+        var sql = "";
+        var Email,// Основные адресса вбиваются через временные интервалы, в реестр вбиваются служебные
+            EMAIL_ALL,
+            stat, 
+            OLD_ACTION = "",//Предыдущее событие
+            NEW_ACTION = "",
+            Final_time,
+            Final_param,
+            Final_date, Start_date = date(), Start_time = time(),
+            Final_STEP = 0, //0- Не было перехода на новый интервал 1- Произошел переход
+            TEXT_MAIL;
+
+private const LOG_ENTRY = "ExecKBDocs_Mass_new.mac::КР для ИК ассинхронный"; 
+
+GetRegistryValue("PRBB\\Интерфейсы\\Получатель_ИК", V_STRING, Email, stat); 
+
+if(stat != 0)
+    Email = "Vladimir N Golovkin/IT/Probusiness Bank@PRBB,Anton O Lisimenko/IT/Probusiness Bank@PRBB";
+end; 
+
+// Внесем запись о старте робота
+execMacroFile("lib_log.mac", "LogProcedure", LOG_ENTRY);
+
+//Логируем шаги робота
+macro log_step(count,err,CountOBR,STATUSSTR,StatusRobots,v_Start_date,v_Start_time);
+    var cmd = RSDCommand("insert into USR_ROBOTS_IK_LOG (TIME_START, PARM_STEP, turn_count,turn_err,final_step,oper,Count_OBR,STATUS_OBR,StatusRobots) values (to_date(?,'dd.mm.yyyy hh24:mi:ss'),?,?,?,?,?,?,?,?)");
+        cmd.addParam("startdate",    RSDBP_IN, string(v_Start_date) + " " + string(v_Start_time));
+        cmd.addParam("parmset",      RSDBP_IN, "start OP"                                       );
+        cmd.addParam("turn_count",   RSDBP_IN, count                                            );
+        cmd.addParam("turn_err",     RSDBP_IN, err                                              );
+        cmd.addParam("final_step",   RSDBP_IN, "0"                                              );
+        cmd.addParam("oper",         RSDBP_IN, {oper}                                           );
+        cmd.addParam("CountOBR",     RSDBP_IN, CountOBR                                         );
+        cmd.addParam("STATUS_STR",   RSDBP_IN, STATUSSTR                                        );
+        cmd.addParam("StatusRobots", RSDBP_IN, StatusRobots                                     );
+        cmd.execute;
+end;
+   
+//обработка событий
+macro EvProc_ERR (rs, Command, id, key )  
+    if((Command == DLG_KEY) and (key == KEY_ENTER))
+        return CM_SELECT;
+    elif((Command == DLG_KEY) and (key == KEY_ESC))
+        return CM_CANCEL;
+    elif((Command == DLG_KEY) and (KEY == KEY_F5)) // обновить информацию
+        msgbox("обновили");
+    else
+        CM_IGNORE;
+    end;
+end;
+    
+macro addCol (ar, ind, fld, head, width, rdonly, DecPoint)
+    ar.value (ind * 6)      = fld;
+    ar.value (ind * 6 + 1)  = head;
+    ar.value (ind * 6 + 2)  = width;
+    ar.value (ind * 6 + 3 ) = 1;        // fldType
+    ar.value (ind * 6 + 4 ) = DecPoint; // decPoint
+    ar.value (ind * 6 + 5 ) = 0;        // reserv
+end;
+  
+//скроллинг  ошибок по F6, только ошибки компиляции, блокировки, оракловые ошибки
+macro LAST_ERROR(); 
+    var col = TArray;
+    var err_cmd, err_rs;
+    var scr = scroll_err();
+
+    err_cmd = rsdCommand(scr);
+    err_rs  = rsdRecordset(err_cmd, RSDVAL_CLIENT, RSDVAL_Static);
+
+    addCol (col, 0,  "T_PAYMENTID",       "Ид платежа",       10,  false, 0);
+    addCol (col, 1,  "T_DATE",            "Дата",             10,  false, 0);
+    addCol (col, 2,  "T_NUMBER",          "Номер",            10,  false, 0);
+    addCol (col, 3,  "T_PAYER",           "Код в РС",         10,  false, 0);
+    addCol (col, 4,  "PAYER",             "Плательщик",       25,  false, 0);
+    addCol (col, 5,  "T_PAYERACCOUNT",    "Счет Плательщика", 22,  false, 0);
+    addCol (col, 6,  "T_Receiver",        "Код в РС",         25,  false, 0);
+    addCol (col, 7,  "RECEIVER",          "Получатель",       25,  false, 0);
+    addCol (col, 8,  "T_RECEIVERACCOUNT", "Счет Получателя",  22,  false, 0);
+    addCol (col, 9,  "T_AMOUNT",          "Сумма",            10,  false, 4);
+    addCol (col, 10, "step",              "Шаг",              14,  false, 0);
+    addCol (col, 11, "T_ERRORMESSAGE",    "Ошибки",           100, false, 0);
+    addCol (col, 12, "stdate",            "Время ответа",     25,  false, 0);
+
+    if(runScroll(err_rs, 13, col, null, @EvProc_ERR, "Список платежей с ошибками", "Только для просмотра", false, null, null, 150, 150))
+        return 0;  
+    end;
+end;
+
+Class (TRecHandler) TParmAgentKB (LbrName)
+
+    private const flag_yes = "Да" ; 
+    private const flag_no  = "Нет";
+    private const over_yes = "Да" ; // Константа для овердрафта
+    private const over_no  = "Нет"; // Константа для овердрафта
+
+    InitTRecHandler ("mon_kb", (LbrName), true);
+
+    macro StartAgent(dlg) 
+        private var _key                 = KEY_F2;
+        private var count_doc_out        = 0,                   // Количество обработанных исходящих
+                    count_doc_in         = 0,                   // Количество обработанных входящих
+                    StatusRobots         = "Активен",
+                    Count_OBR            = 0,
+                    StatusObr            = 0,
+                    ReaLCount            = 0,
+                    CheckCount           = 0,
+                    STATUS_STR           = "Опрос...",
+                    Check_IB             = true,
+                    count_doc_err        = 0;                   // Количество  платежей с ошибками
+        private const flag_out_cat_first = "_out_cat_first";    // Первичный опрос
+        private const flag_out           = "_out";              // Обработка внутр.
+        private const flag_in            = "_in";               // Обработка внешн.
+        private const flag_pause         = "_pause";            // Ожидание следующей обработки
+        private var   flag_action        = flag_out_cat_first;  // Начальное состояние - простановка категорий
+        private var   PaymentId          = 0,                   // Обрабатываемый платёж
+                      DocKind            = 0,                   // Тип обрабатываемого платёжа
+                      purpose            = 0;
+        private var   StartTimeOut       = time(),              // Время начала внутр.
+                      StartTimeIn        = time(),              // Время начала внешн.
+                      LastTimeTest       = time(),              // Время последнего получения ответа от обработчиков
+                      LastTimeSTEP       = time(),              // Время последнего опроса статуса платежей
+                      LastTimeOP         = time(),              // Время последнего опроса ОП
+                      LastTimePPK        = time(),              // Время последнего опроса П/П/К *покупка продажа конверсия
+                      LastTimeExec       = time(),              // Время последнего проведения документов
+                      LastTimeCheck      = time();              // Время последней проверки принятых сообщений
+        private var   FreqTimeTest       = 10,                  // Периодичность проверки ответов от обработчика  - 10 секунд
+                      FreqTimeSTEP       = 40,                  // Периодичность проверки статуса проведенных платежей  - 40 секунд
+                      FreqTimeOP         = 420,                 // Периодичность проверки ОП  - 420 секунд
+                      FreqTimePPK        = 30,                  // Периодичность проверки статуса проведенных платежей  - 130 секунд
+                      FreqTimeExec       = 420,                 // Периодичность проведения документов - 5 минут
+                      FreqTimeCheck      = 420;                 // Периодичность проверки активности обработчика
+        private var   mes                = DefStatusLineActive; // Строка состояния
+        private var   clause             = "";                  // Дополнительное условие по расписанию
+        private var   cnt_cdoub          = 0,                   // Количество дублированных документов
+                      cnt_doub           = 0;                   // Количество задвоенных документов
+        private var   errcode,Value_err;
+        private const prior              = 6;                   //максимальная очередность
+            
+        macro IsCheckAccOver()
+            if(dlg.rec.CheckAccOver == over_yes)
+                return true;
+            end;
+
+            return false;
+        end;
+      
+        macro InvertFlag(flag);
+            if(flag == flag_yes)
+                return flag_no;
+            else
+                return flag_yes;
+            end;
+        end;
+
+        //Обновляет счетчик ошибок
+        macro LAST_ERR
+            var sel;
+
+            dlg.rec.LOG_PAYM = "";
+
+            sel = rsdRecordset ("select t_errormessage cnt_err from usr_dpmpaym_tmp    " +
+                                " where T_ERRORSTATUS =1                               " +
+                                " AND (t_errormessage LIKE '%компиляции%'              " +
+                                " OR t_errormessage LIKE '%ORA%'                       " +
+                                " OR t_errormessage LIKE '%Неверный тип значения%'     " +
+                                " OR t_errormessage like '%доступ к свойству%'         " +
+                                " OR t_errormessage LIKE '%Невозможно зарезервировать%'" +
+                                " OR t_errormessage LIKE '%застрял%'  )  and rownum<5  " +
+                                " order by T_START_DATE");
+
+            while (sel and sel.movenext())
+                dlg.rec.LOG_PAYM = dlg.rec.LOG_PAYM + sel.value(0) + "\n";
+            end;
+        end;
+
+        //Начинаем отслеживать статус таких платежей
+        macro UPD_ERR
+            var sel;
+
+            sel = rsdCommand("update usr_dpmpaym_tmp set T_SKIPDOCUMENT=2           " +
+                             " where T_ERRORSTATUS =1 and T_SKIPDOCUMENT is null    " +
+                             " AND (t_errormessage LIKE '%компиляции%'              " +
+                             " OR t_errormessage LIKE '%ORA%'                       " +
+                             " OR t_errormessage LIKE '%Неверный тип значения%'     " +
+                             " OR t_errormessage like '%доступ к свойству%'         " +
+                             " OR t_errormessage LIKE '%Невозможно зарезервировать%'" +
+                             " OR t_errormessage LIKE '%застрял%')");
+            sel.execute;
+        end;
+
+        set_pipe_server(pipe_server_interbank);
+
+        FreqTimeExec = 420;
+
+        // Проверить ответный пайп. Так же делаем проверку на обработчики
+        // Текста очень много, проверок так же.
+        macro TestPipe()
+            private var cmd, r;
+        
+            r = rsdRecordset(" SELECT count(*) "
+                             " FROM v$session vs, dregistry_dbt rg, usr_fixdoc_dbt fd "
+                             " WHERE" 
+                             " vs.SID = rg.t_connection_number(+) "
+                             " AND vs.SID = fd.t_SID "
+                             " AND vs.LOGON_TIME = fd.T_STARTTIME" 
+                             " AND RG.T_SHORTNAMEUSER ='20001'");
+
+            if(r.movenext())
+                Count_OBR = r.value(0);
+            end;
+
+            //Сколько всего ошибок
+            r = rsdrecordset ("select nvl(sum(T_ERRORSTATUS),0) cnt_err from usr_dpmpaym_tmp /*where T_INITMACRO!='OP'*/");
+
+            if(r.movenext())
+                count_doc_err = r.value(0);
+            else
+                count_doc_err = 0;
+            end;
+        
+            r = rsdrecordset ("select nvl(sum(case when t_purpose = 1 then 1 else 0 end),0) cnt_in,"+
+                              "       nvl(sum(case when t_purpose = 0 then 1 else 0 end),0) cnt_out from usr_dpmpaym_tmp where T_SKIPDOCUMENT is null and T_ERRORSTATUS is null /*and T_INITMACRO!='OP'*/");
+
+            if(r.movenext())
+                count_doc_in  = count_doc_in  + r.value(0);
+                count_doc_out = count_doc_out + r.value(1);
+                CheckCount    = r.value(0)    + r.value(1); //сколько было с самого начала
+                RealCount     = r.value(0)    + r.value(1); //очередь
+         
+                if(count_doc_err >= 30)
+                    StatusRobots = "Внимание! Ошибки в макросах!";
+                else    
+                    StatusRobots = "Работают";            
+                end; 
+            end;
+
+            // Если в канале есть ответ для меня, то удаляю запись 
+            cmd = RSDCommand("declare                                                                                                                        " + "\n" +
+                             "  stat number := 0;                                                                                                            " + "\n" +
+                             "  message varchar2(1000);                                                                                                      " + "\n" +
+                             "  paymentid usr_dpmpaym_tmp.t_paymentid%type;                                                                                  " + "\n" +
+                             "begin                                                                                                                          " + "\n" +
+                             "  while (stat = 0) loop                                                                                                        " + "\n" +
+                             "    stat := dbms_pipe.receive_message (dbms_pipe.unique_session_name, 0);                                                      " + "\n" +
+                             "    if (stat=0) then                                                                                                           " + "\n" +
+                             "      dbms_pipe.unpack_message (message);                                                                                      " + "\n" +
+                             "      dbms_pipe.unpack_message (message);                                                                                      " + "\n" +
+                             "      paymentid := to_number(substr(message,instr(message,usr_common.c_delimiter)+1));                                         " + "\n" +
+                             "      if instr(message,usr_common.c_err_success)=1 then                                                                        " + "\n" + // Если обработка прошла без ошибок
+                             "       update usr_dpmpaym_tmp set T_SKIPDOCUMENT=1,T_START_DATE =sysdate, T_ERRORSTATUS=null where t_paymentid = paymentid;    " + "\n" + 
+                             "      else                                                                                                                     " + "\n" + // Иначе проставляем категорию автомат выгрузка нет, пока закоментировал LAO
+                             "       update usr_dpmpaym_tmp set T_ERRORMESSAGE=message ,T_ERRORSTATUS =1,T_START_DATE =sysdate where t_paymentid = paymentid;" + "\n" +
+                             "      end if;                                                                                                                  " + "\n" +
+                             "       delete from  usr_doprtemp_op_tmp where t_orderid = paymentid;                                                           " + "\n" + //Удалим платеж из очереди
+                             "       delete from  usr_dpmpaym_tmp where t_paymentid = paymentid and T_INITMACRO='DEF';                                       " + "\n" + //Удалим отложенный платеж из очереди
+                             "      commit;                                                                                                                  " + "\n" +
+                             "    end if;                                                                                                                    " + "\n" +
+                             "  end loop;                                                                                                                    " + "\n" +
+                             "exception                                                                                                                      " + "\n" +
+                             "  when others then null;                                                                                                       " + "\n" +
+                             "end;" );
+
+            cmd.addParam("", RSDBP_IN, {curdate});
+            cmd.addParam("", RSDBP_IN, {oper}   );
+            cmd.addParam("", RSDBP_IN, {curdate});
+            cmd.addParam("", RSDBP_IN, {oper}   );
+            cmd.execute();
+
+            //Отфильтруем из общего списка ожидающие поступлений
+            Remove_OP();
+
+            // подключим платежи с крит. ошибками к монитору отслеживания статуса, если такие есть
+            UPD_ERR();
+
+            //Сколько всего ошибок
+            r = rsdRecordset("select nvl(sum(T_ERRORSTATUS),0) cnt_err from usr_dpmpaym_tmp  /*where T_INITMACRO!='OP'*/");
+
+            if(r.movenext())
+                count_doc_err = r.value(0);
+            else
+                count_doc_err = 0;
+            end;
+        
+            r = rsdrecordset ("select nvl(sum(case when t_purpose = 1 then 1 else 0 end),0) cnt_in,"+
+                              "       nvl(sum(case when t_purpose = 0 then 1 else 0 end),0) cnt_out from usr_dpmpaym_tmp where T_SKIPDOCUMENT is null and T_ERRORSTATUS is null /*and T_INITMACRO!='OP'*/");
+
+            if(r.movenext())
+                //сколько стало
+                count_doc_in  = count_doc_in  - r.value(0);
+                count_doc_out = count_doc_out - r.value(1);
+                RealCount     = r.value(1)    + r.value(0);
+            
+                if(CheckCount != 0) //если у нас остались не выполненные платежи 
+                    if(CheckCount == (r.value(0) + r.value(1))) //если не обработаны сообщения
+                        if(StatusObr == 0)
+                            StatusObr     = 1; //промежуточный результат
+                            LastTimeCheck = time();
+                        elif(time() - LastTimeCheck > SecToTime(FreqTimeCheck)) //если прошло более 90 сек
+                            StatusObr  = 2;
+                            STATUS_STR = "Работают";// LAO Временно отключил проверку на проведение документов, в ОП работате не корректно
+                            StatusObr  = 1; // LAO Временно отключил проверку на проведение документов, в ОП работате не корректно
+                        end;
+                    else 
+                        StatusObr = 0;
+                        STATUS_STR= "Активен";
+                        Check_IB  = false;
+                    end;
+                end;
+
+                if(count_doc_err >= 10)
+                    r = rsdRecordset(" SELECT  count(dp.T_PAYMENTID)" 
+                                     "  FROM   usr_dpmpaym_tmp dp"
+                                     "  WHERE   dp.T_ERRORSTATUS = 1 AND (t_errormessage LIKE '%компиляции%'"
+                                     "  OR dp.t_errormessage LIKE '%Неверный тип значения%'"
+                                     "  OR dp.t_errormessage like '%доступ к свойству%'"
+                                     "  OR dp.t_errormessage LIKE '%Невозможно зарезервировать%'"
+                                     "  OR t_errormessage LIKE '%ORA%')"
+                                     "  AND TRUNC (SYSDATE) = TRUNC (t_start_date)"
+                                     "  and t_start_date> sysdate - interval '5' minute"
+                                     "  ORDER BY   t_start_date");
+                    if(r.movenext())
+                        if(r.value(0) >= 10)
+                            StatusRobots      = "Внимание! Ошибки в макросах!";
+                            dlg.rec.ActiveOut = flag_no;  //принудительная остановка LAO
+                            dlg.rec.ActiveIn  = flag_no;
+
+                            r = rsdrecordset(" SELECT  T_PAYMENTID,T_DOCKIND,T_START_DATE,T_ERRORMESSAGE" 
+                                             "  FROM   usr_dpmpaym_tmp dp"
+                                             "  WHERE   dp.T_ERRORSTATUS = 1 AND (t_errormessage LIKE '%компиляции%'"
+                                             "  OR dp.t_errormessage LIKE '%Неверный тип значения%'"
+                                             "  OR dp.t_errormessage like '%доступ к свойству%'"
+                                             "  OR dp.t_errormessage LIKE '%Невозможно зарезервировать%'"
+                                             "  OR t_errormessage LIKE '%ORA%')"
+                                             "  AND TRUNC (SYSDATE) = TRUNC (t_start_date)"
+                                             "  and t_start_date> sysdate - interval '5' minute"
+                                             "  ORDER BY   t_start_date");
+                            TEXT_MAIL = "";
+
+                            while(r.movenext())
+                                TEXT_MAIL = TEXT_MAIL + "\n T_PAYMENTID: " + r.value(0)
+                                                      + " T_DOCKIND:"      + r.value(1)
+                                                      + " T_START_DATE:"   + r.value(2)
+                                                      + " T_ERRORMESSAGE:" + r.value(3);
+                            end;
+
+                            Send_l("Внимание! Ошибки при компиляции! " + {Name_Bank}, "Ошибки при компиляции макросов в РС, остановите обработчики, обратитесь в группу сопровождения РС \n" + TEXT_MAIL, 73, EMAIL_ALL);
+                        else
+                            cmd = rsdCommand(" delete from  usr_dpmpaym_tmp dp"
+                                             " WHERE  dp.T_ERRORSTATUS = 1 and t_start_date< sysdate - interval '600' minute");
+                            cmd.execute();
+
+                            StatusRobots = "Активен";
+                        end;
+                    end;
+                end; 
+            
+                LAST_ERR();// ошибки
+            
+                if(StatusObr == 2)
+                    r = rsdRecordset(" SELECT count(*) "
+                                     " FROM v$session vs, dregistry_dbt rg, usr_fixdoc_dbt fd "
+                                     " WHERE" 
+                                     " vs.SID = rg.t_connection_number(+) "
+                                     " AND vs.SID = fd.t_SID "
+                                     " AND vs.LOGON_TIME = fd.T_STARTTIME" 
+                                     " AND RG.T_SHORTNAMEUSER ='20001'");
+     
+                    if(r.movenext() and (r.value(0) > 0))
+                        StatusObr = 0; //обработчики запущены
+                        Count_OBR = r.value(0);
+                        Check_IB  = true;
+                    elif(STATUS_STR != "ОТСУТСТВУЮТ!")
+                        Send_l("Внимание! Нет запущенных Обработчиков! Платежи не проводятся!" + {Name_Bank}, "Проверьте окно робота, если документы не проводятся - обратитесь в Helpdesc", 73, EMAIL_ALL);
+                        STATUS_STR = "ОТСУТСТВУЮТ!" ;
+                    end;
+                end;
+            end;
+
+            return 0;
+
+        onError
+            return -1;
+        end; //Конец проверки пайпа
+     
+        private macro goto_action(action)
+            flag_action = action;
+
+            if   (flag_action == flag_out)
+                mes = DefStatusLineActive + ". Обработка внутренних.";
+            elif (flag_action == flag_in)
+                mes = DefStatusLineActive + ". Обработка внешних.";
+            elif (flag_action == flag_out_cat_first)
+                mes = DefStatusLineActive + "первый старт";
+            elif (flag_action == flag_pause)
+                mes = DefStatusLineActive + ". Ожидание.";
+            end;
+        end;
+
+        while(1 == 1) // Запускаем бесконечный цикл 
+            if(flag_action == flag_pause)
+                _key = testevent(500); // Здесь можно ещё поставить паузу
+            else
+                _key = testevent(50); // нетрадиционным писателям посвящается 
+            end;
+
+            if(dlg.rec.ActiveOut == flag_yes) //Если флаг стоит на внутр., считаем время
+                dlg.rec.WorkTimeOut = time() - StartTimeOut;
+            end;
+
+            if(dlg.rec.ActiveIn == flag_yes) //внешн. запущены, считаем время
+                dlg.rec.WorkTimeIn = time() - StartTimeIn;
+            end;
+        
+            if(flag_action == flag_pause) // Если мы сейчас в ожидании
+                // Проверка времени 
+               if(time() - LastTimeExec > SecToTime(FreqTimeExec)) // Если пришло время обрабатывать документы
+                   goto_action(flag_out); // То переходим к обработке
+                   LastTimeExec = time(); // Здесь время выставляем сразу
+               end;   
+            end;
+
+            //Выставим таймер следующего старта
+            //FreqTimeExec  - 5*60 // Периодичность проведения документов - 5 минут
+            //LastTimeExec  - время последнего старта кр. робота
+            if(time() > SecToTime(FreqTimeExec) + LastTimeExec)
+                dlg.rec.NextStart = time(0,0,0,0);//обнуляем поле след.старт если время сейчас больше чем запланированное время старта
+            else
+                dlg.rec.NextStart = LastTimeExec + SecToTime(FreqTimeExec)-time(); //иначе выставляем Время посл.старта + время паузы
+            end;
+     
+            // обновляем статус бар
+            message (mes);
+
+            if(time() - LastTimeTest > time(0, int(FreqTimeTest/60), (FreqTimeTest - 60 * int(FreqTimeTest/60)), 0)) // Проверять пайп раз в 10 секунд
+                TestPipe();
+                dlg.rec.REALCOUNT = realcount;
+                dlg.rec.DocsOut   = count_doc_out;
+                dlg.rec.DocsIn    = count_doc_in;
+                dlg.rec.DocsErr   = count_doc_err;
+                dlg.rec.StatusR   = StatusRobots;
+                dlg.rec.StatusOBR = STATUS_STR;
+                dlg.rec.CountOBR  = Count_OBR;
+                LastTimeTest      = time();
+            end;
+       
+            if(time() - LastTimeSTEP > time(0, int(FreqTimeSTEP/60), (FreqTimeSTEP - 60 * int(FreqTimeSTEP/60)), 0)) // Проверять раз в 40 секунд
+                dlg.rec.DocsErr = CHECK_ERR_STEP();
+                LastTimeSTEP    = time();
+            end;
+
+            if(flag_action != flag_pause) // не обрабатываем
+                if(dlg.rec.SNDOP == flag_yes)
+                    if(time() - LastTimeOP > time(0, int(FreqTimeOP/60), (FreqTimeOP - 60 * int(FreqTimeOP/60)), 0)) // Проверять раз в 420 секунд
+                        if(dlg.rec.REALCOUNT <= 50)
+                            log_step(realcount, count_doc_err, dlg.rec.CountOBR, dlg.rec.StatusOBR, dlg.rec.StatusR, Start_date, Start_time);
+
+                            debugbreak;
+
+                            //22.07.2014 VDN С-29828 Исключить платежи со счетами овердрафта для всех банков, кроме НБС и Пойдема
+                            if((not fgBank.is_NBS) or (not fgBank.is_GO))
+                                if(IsCheckAccOver())
+                                    sql = sql + "AND NOT EXISTS (SELECT 1 FROM daccount_dbt WHERE t_account = pmpaym.t_payeraccount AND t_type_account LIKE '%О%')"
+                                end;
+                            end;
+
+                            StartOP(sql);
+                            LastTimeOP = time();
+                            goto_action(flag_pause);    
+                        end;
+                    end;
+                end;
+            end;
+
+            if(_key == KEY_F2)
+                LastTimeExec = time(); // Здесь время выставляем сразу
+            elif(_key == ALT_5)        // "Пасхальные яйца" - alt-5
+                if(dlg.rec.ActiveOut == flag_no)
+                    dlg.rec.ActiveOut = InvertFlag(dlg.rec.ActiveOut);
+                    StartTimeOut      = time();
+                end;
+
+                if(dlg.rec.ActiveIn == flag_no)
+                    dlg.rec.ActiveIn = InvertFlag(dlg.rec.ActiveIn);
+                    StartTimeIn      = time();
+                end;
+            end;
+
+            if(_key == KEY_F6)
+                LAST_ERROR();
+            end;    
+
+            if((dlg.rec.ActiveOut == flag_no) and
+               (dlg.rec.ActiveIn  == flag_no))
+                _key = KEY_F3; // Если оба планировщика остановлены, то, в принципе, можно вообще выходить
+            end;
+
+            if(_key == KEY_F3)
+                mes = DefStatusLinePassive;
+
+                message (mes);
+
+                return _key; // Вообще выходим, чтобы не грузить зря машину
+            elif(_key == KEY_F9)
+                return _key;
+            end;
+
+            updateFields(dlg);
+        end;
+    end; // StartAgent
+
+    macro Event(dlg, cmd, id, key) 
+        var autostart = "no"; // KS 26.10.2012 C-15149 Добавить возможность авто-запуска модуля с параметрамом Старт обработки
+
+        /*Инициализация диалогового окна*/
+        if(cmd == DLG_INIT)
+            ClearTmp;
+            ClearLOG;
+            // Следующий запуск роботов
+            dlg.rec.NextStart   = time(0,0,0,0);
+            // Время начала работы планировщиков
+            dlg.rec.WorkTimeOut = time(0,0,0,0);
+            dlg.rec.WorkTimeIn  = time(0,0,0,0);
+            // Включено / выключено
+            dlg.rec.ActiveOut   = flag_no;
+            dlg.rec.ActiveIn    = flag_no;
+            // Остановка работы по расписанию
+            dlg.rec.ShdStopOut  = flag_no;
+            dlg.rec.ShdStopIn   = flag_no;
+            // ОП ППК
+            dlg.rec.SNDOP       = flag_yes;
+            dlg.rec.SndPPK      = flag_yes;
+            // Остановка работы удалённо
+            dlg.rec.RmtStopOut  = flag_yes;
+            dlg.rec.RmtStopIn   = flag_yes;
+            // Остановка платежей за счет овердрафта
+            dlg.rec.CheckAccOver = over_no;
+            UpdateFields(dlg); 
+        end;
+
+        if(cmd == DLG_KEY)
+            /*Запуск робота*/
+            if(KEY == KEY_F2) // Старт для всех
+                dlg.rec.ActiveOut = flag_yes;
+                dlg.rec.ActiveIn  = flag_yes;
+                debugbreak;     
+                KEY = StartAgent(dlg);
+            elif(KEY == KEY_F7) // Расписание
+                execmacrofile("usr_me_time_panel_op.mac","Run_panel");
+            end;
+
+            if(KEY == KEY_F6) // Расписание
+                LAST_ERROR();
+            end;
+
+            if(KEY == KEY_F3) // Стоп для всех
+                dlg.rec.ActiveOut = flag_no;
+                dlg.rec.ActiveIn  = flag_no;
+                dlg.rec.NextStart = time(0,0,0,0);
+            end;
+
+            if(KEY == KEY_SPACE)
+                if(id == FldIndex ("CheckAccOver"))
+                    if(dlg.("CheckAccOver") == over_no)  
+                        dlg.("CheckAccOver") = over_yes;
+                    else 
+                        dlg.("CheckAccOver") = over_no; 
+                    end;
+                end;
+            end;
+
+            updateFields(dlg);
+
+            /*Выход из диалогового окна*/
+            if(KEY == KEY_F9) // Выход
+                ClearTmp();
+                return CM_CANCEL;
+            end;
+        end;
+    end;
+
+    macro run
+        return runDialog(this, R2M(this, "Event"));
+    end;
+end; // TParmAgentKB
+
+macro MkDatePanelAgentKB( lbr )
+
+    Var rc = lbr.AddPanel( "mon_kb", 32, 5, 48, 20, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+        rc.title      = "Круглосуточное проведение платежей Ожидающих Поступлений";
+        rc.StatusLine = DefStatusLinePassive;
+
+    elem = rc.AddLabel( 3, 1, "Следующий запуск:");
+    elem = rc.AddField( 24, 1, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "NextStart", 10 );
+
+    elem = rc.AddLabel( 26, 2, "Внутренние");
+    elem = rc.AddLabel( 27, 3, "платежи");
+    elem = rc.AddLabel( 38, 2, "Внешние");
+    elem = rc.AddLabel( 38, 3, "платежи");
+
+    elem = rc.AddLabel( 3, 4, "Время работы:");
+    elem = rc.AddField( 24, 4, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "WorkTimeOut", 10 );
+    elem = rc.AddField( 35, 4, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "WorkTimeIn",  10 );
+
+    elem = rc.AddLabel( 3, 5, "Проведенных документов:");
+    elem = rc.AddField( 24, 5, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DocsIn",  10 );
+    elem = rc.AddField( 35, 5, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DocsOut", 10 ); 
+
+    elem = rc.AddLabel( 3, 6, "Остановка по расписанию:");
+    elem = rc.AddField( 24, 6, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ShdStopIn",  10 );
+    elem = rc.AddField( 35, 6, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ShdStopOut", 10 );
+       
+    elem = rc.AddLabel( 3, 7, "Проведение ОП/П-П-К");
+    elem = rc.AddField( 24, 7, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "SNDOP",  10 );
+    elem = rc.AddField( 35, 7, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "SNDPPK", 10 );
+
+    elem = rc.AddLabel( 3, 8, "Внешняя остановка:");
+    elem = rc.AddField( 24, 8, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "RmtStopOut", 10 );
+    elem = rc.AddField( 35, 8, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "RmtStopIn",  10 );
+
+    elem = rc.AddLabel( 3, 9, "Активен:");
+    elem = rc.AddField( 24, 9, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ActiveOut", 10 );
+    elem = rc.AddField( 35, 9, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "ActiveIn",  10 );
+
+    elem = rc.AddLabel( 3, 10, "Ошибки проведения документов:");
+    elem = rc.AddField( 24,10, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "DocsErr", 10 );
+
+    elem = rc.AddLabel( 3, 11, "Статус обработчиков:");
+    elem = rc.AddField( 24,11, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING,  "STATUSOBR", 15 );
+    elem = rc.AddField( 40,11, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "CountOBR",  5  );
+       
+    elem = rc.AddLabel( 3, 12, "Статус Робота:");
+    elem = rc.AddField( 16,12, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "StatusR", 29 );
+    elem = rc.AddLabel( 3, 15, "Последние ошибки:"); 
+    elem = rc.AddLabel( 28,13, "В очереди:");
+    elem = rc.AddField( 36,13, lbr.EFieldType.VIEW,    lbr.EFocus.YES, lbr.EDataType.V_INTEGER, "ReaLCount", 9      );
+    elem = rc.AddField( 1,16,  lbr.EFieldType.LISTBOX, lbr.EFocus.YES, lbr.EDataType.V_STRING,  "LOG_PAYM",  46, 10 );
+
+    elem = rc.AddLabel( 3,14,  "Исключить счета овердрафта:");
+    elem = rc.AddField( 36,14, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "CheckAccOver", 9 );
+end;
+
+macro MkLbrFileAgentKB
+    var LbrPath, LbrName, errcode, lbr;
+  
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, LbrPath, errcode);
+
+    if(errcode > 0) 
+        msgbox("Значение настройки TEXTDIR получено не было!!!");
+    end;
+  
+    LbrName = LbrPath + "\\monitorpmdocsKB" + string(UserNumber) + ".lbr";
+    lbr     = TLbrFile( LbrName, "C" );
+  
+    MkDatePanelAgentKB( lbr );
+     
+    lbr.Save(); //сохраняем ресурсы в файле
+    lbr = NULL;
+
+    return LbrName;
+end;
+
+/* Точка входа. */
+private var LbrName, Parm;
+
+LbrName = MkLbrFileAgentKB();
+
+Parm = TParmAgentKB(LbrName);
+
+if(not Parm.run())
+    Parm = null;
+    DelFile(LbrName);
+    exit (1);
+end;

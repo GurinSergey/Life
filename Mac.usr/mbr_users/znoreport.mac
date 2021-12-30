@@ -1,0 +1,223 @@
+/**********************************************************************/
+/*  Макрос печати обработанных сообщений по запросам налоговых органов*/
+/*  Модификация 365-П                                                 */
+/*  Зленко М.П. R-Style Ukraine, Kiev 20.12.2011                      */
+/*  Версия 1.0                                                        */
+/*  Изменен: 17.01.2012 Зленко М.П. I-00142688-1  I-00141281-1        */
+/*           11.07.2012 vihrov диапазоны меняем                       */
+/*           16.12.2013 Chesnokov D.S. Адаптировал под 2031, но сей   */
+/*              отчет уже не нужен. Т.к. исходящие объекты по 365-П   */
+/*              с 03.2012 не формируются.                             */
+/**********************************************************************/
+import globals, oralib, bankinter, KeyCodes, repforms, likePy, PTInter;
+import rcw,RSD;
+import "wlmnstls.mac";
+
+var path = "",
+    pathfile = "",
+    filen = "365P.lbr",
+    PartyID ; 
+    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",V_STRING,path);
+    pathfile = FindPath(filen,path);
+  if (not pathfile)
+    msgbox("Не найдена LBR");
+    exit();
+  end;
+
+var dlg = TRecHandler("dateimp",pathfile,True);
+
+macro getFormID(_name)
+  var select:string =  " SELECT T_formid         "
+                       " FROM   dwlmesfrm_dbt    "
+                       " WHERE t_kindmes = 5 and "
+                       " T_NAME = :NAME   "  ;                                           
+ 
+  var params = makeArray( SQLParam("NAME", _name));
+                                          
+  var  rs = execSQLselect( select, params, FALSE );
+  
+  if( rs and rs.moveNext() )
+    return rs.value(0);
+  end;
+  return -1; 
+end;
+
+//Получаем ID клиента по его ИНН
+private macro  GetPartyidByINN(inn,kpp)
+ var ptid = -1,error=0;
+
+ if(strlen(trim(inn)) == 10)
+    ptid = ПолучитьКодСубъекта(inn+"/"+kpp, PTCK_INN/*16*/, Error );
+ else
+    ptid = ПолучитьКодСубъекта(inn, PTCK_INN/*16*/, Error );
+ end;
+   
+ if((strlen(trim(inn)) == 10) and (error != 0))
+   error = 0;
+   ptid = ПолучитьКодСубъекта(inn, PTCK_INN/*16*/, Error );
+ end;
+ 
+ if (error != 0)
+    ptid = -1;
+ end;
+ 
+ return ptid;
+end;
+
+private macro PrintHead()
+[     
+                     Журнал обработанных сообщений по запросам налоговых органов   
+┌──────┬────────────┬────────────┬──────────────┬──────────────┬─────┬────────────┬──────────┬───────────────┐
+│№ п/п │ Дата       │ Дата       │Rs-код        │ Наименование │Вид  │ Дата       │ Номер    │ ФИО           │
+│      │ загрузки   │ запроса    │клиента       │ клиента      │запро│ формирова  │ справки/ │ представителя │         
+│      │ сообщения  │ налогового │              │              │са   │ ния        │ выписки  │ банка         │
+│      │ в RS-bank  │ органа     │              │              │(Вид │ справки    │ (НомСп   │ (ФИОПрБ)      │
+│      │            │ (ДатаЗапр) │              │              │Запр)│ (ДатаСооб) │  рав/Ном │               │
+│      │            │            │              │              │     │            │ Выпис    │               │                             
+├──────┼────────────┼────────────┼──────────────┼──────────────┼─────┼────────────┼──────────┼───────────────┤    
+] 
+end;
+
+private macro printBottom()
+                                                                                                  
+[└──────┴────────────┴────────────┴──────────────┴──────────────┴─────┴────────────┴──────────┴───────────────┘
+    
+]
+
+end;
+
+private macro PrintLine(_Count,_DateDownload, _DateReq, _RsCode, _NameClient, _KindReq, _DateSpr,_NumberSpr,_FIO)
+
+[│ #### │ ########## │ ########## │    #######   │ ############ │  #  │ ########## │   ###### │ ############# │
+ │      │            │            │              │              │     │            │          │               │ 
+](_Count,date(_DateDownload), date(_DateReq):w, _RsCode:w, _NameClient:w, _KindReq, date(_DateSpr):w,_NumberSpr,_FIO:w);
+end;
+
+private macro PrintLineErr(_ИНННП)
+
+[│                     Не найден субъект экономики с ИНННП = ###########                           │
+ │                                                                                                 │ 
+](_ИНННП);
+end;
+
+
+private macro PrintItAll()
+  var sqlReq = "",
+      sqlMes = "",
+      error,
+      rsReq, 
+      rsMes,
+      PartyID ,
+      partyobj,
+      ВидЗапр  ,
+      ДатаЗапр  ,
+      ДатаСооб ,
+      НомСВ    ,
+      ФИОПрБ   ,
+      ДатаЗагр ,
+      КППНП    ,
+      ТипОтв,
+      ИНННП    ,
+      FormID,
+      Count:integer = 1;
+      PrintHead();
+      //вытаскиваем все сгенерировынные запросы
+       sqlReq = "  select to_number(REQ.T_RELATEDREF) ref,  REQ.T_REQID , ses.t_bankdate bdate "
+                "  from DWLREQ_DBT req, dwlmes_dbt mes, dwlsess_dbt ses,dwlmeslnk_dbt lnk      "
+                "  where  REQ.T_DIRECT <> 'X' and                                              "
+                "  REQ.T_KIND   = 6 and                                                        "
+                "  REQ.T_INITFORMIDMES = "+getFormID(ФормаZNO)+
+                "  and ses.t_sessionid = mes.t_sessionid                                       "
+                "  and mes.t_mesid = lnk.t_mesid                                               "
+                "  and lnk.t_objid = to_number(REQ.T_RELATEDREF)                               "
+                "  and LNK.T_OBJKIND = 505                                                     "
+                "  and mes.t_bankdate between  to_date('" + dlg.rec.BeginDate+  "','dd.mm.yyyy')"
+                "  and  to_date('" + dlg.rec.EndDate  +  "','dd.mm.yyyy') order by bdate "  ;
+                                                                                      
+          rsReq =  RsdRecordset(sqlReq);
+          
+      while(rsReq.moveNext())      
+           ДатаЗапр = "";
+           ДатаСооб = "";
+           НомСВ    = "";
+           ФИОПрБ   = "";                                 
+           ДатаЗагр = "";
+           КППНП    = "";
+           ИНННП    = "";
+           ДатаЗагр = "";
+           ТипОтв   = "";
+           ДатаЗагр = rsReq.value("bdate") ;
+
+           sqlMes = "   SELECT f.t_name, t.t_value                                              "   
+                    "   FROM dwlmesval_dbt t, dwlmeslnk_dbt l, dwltpfld_dbt f, dwlmesfld_dbt m  "
+                    "   WHERE      l.t_objkind = 505                                            "
+                    "         AND l.t_objid   in ("+rsReq.value("REF") +","+rsReq.value("T_REQID")+ " )"                                           
+                    "         AND t.t_mesid = l.t_mesid                                         "
+                    "         AND t.t_tpfieldid = f.t_tpfieldid                                 "
+                    "         AND m.t_fieldid = t.t_fieldid                                     " ;
+         rsMes = RsdRecordset(sqlMes);
+      
+      while(rsMes.moveNext)
+            if  (rsMes.value("t_name") == "ВидЗапр")
+                 ВидЗапр = rsMes.value("t_value") ;
+            elif (rsMes.value("t_name") == "ДатаЗапр")
+                ДатаЗапр = rsMes.value("t_value");
+
+            elif (rsMes.value("t_name") == "ИНННП")
+                ИНННП = rsMes.value("t_value");
+            elif (rsMes.value("t_name") == "КППНП")
+                КППНП = rsMes.value("t_value");
+
+            elif (rsMes.value("t_name") == "ДатаСооб")
+                ДатаСооб = rsMes.value("t_value");
+
+            elif ((rsMes.value("t_name") == "НомСправ") or (rsMes.value("t_name") == "НомВыпис"))
+                НомСВ = rsMes.value("t_value");
+            elif (rsMes.value("t_name") == "ФИОПрБ")
+                ФИОПрБ = rsMes.value("t_value");
+            elif (rsMes.value("t_name") == "ТипОтв")
+                ТипОтв = rsMes.value("t_value");
+            end;
+      end;
+
+      PartyID = "";
+      PartyID = GetPartyidByINN(ИНННП,КППНП) ;   
+      if ((ТипОтв == "") and (PartyID != -1) )//Схитрил, чтобы не писать сложный запрос, если поле ТипОтв не пустое значит это PB
+          PrintLine(Count,ДатаЗагр,ДатаЗапр,substr(rsbParty(PartyID).code(1),7),rsbParty(PartyID).fullname,ВидЗапр,ДатаСооб,НомСВ,ФИОПрБ); //11.07.2012 vihrov диапазоны меняем
+          Count = Count + 1 ;
+      end;
+    end;
+
+      PrintBottom();
+end;
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key)     
+   if(cmd == DLG_INIT)
+     message("~F2~ продолжить,  ~ESC~ выход");
+     dlg.rec.BeginDate = {curdate};
+     dlg.rec.EndDate   = {curdate};
+
+   end;
+   if ((KEY==KEY_F2) or (KEY==KEY_ENTER))
+     if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+       MsgBox("Дата начала больше даты окончания отчетного периода");
+       return CM_IGNORE;
+     end;
+
+    PrintItAll(); 
+    return CM_save;
+
+   end; 
+
+  if (cmd == DLG_REMFOCUS)
+    if ( dlg.rec.BeginDate > dlg.rec.EndDate ) 
+      MsgBox("Дата начала больше даты окончания отчетного периода");
+      return CM_CANCEL;
+    end;
+  end;
+  UpdateFields(dlg); 
+END;
+
+if ( RunDialog(dlg, "Event"))
+end;

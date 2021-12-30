@@ -1,0 +1,899 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    ███████       █████      █████     ███
+    █████████   ████████   ████████    ███
+    ███   ███   ███        ███         ███
+    ████████     ███████    ███████    ███
+    ██████            ███        ███   ███
+    ███ ████    █████████  █████████   ████████
+    ███   ████    █████      █████     ████████
+
+   R-Style Softlab
+   
+   Имя файла sfacctrnbatch.mac
+
+   Описание: Формирование документов оплаты комиссий в пакетном режиме
+
+   ChangeLog:
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //EVG 17.03.2014 добавил вызов мефедовской процедуры поиска счета для оплаты
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 17.03.2014 Добавил в главный рекордсет SFCreateDocPayBatch недостающий полей basequant и basesum
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 19.03.2014 Добавлена корректировки даты окончания периода и даты расчета УПК
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //joy 16.04.2014 R-361841 В мефедовской процедуре selectAccountForSfPay нужно определять остаток по счету на дату оплаты 
+                             из сервисной операции (т.к. в УПК ее еще нет), а не на дату расчета комиссии
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 18.04.2014 В SFCreateDocPayBatch перед изменением даты окончания периода, для каждого ДО добавлена простановка признака T_SKIPEDBYMACRO 
+                   для всех УПК, дата окончания которых меньше максимальной даты окончания периода
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //joy 11.07.2014 По R-410112 для верности, еще и удалим ненужные УПК в функции форм-я дов-ов оплаты УПК (FCreateDocPayBatch)
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 12.11.2014 В дополение к вышеописанным правка Надежды, поправил скрипт на удаление УПК
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 01.12.2014 Установка HF-106
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+   //RR 11.02.2015 В рамках установки 130-ХФ убираются пользовательские доработки
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import SfInter, BankInter, OprInter, RsbDataSet, "globals.mac", "sfcommon.mac", "sfpay_lib.mac", "sfground.mac", "sfpay.mac", "sfacctrnbatch.mac", "sfbatch_lib.mac", "sfdefopr.mac", lib_fg, lib_account;
+
+/* EVG 17/03/2014 Для вызова мефёдовской процедуры поиска счёта для оплаты */
+import "sf_prbb.mac";
+
+//zmp 15.09.2014 C-32626
+private macro check_over(account)
+    var sql = "select 1 from daccount_dbt where instr (t_type_account, 'О') > 0 and t_account = :account";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("account", account)));
+    return sql.moveNext ();
+end;
+
+//Gurin S. 11.11.2014 I-00531176-1 <=
+private macro haveNotFreeRest(sum, acc)                                                        
+   var sql = " SELECT  nvl(max(1), 0)                                                                                    "+
+             " FROM   DUAL                                                                                               "+
+             " WHERE   " + sum + " <=                                                                                    "+
+             "          ( (SELECT   usr_get_rest ('" + acc + "', rsbsessiondata.curdate - 1)  FROM   DUAL)               "+
+             "           + (SELECT   NVL (SUM (trn1.T_SUM_NATCUR), 0)                                                    "+
+             "                FROM   dacctrn_dbt trn1                                                                    "+
+             "               WHERE   trn1.T_ACCOUNT_RECEIVER = '" + acc + "'                                             "+
+             "                       AND trn1.t_date_carry = rsbsessiondata.curdate                                      "+
+             "                       AND NOT SUBSTR (trn1.T_ACCOUNT_PAYER, 1, 3) BETWEEN '452' AND  '458')               "+
+             "           - (SELECT   NVL (SUM (trn2.T_SUM_NATCUR), 0)                                                    "+
+             "                FROM   dpmdocs_dbt docs,                                                                   "+
+             "                       usr_over_comiss com,                                                                "+
+             "                       dacctrn_dbt trn2                                                                    "+
+             "               WHERE       DOCS.T_PAYMENTID = COM.T_PAYMENTID                                              "+
+             "                       AND trn2.T_ACCTRNID = DOCS.T_ACCTRNID                                               "+
+             "                       AND trn2.T_ACCOUNT_PAYER = 111                                                      "+
+             "                       AND trn2.T_DATE_CARRY = rsbsessiondata.curdate)                                     "+
+             "           - (SELECT   USR_ACCREST.GET_CLAIMS ('" + acc + "', rsbsessiondata.curdate, 5) FROM   DUAL))     ";
+                                                                                                                         
+   sql = rsdrecordset(sql);                                                                                    
+   sql.movenext();                                                                      
+   return sql.value(0, null, v_integer) == 0;
+
+onError
+   return false;
+end;
+
+
+private macro SfFormDocumentsBatch(sfdefArray, sfrepaccCache, SfSrvDoc)
+  var stat:integer = 0;
+  var cmd, rs, strSql;
+  var accTrnData;
+
+
+  var BankID = {OurBank};
+  var OperDprt = {OperDprt};
+
+
+  cmd = RsdCommand( "SELECT RsbSessionData.OurBank As BankID, RsbSessionData.OperDprt As OprDprt FROM DUAL" );
+  cmd.NullConversion = true;
+
+  rs = RsdRecordset( cmd ); 
+  if( rs.moveNext() )
+    BankID   = int(rs.value("BankID"));     
+    OperDprt = int(rs.value("OprDprt"));     
+  end;
+
+  // Получить свободный остаток на счете плательщика с учетом претензий
+  strSql = "UPDATE dsfpaydoc_tmp tmp " +
+           "SET tmp.t_FreeRest = RSI_RsbAccTransaction.AccGetFreeAmountEx( tmp.t_PayerAccount, 1, tmp.t_PayerFIID, tmp.t_DateCarry, -1, 0, 0 ) " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.execute();   
+
+
+  // Получить свободный остаток с учетом картотек
+  strSql = "UPDATE dsfpaydoc_tmp tmp " +
+           "SET tmp.t_FreeRest = tmp.t_FreeRest +" +
+           "  (SELECT NVL(SUM(ind.t_Sum),0) FROM dpsindacc_dbt ind " +
+           "    WHERE ind.t_account = tmp.t_PayerAccount " +
+           "    AND ind.t_chapter = 1 AND ind.t_fiid = tmp.t_PayerFIID) ";
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.execute();   
+
+
+  // Перевести суммы комиссии и НДС в нужные валюты
+    // Сумму свободного остатка в валюту счетов по КУ, если получатель наш банк и комиссия начислена:
+  strSql = " UPDATE dsfpaydoc_tmp tmp " +
+           " SET tmp.t_ConvFreeRest = " +
+           " RSI_RSB_FIInstr.ConvSum( tmp.t_FreeRest, tmp.t_PayerFIID, tmp.t_FIIDPaySum, tmp.t_DateCarry, 0 ) "; 
+//           " WHERE t_PayerFIID <> t_FIIDPaySum " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.execute();   
+
+    //Суммы оплаты комиссии и ее НДС в  валюту счетов по КУ
+  strSql = " UPDATE dsfpaydoc_tmp tmp                                                                                         " +
+           " SET tmp.t_ConvPaySum =                                                                                           " +
+           "       RSI_RSB_FIInstr.ConvSumType( tmp.t_PaySum, tmp.t_FIIDSum, tmp.t_FIIDPaySum, t_RateType, tmp.t_DateCarry, 0 ), " +
+           "     tmp.t_ConvTaxSum =                                                                                           " +
+           "       RSI_RSB_FIInstr.ConvSumType( tmp.t_TaxSum, tmp.t_FIIDSum, tmp.t_FIIDPaySum, t_RateType, tmp.t_DateCarry, 0 )  " +
+           " WHERE tmp.t_FIIDSum <> tmp.t_FIIDPaySum                                                                             " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.execute();   
+
+    //  Сумму комиссии в валюту счета получателя, если получатель не наши банк или по комиссии не было начисления:
+  strSql = " UPDATE dsfpaydoc_tmp tmp                                                                                 " +
+           " SET tmp.t_ConvPaySum =                                                                                   " +
+           "       RSI_RSB_FIInstr.ConvSum( tmp.t_ConvPaySum, tmp.t_FIIDPaySum, tmp.t_ReceiverFIID, tmp.t_DateCarry, 0 ) " +
+           " WHERE tmp.t_FIIDPaySum <> tmp.t_ReceiverFIID                                                                " +
+           "   AND (tmp.t_ReceiverID != ? OR tmp.t_IsIncluded != 'X')                                          " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, BankID );
+  cmd.execute();   
+
+    // Сумму НДС комиссии из валюты счета по КУ в нац. валюту для проводки учета НДС:
+  strSql = " UPDATE dsfpaydoc_tmp tmp                                                                      " +
+           " SET tmp.t_ConvTaxSumNC =                                                                      " +
+           "       RSI_RSB_FIInstr.ConvSum( tmp.t_ConvTaxSum, tmp.t_FIIDPaySum, ?, tmp.t_DateCarry, 0 )       " +
+           " WHERE tmp.t_FIIDPaySum <> ?                                                                      " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, NATCUR    );
+  cmd.addParam( "", RSDBP_IN, NATCUR    );
+  cmd.execute();   
+
+  strSql = " UPDATE dsfpaydoc_tmp tmp " +
+           " SET tmp.t_Error = ?, " +
+           "     tmp.t_ErrMsg = ? " +
+           " WHERE t_ConvFreeRest < (t_ConvPaySum + t_ConvTaxSum) " ;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Недостаточно средств на счете плательщика. Формирование проводки оплаты невозможно." );
+  cmd.execute();   
+         
+  var IsBankOrderForComm = bBankorderForComm_Setting();
+
+  var sfdefAccTrnCharger = TSfDefAccTrnDataCharger();
+
+    strSql = " SELECT paydoc.*, NVL(ground.t_Ground, chr(1)) As groundVO, payeracc.t_Department As PayerDprt, recacc.t_Department As RecDprt, fininstr.t_Ccy As fiidCCY" +
+             " FROM dsfpaydoc_tmp paydoc, dsfground_tmp ground, daccount_dbt payeracc, daccount_dbt recacc, dfininstr_dbt fininstr" + 
+             " WHERE paydoc.t_SfDefID = ground.t_SfDefID(+) " + 
+             " AND payeracc.t_Account = paydoc.t_PayerAccount " + 
+             " AND payeracc.t_Chapter = 1 " + 
+             " AND payeracc.t_Code_Currency = paydoc.t_PayerFIID " + 
+             " AND recacc.t_Account = paydoc.t_ReceiverAccount " + 
+             " AND recacc.t_Chapter = 1 " + 
+             " AND recacc.t_Code_Currency = paydoc.t_ReceiverFIID " +
+             " AND fininstr.t_FIID = paydoc.t_FIIDSum "; 
+
+
+   cmd = RsdCommand( strSql ); 
+   cmd.NullConversion = true;
+
+   cmd.execute();   
+   var i = 0;
+   rs = RsdRecordset( cmd ); 
+   while( rs.moveNext() )
+     var ErrorNum = rs.value("t_Error"); 
+     var ErrorMsg = rs.value("t_ErrMsg"); 
+     var SfDefArrayIndex = rs.value("t_ArrayIndex");
+     if(ErrorNum != 0)
+
+       sfdefArray[SfDefArrayIndex].Error = ErrorNum;
+       // Сформировать соответствующую запись для отчета sfrepacc.tmp.
+       var sfrepacc = TRecHandler ("sfrepacc.tmp");
+       ClearRecord( sfrepacc );
+                                                                 
+       sfrepacc.rec.debit           = rs.value("t_PayerAccount");
+       sfrepacc.rec.credit          = rs.value("t_CalcAccount");  //счет кредита проводки
+       sfrepacc.rec.BeginDate       = sfdefArray[SfDefArrayIndex].SfDef.rec.DatePeriodBegin;
+       sfrepacc.rec.EndDate         = sfdefArray[SfDefArrayIndex].SfDef.rec.DatePeriodEnd  ;
+       sfrepacc.rec.TransactionDate = rs.value("t_DateCarry"); 
+       sfrepacc.rec.Amount          = rs.value("t_ConvPaySum") + rs.value("t_ConvTaxSum");
+       sfrepacc.rec.ContrID         = sfdefArray[SfDefArrayIndex].SfDef.rec.SfContrID    ;
+       sfrepacc.rec.FeeType         = SF_FEE_TYPE_PERIOD;                                ;
+       sfrepacc.rec.ComissNumber    = sfdefArray[SfDefArrayIndex].SfDef.rec.CommNumber   ;
+       sfrepacc.rec.Comment         = ErrorMsg;
+       sfrepacc.rec.ErrorCode       = ErrorNum;
+       sfrepacc.rec.SfDefcomID      = rs.value("t_SfDefID");
+       sfrepacc.rec.Kind            = 1;
+       sfrepacc.rec.Department      = sfdefArray[SfDefArrayIndex].SfDef.rec.Department   ;
+
+       if(sfrepaccCache != NULL)
+         sfrepaccCache.AddRecord( sfrepacc );
+       end;
+     else
+       var PayerID    = rs.value("t_PayerID");
+       var ReceiverID = rs.value("t_ReceiverID");
+       var IsIncluded = rs.value("t_IsIncluded");
+
+       var CalcNDSAccount = rs.value("t_CalcNDSAccount");
+       var CalcAccount    = rs.value("t_CalcAccount");
+       var TaxSum         = rs.value("t_TaxSum");
+
+       var GroundVO   = rs.value("groundVO" );
+       var ComissCode = rs.value("t_ComissCode");
+       var fiidCCY    = rs.value("fiidCCY");
+
+       var SfDefID         = rs.value("t_SfDefID");
+       var OperationID     = rs.value("t_OperationID"); 
+       var StepID          = rs.value("t_StepID");
+
+       sfdefAccTrnCharger.SetPoint();
+
+       // sfdefArray[SfDefArrayIndex].SfDef.rec.Status = SFDEFCOM_STATUS_PAYED;
+
+       // Если получатель комиссии "Наш банк" и комиссия учтена в доход 
+       if((ReceiverID == BankID) AND (IsIncluded == "X"))
+
+         // Если счета начисления НДС "+Расчеты НДС[, НВПИ]" и комиссии "+Расчеты[, НВПИ]" совпадают и комиссия облагается НДС;
+         if((CalcNDSAccount == CalcAccount) AND (TaxSum != $0))
+           accTrnData = RsbAccTransactionData();
+
+           accTrnData.Chapter = 1;
+           accTrnData.Date_Carry    = rs.value("t_DateCarry");
+           accTrnData.ResultCarry = SFPAY_CARRY;
+
+           accTrnData.Department   = OperDprt;
+
+           accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+           accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+
+           accTrnData.FIIDReceiver    = rs.value("t_CalcFIID");
+           accTrnData.AccountReceiver = rs.value("t_CalcAccount");
+           accTrnData.SumReceiver     = rs.value("t_ConvPaySum") + rs.value("t_ConvTaxSum");
+
+           accTrnData.Ground       = trim(string(GroundVO) + " " + "Оплата комиссии " + ComissCode + ". В том числе НДС " + TaxSum + " " + fiidCCY + ".");
+
+           if(IsBankOrderForComm == true)
+             accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+           end;
+
+           sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_COMISSPAY, 0, OperationID, StepID);
+         else
+           accTrnData = RsbAccTransactionData();
+
+           accTrnData.Chapter = 1;
+           accTrnData.Date_Carry    = rs.value("t_DateCarry");
+           accTrnData.ResultCarry = SFPAY_CARRY;
+
+           accTrnData.Department   = OperDprt;
+
+           accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+           accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+
+           accTrnData.FIIDReceiver    = rs.value("t_CalcFIID");
+           accTrnData.AccountReceiver = rs.value("t_CalcAccount");
+
+           accTrnData.SumReceiver     = rs.value("t_ConvPaySum");
+           accTrnData.Ground          = trim(GroundVO + " " + "Оплата комиссии " + ComissCode +".");
+
+           if(IsBankOrderForComm == true)
+             accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+           end;
+
+           sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_COMISSPAY, 0, OperationID, StepID);
+
+           if(TaxSum != $0)
+             accTrnData = RsbAccTransactionData();
+
+             accTrnData.Chapter = 1;
+             accTrnData.Date_Carry    = rs.value("t_DateCarry");
+             accTrnData.ResultCarry = SFPAY_CARRY;
+
+             accTrnData.Department   = OperDprt;
+
+             accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+             accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+
+             accTrnData.FIIDReceiver    = rs.value("t_CalcFIID");
+             accTrnData.AccountReceiver = rs.value("t_CalcNDSAccount");
+             accTrnData.SumReceiver     = rs.value("t_ConvTaxSum");
+             accTrnData.Ground       = trim(GroundVO + " " +  "Оплата НДС комиссии " + ComissCode +".");
+
+             if(IsBankOrderForComm == true)
+               accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+             end;
+
+             sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_NDSPAY, 0, OperationID, StepID);
+           end;
+         end;
+
+           if(TaxSum != $0)
+             accTrnData = RsbAccTransactionData();
+
+             accTrnData.Chapter = 1;
+             accTrnData.Date_Carry    = rs.value("t_DateCarry");
+             accTrnData.ResultCarry = SFPAY_CARRY;
+
+             accTrnData.Department   = OperDprt;
+
+             accTrnData.FIIDPayer       = rs.value("t_CalcFIID");
+             accTrnData.AccountPayer    = rs.value("t_MinusNDSAcrAccount");
+
+             accTrnData.FIIDReceiver    = NATCUR;
+             accTrnData.AccountReceiver = rs.value("t_MinusNDSAccount");
+             accTrnData.SumReceiver     = rs.value("t_ConvTaxSumNC");
+
+             accTrnData.Ground       = "Учет НДС комиссии " + ComissCode + ".";
+
+
+             if(IsBankOrderForComm == true)
+               accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+             end;
+
+             sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_NDSDISCOUNT, 0, OperationID, StepID);
+           end;
+       else // Иначе: комиссия не начислена или получатель комиссии не наш банк.
+         if(ReceiverID == BankID)
+           // Выполнить проводку по оплате комиссии со счета СПИ плательщика на счет СПИ получателя в валюте оплаты комиссии за дату оплаты:
+
+             accTrnData = RsbAccTransactionData();
+             accTrnData.Chapter = 1;
+
+             accTrnData.Date_Carry    = rs.value("t_DateCarry");
+             accTrnData.ResultCarry = SFPAY_CARRY;
+
+             accTrnData.Department   = OperDprt;
+
+             accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+             accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+
+             accTrnData.FIIDReceiver    = rs.value("t_ReceiverFIID");
+             accTrnData.AccountReceiver = rs.value("t_ReceiverAccount");
+             accTrnData.SumReceiver     = rs.value("t_ConvPaySum");
+
+             accTrnData.Ground       = trim(GroundVO + " " + "Оплата комиссии " + ComissCode + ".");
+
+             if(IsBankOrderForComm == true)
+               accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+             end;
+
+             sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_COMISSPAY, 0, OperationID, StepID);
+
+           if(TaxSum != $0)
+             accTrnData = RsbAccTransactionData();
+
+             accTrnData.Chapter = 1;
+             accTrnData.Date_Carry      = rs.value("t_DateCarry");
+             accTrnData.ResultCarry     = SFPAY_CARRY;
+
+             accTrnData.Department      = OperDprt;
+
+             accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+             accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+
+             accTrnData.FIIDReceiver    = NATCUR;
+             accTrnData.AccountReceiver = rs.value("t_MinusNDSAccount");
+             accTrnData.SumReceiver     = rs.value("t_ConvTaxSumNC");
+
+             accTrnData.Ground          = trim(GroundVO + " " + "Оплата НДС комиссии " + ComissCode +".");
+
+             if(IsBankOrderForComm == true)
+               accTrnData.Shifr_Oper = SF_SHIFR_OPER_BANK_ORDER;
+             end;
+
+             sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_NDSPAY, 0, OperationID, StepID);
+           end;
+
+         elif (PayerID == BankID) // Иначе если плательщик комиссии наш банк
+           // Выполнить проводку по оплате комиссии со счета СПИ плательщика на счет СПИ получателя в валюте оплаты комиссии за дату оплаты:
+            accTrnData = RsbAccTransactionData();
+            accTrnData.Chapter = 1;
+
+            accTrnData.Date_Carry    = rs.value("t_DateCarry");
+            accTrnData.ResultCarry = SFPAY_CARRY;
+
+            accTrnData.Department   = OperDprt;
+
+            accTrnData.FIIDPayer       = rs.value("t_PayerFIID");
+            accTrnData.AccountPayer    = rs.value("t_PayerAccount");
+            accTrnData.SumPayer        = rs.value("t_ConvPaySum");
+
+            accTrnData.FIIDReceiver    = rs.value("t_ReceiverFIID");
+            accTrnData.AccountReceiver = rs.value("t_ReceiverAccount");
+
+            accTrnData.Ground       = trim(GroundVO + " " + "Оплата комиссии " + ComissCode + ".");
+
+            sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_COMISSPAY, 0, OperationID, StepID);
+
+            if(TaxSum != $0) // Если комиссия облагается НДС, то выполнить проводку по оплате НДС со счет КУ "+НДС" на счет СПИ получателя комиссии в нац. валюте за дату оплаты
+              accTrnData = RsbAccTransactionData();
+              accTrnData.Chapter = 1;
+
+              accTrnData.Date_Carry    = rs.value("t_DateCarry");
+              accTrnData.ResultCarry = SFPAY_CARRY;
+
+              accTrnData.Department   = OperDprt;
+
+              accTrnData.FIIDPayer       = NATCUR;
+              accTrnData.AccountPayer    = rs.value("t_NDSAccount ");
+              accTrnData.SumPayer = rs.value("t_ConvTaxSumNC");
+
+              accTrnData.FIIDReceiver    = rs.value("t_ReceiverFIID");
+              accTrnData.AccountReceiver = rs.value("t_ReceiverAccount ");
+
+              accTrnData.Ground       = trim(GroundVO + " " + "Оплата НДС комиссии " + ComissCode +".");
+
+              sfdefAccTrnCharger.AddDocsTrn(accTrnData, SfDefArrayIndex, SFDOCS_LINKKIND_NDSPAY, 0, OperationID, StepID);
+            end;
+         end;
+       end;
+     end;
+   end;
+
+
+  stat = sfdefAccTrnCharger.ExecuteTrnDataArray2(sfdefArray);
+
+  return stat;
+end;
+
+
+// Формирование документов оплаты по УК
+macro SFCreateDocPayBatch(FeeType, BlockID, Number_Step, SfSrvDoc)
+  debugbreak;
+  var stat:integer = 0;
+  var cmd, rs, strSql;
+  var oprID_Operation = 0; 
+  var oprID_Step      = 0; 
+  var sfdefArray       = TArray;
+  var flagTrnPay      = false; // Оплата проводками  
+  var ObjectType = 0;
+  record SfContr(SfContr);
+  record SfConcom(sfconcom);
+  record SfComissRec("sfcomiss.dbt"); // Для MakeObjectID
+
+  ClearTempTable("dsfpaydoc_tmp");
+  ClearTempTable("dsfground_tmp");
+
+  if(FeeType == SF_FEE_TYPE_PERIOD)  
+    ObjectType = OBJTYPE_SFDEFCOM;
+  elif (FeeType == SF_FEE_TYPE_SINGLE)
+    ObjectType = OBJTYPE_OPRSFCOM;
+  else
+    return stat;
+  end;
+
+
+  var CashSize = SfCashSizeGetRegValue();
+  var sfrepacc = TRecHandler ("sfrepacc.tmp");
+  debugbreak;
+
+  SfGroundAddVOBatch(FeeType, SfSrvDoc, BlockID, Number_Step);
+
+//  var bbeBatch = BilBookEntryBatchCharger(); ADD ??
+//  var bilfDocArray; ADD ??
+  var payDocsTotal : integer = 0;
+
+  if(FeeType == SF_FEE_TYPE_PERIOD)
+    strSql = "SELECT COUNT (1) cont FROM doprtemp_tmp WHERE t_errorstatus = 0";
+  else
+    strSql = "SELECT COUNT (1) cont FROM dsfoprcompay_tmp";
+  end;
+
+  cmd = RsdCommand( strSql );
+  cmd.NullConversion = true;
+
+  rs = RsdRecordset( cmd ); 
+  if( rs.moveNext() )
+    payDocsTotal =  int(rs.value("cont"));     
+  end;
+
+  var OldDialogFlag = SetDialogFlag(1);
+  InitProgress(payDocsTotal, "Пожалуйста подождите...", "Формирование документов оплаты.");
+
+  var pmBatch = BatchMode( payDocsTotal );
+  var oprchildCache = RsbSQLInsert("oprchild.tmp");
+  var sfpaydocCache = RsbSQLInsert("sfpaydoc.tmp");
+  var sfrepaccCache = NULL;
+
+  if(FeeType == SF_FEE_TYPE_PERIOD)
+    sfrepaccCache = RsbSQLInsert("sfrepacc.tmp")
+  end;
+    cmd = RsdCommand(); 
+    cmd.NullConversion = true;
+
+    strSql =" SELECT tmp.t_ID_Operation As oprID_Operation, tmp.t_ID_Step As oprID_Step, " +
+
+// УПК
+            " sfdef.t_ID As sfdefID, sfdef.t_Sum As sfdefSum, sfdef.t_SumNDS As sfdefSumNDS, " + 
+            " sfdef.t_FIID_Sum As sfdefFIID_Sum, sfdef.t_Status As sfdefStatus, sfdef.t_IsIncluded As sfdefIsIncluded, sfdef.t_Department As sfdefDepartment," +
+            " sfdef.t_FacturaID As sfdefFacturaID, sfdef.t_DatePeriodBegin As sfdefDatePeriodBegin, sfdef.t_DatePeriodEnd As sfdefDatePeriodEnd, sfdef.t_commNumber As sfdefcommNumber, sfdef.t_DateFee As sfdefDateFee, sfdef.t_FeeType As sfdefFeeType, " +
+            " SFDEF.T_BASEQUANT SFDEFBASEQUANT, SFDEF.T_BASESUM SFDEFBASESUM, " + 
+            
+// ДО
+            " contr.t_ID As contrID, contr.t_ServKind As contrServKind, " +
+            " contr.t_PartyID As contrPartyID, contr.t_Department As contrDepartment, " +
+            " contr.t_PayRateID As contrPayRateID, contr.t_PayRateDateKind As contrPayRateDateKind, " +
+            " contr.t_PayRatePercent As contrPayRatePercent, " +
+            " contr.t_PayFIID As contrPayFIID, contr.t_Number As contrNumber, contr.t_DateConc contrDateConc, " +
+            " contr.t_PayMethod As contrPayMethod, contr.t_PreAcptID As contrPreAcptID, contr.t_DateBegin As contrDateBegin," +
+
+// Вд комиссии sfcomiss
+            " sfcomiss.t_feeType As feeType, sfcomiss.t_number As commNumber, " +
+            " sfcomiss.t_InstantPayment As InstantPayment, sfcomiss.t_RateType As comissRateType, sfcomiss.t_Code As comissCode, " +
+
+            " DECODE(sfcomiss.t_FIID_paySum, -1, sfdef.t_FIID_Sum, sfcomiss.t_FIID_paySum) As payFIID, " +
+
+// СПИ получателя УПК
+            " sicredit.t_Account As sicreditAccount, sicredit.t_FIID As sicreditFIID, sicredit.t_PartyID As sicreditPartyID, sicredit.t_BankID As sicreditBankID, sicredit.t_Department As sicreditDepartment, " +
+
+// СПИ плательщика УПК
+            " sidebet.t_Account As sidebetAccount, sidebet.t_FIID As sidebetFIID, sidebet.t_PartyID As sidebetPartyID, sidebet.t_BankID As sidebetBankID, sidebet.t_NoAccept As sidebetNoAccept, sidebet.t_Department As sidebetDepartment, " +
+
+// счета по КУ +Расчеты
+            " NVL(pluscalc.t_Account, chr(0)) As plusCalcAccount, NVL(pluscalc.t_FIID, -1) As plusCalcFIID, " +
+
+// счета по КУ +Расчеты, НДС
+            " NVL(pluscalcnds.t_Account, chr(0)) As plusCalcNDSAccount, NVL(pluscalcnds.t_FIID, -1) As plusCalcNDSFIID, " +
+
+// счета по КУ -НДС начисленный
+            " NVL(minusndsacr.t_Account, chr(0)) As minusNDSAcrAccount, NVL(minusndsacr.t_FIID, -1) As minusNDSAcrFIID, " +
+
+// счета по КУ -НДС
+            " NVL(minusnds.t_Account, chr(0)) As minusNDSAccount, NVL(minusnds.t_FIID, -1) As minusNDSFIID, " +
+
+// код ВО для основание 
+            " NVL(ground.t_Ground, chr(1)) As groundVO " ;
+
+
+    if(FeeType == SF_FEE_TYPE_PERIOD)
+      strSql = strSql + " FROM doprtemp_tmp tmp, dsfdef_dbt sfdef, dsfcontr_dbt contr, dsfcomiss_dbt sfcomiss, " +
+                        " dsfsi_dbt sicredit, dsfsi_dbt sidebet, dsfsi_dbt pluscalc, dsfsi_dbt pluscalcnds, dsfsi_dbt minusnds, dsfsi_dbt minusndsacr, dsfground_tmp ground " +
+                        " WHERE tmp.t_ErrorStatus = 0 " +
+                        " AND sfdef.t_FeeType = ?  " +
+                        " AND sfdef.t_ID = to_number(tmp.t_documentID)  " ;
+      cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_PERIOD );
+    else
+      strSql = strSql + "FROM dsfoprcompay_tmp tmp, dsfdef_dbt sfdef, dsfcontr_dbt contr, dsfcomiss_dbt sfcomiss, " +
+                        "dsfsi_dbt sicredit, dsfsi_dbt sidebet, dsfsi_dbt pluscalc, dsfsi_dbt pluscalcnds, dsfsi_dbt minusndsacr, dsfsi_dbt minusnds, dsfground_tmp ground " +
+                        "WHERE sfdef.t_FeeType = ? " +
+                        "AND sfdef.t_ID = tmp.t_SfDefID " +
+                        "AND tmp.t_BlockID = ? " +
+                        "AND tmp.t_Number_Step = ? " +
+                        "AND tmp.t_AutoFormDocs = 'X'" ;
+      cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_SINGLE );
+      cmd.addParam( "", RSDBP_IN, BlockID );
+      cmd.addParam( "", RSDBP_IN, Number_Step );
+    end;
+
+    strSql = strSql + " AND contr.t_ID = sfdef.t_SfContrID " +
+                      " AND sfcomiss.t_feetype = sfdef.t_feetype AND sfcomiss.t_number = sfdef.t_commnumber " +
+                      " AND sicredit.t_ObjectType = ? AND sicredit.t_DebetCredit = ? AND sicredit.t_ObjectID = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND sidebet.t_ObjectType = ? AND sidebet.t_DebetCredit = ? AND sidebet.t_ObjectID = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND pluscalc.t_ObjectType(+) = ? AND pluscalc.t_DebetCredit(+) = ? AND pluscalc.t_ObjectID(+) = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND pluscalcnds.t_ObjectType(+) = ? AND pluscalcnds.t_DebetCredit(+) = ? AND pluscalcnds.t_ObjectID(+) = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND minusndsacr.t_ObjectType(+) = ? AND minusndsacr.t_DebetCredit(+) = ? AND minusndsacr.t_ObjectID(+) = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND minusnds.t_ObjectType(+) = ? AND minusnds.t_DebetCredit(+) = ? AND minusnds.t_ObjectID(+) = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+                      " AND ground.t_SfDefID(+) = sfdef.t_ID";
+
+    if(FeeType == SF_FEE_TYPE_PERIOD)
+      strSql = strSql +  " ORDER BY sfdef.t_Department, sfdef.t_SfContrID, sfdef.t_feeType, sfdef.t_commNumber, sfdef.t_DatePeriodBegin"; 
+    else
+      strSql = strSql +  " ORDER BY tmp.t_ID_Operation, sfdef.t_feeType, sfdef.t_commNumber"; 
+    end;
+
+
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, BANK_CREDIT                 );
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, BANK_DEBET                  );
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, CALC_SFSI_KIND              );
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, CALC_SFSI_KIND              );
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, NDSACRUAL_SFSI_KIND         );
+    cmd.addParam( "", RSDBP_IN, ObjectType                  ); 
+    cmd.addParam( "", RSDBP_IN, NDS_SFSI_KIND               );
+
+    cmd.CmdText = strSql;
+
+    cmd.execute();   
+    var i = 0;
+    rs = RsdRecordset( cmd ); 
+    while( rs.moveNext() )
+        oprID_Operation = rs.value("oprID_Operation");
+        oprID_Step      = rs.value("oprID_Step");
+
+
+        var DefOpr = SfDefOpr();
+        // var SfDef = TRecHandler("sfdef.dbt");
+        ClearRecord(DefOpr.SfDef);
+        DefOpr.SfDef.rec.ID         = rs.value("sfdefID");
+        DefOpr.SfDef.rec.Sum        = rs.value("sfdefSum");
+        DefOpr.SfDef.rec.SumNDS     = rs.value("sfdefSumNDS");
+        DefOpr.SfDef.rec.FIID_Sum   = rs.value("sfdefFIID_Sum");
+        DefOpr.SfDef.rec.Status     = rs.value("sfdefStatus");
+        DefOpr.SfDef.rec.IsIncluded = rs.value("sfdefIsIncluded");
+        DefOpr.SfDef.rec.FacturaID  = rs.value("sfdefFacturaID");
+        DefOpr.SfDef.rec.DatePeriodBegin = rs.value("sfdefDatePeriodBegin");
+        DefOpr.SfDef.rec.DatePeriodEnd   = rs.value("sfdefDatePeriodEnd");
+        DefOpr.SfDef.rec.CommNumber      = rs.value("sfdefcommNumber");
+        DefOpr.SfDef.rec.SfContrID       = rs.value("contrID");
+        DefOpr.SfDef.rec.DateFee         = rs.value("sfdefDateFee");
+        DefOpr.SfDef.rec.FeeType         = rs.value("sfdefFeeType");
+        DefOpr.SfDef.rec.Department      = rs.value("sfdefDepartment");
+        //RR 17.03.2014 Добавляю недостающие поля
+        DefOpr.SfDef.rec.basequant = rs.value("SFDEFBASEQUANT");
+        DefOpr.SfDef.rec.basesum   = rs.value("SFDEFBASESUM");
+        
+        DefOpr.OldStatus       = DefOpr.SfDef.rec.Status;
+        DefOpr.oprID_Operation = oprID_Operation;
+        DefOpr.oprID_Step      = oprID_Step;     
+
+        var SfComiss = TRecHandler("sfcomiss.dbt");
+        ClearRecord(SfComiss);
+        SfComiss.rec.FeeType        = rs.value("feeType");
+        SfComiss.rec.Number         = rs.value("commNumber");
+        SfComiss.rec.InstantPayment = rs.value("InstantPayment");
+        SfComiss.rec.RateType       = rs.value("comissRateType");
+        SfComiss.rec.Code           = rs.value("comissCode");
+        
+        if(SfComiss.rec.InstantPayment != "X")
+          DefOpr.SfDef.rec.Status = SFDEFCOM_STATUS_CALCULATED;
+        else
+          var sicredit = TRecHandler("sfsi.dbt");
+          ClearRecord(sicredit);
+          sicredit.rec.Account            = rs.value("sicreditAccount");
+          sicredit.rec.FIID               = rs.value("sicreditFIID");
+          sicredit.rec.PartyID            = rs.value("sicreditPartyID");
+          sicredit.rec.BankID             = rs.value("sicreditBankID");
+          sicredit.rec.ReceiverNDSAccount = rs.value("minusNDSAccount");
+          sicredit.rec.Department         = rs.value("sicreditDepartment");
+
+          var sidebet = TRecHandler("sfsi.dbt");
+          ClearRecord(sidebet);
+          sidebet.rec.Account    = rs.value("sidebetAccount");
+          sidebet.rec.FIID       = rs.value("sidebetFIID");
+          sidebet.rec.PartyID    = rs.value("sidebetPartyID");
+          sidebet.rec.BankID     = rs.value("sidebetBankID");
+          sidebet.rec.NoAccept   = rs.value("sidebetNoAccept");
+          sidebet.rec.Department = rs.value("sidebetDepartment");
+
+
+          // EVG 3/12/2015 Возврат корректного значения филиала
+          if( sicredit.rec.Department == -1 )
+             sicredit.rec.Department = sidebet.rec.Department;
+          end;
+
+
+          /* EVG 17/03/2014 Поиск счёта оплаты - вызов мефёдовской процедуры */
+          var ClientID = getClientOnContr( DefOpr.SfDef.rec.SfContrID );
+          sidebet.rec.Account = selectAccountForSfPay( DefOpr.SfDef.rec.Sum + 
+                                                          DefOpr.SfDef.rec.SumNDS, 
+                                                             DefOpr.SfDef.rec.FIID_Sum, 
+                                                                //DefOpr.SfDef.rec.DateFee, //16.04.2014 joy R-361841 Нужна определять остаток по счету на дату оплаты
+                                                                SfSrvDoc.DatePay,           //  из сервисной операции (т.к. в УПК ее еще нет), а не на дату расчета комиссии
+                                                                   ClientID, 
+                                                                      SF_FEE_TYPE_PERIOD, 
+                                                                         DefOpr.SfDef.rec.ID,
+                                                                            DefOpr.SfDef.rec.SfContrID,
+                                                       @sidebet.rec.FIID );
+          
+          ClearRecord(SfContr);
+          SfContr.id               = rs.value("contrID"             );
+          SfContr.servkind         = rs.value("contrServKind"       );
+          SfContr.partyid          = rs.value("contrPartyID"        );
+          SfContr.department       = rs.value("contrDepartment"     );
+          SfContr.payrateid        = rs.value("contrPayRateID"      );
+          SfContr.payratedatekind  = rs.value("contrPayRateDateKind");
+          SfContr.payratepercent   = rs.value("contrPayRatePercent" );
+          SfContr.payfiid          = rs.value("contrPayFIID"        );
+          SfContr.number           = rs.value("contrNumber"         );
+          SfContr.dateconc         = rs.value("contrDateConc"       );
+          SfContr.paymethod        = rs.value("contrPayMethod"      );
+          SfContr.preacptid        = rs.value("contrPreAcptID"      );
+          SfContr.DateBegin        = rs.value("contrDateBegin"      );
+
+          var isNVPI = false;
+          if((SfContr.payfiid != DefOpr.SfDef.rec.FIID_Sum) AND (SfContr.payratedatekind != SFINV_RATEDATEKIND_DRAWN))
+            isNVPI = true;
+          else
+            isNVPI = false;
+          end;
+
+          // 8.5.6. Определить массив bilfDocArray для получения параметров для формирования ЗК по УПК для ДО с методом оплаты "проводками".
+          // 8.5.7. Сформировать основание документа оплаты УПК ground с помощью функции BuildGroundWithVO().
+
+          if((not Sf_IsInstalledRKO()) OR (SfContr.paymethod == SF_PAY_METHOD_DOCUMENT)) // Оплата проводками 
+            flagTrnPay = true;
+            var sfpaydoc = TRecHandler("sfpaydoc.tmp");
+            ClearRecord( sfpaydoc );
+            sfpaydoc.rec.ArrayIndex         = i;
+            sfpaydoc.rec.SfDefID            = DefOpr.SfDef.rec.ID;
+            sfpaydoc.rec.PayerAccount       = sidebet.rec.Account;
+            sfpaydoc.rec.PayerFIID          = sidebet.rec.FIID;
+//            sfpaydoc.rec.PayerDprt          = 
+            sfpaydoc.rec.PayerID            = sidebet.rec.PartyID;
+            sfpaydoc.rec.ReceiverAccount    = sicredit.rec.Account;
+            sfpaydoc.rec.ReceiverFIID       = sicredit.rec.FIID;
+//            sfpaydoc.rec.ReceiverDprt       = 
+            sfpaydoc.rec.ReceiverID         = sicredit.rec.PartyID;
+
+            if(FeeType == SF_FEE_TYPE_PERIOD)
+              sfpaydoc.rec.DateCarry          = SfSrvDoc.DatePay;
+            else
+              sfpaydoc.rec.DateCarry          = DefOpr.SfDef.rec.DateFee; // DateFee ??
+            end;
+
+            sfpaydoc.rec.FreeRest           = $0;
+            sfpaydoc.rec.ConvFreeRest       = $0;
+            sfpaydoc.rec.PaySum             = DefOpr.SfDef.rec.Sum;     
+            sfpaydoc.rec.TaxSum             = DefOpr.SfDef.rec.SumNDS;  
+            sfpaydoc.rec.FIIDSum            = DefOpr.SfDef.rec.FIID_Sum;
+            sfpaydoc.rec.FIIDPaySum         = rs.value("payFIID");
+            sfpaydoc.rec.ConvPaySum         = DefOpr.SfDef.rec.Sum;
+            sfpaydoc.rec.ConvTaxSum         = DefOpr.SfDef.rec.SumNDS;
+            sfpaydoc.rec.ConvTaxSumNC       = DefOpr.SfDef.rec.SumNDS;
+            sfpaydoc.rec.RateType           = SfComiss.rec.RateType;
+            sfpaydoc.rec.CalcFIID           = rs.value("plusCalcFIID");
+            sfpaydoc.rec.CalcAccount        = rs.value("plusCalcAccount");
+            sfpaydoc.rec.CalcNDSAccount     = rs.value("plusCalcNDSAccount");
+            sfpaydoc.rec.MinusNDSAcrAccount = rs.value("minusNDSAcrAccount");
+            sfpaydoc.rec.MinusNDSAccount    = rs.value("minusNDSAccount");
+            sfpaydoc.rec.OperationID        = rs.value("oprID_Operation"); 
+            sfpaydoc.rec.StepID             = rs.value("oprID_Step");      
+            sfpaydoc.rec.IsIncluded         = DefOpr.SfDef.rec.IsIncluded;
+            sfpaydoc.rec.ComissCode         = SfComiss.rec.Code;
+            sfpaydoc.rec.Error              = 0;
+            sfpaydoc.rec.ErrMsg             = "";
+
+            sfpaydocCache.AddRecord( sfpaydoc );
+          else
+            var payParams = TSfPayParams();
+            var groundVO = rs.value("groundVO");
+            Copy(SfComissRec, SfComiss);   
+
+            if(FeeType == SF_FEE_TYPE_PERIOD)
+              payParams.payDate    = SfSrvDoc.DatePay; // Дата взимания оплаты УПК dsfsrvdoc_dbt.T_DATEPAY.
+            else
+              payParams.payDate    = DefOpr.SfDef.rec.DateFee; // DateFee ??
+            end;
+            payParams.ground       = BuildGroundBatch(groundVO, DefOpr.SfDef.rec, SfComissRec, SfContr);
+            payParams.paySum       = DefOpr.SfDef.rec.Sum   ; // Сумма комиссии без НДС: DSFDEFCOM_DBT.T_COMMSUM.
+            payParams.taxSum       = DefOpr.SfDef.rec.SumNDS; // Сумма НДС: DSFDEFCOM_DBT.T_NDSSUM.
+            payParams.FIID         = DefOpr.SfDef.rec.FIID_Sum; // Валюта УПК: DSFDEFCOM_DBT.T_FIID_COMMSUM.
+            payParams.primKind     = SFCONTR_DOC;
+            payParams.primID       = sfcontr.ID;
+            payParams.PreAcptID    = sfcontr.PreAcptID;
+
+            if(FeeType == SF_FEE_TYPE_PERIOD)
+              payParams.objectType = OBJTYPE_SFDEFCOM;
+            else
+              payParams.objectType = OBJTYPE_OPRSFCOM;
+            end;
+
+            payParams.objectBuf    = DefOpr.SfDef.rec;
+            payParams.payMethod    = SfContr.paymethod;
+            payParams.IsIncluded   = DefOpr.SfDef.rec.IsIncluded ;
+            payParams.PlusCalc_Account          = rs.value("plusCalcAccount");
+            payParams.PlusCalcNDS_Account       = rs.value("plusCalcNDSAccount");
+            payParams.MinusNdsAcrual_Account    = rs.value("minusNDSAcrAccount");
+            payParams.MinusNds_Account          = rs.value("minusNDSAccount");
+            payParams.isNVPI       = isNVPI; 
+            payParams.FacturaID    = DefOpr.SfDef.rec.FacturaID;
+            payParams.PreAcptID    = SfContr.preacptid;
+
+            var oprchild = TRecHandler("oprchild.tmp");
+            ClearRecord( oprchild );
+            oprchild.rec.ID_Operation = rs.value("oprID_Operation");
+            oprchild.rec.ID_Step      = rs.value("oprID_Step");     
+            oprchild.rec.MassOprStart = "X";
+
+//            bilfDocArray = TArray; ADD ??
+            SfFormDocsCommon( 
+                null, 
+                sidebet, // СПИ по дебету УПК
+                sicredit, // СПИ по кредиту УПК
+                sfcomiss.rec, // буфер вида периодический комиссии
+                payParams, // параметры оплаты
+                null, // параметры sfinvlnk
+                null, // сумма в валюте ТО    
+                null, // @bilfDocArray, ADD!!
+                true, // IsBatchMode признак пакетного режима    
+                oprchild.rec );
+
+    
+            ClearRecord( sfrepacc );
+            sfrepacc.rec.sfdefcomID      = DefOpr.SfDef.rec.ID;
+            sfrepacc.rec.debit           = sidebet.rec.Account;
+            sfrepacc.rec.credit          = sicredit.rec.Account;
+            sfrepacc.rec.BeginDate       = DefOpr.SfDef.rec.DatePeriodBegin;
+            sfrepacc.rec.EndDate         = DefOpr.SfDef.rec.DatePeriodEnd  ;
+            sfrepacc.rec.Amount          = DefOpr.SfDef.rec.Sum;
+            sfrepacc.rec.ContrID         = SfContr.id;
+            sfrepacc.rec.FeeType         = SF_FEE_TYPE_PERIOD;
+            sfrepacc.rec.ComissNumber    = SfComiss.rec.Number;
+            sfrepacc.rec.InvoiceID       = -1;
+            sfrepacc.rec.Kind            = 1;
+            sfrepacc.rec.Department      = DefOpr.SfDef.rec.Department;
+
+            if(FeeType == SF_FEE_TYPE_PERIOD)
+              sfrepaccCache.AddRecord( sfrepacc );
+            end;
+
+            //zmp 15.09.2014 C-32626
+            if( not ((FeeType == SF_FEE_TYPE_PERIOD) and _bank.is_vuz and
+               (haveNotFreeRest(sfrepacc.rec.Amount, sidebet.rec.Account)) and  (check_over(sidebet.rec.Account))) )
+               oprchildCache.AddRecord( oprchild );
+            end;
+          end;
+
+          if(SfContr.paymethod != SF_PAY_METHOD_DOCUMENT)
+            DefOpr.SfDef.rec.Status = SFDEFCOM_STATUS_FOR_PAY;
+          end;
+        end;
+
+        sfdefArray[i] = DefOpr;
+        i = i + 1;
+        
+        UseProgress(i);
+    end;
+
+    RemProgress();
+    SetDialogFlag(OldDialogFlag);
+    
+    // Выполнить пакетную вставку в doprchild_tmp  
+
+    if(stat == 0)
+      oprchildCache.Insert();
+    end;
+
+    
+
+    // Выполнить пакетную вставку ЗК .
+    if(stat == 0)
+      // stat = bbeBatch.run(); ADD !!
+    end;
+
+    pmBatch.TransferToBase( false );
+
+
+    if((stat == 0) AND (flagTrnPay == true))
+      sfpaydocCache.Insert();
+    end;
+
+    // Вставка проводок
+    if((stat == 0) AND (flagTrnPay == true))
+       stat = SfFormDocumentsBatch(sfdefArray, sfrepaccCache, SfSrvDoc);
+    end;
+
+    // Выполнить пакетную вставку в dsfrepacc_tmp
+    if(FeeType == SF_FEE_TYPE_PERIOD)
+      sfrepaccCache.Insert();
+    end;
+
+    if(stat == 0)
+      stat = UpdateSfDefStatusSfOpr( sfdefArray );
+    end;
+
+  return stat;
+end;
+

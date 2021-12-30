@@ -1,0 +1,689 @@
+ //-----------------------------------------------------------------------------
+// Блок      : 29005 - "Выгрузка в МБР"
+// Шаг       : 190   - "Выгрузка в МБР"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+// Изменения:
+// SDA 21.05.2012 "02" - клиентские требования в электронном виде не корректно оформляются ED103
+// TAM 30.11.2011 I-00126112 - кроме случаев, когда все платежи отправляются электронно как ED101
+// TAM 01.11.2012 C-14674
+// TAM 25.03.2013 - "причесывание" макроса: 0 == CompareStrWithMasks()
+// Gurin S. 09.04.2013 C-18203-6
+// TAM      05.12.2013 C-22504 - для филиалов ЭВ работа со SWIFT в полном объеме
+// Jushmanov 2014-02-24 C-19151 Логгирвание массово выполненных шагов
+//-----------------------------------------------------------------------------
+
+import PaymInter, InsCarryDoc, WldInter, MesInter, "rmtools.mac", "multypm.mac", "pm_opr.mac", "cbsttls.mac";
+import "DoublCheck.mac";
+import "PMTax.mac";
+IMPORT pmcarfun;
+import "AvtoTypePayment.mac";
+import "fg_Life_parm.mac"; // KS 26.01.2011 Для универсальности
+import "lib_const.mac";
+import OprInter, oralib; //Jushmanov 2014-02-24 C-19151
+import "lib_pm_check.mac";
+
+private var fgBank = fg_life_subject({OurBank});
+
+var PaymentObj:RsbPayment;
+
+// EVG Добавлены определения глобальных переменных из rm110_10.mac (Позиционирование), иначе, при откате шага 
+// перепозиционирования и вызове этого макроса возникают сообщения "Не определена глобальная переменная". 
+record Corschem(corschem); //корсхема до позиционирования
+record OutProp(pmprop); //исходящее свойство платежа после позиционирования
+
+var error_flag = false;
+
+
+private macro ТранспортСообщения( ID_Kind, MesID )
+    var TpID:integer;
+    var rs:object;
+    var select:string;
+    var params:TArray;
+
+    if( ID_Kind == OPR_ID_REAL)
+        select = "select tpschem.t_TpID " +
+                  "from dwlmes_dbt wlmes, dwltpshem_dbt tpschem "; 
+    else
+        select = "select tpschem.t_TpID " +
+                  "from dwlmes_tmp wlmes, dwltpshem_dbt tpschem "; 
+    end;
+
+    select = select + "where wlmes.t_MesID = :MesID and wlmes.t_TpSchemID = tpschem.t_TpShemID ";
+    params = makeArray( SQLParam("MesID", MesID) );
+    rs = execSQLselect( select, params, FALSE );
+
+    if( rs.MoveNext() )
+        TpID = rs.value(0);
+    else
+        TpID = -1;
+    end;
+
+    return TpID;
+end;
+
+
+macro ЕстьСвязьКвитовки(PaymentID)
+    var prm = TArray();
+    prm[0] = SQLParam("", PaymentID);
+    var rsd = execSQLselect("select count(1) from dwlpm_dbt wlpm, dwlkvtlnk_dbt wlkvtlnk " +
+        "where wlpm.t_PaymentID = ? and wlpm.t_direct = chr(0) /*WLD_MES_OUT*/ and wlpm.t_WlPmNum = 0 and "+
+        "wlkvtlnk.t_Type = chr(0) /*WLD_KVIT_NORMAL*/ and wlpm.t_WlPmID = wlkvtlnk.t_WlPmID", prm);
+    rsd.moveNext();
+    return rsd.value(0) > 0;
+end;
+
+private macro prepareMessageToUpload(pid, mid)
+   execSql(" BEGIN "+
+           "   UPDATE dwlpm_dbt dw "
+           "      SET dw.T_PROPSTATUS = 6600 "+
+           "    WHERE     dw.T_PAYMENTID = :m_pid "+
+           "          AND dw.T_WLPMID = (SELECT MAX (T_WLPMID) "+
+           "                               FROM dwlpm_dbt "+
+           "                              WHERE t_paymentid = DW.T_PAYMENTID); "+
+           "   UPDATE dwlmes_dbt SET T_STATE = 10, T_SYSTIME = SYSDATE WHERE T_MESID = :m_mid; "+
+           " END; ",
+           makeArray (SQLParam ("m_pid", pid), SQLParam ("m_mid", mid))
+           );
+end;
+
+//-----------------------------------------------------------------------------
+// Выгрузка в МБР
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first, KindDoc, ID_Operation, ID_Step )
+    debugbreak;
+    FILE Corschem(corschem) key 1;
+    //Gurin S. 11.08.2015
+    FILE tpshem(wltpshem) key 0;
+    var stat:integer = 0, err = 0;
+    var ID_Kind, MesID, Context, str, depName = "", partyName = "";
+    record _wlreq( "wlreq.dbt" );
+    Array Text;
+    Array Buttons;
+    file dp_dep("dp_dep.dbt");
+    file party("party.dbt");
+    var query:string, param:TArray, rs:RsdRecordset;
+    private var NeedKvit = false;  //03.02.2012  SDA - определение необходимости использования шага квитовки
+    
+    if ({oper} != 20020)
+       var sql = execSqlSelect("select 1 from USR_ROBOT_PAYMENT_TMP where paymid = :id and ismanual = chr(0)",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+       if (sql.movenext()) 
+          MsgBox("В данный момент платеж: "+PaymentObj.Paymentid+" обрабатывается роботом. | Ручная обработка/корректировка запрещена."); 
+          return 1; 
+       end;
+    end;
+
+    //TAM 25.06.2013 HF_81
+    if( NeedIncludeInMultyPaym(PaymentObj) )    
+        if(IncludeInMultyPaym(PaymentObj))
+            MsgBox( "Возникла ошибка при сведении платежа" );
+            return 1;      
+        end;
+        return 0;
+    end;
+
+    // zip_z I-098102 2010-12-17 | begin ---------------------------------------------------------------------------
+    // PMTAX::PM_CheckTaxProp( pmrmprop, RecAccount: string ):integer
+    //LAO HF20
+    record pm_rmpropbuff ( pmrmprop );   // буфер налоговых реквизитов
+    if (PaymentObj.OutCorschem == 1)
+        if (FindPayment (PaymentObj.paymentid, 
+                         PaymentObj.purpose, 
+                         PaymentObj.subpurpose, 
+                         PaymentObj.dockind, 
+                         PaymentObj.documentid, true, null, null, null, pm_rmpropbuff) == 0)
+            if (PM_CheckTaxPropForStep(PaymentObj.paymentid)) /* (PM_CheckTaxProp( pm_rmpropbuff, PaymentObj.ReceiverAccount ))*/
+                return 1;
+            end;
+        end;
+    end;
+    
+    if (PaymentObj.OutRlsForm == 0)
+        DefMessRelForPm(PaymentObj.PaymentID);
+    end;
+
+    //Gurin S. 09.10.2015 R-623427-2 Это уже не нужно, нет RS-Payments
+    //   //SDA ЭВ - транзитные филиалов через голову на Палату ПРББ обрабатываются наравне с начальными 
+    //if ( not fgBank.is_EXV )
+    //    //Seleznev сообщение по валютным транзитным не нужно, т.к. оно уже есть в RS-Payments
+    //    if ((PaymentObj.IsTransit) and (PaymentObj.BaseFIID != 0) and (not fgBank.is_GEB)) //Gurin S. 08.10.2015 R-623151-2
+    //        if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, 309/*Выгрузка в RS-Payments = требуется*/, 1) )
+    //            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+    //            return 1;
+    //        end;     
+    //        return 0;
+    //    end;
+    //end;
+    
+    //SDA 21.06.2012 - нельзя отправлять платежи транзитом через ВУЗ на спец. брокерский счет
+    if ((PaymentObj.BaseFIID == 0) and 
+        (fgBank.is_PRBB) and 
+        (PaymentObj.OutCorschem == 941) and 
+        (substr(PaymentObj.ReceiverAccount,1,5) =="40821"))
+            msgbox("Отправка документов на счета 40821 по данной корсхеме запрещена. | Смените исходящую схему расчетов ");
+            return 1;
+    end;
+        
+    //SDA в рублях 1-я схема расчетов РКЦ, 2-я - RsPayments - для региональных банков
+    if ((PaymentObj.BaseFIID == 0) and 
+       (((fgBank.is_PRBB) and (PaymentObj.OutCorschem != 1)) or 
+        ((not fgBank.is_PRBB) and (PaymentObj.OutCorschem == 2))) and 
+         (not (ПлатежЗачисленНаСНР(PaymentObj))))
+    
+        if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, 309/*Выгрузка в RS-Payments = требуется*/, 1) )
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;     
+        //SDA 22.11.2011 I-00123192- дата значения документа устанавливается по ДПП 
+        PaymentObj.ValueDate = PaymentObj.OutTransferDate; 
+        return 0;
+    else
+        //МБР
+        ClearRecord(Corschem);
+        Corschem.Number = PaymentObj.OutCorschem;
+        Corschem.FIID = PaymentObj.OutCorschemFIID;
+        Corschem.FI_Kind = 1;
+        if(not GetEQ(Corschem))
+            msgbox( "Не найдена исходящая корсхема" );
+            return 1;
+        end;
+        // Проверяем ДПП
+        if ( PaymentObj.CorrectOutDPP(true) )
+            msgbox( "Неверное значение ДПП" );
+            return 1;
+        end;
+       
+        //Gurin S. 09.10.2015 R-623427-2 Это уже не нужно, нет RS-Payments
+        //if (not fgBank.is_GEB) //Gurin S. 08.10.2015 R-623151-2
+        //    if (PaymentObj.BaseFIID != 0)
+        //        if( УстановитьСтатусыПлатежа(309, 1) )
+        //            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+        //            return 1;
+        //       end;      
+        //    end;
+        //end;
+    end;
+    //SDA START - если на шаге зачисления проводка была сделана на счет СНР, при выгрузке в МБР закрывает проводку
+    //на корр.счет - аналог функциональности закрытого шага - выполнить проводку по коррсчету. 
+    private  var paymtr:RsbPaymTransaction;
+    // SDA - проводка С СНР формируется, только если документ выгружается ДПП == {curdate} 
+    //иначе проводка с СНР формируется на шаге квитовки w110_200.mac 
+    if (PaymentObj.OutTransferDate > {curdate})
+        NeedKvit = true;
+        //SDA - 15.05.2012 I-00189631-2 - на блоке 10000145 - Выгрузке в МБР установлено 
+        //дефолтное значение сегмента К(квитовка начального) = 1- сквитован 
+        if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_UNKVIT) )
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;     
+    else
+        PaymentObj.FreeReserve( PaymentObj.PayerAccount, 1, PaymentObj.PayerFIID );
+        if ( not CarryPlanDocuments(PaymentObj.PaymentID) )
+            MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+            return 1;
+        end;
+      
+        if (((PaymentObj.FuturePayerAccount != PaymentObj.FutureReceiverAccount) or
+           (PaymentObj.FuturePayerFIID  != PaymentObj.FutureReceiverFIID)) and 
+           ((ПолучитьВсеПроводки(PaymentObj.PaymentID,@rs, 1/*CHAPT1*/) and
+            rs.moveLast() and
+           //SDA - это не ошибка, в строке ниже идет приравнивание для функции ПлатежЗачисленНаСНР 
+           (PaymentObj.FuturePayerAccount = rs.value("t_ReceiverAccount"))) and
+           (ПлатежЗачисленНаСНР(PaymentObj))))
+    
+            PaymentObj.ValueDate = PaymentObj.OutTransferDate;
+            paymtr = PaymentObj.MakeTransaction();
+            if( paymtr == NULL )
+                MsgBox("Ошибка при создании проводки по платежу");
+                return 1;
+            end;     
+           
+            paymtr.Chapter         = PaymentObj.Chapter;
+            paymtr.Date_Carry      = {curdate};
+            //paymtr.Date_Document   = {curdate}; TAM 26.12.2013 SCR 205381
+            paymtr.Number_Pack     = PaymentObj.NumberPack;
+            paymtr.Numb_Document   = PaymentObj.Number;
+            paymtr.ResultCarry     = 1;
+            paymtr.Kind_Oper       = " 1";
+            
+            if (PaymentObj.ShifrOper != "")
+                paymtr.Shifr_Oper      = PaymentObj.ShifrOper;
+            else
+                paymtr.Shifr_Oper      = "09";
+            end;
+        
+            paymtr.Ground          = PaymentObj.Ground;
+            paymtr.Department      = PaymentObj.Department;
+            paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+            paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+                
+            //TAM 30.08.2012 I-00243867-2
+            if(PaymentObj.PayerFIID == PaymentObj.FuturePayerFIID)
+                paymtr.SumPayer        = PaymentObj.PayerAmount; 
+            end;
+            
+            paymtr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+            paymtr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+            //TAM 30.08.2012 I-00243867-2
+            if(PaymentObj.PayerFIID == PaymentObj.FutureReceiverFIID)
+                paymtr.SumReceiver     = PaymentObj.PayerAmount;
+            end;
+            paymtr.ClaimID         = PaymentObj.ClaimID;
+        
+            if( PaymentObj.CoverAmount != $0 ) 
+                paymtr.SumEquivalentCarry = PaymentObj.CoverAmount;
+            end;
+            
+            if( not paymtr.Carry )
+                MsgBox("Ошибка при актуализации платежа");
+                return 1;
+            end;  
+        end;
+    end;
+    //SDA END
+    
+    if ((PaymentObj.BaseFIID == 0) and 
+      (((fgBank.is_PRBB) and (PaymentObj.OutCorschem != 1)) or 
+       ((not fgBank.is_PRBB) and (PaymentObj.OutCorschem == 2)))) 
+    
+        if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, 309/*Выгрузка в RS-Payments = требуется*/, 1) )
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;     
+        //SDA 22.11.2011 I-00123192- дата значения документа устанавливается по ДПП 
+        PaymentObj.ValueDate = PaymentObj.OutTransferDate; 
+        return 0;
+    end;
+    
+    private var Route = Trim(Corschem.Userfield1), to_close = false;
+    if (Route == "to_close")
+        to_close = true;
+    end;
+
+    if (to_close)
+        if( not InsertPaymentPropStat( PaymentObj.PaymentID, PM_FINISHED ) )
+            msgbox("Ошибка при вставке статуса платежа");
+            return 1;
+        end;
+    
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+        
+        return 0;
+    end;
+    
+    //Gurin S. 09.10.2015 R-623427-2 Это уже не нужно, нет RS-Payments
+    //if (PaymentObj.BaseFIID != 0)
+    //    //SDA - дата значения документа устанавливается по ДПП 
+    //    PaymentObj.ValueDate = PaymentObj.OutTransferDate; 
+    //    //TAM 05.12.2013 C-22504 - для филиалов ЭВ выгрузка в пейментс не нужна - пейментса нет, формируем свифтовые сообщения.
+    //    if(fgBank.is_EXV_VOLGOGRAD or fgBank.is_EXV_VORONEZH or fgBank.is_EXV_ULYANOVSK or fgBank.is_EXV_STAVROPOL)
+    //        if( УстановитьСтатусыПлатежа(309, 2) )
+    //           MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+    //           return 1;
+    //        end; 
+    //    else
+    //       if (not fgBank.is_GEB) //Gurin S. 08.10.2015 R-623151-2
+    //          if( УстановитьСтатусыПлатежа(309, 1) )
+    //             MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+    //             return 1;
+    //          end;     
+    //       end;
+    //    end;
+    //end;
+    
+    private var POSTA_ExecToday = true; /*SDA - значение по-умолчанию*/
+    GetRegistryValue( "PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ДПП_ТЕКУЩИМ_ДНЕМ\\ПОЧТОВЫЕ", V_BOOL, POSTA_ExecToday, err );
+    
+    if ( err != 0 )
+        POSTA_ExecToday = false;
+    end;
+    
+    if (PaymentObj.BaseFIID == 0)   /*SDA - для валютных сообщение уже сгенерировано */
+        stat = InsertPaymentMessage( PaymentObj.PaymentID, ID_Kind, MesID );
+
+        if( stat )
+            РасширенноеСообщениеОбОшибке( "Ошибка при генерации сообщения по платежу" );
+        else
+            //SDA 09.06.2001 - согласно реестровой настройке PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ДПП_ТЕКУЩИМ_ДНЕМ\\ПОЧТОВЫЕ 
+            if ((not NeedKvit) and ((POSTA_ExecToday) or (PaymentObj.PaymentKind == "Э") or (PaymentObj.PaymentKind == "С"))) 
+                if (Corschem.IsKvitOutPaym != "X")  //Gurin S. если на сх. расчетов стоит необходимость квитовать начальные, то не надо сегмент проставлять
+                   if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT) )
+                      MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                      return 1;
+                   end;     
+                end;
+            end;
+        end;
+
+        //Gurin S. 11.08.2015 
+        if(((Corschem.IsKvitOutPaym != "X") and (tpshem.BanAutoKvit !="X")) or ЕстьСвязьКвитовки(PaymentObj.PaymentID))
+           if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT) )
+              MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+              return 1;
+           end;   
+        else
+            if (GetOprStatus(OPR_PAYM_OUT_KVIT) != OPR_PM_ST_KVIT)
+               PaymentObj.PaymStatus = PM_IS_SENDING;
+               if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_UNKVIT) )
+                  MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                  return 1;
+               end;     
+            end;
+        end;
+    else
+        //Gurin S. 09.10.2015 R-623427-2 Для всех делаем это, так как нет RS-Payments
+        //if (fgBank.is_GEB) //Gurin S. 08.10.2015 R-623151-2
+            //Для ГЕБа нужно формировать сообщение в валюте, так как RS-Payments теперь нет, руками сообщение по Ctrl+G не формируем.
+            //Реализация с дистрибутива
+
+            if (not WL_IsExistsMessage (PaymentObj.PaymentID))
+               stat = InsertPaymentMessage( PaymentObj.PaymentID, ID_Kind, MesID );
+            else
+               getMessageInfo( PaymentObj.PaymentID, ID_Kind, MesID );
+               prepareMessageToUpload( PaymentObj.PaymentID, MesID );
+            end;
+
+            if( stat )
+                РасширенноеСообщениеОбОшибке( "Ошибка при генерации сообщения по платежу" );
+            else
+
+                // наложение ЭЦП на сообщение
+                Context = "ТранспортМБР|" + ТранспортСообщения(ID_Kind, MesID) + "|Выгрузка платежа в МБР";
+                InsertMesSign( ID_Kind, MesID, Context );
+                FiscLogDischDoc(PaymentObj.PaymentID);
+
+                ClearRecord(tpshem);
+                tpshem.TpShemID = PaymentObj.OutTpSchem;
+                if(not GetEQ(tpshem))
+                    msgbox( "Не найдена транспортная схема" );
+                    return 1;
+                end;     
+            end;
+        //end;
+        //TAM 05.12.2013 C-22504 переводим сообщения в состояние "Подготовлено"
+        //if(fgBank.is_EXV_VOLGOGRAD or fgBank.is_EXV_VORONEZH or fgBank.is_EXV_ULYANOVSK or fgBank.is_EXV_STAVROPOL)
+        //    stat = InsertPaymentMessage( PaymentObj.PaymentID, ID_Kind, MesID );
+        //    if( stat )
+        //       РасширенноеСообщениеОбОшибке( "Ошибка при генерации сообщения по платежу" );
+        //    end;
+        //end;
+
+        PaymentObj.PaymStatus = PM_IS_SENDING;
+
+        if( УстановитьСтатусыПлатежа(OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT) )
+            MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+            return 1;
+        end;     
+        
+        stat = 0;
+    end;
+
+    //TAM 01.11.2012 C-14674
+    debugbreak;
+    if((fgBank.is_PRBB or fgBank.is_EXV or fgBank.is_GEB) and //TAM 12.12.12 R-133747-3
+       (PaymentObj.BaseFIID == 0) and
+       (PaymentObj.Dockind == 16) and 
+       ( 0 == (CompareStrWithMasks ("426*, 40820*, 40913*", PaymentObj.PayerAccount))) and
+       ( 0 == (CompareStrWithMasks ("30111*, 30231*", PaymentObj.ReceiverAccount))))
+        
+        stat = УстановитьСтатусыПлатежа(378,1);
+    end;//end TAM C-14674
+
+    return stat;
+end;
+
+
+macro CheckStepAction( mes )
+    var MultyPaymID;
+    RECORD wldmes( wlmes  );
+    private var cmd;
+    
+    if( mes == OP_BACKOUT_STEP )
+        MultyPaymID = IsIncludedInMultyPM(PaymentObj);
+        if(MultyPaymID)
+            if(Opr_IsStepExecuteSymb( MultyPaymID, DLDOC_MULTYPM, "Ф" ))
+                msgbox("Нельзя исключить платеж, так как по связанному | сводному платежу сформировано сообщение");
+                return 1;
+            end;
+        end;
+
+        if( ПолучитьСообщение( PaymentObj.PaymentID, OBJTYPE_PAYMENT, 0, wldmes, NULL ) )
+            //При откате шага, если есть сообщение, то оно должно быть не выгружено (#144467)
+            if(wldmes.State > WLD_STATUS_MES_DEFECT)
+                msgbox("Состояние сообщения не позволяет откатить шаг");
+                return 1;
+            end;
+        end;
+
+        //SDA 28.02.2012 - Лечилка для  нетрадиционно откаченных, выгруженных платежей из МБР
+        if (PaymentObj.DocKind == PS_PAYORDER)
+            rsldefcon.begintrans;
+            RSDCommand("update dpspayord_dbt set t_currentstate = 1 where t_orderid = "+PaymentObj.paymentid).execute();
+            RSDCommand("delete dpspohist_dbt where t_orderid = "+PaymentObj.paymentid+" and t_statusidto = 15").execute();
+            rsldefcon.committrans;
+        end;
+    end;
+    
+    if ( mes == OP_BACKOUT_STEP )
+        // KS 06.09.2012 Простановка категории
+        cmd = RSDCommand(
+                         "delete from dobjatcor_dbt "+
+                         "      where t_objecttype = 501"+
+                         "        and t_groupid = 1016"+
+                         "        and t_object = lpad(?,10,'0')");
+        cmd.addParam("", RSDBP_IN, PaymentObj.paymentid);
+        cmd.Execute();
+        cmd = RSDCommand(
+                         "insert into dobjatcor_dbt values(501,"+
+                         "   1016,"+
+                         "   7,"+
+                         "   lpad(?,10,'0'),"+
+                         "   chr(0),"+
+                         "   ?,"+
+                         "   ?,"+
+                         "   to_date('31.12.9999','DD.MM.YYYY'),"+
+                         "   trunc(sysdate),"+
+                         "   sysdate-trunc(sysdate)+to_date('01.01.0001','DD.MM.YYYY'),"+
+                         "   chr(0))");
+        cmd.addParam("", RSDBP_IN, PaymentObj.paymentid);
+        cmd.addParam("", RSDBP_IN, {curdate});
+        cmd.addParam("", RSDBP_IN, {oper});
+        cmd.Execute();
+    end;
+
+    //Gurin S. 09.04.2013 C-18203-6
+    if (mes == OP_REJECT_STEP)
+        debugbreak;
+        var reason = "";
+        if (PaymentObj.Origin == USR_PAYMENT_OR_ABBYY_FC)
+            getstring(reason, "Введите причину отвержения шага:");
+            if (reason == "") return 1; 
+            else 
+                PaymentObj.notes.addnote(42,reason);
+                PaymentObj.notes.save(true); //SCR #194241
+            end;
+        end;         
+    end;
+    
+    return 0;
+end;
+
+
+// KS 06.09.2012 Простановка категории
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var cmd, logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    //Jushmanov 2014-02-24 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if (( message == OP_EXECUTE_STEP ) and (errTrn==0))
+        cmd = RSDCommand(
+                         "delete from dobjatcor_dbt "+
+                         "      where t_objecttype = 501"+
+                         "        and t_groupid = 1016"+
+                         "        and t_object = lpad(?,10,'0')");
+        cmd.addParam("", RSDBP_IN, PaymentObj.paymentid);
+        cmd.Execute();
+    end;
+
+    //Gurin S. 04.12.2014 C-30151-7
+    if( message == OP_BACKOUT_STEP )
+       if (PaymentObj.OutCorschem == 1/*РКЦ*/)
+          var sql = execSqlSelect("select check_kind from USR_ROBOT_CHECKS where paymid = :id",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+          if (sql.movenext() and (InList(sql.value("check_kind"),2,3)))
+             var _tmp = sql.value("check_kind");
+             sql = execSqlSelect("SELECT chk2.paymid id FROM   USR_ROBOT_CHECKS chk1, USR_ROBOT_CHECKS chk2, dpmpaym_dbt dp1, dpmpaym_dbt dp2 "+
+                                 " WHERE     chk1.check_kind = :chk1 AND chk1.paymid = dp1.t_paymentid AND chk1.paymid = :id1 "+
+                                 "       AND dp1.t_payeraccount = dp2.t_payeraccount AND dp1.t_receiveraccount = dp2.t_receiveraccount "+
+                                 "       AND dp1.t_amount = dp2.t_amount AND dp2.t_paymentid = chk2.paymid AND chk2.paymid not in (:id2) "+
+                                 "       AND chk2.check_kind = :chk2",
+                                 makeArray (SQLParam ("chk1", _tmp), SQLParam ("id1", PaymentObj.PaymentId), 
+                                            SQLParam ("id2", PaymentObj.PaymentId), SQLParam ("chk2", _tmp)));
+             if (sql.movenext())
+                execSql("delete from USR_ROBOT_CHECKS where paymid = :id",makeArray (SQLParam ("id", cmd.value("id"))));
+                execSql("delete from dobjatcor_dbt where t_object = LPAD (:id, 10, '0') AND t_objecttype = 501 AND t_groupid IN (1016, 1017)",makeArray (SQLParam ("id", cmd.value("id"))));
+                execSql("delete from dnotetext_dbt where t_documentid = lpad(:id,10,'0') and t_objecttype = 501 and t_notekind = 999",makeArray (SQLParam ("id", cmd.value("id"))));
+             end;
+          end;
+          execSql("delete from USR_ROBOT_CHECKS where paymid = :id",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+          execSql("delete from dobjatcor_dbt where t_object = LPAD (:id, 10, '0') AND t_objecttype = 501 AND t_groupid IN (1016, 1017)",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+          execSql("delete from dnotetext_dbt where t_documentid = lpad(:id,10,'0') and t_objecttype = 501 and t_notekind = 999",makeArray (SQLParam ("id", PaymentObj.Paymentid)));
+       end;
+    end;
+
+end;
+
+
+macro PrepMassExecuteStep() 
+    var retval = 0, cmd, rs;
+    //SDA 14/02/2012 ... при определении релизов в режиме массовой выгрузки... 
+    rs = RSDRecordset( " select t_orderid " +
+                       "   from doprtemp_tmp ");
+    while (rs.movenext)
+         DefMessRelForPm(rs.value(0));
+    end;
+    retval = execStoredFunc( "WLD_COMMON.GenMes_Prep", V_INTEGER );
+    if(retval)
+        error_flag = true;
+        rs = RSDRecordset( "  select   t_errormessage, count (1) " +
+                           "    from   doprtemp_tmp " +
+                           "   where   t_errorstatus <> 0 " +
+                           "group by   t_errormessage "
+                          );
+
+        if ((rs.movenext) and (int(rs.value(1))==1))
+            msgbox(rs.value(0));
+        end;
+
+        MemoryError(retval, IfThenElse(retval == 1, "Не найден формат транспорта УФЭБС для транспортной схемы", NULL));
+        return 1;
+    end;
+
+    return 0;
+end;
+
+
+macro MassExecuteStep()
+// vea 30.03.2016 исправили ошибку в пакете
+/*
+    //Gurin S. 28.03.2016 В WLD_UFEBS не заполняется УИН, массовую выгрузку отключаю
+    if (not fgBank.is_EXV)
+       msgbox("Пользуйтесь выгрузкой по F2");
+       return 1;
+    end;
+*/
+    var retval = 0;
+    //TAM 30.11.2011 I-00126112
+    //SDA - формирование всех начальных межбанковских платежей как ED101 - для ГЭБ 
+    private var errCode,OutRegEDoc=false,sql;
+    GetRegistryValue("PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ДПП_ТЕКУЩИМ_ДНЕМ\\ПОЧТОВЫЕ\\МЕЖРЕГИОН В ЭЛЕКТРОННОМ ВИДЕ", v_bool,OutRegEDoc, errCode); 
+    if (errCode)
+        OutRegEDoc=false;
+    end;
+    //Заглушка на платежи не УФЭБС
+    sql = "update  doprtemp_tmp t " +
+          "   set  t_errorstatus = 10001, " +
+          "        t_errormessage = 'Платежи на Payments или транспортом \"Почта\"| следует выгружать в обычном режиме (F2)' " +
+          " where  exists " +
+          "           (select  1 " +
+          "              from  dpmpaym_dbt pm, dpmprop_dbt pr, dpmrmprop_dbt rm " +
+          "             where      t.t_orderid = pm.t_paymentid " +
+          "                    and pr.t_debetcredit = 1 " +
+          "                    and pm.t_paymentid = rm.t_paymentid " +
+          "                    and pm.t_paymentid = pr.t_paymentid "; 
+    //SDA 21.05.2012 "02" - клиентские требования в электронном виде не корректно оформляются ED103 
+    //TAM 31.07.2012 I-00228862-2
+    sql = sql + "  and (pr.t_corschem <> 1 or (rm.t_paymentkind <> 'Э' and rm.t_paymentkind <> 'Н') or rm.T_SHIFROPER = '02' or pm.t_basefiid <> 0)) ";
+    RSDCommand(sql).Execute;
+    RSDCommand(
+                "update   doprtemp_tmp t " +
+                "   set   t_errorstatus = 10002, t_errormessage = 'Платежи помещенные ранее на СНР| следует выгружать в обычном режиме (F2)' " +
+                " where   exists " +
+                "            (select   1 " +
+                "               from   dpmpaym_dbt pm, dmcaccdoc_dbt doc, dmccateg_dbt cat " +
+                "              where       t.t_orderid = pm.t_paymentid " +
+                "                      and doc.t_chapter = 1 " +
+                "                      and doc.t_currency = pm.t_payfiid " +
+                "                      and doc.t_account = pm.t_futurepayeraccount " +
+                "                      and doc.t_catid = cat.t_id and cat.t_Number = 103 " +
+                "                      and doc.t_docid = pm.t_paymentid " +
+                "                      and doc.t_dockind = pm.t_dockind) "
+                 ).Execute;
+
+    RSDCommand(
+                "insert into doprstval_tmp (t_id_operation, " +
+                "                           t_statuskindid, " +
+                "                           t_dockind, " +
+                "                           t_id_step, " +
+                "                           t_numvalue) " +
+                "   select   oprtmp.t_id_operation, " +
+                "            309, " +
+                "            oprtmp.t_dockind, " +
+                "            oprtmp.t_id_step, " +
+                "            1 " +
+                "     from   doprtemp_tmp oprtmp, " +
+                "            dpmprop_dbt deb, " +
+                "            dpmprop_dbt kred, " +
+                "            dpmpaym_dbt pm " +
+                "    where       oprtmp.t_errorstatus = 0 " +
+                "            and deb.t_paymentid = oprtmp.t_orderid " +
+                "            and deb.t_debetcredit = 1 " +
+                "            and kred.t_debetcredit = 0 " +
+                "            and kred.t_paymentid = oprtmp.t_orderid " +
+                "            and pm.t_paymentid = oprtmp.t_orderid " +
+                "            and ( (deb.t_group = 1 and kred.t_group = 1 and pm.t_basefiid <> 0) " +
+                "                 or (pm.t_basefiid = 0 and deb.t_corschem <> 1)) "
+                ).Execute;
+    retval = execStoredFunc( "RSBSESSIONDATA.oper", V_INTEGER );
+    retval = execStoredFunc( "RSBSESSIONDATA.OurBank", V_INTEGER );
+    retval = execStoredFunc( "WLD_COMMON.GenMes_Execute", V_INTEGER );
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+    FiscLogDischDoc();
+    return 0;
+end;
+
+
+macro PostMassExecuteStep()
+    return 0;
+end;

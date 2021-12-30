@@ -1,0 +1,245 @@
+import Globals;
+import oralib, likepy, "KeyCodes.mac", repforms;
+
+const db_reg = "PRBB\\БД";      // Ветка реестра с именами и паролями
+const db_reg_user = "USERNAME"; // Ветка реестра с именами
+const db_reg_db   = "DBNAME";   // Ветка реестра паролями
+
+var   our_db; // Наша БД
+var   inn;
+
+private macro getName(tablename,USERNAME,DBNAME)
+  if (DBNAME == our_db) // Для нашей
+    return USERNAME+"."+tablename;
+  else// Для не нашей
+    return tablename+"@"+DBNAME;
+  end;
+end;
+
+private macro TestDBLink(USERNAME,DBNAME)
+
+ var query:string = "select db_link from user_db_links l \n" +
+                    " where (USERNAME=:USERNAME and HOST=:DBNAME) or \n" + // В параметре можно указывать либо ТНС
+                    "       (USERNAME=:USERNAME and DB_LINK = :DBNAME)";                          // либо имя линка, кому как удобнее
+
+ var params:TArray = makeArray( SQLParam( "USERNAME", USERNAME ),
+                                SQLParam( "DBNAME",   DBNAME )); 
+
+ var rs:RsdRecordset = execSQLselect( query, params, true );
+
+ if ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   return rs.value("db_link"); // dblink уже создан
+  end;
+ end;
+
+ return "";
+
+end;
+
+private macro TestPrivs(USERNAME,TABLE);
+
+ var query:string = "select 1 from USER_SYS_PRIVS s where s.privilege='SELECT ANY TABLE'"; // По любой таблице
+
+ var rs:RsdRecordset = execSQLselect( query );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   return 0;
+  end;
+ end;
+
+ query = "select 1 \n" + // По конкретной таблице
+         "  from dba_tab_privs p \n" +
+         " where (p.privilege = 'SELECT' and \n" +
+         "        grantee = user and \n" +
+         "        p.grantor = upper(:USERNAME) and \n" +
+         "        p.table_name = upper(:TABLENAME)) \n" +
+         "       or \n" +
+         "       (user = upper(:USERNAME))"; // Или в нашей схеме
+
+ var params:TArray = makeArray( SQLParam( "USERNAME",  USERNAME ),
+                                SQLParam( "TABLENAME", TABLE )
+                                ); 
+
+ rs = execSQLselect( query, params, true );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   return 0;
+  end;
+ end;
+
+ return 1;
+
+end;
+
+private macro AnalizeDB(USERNAME,DBNAME)
+
+ // 1. Создаем dblink
+ if (DBNAME != our_db) // Для не нашей
+   // Создать dblink
+   DBNAME = TestDBLink(USERNAME,DBNAME);
+   // Проверим есть ли доступ к нужным таблицам
+   if (DBNAME=="")
+    println("Ошибка!!! Недостаточно прав для присоединения к "+USERNAME+". Необходим DBLINK");
+    return 1;
+   end;
+ else
+   // Проверим есть ли доступ к нужным таблицам
+   if ((TestPrivs(USERNAME,"ddp_dep_dbt")>0)or // Тк таблиц и схем будет не так много, то позволим себе несколько раз вызавать один и тот же код
+       (TestPrivs(USERNAME,"dparty_dbt")>0)or
+       (TestPrivs(USERNAME,"daccount_dbt")>0)or
+       (TestPrivs(USERNAME,"dacclaim_dbt")>0)or
+       (TestPrivs(USERNAME,"dobjcode_dbt")>0)
+       )
+    println("Ошибка!!! Недостаточно прав для присоединения к "+USERNAME+". Необходимо настроить grant'ы");
+    return 1; // grant select on <USERNAME>.<TABLE> to <myuser>;
+              // grant select any table to <myuser>;
+   end;
+ end;
+
+ // 2. Шапка
+ var query:string = "select p.t_name \n" +
+                    "  from "+getName("ddp_dep_dbt",USERNAME,DBNAME)+" t,  \n" +
+                    "       "+getName("dparty_dbt" ,USERNAME,DBNAME)+" p  \n" +
+                    " where t.t_parentcode = 0  \n" +
+                    "   and p.t_partyid = t.t_partyid";
+
+ var rs:RsdRecordset = execSQLselect( query );
+
+ if ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   [ ########################################################################################
+     ######################################################################################## ]
+   ("Анализ счетов клиента в банке(филиале)":c,
+    rs.value("t_name"):c);
+  end;
+ end;
+
+ // 3. Анализ счетов
+ query =            "select a.t_account, \n" +
+                    "       a.t_open_date, \n" +
+                    "       a.t_close_date, \n" +
+                    "       a.t_open_close, \n" +
+                    "       cl.t_docnumber, \n" +
+                    "       cl.t_startdate, \n" +
+                    "       cl.t_finishdate \n" +
+                    "  from "+getName("dobjcode_dbt",USERNAME,DBNAME)+" c, \n" +
+                    "       "+getName("daccount_dbt",USERNAME,DBNAME)+" a, \n" +
+                    "       "+getName("dacclaim_dbt",USERNAME,DBNAME)+" cl \n" +
+                    " where substr(c.t_code || '/', 1, instr(c.t_code || '/', '/') - 1) = ? \n" +
+                    "   and c.t_objecttype = 3 \n" +
+                    "   and c.t_codekind = 16 \n" +
+                    "   and a.t_client=c.t_objectid \n" +
+                    "   and cl.t_account(+)=a.t_account \n" +
+                    " order by substr(a.t_account,1,8),substr(a.t_account,10),cl.t_startdate,cl.t_finishdate";
+
+ var params:TArray = makeArray( SQLParam( "inn", inn ) );
+
+ rs = execSQLselect( query, params, true );
+
+   [┌────────────────────┬─────────────┬─────────────┬──────┬─────┬───────────┬──────────────┐
+    │                    │             │             │      │     │Дата начала│Дата окончания│
+    │        Счет        │Дата открытия│Дата закрытия│Статус│№ док│ действия  │   действия   │
+    │                    │             │             │      │     │ претензии │   претензии  │
+    ├────────────────────┼─────────────┼─────────────┼──────┼─────┼───────────┼──────────────┤];
+
+ while ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   if (rs and (ValType(rs.value(4)) != 26))
+    [│####################│#############│#############│######│#####│###########│##############│]
+    (rs.value("t_account"),date(rs.value("t_open_date")):r,date(rs.value("t_close_date")):r,rs.value("t_open_close"):c,
+     rs.value("t_docnumber"):r,date(rs.value("t_startdate")):r,date(rs.value("t_finishdate")):r);
+   else
+    [│####################│#############│#############│######│     │           │              │]
+    (rs.value("t_account"),date(rs.value("t_open_date")):r,date(rs.value("t_close_date")):r,rs.value("t_open_close"):c);
+   end;
+  end;
+ end;
+
+    [└────────────────────┴─────────────┴─────────────┴──────┴─────┴───────────┴──────────────┘
+    
+    ];
+
+end;
+
+private macro AnalizeReg(parentid)
+
+ var USERNAME="",DBNAME="";
+
+ var query:string = "select p.t_name, utl_raw.cast_to_varchar2(v.t_fmtblobdata_xxxx) t_value \n" +
+                    "  From dregparm_dbt p, dregval_dbt v \n" +
+                    " where p.t_parentid = :parentid \n" +
+                    "   and p.t_keyid = v.t_keyid";
+
+ var params:TArray = makeArray( SQLParam( "parentid", parentid ) ); 
+
+ var rs:RsdRecordset = execSQLselect( query, params, true );
+
+ while ((rs)and(rs.moveNext()))
+  if (rs and (ValType(rs.value(0)) != 26))
+   if (rs.value("t_name") == db_reg_user)
+    USERNAME = rs.value("t_value");
+   elif (rs.value("t_name") == db_reg_db)
+    DBNAME   = rs.value("t_value");
+   end;
+  end;
+ end;
+
+ if (DBNAME == "") // Если БД не задана, то считаем, что нужно работать в нашей БД
+  DBNAME=our_db;
+ end;
+
+ AnalizeDB(USERNAME,DBNAME);
+
+ return 0;
+
+end;
+
+private macro init
+
+ var query:string = "SELECT GLOBAL_NAME FROM GLOBAL_NAME";
+
+ var rs:RsdRecordSet = execSQLselect( query );
+
+ if ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   our_db = rs.value("GLOBAL_NAME");
+  end;
+ end;
+
+end;
+
+macro GetAccounts
+
+ init;
+
+ var query:string = "select reg.t_keyid \n" +
+                    "  from (select t.t_keyid, sys_connect_by_path(t.t_name, '\\') fld, level lv,t.t_description \n" +
+                    "          from dregparm_dbt t \n" +
+                    "         start with t.t_parentid = 0 \n" +
+                    "        connect by prior t.t_keyid = t.t_parentid) reg, \n" +
+                    "       dregval_dbt val \n" +
+                    " where reg.fld     like '\\"+db_reg+"\\%' \n" +
+                    "   and reg.fld not like '\\"+db_reg+"\\%\\%' \n" +
+                    "   and val.t_keyid=reg.t_keyid \n";
+
+ var rs:RsdRecordSet = execSQLselect( query );
+
+ while ((rs)and(rs.moveNext())) // Перебираем все БД
+  if (rs and (ValType(rs.value(0)) != 26))
+   AnalizeReg(rs.value("t_keyid"));
+  end;
+ end;
+
+ return 0;
+end;
+
+//inn = "7328031926";
+//inn = "6454027396";
+//inn = "";
+
+if (getstring(inn,"Введите ИНН"))
+ GetAccounts;
+end;

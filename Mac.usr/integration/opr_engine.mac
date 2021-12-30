@@ -1,0 +1,289 @@
+/******************************************************************************
+   Имя файла.:       AccountProc.mac
+   Назначение:       Класс для работы с операциями RS-Bank
+   Дата......:       22.08.2008
+   Автор.....:       Селезнёв Владимир
+******************************************************************************/
+
+
+import RSD;
+
+class opr_engine
+
+   var kindoperation;
+   var oper;
+   var dockind;
+   var lasterror;
+
+   private var cmd:object;
+   private var cmd0:object;
+   private var rs:object;
+   private var err_count = 0;
+   //процедура регестрирует перечень доукументов
+   //подлежащих обработке
+
+   private macro throw(x)
+
+      lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message;
+      println (lasterror);
+
+      while( err_count < RSLDefEnv.ErrorCount )
+         println( RSLDefEnv.error(err_count).descr);
+            err_count = err_count + 1;
+      end;
+
+      if (RSLDefCon.IsinTrans)
+         RSLDefCon.RollbackTrans;
+      end;
+   end;
+
+   macro reg_payments(PmIDs /*массив*/)
+      
+
+      //вспомогательная функция создает список ID платежей
+      macro get_pmids_list(PmIDs)
+         var list = "";
+         var i = 0;
+
+         while (i < PmIDs.size)
+            if (PmIDs.size == i+1)
+               list = list+PmIDs(i);
+            else
+               list = list+PmIDs(i)+",";
+            end;
+            i = i + 1;
+         end;
+
+         return list;
+      end;
+
+      cmd = RSDCommand("delete from doprtemp_tmp");
+      cmd.Execute;
+
+      cmd = RSDCommand(
+        "insert into doprtemp_tmp "+
+                "(t_id_operation, t_sort, t_dockind, t_documentid, t_orderid, t_kind_operation, t_start_date, t_isnew, t_id_step)  "+
+        "select od.t_id_operation, rownum, pm.t_dockind, lpad (to_char (pm.t_paymentid), 34, '0'), pm.t_paymentid, "+KindOperation+", rsbsessiondata.curdate, chr (88), 0  "+
+         "from dpmpaym_dbt pm, doproper_dbt od, dpmrmprop_dbt pr "+
+         "where pm.t_paymentid in ("+get_pmids_list(PmIDs)+") "+
+           "and pm.t_dockind =  "+dockind+" "+
+           "and pm.t_paymentid = pr.t_paymentid "+
+           "and pr.t_date <= trunc(sysdate) "+
+           "and od.t_dockind = pm.t_dockind "+
+           "and od.t_documentid = lpad (to_char (pm.t_paymentid), 34, '0') ");
+      cmd.execute;
+
+   onerror(x)
+     throw(x);
+
+   end;
+
+   //функция запускает операцию и меняет статус первички и платежа на "открыт"
+   macro start_operation
+      var stat;
+
+      cmd = RSDCommand("{? = call rsbemoperation.opr_startoperation()}");
+      cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+      cmd.execute;
+
+      stat = cmd.Param("stat").value;
+
+      if (stat == 0)
+         //меняем статус первички
+         if (dockind == 201)
+            cmd = RSDCommand ("{? = call ps_payord.ChangePayOrderStatus( 0, 1, 0, 0, ?, 'X')}");
+//            cmd = RSDCommand ("{? = call ps_payord.ChangePayOrderStatus( 0, 1, 0, 0, ?, chr(0))}");
+            cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+            cmd.addParam("oper", RSDBP_IN,  oper);
+         elif (dockind == 16)
+            cmd = RSDCommand ("{? = call bb_bankpaym.ChangeBankPaymStatus( 0, 2, 0, 0)}");
+            cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+         elif (dockind == 70)
+            cmd = RSDCommand ("{? = call bb_memorder.changememorderstatus ( 0, 1, 0, 0)}");
+            cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+         elif (dockind == 200)  //lao ДОБАВИЛ ДЛЯ ВАЛЮТЫ
+            cmd = RSDCommand ("{? = call PS_BCORD.ChangeBCOrderStatus ( 0, 10, 0, 0)}");
+            cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+        
+         end;
+
+         cmd.execute;
+
+         stat = cmd.Param("stat").value;
+         if (stat == 0)
+
+            cmd = RSDCommand ("{? = call pm_common.changepaymstatus (0, 1000, 0, 0, ?)}");
+            cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+            cmd.addParam ("oper", RSDBP_IN,  oper);
+
+            cmd.execute;
+   
+            stat = cmd.Param("stat").value;
+
+            if (stat == 0)
+               cmd = RSDCommand ("{? = call pm_common.changepmpropstatus (0, null, 1000, null)}");
+               cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+               cmd.execute;
+      
+               stat = cmd.Param("stat").value;
+
+               if (stat != 0)
+                  lasterror = "ошибка при изменении статуса платежа (pmprop), код:" + stat;
+                  return false;
+               end;
+            else
+               lasterror = "ошибка при изменении статуса платежа (pmpaym), код:" + stat;
+               return false;
+            end;
+         else
+            lasterror = "ошибка при изменении статуса документа, код:"+stat;
+            return false;
+         end;
+      else
+         lasterror = "ошибка при старте операции, код:"+stat;
+         return false;
+      end;
+
+      return true;
+
+   onerror(x)
+     throw(x);
+     return false;
+   end;
+
+   macro execute_step(idstep, idoperation)
+
+     var stat;
+
+
+     if ((idoperation != 0) and (valtype(idoperation))!=V_UNDEF)
+
+        cmd = RSDCommand ("{? = call rsbemoperation.Opr_ExecuteStep( ?, ?)}");
+        cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+        cmd.addParam("ID_Operation", RSDBP_IN,  idoperation);
+        cmd.addParam("ID_Step", RSDBP_IN,  idstep);
+
+     else
+
+        cmd = RSDCommand("update doprtemp_tmp set t_id_step = ?");
+        cmd.addParam ("oper", RSDBP_IN,  idstep);
+        cmd.execute;
+
+        cmd = RSDCommand ("{? = call rsbemoperation.opr_massexecutestep (null)}");
+        cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+     end;
+
+     cmd.execute;
+
+     stat = cmd.Param("stat").value;
+
+     if (stat != 0)
+        lasterror = "ошибка при выполнении шага операции, код:" + stat;
+        return false;
+     end;
+     return true;
+
+   onerror(x)
+     throw(x);
+     return false;
+
+   end;
+
+   macro change_opr_stat(statid, statvalue, stepid, operationid)
+     var stat;
+
+     if ((operationid != 0) and (valtype(operationid))!=V_UNDEF)
+
+        cmd = RSDCommand ("{call rsi_rsboperation.setoprstatusvalue(?,?,?,?,?)}");
+        cmd.addParam("p_DocKind",     RSDBP_IN, dockind);
+        cmd.addParam("p_ID_Operation",RSDBP_IN, operationid);
+        cmd.addParam("p_StatusKindID",RSDBP_IN, statid);
+        cmd.addParam("p_NumValue",    RSDBP_IN, statvalue);
+        cmd.addParam("p_ID_Step",     RSDBP_IN, stepid);
+
+        cmd.Execute();
+
+     else
+        cmd = RSDCommand ("{? = call rsbemoperation.opr_setoprstatusvalue (?,?,?)}");
+        cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+        cmd.addParam("statid",    RSDBP_IN, statid );
+        cmd.addParam("statvalue", RSDBP_IN, statvalue );
+        cmd.addParam("stepid",    RSDBP_IN, stepid ); //привязываем к старту операции или шагу
+
+        cmd.Execute();
+
+        stat = cmd.Param("stat").value;
+        if (stat != 0)
+           lasterror = "ошибка при установке статуса операции, код:" + stat;
+           return false;
+        end;
+
+     end;
+
+
+     return true;
+
+   onerror(x)
+     throw(x);
+     return false;
+
+   end;
+
+   macro Change_Perv_Status(stat, OrderID, OperationID, StepID)
+
+      if(dockind == 16)
+         cmd = RSDCommand("{? = call BB_BANKPAYM.ChangeBankPaymStatus(?,?,?,?)}");
+      elif(dockind == 70)
+         cmd = RSDCommand("{? = call BB_MEMORDER.ChangeMemOrderStatus(?,?,?,?)}");
+      elif (dockind == 201)
+         cmd = RSDCommand("{? = call PS_PAYORD.ChangePayOrderStatus(?,?,?,?,?,?)}");
+      end;
+      cmd.addParam("error",           RSDBP_RETVAL, V_INTEGER );
+      cmd.addParam("p_OrderID" ,      RSDBP_IN, OrderID );
+      cmd.addParam("p_Status"  ,      RSDBP_IN, stat );
+      cmd.addParam("p_IDOperation",   RSDBP_IN, OperationID );
+      cmd.addParam("p_IDStep",        RSDBP_IN, StepID );
+
+      if (dockind == 201)
+         cmd.addParam("p_oper",        RSDBP_IN, {oper});
+         cmd.addParam("p_connect",     RSDBP_IN, strfor(1));
+      end;
+
+      cmd.Execute();
+      stat = cmd.Param("error").value;
+      if (stat != 0)
+         lasterror = "ошибка при установке статуса первички, код: "+stat;
+      end;
+
+      return stat;
+
+   onerror(x)
+     throw(x);
+     return false;
+
+   end;
+
+   macro Change_Payment_Status(stat, PaymentID, ID_Operation, ID_Step)
+
+      cmd = RSDCommand("{? = call pm_common.changepaymstatus(?,?,?,?,?)}");
+      cmd.addParam("error",          RSDBP_RETVAL, V_INTEGER );
+      cmd.addParam("p_PaymentID",    RSDBP_IN, PaymentID );
+      cmd.addParam("p_PaymStatus",   RSDBP_IN, stat );
+      cmd.addParam("p_ID_Operation", RSDBP_IN, ID_Operation );
+      cmd.addParam("p_ID_Step",      RSDBP_IN, ID_Step );
+      cmd.addParam("p_Oper",         RSDBP_IN, {oper} );
+      cmd.Execute();
+
+      stat = cmd.Param("error").value;
+      if (stat != 0)
+         lasterror = "ошибка при установке статуса платежа, код: "+stat;
+      end;
+
+      return stat;
+
+   onerror(x)
+     throw(x);
+     return false;
+
+   end;
+end;

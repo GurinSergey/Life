@@ -1,0 +1,684 @@
+/************************************************************************************************************/
+/*       Процедуры для контроля целевого использования средств. ХД I-045992                                 */
+/*----------------------------------------------------------------------------------------------------------*/
+/* Создан:                                                                                                  */
+/*----------------------------------------------------------------------------------------------------------*/
+/* Изменен:   kOZINA   I-045992                                                                             */
+/* 04.10.2012   GSP    C-14585 Всвязи с перенумерацией изменен алгоритм отбора кода клиента                 */
+/* 10.12.2012   zmp    C-15529-6 сделана отдельно обработка овердрафта, только для ПрББ                     */
+/* KS 22.11.2013 Предварительная адаптация под 31ю сборку. Также проведена предварительная адаптация USR_FS */
+/* 30.09.2014   VDN    C-33744 Проверка ВУЗ для постановки на шаг ОП со счета овердрафта                    */
+/* 20.11.2014 Golovkin С-34083 клиентский платеж себе в другой банк. ставится источник 1                    */
+/*                             и не меняется. происхождение не важно                                        */
+/************************************************************************************************************/
+import rsd, BankInter;
+import rslx, ActiveX;
+import pm_syscont;
+import "diver.mac";
+import "cbsttls.mac";
+import "fg_Life_parm.mac", "Send_lotus.mac", "lib_types.mac";
+
+var rsdrec, comand;
+
+//ПРоверка, по комиссии ли платеж
+macro IsCommPaym(paymentID)
+  rsdrec = RSDRecordset("select t_origin from dpspayord_dbt where t_orderid ="+ paymentID);
+  if(rsdrec.MoveNext)
+    if( (rsdrec.value(0) == 7) ) 
+       return 1;
+    end;
+  end;
+   return 0;
+end;
+
+//Изменение признака "Источник финансирования"
+macro ChangeFC( PaymID, Sourc )
+   rsdrec = RSDCommand(" begin USR_FS.Set_source("+PaymID+", to_date('"+{curdate}+"','dd.mm.yyyy'), "+{oper}+", "+Sourc+"); end;");
+   rsdrec.Execute();
+end;
+
+macro isOver_(Account:String, FIID:integer,Chapter:integer)
+var cmd;
+    cmd = RSDCommand("Select 1 from daccount_dbt acc where acc.t_account = ? and acc.T_CODE_CURRENCY = ? and instr(acc.T_TYPE_ACCOUNT,'О') != 0 and acc.t_chapter = ?");
+    cmd.addparam("acc",    RSDBP_IN, Account);
+    cmd.addparam("FIID",   RSDBP_IN, FIID);
+    cmd.addparam("chapter",RSDBP_IN, Chapter);
+    cmd.execute;
+var rsd = rsdrecordset(cmd);
+if (rsd.movenext())
+    return true;
+else
+    return false;
+end;
+end;
+
+
+//Определяем, был ли изменен признак с 1, 2 или 5 на 4
+macro ChangedFS( PaymID )
+       var rs;
+       rs = RSDRecordset("SELECT 1 "+
+         "  FROM dpmpaym_dbt pm, usr_financ_source_dbt fs                                       "+
+         " WHERE pm.t_paymentid = "+PaymID+
+         "   AND usr_fs.get_source (fs.t_paymentid, to_date('"+{curdate}+"','dd.mm.yyyy')) = 4     "+
+         "   AND usr_fs.get_last_source (fs.t_paymentid, to_date('"+{curdate}+"','dd.mm.yyyy')) in (1, 2, 5) "+
+         "   AND pm.t_chapter = 1                                                                "+
+         "   AND pm.t_dockind = 201 "+
+         "   and fs.t_paymentid = pm.t_paymentid");
+      if( rs.MoveNext() )
+        return 1;
+      else
+        return 0;
+      end;
+end;
+
+//Берем код Клиента(после перенумерации)     //GSP по C-14585
+macro ClientCode(PaymentID)
+   var Data;
+   var New_code = "Отсутств.";
+       Data = RSDRecordset("Select substr(obj.t_code,-6,6) t_code from dpmpaym_dbt paym, dobjcode_dbt obj      "+
+                           " Where obj.t_codekind = 1 and obj.T_OBJECTID = paym.t_payer                        "+
+                           "   and t_objecttype = 3 and obj.t_state = 0 and paym.t_paymentid = "+ PaymentID    );
+    if(Data.movenext())
+       New_code = Data.value("t_code");
+      if(substr(New_code,1,1) == "0")
+       New_code = substr(New_code,2,5);              
+      end;
+    end;
+   return New_Code;
+end;
+
+//Формируем текст сообщения по Lotus'у
+macro LotusText( PaymID, Cash )
+   var rs;
+   var letter = "Следующий платеж классифицирован как нецелевой за счет кредитных средств: \n"; 
+   rs = RSDRecordset("SELECT      'Плательщик: '                      "+
+       "  || prop.T_PAYERNAME                                         "+
+       "  || '. Код в RS: '                                           "+
+/*GSP--------------------------------------------------------------------------------------------*/
+//       "  || SUBSTR (PM.T_PAYERACCOUNT, 16, 5)                        "+
+/*-----------------------------------------------------------------------------------------------*/
+       "  || " + ClientCode(PaymID) +
+/*--------------------------------------------------------------------------------------------GSP*/
+       "  || '. Платеж: № '                                           "+
+       "  || prop.t_number                                            "+
+       "  || ', от '                                                  "+
+       "  || prop.t_date                                              "+
+       "  || ', '                                                     "+
+       "  || pm.t_amount                                              "+
+       "  || 'р. Исп.: '                                              "+
+       "  || pers.t_name                                              "+
+       "  || '. Назн.: '                                              "+
+       "  || PROP.T_GROUND                                            "+
+       "  || '. Сумма кредитных средств: '                            "+
+       "  || (pm.t_amount - " + Cash + ")                             "+
+       "  || 'р. '                                                    "+ 
+"  FROM   dpmrmprop_dbt prop, dpmpaym_dbt pm, dperson_dbt pers        "+
+" WHERE   PM.T_PAYMENTID = prop.t_paymentid AND PM.T_PAYMENTID = "+PaymID+
+"         AND PERS.T_OPER =                                           "+
+"               usr_fs.Get_Oper ("+PaymID+",                          "+
+"                                TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy'))");
+      if( rs.MoveNext() )
+        letter = letter + rs.value(0) + "Сумма собственных средств: " + Cash;
+      end;
+    return letter;
+   
+end;
+
+//Повторное сообщение
+macro RepeatedMessage(PaymID)
+   var rs = RSDRecordset("select * from usr_financ_source_dbt where t_source in (2,5) and t_paymentid = "+PaymID);
+   if (rs.MoveNext())
+      return True;
+   else
+      return False;
+   end;
+end;
+
+
+macro isFiveCatagory(PaymID)
+   var rs = RSDRecordset("select 1 from usr_financ_source_dbt where t_source = 5 and t_paymentid = "+PaymID);
+   if (rs.MoveNext())
+      return True;
+   else
+      return False;
+   end;
+end;
+
+
+
+
+//Числовое значение признака "Источник финансирования"
+macro GetFC( PaymID ) : integer
+  rsdrec = RSDRecordset("select USR_FS.Get_Source("+PaymID+", to_date('"+{curdate}+"','dd.mm.yyyy')) from dual");
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+
+
+//Текстовое значение признака "Источник финансирования"
+macro GetFCtext( Source ) : string
+
+  if(Source == 1)
+    return "за счет собственных средств";
+  elif(Source == 2)
+    return "за счет кредитных средств";
+  elif(Source == 3)
+    return "подлежит контролю";
+  elif(Source == 4)
+    return "не подлежит контролю";
+  elif(Source == 5)
+    return "пополнение расчетного счета";
+  else
+    return "не определен";
+  end;
+end;
+
+
+//Поиск стоп-слов в основании платежа
+macro substr_in_ground(paymID)
+   rsdrec = RSDRecordset("select USR_FS.substr_in_ground("+PaymID+") from dual");
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+
+//Это для пополнения расчетника в другом банке
+macro substr_in_ground2(paymGround)
+/*DAI набор стоп-слов по категории 5 перенесен в реестр
+  if ( not Comparestrwithmasks("пополнени*,расчетн*,оборотны*", paymGround))
+    return 1;
+  end;
+    return 0;
+*/
+var mask, ErrCode, Ground = strupr(paymGround);
+  GetRegistryValue("PRBB\\ЦЕЛЕВОЕ ИСПОЛЬЗОВАНИЕ\\ОСНОВАНИЕ ПЛАТЕЖА КАТЕГОРИИ 5", V_STRING, mask, ErrCode);
+  if (ErrCode == 0)
+    mask = strupr(mask);
+    if ( Comparestrwithmasks(mask, Ground) == 0)
+      return True;
+    end;
+  end;
+  return False;
+end;
+
+//Выделение ИНН из строки с КПП
+macro INNinSTR(str)
+   var i = 1;
+   var s = "";
+   Trim(str);
+   var d = SubStr(str,i,1);
+   while ((d >= "0") and (d <= "9") )
+      s = s + d;
+      i = i + 1;
+      d = SubStr(str,i,1);
+   end;
+   return s;
+end;
+
+//Проверка что  ИНН плательщика равен ИНН получателя, а счет получателя открыт не в нашем банке 
+//Иными славами платеж себе но наружу (внешний себе)
+macro IsExternalToItself(PaymentObj)
+   var INNP = INNinSTR(PaymentObj.PayerINN);
+   var INNR = INNinSTR(PaymentObj.ReceiverINN);
+   var IdBank = PaymentObj.ReceiverBankID;
+   if ((INNP == INNR) and (IdBank !=  {OurBank}))
+     return True;
+   else
+     return False;
+   end;
+end;
+
+//Проверка по счету получателя, а не кредит ли оплачивается
+macro IsLoanPaym( receiveracc )
+   comand = RSDCommand("select USR_FS.IsLoanPaym( '"+receiveracc+"' ) from dual");
+   rsdrec = RSDRecordset(comand);
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+
+//Ищем первый день, когда остаток на счете ненулевой (за последние 10)
+macro startdateforFS( acc, enddate )
+     var startdate = enddate;
+     while( (RestA(acc, startdate) != 0) and (startdate > (enddate - 10)) )
+       startdate = startdate - 1;
+     end;
+     return startdate;
+end;
+
+//Получать остаток лимита на счете
+macro getlimit(acc)
+   var rs;
+   // KS 15.01.2014 Адаптация
+   //rs = RSDRecordset("select t_limit from daccount_dbt where t_chapter = 1 and t_account = '"+acc+"'");
+   rs = RSDRecordset("select rsi_rsb_account.GetAccLimit(t_account,t_chapter,t_code_currency,to_date('"+{curdate}+"','dd.mm.yyyy')) t_limit "+
+                     "  from daccount_dbt where t_chapter = 1 and t_account = '"+acc+"'");
+   if(rs.MoveNext())
+     return rs.value(0);
+   else 
+     return 0;
+   end;
+end;
+
+//Рассчет собственных средст нарастающим итогом, с учетом кредитных средств
+//zmp 23.10.2013 I-00436144 добавлено поле accDate
+macro Cash_for_period(acc, accDate)
+   if(isNull(accDate)) accDate   = {curdate}; end;
+   var carrydate = startdateforFS( acc, accDate );
+   var inputcc = RestA(acc, carrydate-1);
+   var inputcred = 0;
+
+  while( carrydate < accDate )
+    rsdrec = RSDRecordset("select USR_FS.Get_Cc( '"+acc+"', to_date('"+carrydate+
+                          "','dd.mm.yyyy'), "+inputcc+" ) from dual");
+ 
+    if ( rsdrec.Movenext() )
+      inputcc = rsdrec.value(0);
+    end;
+
+    rsdrec = RSDRecordset("select USR_FS.Get_Cred( '"+acc+"', to_date('"+carrydate+
+                          "','dd.mm.yyyy'), "+inputcred+" ) from dual");
+    if ( rsdrec.Movenext() )
+      inputcred = rsdrec.value(0);
+    end;
+
+    if( (inputcred < 0) )
+       inputcc = inputcc + inputcred;
+       inputcred = 0;
+    end;
+    carrydate = carrydate + 1;    
+  end;           
+
+    //В текущем дне
+    rsdrec = RSDRecordset("select USR_FS.Get_Cc( '"+acc+"', to_date('"+carrydate+
+                          "','dd.mm.yyyy'), "+inputcc+" ) from dual");
+ 
+    if ( rsdrec.Movenext() )
+      inputcc = rsdrec.value(0);
+    end;
+
+    rsdrec = RSDRecordset("select USR_FS.Get_Cred( '"+acc+"', to_date('"+carrydate+
+                          "','dd.mm.yyyy'), "+inputcred+" ) from dual");
+    if ( rsdrec.Movenext() )
+      inputcred = rsdrec.value(0);
+    end;
+/*SDA 21.03.2012 - правил по-быстрому, по звонку.. мог и напортачить */
+var _getlim = (getlimit(acc));
+ if (valtype(_getlim) != 26)
+  if( (_getlim + inputcred) < 0)
+     inputcc = inputcc + _getlim + inputcred;   
+  end;
+ end;
+  return inputcc;
+end;
+
+// Golovkin получить сумму "собственных средств" за день
+macro getOwnMoney( acc )
+    var ownMoney   = 0;
+    var accLimit   = getlimit(acc);
+    var accRest    = RestA(acc, {curdate}); 
+    var accLimRest = accLimit + accRest;
+
+    // приход некредитных средств минус расход за счет собственных средств
+    var rs = rsdRecordset( "SELECT USR_FS.GET_CC ('"+acc+"',TO_DATE('"+{curdate}+"','dd.mm.yyyy'),0) FROM DUAL" );
+
+    if( rs.movenext )
+       ownMoney = rs.value(0);
+    end;
+
+    // все равно больше лимита потратить не сможем...
+    if( ownMoney > accLimRest )
+        return accLimRest;
+    end;
+
+    return ownMoney;
+onerror return 0;
+end;
+
+
+/*macro Cred_for_period(acc)
+   var carrydate = startdateforFS( acc, {curdate} );
+   var inputrest = 0;
+   rsdrec = RSDRecordset("select USR_FS.Get_Cred( "+acc+", to_date('"+carrydate+"','dd.mm.yyyy'), inputrest ) from dual");
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+*/
+
+//Были ли выданы кредиты на счет за последние 10 дней
+macro HasLoanPaym(acc)
+   var startdate = {curdate}-10;
+   rsdrec = RSDRecordset("select USR_FS.HasLoanPaym( "+acc+", to_date('"+startdate+"','dd.mm.yyyy'), to_date('"+{curdate}+"','dd.mm.yyyy') ) from dual");
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+
+macro HasLoanAcc(acc)
+   rsdrec = RSDRecordset("select USR_FS.HasLoanAcc( "+acc+") from dual");
+  if (rsdrec.Movenext())
+    return rsdrec.value(0);
+  end;
+    return 0;
+end;
+
+
+//Запрос на изменение категории 2 - формочка с 3мя кнопочками
+macro Edit_FS2()
+  Array Text;
+  Array Buttons;
+
+  var select_button:integer = 0;
+
+    Text(0) = "Изменить значение категории \"Источник финансирования\"?";
+
+    Buttons(0) = "Отмена";
+    Buttons(1) = "4-не контролировать";
+    Buttons(2) = "3-контролировать";
+
+  select_button = ConfWin( Text, Buttons );
+  return select_button;
+end;
+
+//Скролинг для просмотра и изменения категории "Источник финансирования"
+var col;
+macro AddCol (ar,ind, fld, head, width, fldType, decPoint)
+  ar.value (ind * 6)     = fld;
+  ar.value (ind * 6 + 1) = head;
+  ar.value (ind * 6 + 2) = width;
+  ar.value (ind * 6 + 3 ) = fldType;
+  ar.value (ind * 6 + 4 ) = decPoint;
+  ar.value (ind * 6 + 5 ) = 0;   // reserv
+end;
+
+col = TArray;
+
+   AddCol(col,0,"Name","Категория",null,2);
+   AddCol(col,1,"Sourc","Значение",null,1,0);
+   AddCol(col,2,"text_sourc","Описание",null,2);
+
+
+MACRO ObrabScr (rs, comand, id, key)
+     var ind;
+
+     If (comand == DLG_KEY)
+        if (key == 27) //ESC                                                                                                              
+                Sobitie = "ESC"; //Выйти из ранскролла навсегда!                                                                                  
+                return CM_CANCEL;                                                                                                                
+        elif (key == 13) //Enter                                                                                                         
+             if(rs.value(1) == 1)
+                if ( not (ВходитВГруппу({oper}, 190)))
+                     msgbox("Нет прав на изменение категории");
+                     return CM_CANCEL;//Запустится снова
+                elif( GetTrue(true,"Изменить значение на 4 - не подлежит контролю?") )
+                     ChangeFC(rs.value(3), 4);
+                     return CM_CANCEL;
+                end;
+              elif(rs.value(1) == 4)
+                   if ( not (ВходитВГруппу({oper}, 190)))
+                     msgbox("Нет прав на изменение категории");
+                     return CM_CANCEL;//Запустится снова
+                   elif( GetTrue(true,"Изменить значение на 1 - не подлежит контролю?") )
+                     ChangeFC(rs.value(3), 1);
+                     return CM_CANCEL;
+                   elif( GetTrue(true,"Изменить значение на 2 - не подлежит контролю?") )
+                     ChangeFC(rs.value(3), 2);
+                     return CM_CANCEL;
+                   end;
+              elif(rs.value(1) == 2)
+                if ( ВходитВГруппу({oper}, 191))
+                   ind = Edit_FS2();
+                   if( ind == 0 )
+                      return CM_CANCEL;
+                   elif( ind == 1 )
+                      ChangeFC(rs.value(3), 4);
+                      return CM_CANCEL;
+                   elif( ind == 2 )
+                      ChangeFC(rs.value(3), 3);
+                      return CM_CANCEL;
+                   end;
+                else
+                   msgbox("Нет прав на изменение категории");
+                   return CM_CANCEL;
+                end;
+              elif(rs.value(1) == 5)
+                if ( not (ВходитВГруппу({oper}, 190)))
+                     msgbox("Нет прав на изменение категории");
+                     return CM_CANCEL;//Запустится снова
+                elif( GetTrue(true,"Изменить значение на 4 - не подлежит контролю?") )
+                     ChangeFC(rs.value(3), 4);
+                     return CM_CANCEL;
+                end;
+                /*
+                if( GetTrue(true,"Изменить значение на 4 - не подлежит контролю?") )
+                   ChangeFC(rs.value(3), 4);
+                   return CM_CANCEL;
+                end;
+                */
+                return CM_CANCEL;
+              end;
+         end;
+      end;
+END;
+                                                                                       
+
+macro Edit_FS(PaymID)
+     debugbreak;
+     WHILE (Sobitie != "ESC") //Будем переоткрывать сроллинг, что бы на экране были новые значения при изменении (UpdateScroll не применял так как NOTETEXT и чота глючит)
+        rsdrec = RSDRecordset("SELECT 'Источник финансирования' AS NAME,     "+
+    "   usr_fs.get_source ("+PaymID+",                                       "+
+    "                      TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy')            "+
+    "                     ) AS sourc,                                      "+
+    "   DECODE (usr_fs.get_source ("+PaymID+",                               "+
+    "                      TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy')            "+
+    "                     ),                                               "+
+    "           1, 'за счет собственных средств',                          "+
+    "           2, 'за счет кредитных средств',                            "+
+    "           3, 'подлежит контролю',                                    "+
+    "           4, 'не подлежит контролю',                                 "+
+    "           5, 'пополнение расчетного счета',                          "+
+    "           'не определено'                                            "+
+    "          ) AS text_sourc,                                            "+
+    PaymID+
+  " FROM DUAL", RSDVAL_CLIENT, RSDVAL_STATIC );
+        //RunScroll (rsd,2,col,null,@ObrabScr);
+        RunScroll (rsdrec,3,col,null,@ObrabScr,"Категория","Категория \"Источник финансирования\"",true,null,null,60,10);//Вызвать скроллинг по отбираемым записям.
+     END;
+ Sobitie = "";
+    
+End; 
+ 
+/*10.12.2012 zmp C-15529-6*/
+macro sendLotusTextFromCarryFS(PaymentObj)
+var Letter = "", Email = "", Cash = 0, stat ;
+var Theme = "ВНЕШНИЙ ПЛАТЕЖ за счет К/С";                     
+if((IsExternalToItself(PaymentObj)) and (isOver_(PaymentObj.PayerAccount, PaymentObj.PayerFIID,PaymentObj.Chapter)) and
+  (RestA(PaymentObj.PayerAccount,{Curdate}) < PaymentObj.PayerAmount) and (ChangedFS(PaymentObj.paymentID)))
+   Cash = Cash_for_period( PaymentObj.PayerAccount );
+   Letter = LotusText( PaymentObj.paymentID, Cash );
+   GetRegistryValue("PRBB\\ЦЕЛЕВОЕ ИСПОЛЬЗОВАНИЕ\\ПОЛУЧАТЕЛЬ", V_STRING, Email, stat);//"контроль за целевым использованием КС";
+   if (stat == 0)
+       Send_l( Theme, Letter, 73, Email);
+      //msgBox(Letter);
+   end;
+end;                 
+
+end;
+
+
+macro КонтрольЦелевогоИспользоваия(PaymentObj, send, isFCOver, stat);
+private var Letter = "", Theme ="", Email = "", Cash = 0;
+private const fgBank = fg_life_subject( {OurBank} );   
+   //Kozina  процедура контроля целевого использования
+   /*VDN R-470169 Для ВУЗ отдельно проверка при неизмененном источнике финансирования*/
+   //zmp 28.10.2014 I-00527324-2  изменил в условии GetFC(PaymentObj.PaymentID) != 4 => not ChangedFS(PaymentObj.paymentID)
+   if( ( (PaymentObj.dockind == 201) and (not ChangedFS(PaymentObj.paymentID)) ) or ( (fgBank.is_VUZ) and (GetFC(PaymentObj.PaymentID) == 4) ) )
+      if((IsLoanPaym( PaymentObj.Receiveraccount) or substr_in_ground(PaymentObj.PaymentID)) and (not ChangedFS(PaymentObj.paymentID)) )//Надо будет написать процедуру по определению, был ли изменен номер на 4 с 1, 2 или 5 и вставить сюда
+         if(HasLoanAcc(PaymentObj.PayerAccount)>0)//Если есть ссудные счета у клиента
+            if (HasLoanPaym(PaymentObj.PayerAccount)>0)//Если были ссудные платежи на счет клиента или конверсия вал.кредитов за последние 10 дней
+               Cash = Cash_for_period( PaymentObj.PayerAccount );
+               if ( Cash >= PaymentObj.PayerAmount )
+                  ChangeFC(PaymentObj.paymentID, 1);
+               elif( RESTA(PaymentObj.PayerAccount, {curdate}) >= PaymentObj.PayerAmount )
+                  ChangeFC(PaymentObj.paymentID, 2);
+                  if (send) //Email = "контроль за целевым использованием КС";
+                     Theme = "Нецелевой платеж за счет кредитных средств";
+                     Letter = LotusText( PaymentObj.paymentID, Cash );
+                     GetRegistryValue("PRBB\\ЦЕЛЕВОЕ ИСПОЛЬЗОВАНИЕ\\ПОЛУЧАТЕЛЬ", V_STRING, Email, stat);//"контроль за целевым использованием КС";
+                     if (stat == 0)
+                        Send_l( Theme, Letter, 73, Email);
+                     end;
+                  end;
+                  MsgBox( "Нецелевой платеж проводится за счет кредитных средств!" );
+               elif( getlimit(PaymentObj.PayerAccount) and not IsCommPaym(PaymentObj.paymentID)) /*Остатка не хватило, значит за счет овера, однако комиссии тоже отбираются по счету получателя, надо их "отсечь"*/
+                  ChangeFC(PaymentObj.paymentID, 1);//Нецелевой за счет овердрафта отмечаем единичкой и помещаем в ожид.поступлений 
+                  setparm(2,1); //isFCOver = 1;
+                  MsgBox("Не хватает собственных средств на проведение платежа.||"+ 
+                         "Нецелевой платеж нельзя проводить за счет овердрафта.||"+ 
+                         "Платеж помещен в ожидающие поступлений.");
+                  setparm(3,УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 )); //stat = УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 );
+                  InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_NO); //Это чтоб после ожидания поступлений параллельно не планировалась выгрузка во фронт
+               end;
+// LVV 23.01.15 I-00544939-3  Убрал следующий код, как не соотвествующий требованиям ТЗ Контроля целевого использования средств. Если выдачи оверов по ссудным счетам не было, то больше ничего не проверяем.
+       /*     elif( getlimit(PaymentObj.PayerAccount)) //Kozina Овер отконтролируем здесь, т к для него не важно, были предоставлены кредиты в последние дни или не были
+               if ( Cash_for_period( PaymentObj.PayerAccount ) < PaymentObj.PayerAmount )//Хотим провести платеж за счет овера     
+                  ChangeFC(PaymentObj.paymentID, 1);//Нецелевой за счет овердрафта отмечаем единичкой и помещаем в ожид.поступлений 
+                  setparm(2,1); //isFCOver = 1;
+                  MsgBox("Не хватает собственных средств на проведение платежа.||"+ 
+                         "Нецелевой платеж нельзя проводить за счет овердрафта.||"+ 
+                         "Платеж помещен в ожидающие поступлений.");
+                  setparm(3,УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 )); //stat = УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 );
+                  InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_NO);
+               else 
+                  ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования
+               end;   
+   */
+            end;
+         else
+            ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования   
+         end;
+
+      // Golovkin 20.11.2014 С-34083
+      // клиентский платеж себе в другой банк. ставится источник 1 и не меняется. происхождение не важно
+      elif(     ( PaymentObj.ShifrOper == "01"                                               ) //   ──┐ клиентский платеж
+            and ( IsExternalToItself(PaymentObj)                                             ) //   ──┤ платеж себе в другой банк
+            and ( isOver_(PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.Chapter) ) //   ──┤ счет с типом овердрафт
+            and (    ( fgBank.is_VUZ  )                                                        // ──┬─┘ ВУЗ 
+                  or ( fgBank.is_PRBB )                                                        // ──┘   или ПРББ
+                )                                    
+          )                                          
+
+         ChangeFC( PaymentObj.PaymentId, 1 ); // такие документы оплачиваются за счет собственных средств   
+
+         if(     ( isOver_( PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.Chapter) ) 
+             and ( getlimit(PaymentObj.PayerAccount)                                           )
+             and (     ( ( RESTA(PaymentObj.PayerAccount,{curdate}) - PaymentObj.PayerAmount) < 0 ) // проверяем остаток 
+                   and ( ( getOwnMoney(PaymentObj.PayerAccount)     - PaymentObj.PayerAmount) < 0 ) // если остаток не позволяет провести документ, то проверяем "собственные средства", 
+                                                                                                    // т.е. приход минус расход за день( насколько я понял )
+                 ) 
+           )
+            MsgBox("Внешний платеж за счет кредитных средств или овердрафта! | Собственных средств недостаточно! Платеж помещен в ожидающие поступлений.");
+            setparm( 2, 1 );
+            setparm( 3, УстановитьСтатусыПлатежа ( OPR_PAYM_INDEX, 9 ) );
+            InsertOprStatus( OPR_STATUS_FRONT, OPRSTAT_FRONT_NO );
+         end;
+      //VDN C-33744 30.09.2014 Проверка для ВУЗ
+      elif ( ( fgBank.is_VUZ )                                                             and
+           ( ( IsExternalToItself ( PaymentObj )                                         ) and
+           ( inList ( PaymentObj.Origin, 1, 2, 2100 )                                    ) and
+           ( isOver_( PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.Chapter) ) and
+           ( getlimit(PaymentObj.PayerAccount)                                           ) and
+           ( ( RESTA(PaymentObj.PayerAccount, {curdate}) - PaymentObj.PayerAmount) < 0 ) ) )
+         MsgBox("Внешний платеж за счет кредитных средств или овердрафта! | Собственных средств недостаточно! Платеж помещен в ожидающие поступлений.");
+         setparm ( 2, 1 ); //isFCOver = 1; 
+         setparm ( 3, УстановитьСтатусыПлатежа ( OPR_PAYM_INDEX, 9 ) );
+         InsertOprStatus ( OPR_STATUS_FRONT, OPRSTAT_FRONT_NO ); //Это чтоб после ожидания поступлений параллельно не планировалась выгрузка во фронт
+      //Ветка контроля внешних платежей ("пополнение расчетного счета" в другом банке)
+      elif((IsExternalToItself(PaymentObj)) and (substr_in_ground2(PaymentObj.Ground)) and
+           (not ChangedFS(PaymentObj.paymentID)) and
+            not((isOver_(PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.Chapter)) and (fgBank.is_PRBB)) /*10.12.2012 zmp C-15529-6*/
+          ) //Процедура контроля
+         if(HasLoanAcc(PaymentObj.PayerAccount)>0)//Если есть ссудные счета у клиента
+            if(HasLoanPaym(PaymentObj.PayerAccount) > 0)//Если были ссудные платежи на счет клиента или конверсия вал.кредитов за последние 10 дней
+               Cash = Cash_for_period( PaymentObj.PayerAccount );
+               if( Cash >= PaymentObj.PayerAmount )
+                  if (not RepeatedMessage(PaymentObj.paymentID)) //DAI для платежа, дождавшегося денег, категорию не меняем
+                     ChangeFC(PaymentObj.paymentID, 4);
+                  end;
+               else //Внешний платеж на пополнение расчетного счета за счет кредита или овера
+                  Letter = "";
+                  if (RepeatedMessage(PaymentObj.paymentID))
+                     Letter = "Повторное сообщение \n";
+                  end;
+                  ChangeFC(PaymentObj.paymentID, 5); //DAI пока нет своих средств обновляем категорию
+                  if (send)
+                     //DAI рассылка сообщения по категории 5
+                     Theme = "ВНЕШНИЙ ПЛАТЕЖ за счет К/С";
+                     Letter = Letter + LotusText( PaymentObj.paymentID, Cash );
+                     GetRegistryValue("PRBB\\ЦЕЛЕВОЕ ИСПОЛЬЗОВАНИЕ\\ПОЛУЧАТЕЛЬ", V_STRING, Email, stat);//"контроль за целевым использованием КС";
+                     if (stat == 0)
+                        Send_l( Theme, Letter, 73, Email);
+                        //на время теста
+                        //Send_l( Theme, Letter+" ID:"+PaymentObj.paymentID+" БИК:"+fgBank.BankBic, 73, "Arkadiy I Dunaev/IT/Probusiness Bank");
+                     end;
+                  end;
+                  /*zmp 11.04.2013 из письма Мочалова Ивана ТЗ C-15529-6
+                    Стоп-условие должно срабатывать только для овердрафтов,
+                    платежам без овердрафта должна присваиваться 5-я категория, но в "Ожид поступления" они идти не должны 
+                  
+                  if (fgBank.is_PRBB) //DAI добавлен перевод в ожидающие поступления аналогично категории 1 по C-8845 только ПРББ
+                     MsgBox("Внешний платеж за счет кредитных средств или овердрафта! \nПлатеж помещен в ожидающие поступлений.");
+                     setparm(2,1); //isFCOver = 1;
+                     setparm(3,УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 )); //stat = УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 );
+                     InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_NO); //Это чтоб после ожидания поступлений параллельно не планировалась выгрузка во фронт
+                  else
+                  */
+                     MsgBox("Внешний платеж за счет кредитных средств или овердрафта!");
+                  //end;
+               end;
+            else 
+               ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования
+
+            end;
+         else   
+           ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования
+         end;
+      /*10.12.2012 zmp C-15529-6*/
+      elif(((IsExternalToItself(PaymentObj)) and (isOver_(PaymentObj.PayerAccount, PaymentObj.PayerFIID,PaymentObj.Chapter)) and
+           (RestA(PaymentObj.PayerAccount,{Curdate}) < PaymentObj.PayerAmount) and (not ChangedFS(PaymentObj.paymentID)))
+           and (fgBank.is_PRBB)
+          )
+         ChangeFC(PaymentObj.paymentID, 5);
+         MsgBox("Внешний платеж за счет кредитных средств или овердрафта! \nПлатеж помещен в ожидающие поступлений.");
+         setparm(2,1); //isFCOver = 1;
+         setparm(3,УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, 9 )); //stat = УстановитьСтатусыПла	тежа( OPR_PAYM_INDEX, 9 );
+         InsertOprStatus(OPR_STATUS_FRONT, OPRSTAT_FRONT_NO); //Это чтоб после ожидания поступлений параллельно не планировалась выгрузка во фронт
+      else 
+         ChangeFC(PaymentObj.paymentID, 4);// Не контролировать источник финансирования
+      end;
+   end;
+end;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

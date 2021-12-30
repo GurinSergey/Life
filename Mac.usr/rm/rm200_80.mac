@@ -1,0 +1,432 @@
+//-----------------------------------------------------------------------------
+// Блок      : 29026 - "Квитовка входящего"
+// Шаг       : 80    - "Квитовка входящего платежа"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+//-----------------------------------------------------------------------------
+import InsCarryDoc, OprInter, PaymInter, WldInter, "rmtools.mac", "wlkvit.mac", "cbsttls.mac", "pm_opr.mac";
+import "pm_categ.mac", pm_tools;
+import oralib; //Jushmanov 2014-02-24 C-19151
+
+RECORD Corschem( corschem );
+RECORD cors    ( corschem );
+
+var PaymentObj:RsbPayment;
+
+//-----------------------------------------------------------------------------
+// Существуют ли у платежа дочерние документы?
+//-----------------------------------------------------------------------------
+private macro PM_IsExistsChieldDocuments( PaymentID ):bool
+
+    var rs    :object;
+    var select:string;
+    var params:TArray;
+
+    // Проверить проводки
+    select = "select  1 " + 
+             "  from  doproper_dbt opr, doprdocs_dbt docs " +
+             " where  To_Number(opr.t_DocumentID) = :PaymentID "+  
+             "   and  opr.T_DOCKIND = 320 " +
+             "   and  docs.T_ID_OPERATION = opr.T_ID_OPERATION " +
+             "   and  docs.T_DOCKIND in (1,2,7) " +
+             "   and  docs.T_STATUS  in (1,2,1001,1002) "; // DSTAT_DOCUMENT, DSTAT_ARHDOC, DSTAT_DOCUMENTC или DSTAT_ARHDOCC
+    params = makeArray( SQLParam("PaymentID", PaymentID));
+    rs = execSQLselect( select, params, FALSE );
+    if ( rs.moveNext() )
+        return true;
+    end;
+
+    select = "select  1 " + 
+             "  from  dpmlink_dbt link " +
+             " where  link.t_InitialPayment = :PaymentID " +
+             "   and  link.t_linkKind In(:PMLINK_KIND_RETREDIR,:PMLINK_KIND_CLOSACC) ";
+    params = makeArray( SQLParam("PaymentID", PaymentID),
+                        SQLParam("PMLINK_KIND_RETREDIR", PMLINK_KIND_RETREDIR),
+                        SQLParam("PMLINK_KIND_CLOSACC" , PMLINK_KIND_CLOSACC ));
+    rs = execSQLselect( select, params, FALSE );
+
+    if( rs.moveNext() )
+        return true;
+    end;
+
+    return false;
+end;
+
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+macro ExecuteStep( doc, first, KindDoc )
+  
+    var stat:integer = 0,
+        UnkvitSum    = moneyl(0),
+        KvitSum      = moneyl(0),
+        Cancel       = KVIT_NORMAL;
+
+    if( not ПолучитьСуммуКвитовки( PaymentObj, KvitSum, Cancel ) )
+        return 1; //  Ошибка создана
+    end;
+    // Проводка
+    var paymtr:RsbPaymTransaction = PaymentObj.MakeTransaction();
+
+    // Счета для проводки
+    var AccountLORO:string = "",
+        AccountCard:string = "";
+
+    // Виды счетов
+    var AccountLOROKind:string = "",
+        AccountCardKind:string = "";
+
+    var AccCardObj;
+
+    // А надо ли квитовать?
+    if( IsNeedInAccounting( PaymentObj.ReceiverFIID, PaymentObj.ToBackOffice ) )
+        // Если ответные платежи квитуются - выполняем проводку
+        if( Corschem.IsKvitInPaym == "X" ) // Надо
+            if( Cancel == KVIT_CALL_BACK )
+                MsgBox( "Нельзя квитовать входящие платежи отзывом" );
+                return 1;
+            end;
+        end;
+    end;
+
+    // Если квитовка все-таки на полную сумму
+    if( Cancel == KVIT_CANCEL ) // Квитовка отказом
+        if(PaymentObj.DocKind != DLDOC_MULTYPM)
+            // Если у документа имеются порожденные документы - то ругаемся
+            if( PM_IsExistsChieldDocuments( PaymentObj.PaymentID ) )
+                msgbox( "У платежа имеются порожденные документы" );
+                return 1;
+            end;
+
+            if( ( PaymentObj.ToBackOffice == "" ) or ( IsNeedInAccounting( PaymentObj.ReceiverFIID, PaymentObj.ToBackOffice ) ) )
+
+                // Если документ в картотеке ЛОРО - сформировать внебалансовую проводку
+                if( GetOprStatus( OPR_PAYM_INDEX ) == OPR_PAYM_ST_INDEX_LORO )
+
+                    // Получить счет "Картотека корсчета ЛОРО"
+                    AccountLORO = GetCorAcc( PaymentObj.ReceiverFIID, Corschem.Number, CORS_ACC_CARDFILELORO );
+
+                    // Получить вид счета "Картотека корсчета ЛОРО"
+                    AccountLOROKind = PM_GetAccountKind( AccountLORO, PaymentObj.ReceiverFIID, 3 );
+
+                    // Получить вид счета корреспонденции с картотеками
+                    if( Index( AccountLOROKind, "А" ) )
+                        AccountCardKind = "П";
+                    else
+                        AccountCardKind = "А";
+                    end;
+
+                    // Получить счет корреспонденции с картотеками
+                    AccCardObj  = NotBalCorrAcc_FirstDoc( AccountCardKind );
+                    AccountCard = AccCardObj.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+
+                    paymtr.Chapter         = 3;
+                    paymtr.FIIDPayer       = PaymentObj.ReceiverFIID;
+                    paymtr.Sum             = PaymentObj.ReceiverAmount;
+                    paymtr.ResultCarry     = 1;
+                    paymtr.Kind_Oper       = " 1";
+                    paymtr.Shifr_Oper      = "09";
+                    paymtr.AccountPayer    = AccountCard;
+                    paymtr.AccountReceiver = AccountLORO;
+                    paymtr.Date_Carry      = {curdate};
+                    paymtr.Department      = PaymentObj.Department;
+                    paymtr.Ground          = substr( "Квитовка входящего платежа отказом/"+PaymentObj.Ground, 1, 210 );
+                    paymtr.Numb_Document   = PaymentObj.Number;
+                        
+                    if( not paymtr.Carry() )
+                        MsgBox("Ошибка при актуализации платежа");
+                        return 1;
+                    end;
+      
+                else
+
+                    // Удаляем проводки
+                    if( not OprDeleteDocumentsPaymObject( PaymentObj.PaymentID ) )
+                        msgbox("Ошибка при удалении балансовых проводок");
+                        return 1;
+                    end;
+
+                    // Найти входящую корсхему
+                    if( НайтиКорсхему( PaymentObj.InCorschem, PaymentObj.ReceiverFIID, cors ) )
+                        msgBox("Не найдена входящая корсхема");
+                        return 1;
+                    end;
+
+                    // Удалить резервирование средств
+                    PaymentObj.FreeReserve( cors.Account, 1, PaymentObj.ReceiverFIID );
+
+                    // Удалить связанные документы, изменяющие претензии !!!
+                end;
+
+            else
+
+                if( PaymentObj.PaymStatus == PM_KVITPROCESSING )
+                    msgbox("Платеж обрабатывается в бэкофисе");
+                    return 1;
+                else
+                    // Снять символ бэк-офиса
+                    PaymentObj.ToBackOffice = "";
+
+                    // Удаляем проводки
+                    if( not OprDeleteDocumentsPaymObject( PaymentObj.PaymentID ) )
+                        msgbox("Ошибка при удалении проводок");
+                        return 1;
+                    end;
+
+                    // Найти входящую корсхему
+                    if( НайтиКорсхему( PaymentObj.InCorschem, PaymentObj.ReceiverFIID, cors ) )
+                        msgBox("Не найдена входящая корсхема");
+                        return 1;
+                    end;
+
+                    // Удалить резервирование средств
+                    PaymentObj.FreeReserve( cors.Account, 1, PaymentObj.ReceiverFIID );
+
+                    // Удалить связанные документы, изменяющие претензии !!!
+                end;
+            end; 
+     
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_IN_KVIT, OPR_PM_ST_CANCEL, OPR_PAYM_STATE, OPR_PM_ST_REJECT ) )
+                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                return 1;
+            end;
+
+        else
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+                MsgBox("Возникла ошибка при смене статусов операции платежа");
+                return 1;
+            end;
+        end;
+
+    elif( Cancel == KVIT_NORMAL ) // Квитовка нормальная
+
+        if(PaymentObj.DocKind != DLDOC_MULTYPM)
+
+            var kvt = execSQLselect("select t_TransferDate, t_ValueDate from dwlkvtlnk_dbt where t_wlpmid = ? and t_confid = ?", 
+                      makeArray(SQLParam("", PaymentObj.InWlPmID), 
+                                SQLParam("", ifThenElse(KVITDATA_CONFID.size>0, KVITDATA_CONFID(0), 0))));
+
+            if( kvt.moveNext() and ((date(kvt.value(0)) != PaymentObj.InTransferDate) or (date(kvt.value(1)) != PaymentObj.ValueDate)) )
+                if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_POS, OPR_PAYM_STATE, OPR_PM_ST_OPEN ) )
+                    MsgBox("Возникла ошибка при смене статусов операции платежа");
+                    return 1;
+                end;
+            else
+                // Планируемые проводки становятся фактическими
+                if( not CarryPlanDocuments( PaymentObj.PaymentID ) )
+                    MsgBox("Ошибка при помещении планируемой проводки в проведенные");
+                    return 1;
+                end;
+            end;
+
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_IN_KVIT, OPR_PM_ST_KVIT ) )
+                MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+                return 1;
+            end;
+
+        else
+
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_OUT_KVIT, OPR_PM_ST_KVIT, OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+                MsgBox("Возникла ошибка при смене статусов операции платежа");
+                return 1;
+            end;
+        end;
+        /*VDN 25.02.2015 HF139*/
+       PaymentObj.StatusInfo = "Исполнен";
+    end;
+
+    return 0;
+end;
+  
+
+macro PrepMassExecuteStep() 
+    var strQuery;
+    return execStoredFunc( "WLD_KVTINSTEP.MassKvitInStepPrepare", V_INTEGER );  
+end;
+
+
+private macro DeleteAllPaymCarry(PaymentID, ID_Operation, ID_Step)
+    var select:string = "select t.t_ApplicationKind, t.t_ApplicationKey " +
+                          "from dpmdocs_dbt t " +
+                         "where t.t_LinkKindID = 1 " /*PMLINK_CARRY*/ +
+                           "and t.t_PaymentID = :PaymentID " +
+                         "order by t.t_AutoKey desc";
+    var params:TArray = TArray();
+    params[0] = SQLParam( "PaymentID", PaymentID );
+    var rs:RsdRecordset = execSQLselect( select, params );
+    var stat:bool = true;
+
+    while( stat and rs.moveNext() )
+        stat = Opr_DeleteCarry( rs.value(0), rs.value(1), ID_Operation, ID_Step );
+    end;
+
+    return stat;
+end;
+
+
+macro MassExecuteStep()
+    var retval = 0;
+    var select;
+    var select_;
+    var params:TArray = TArray();
+    var rs:RsdRecordset;
+    var strSQL;
+    var OprStatus;
+    var Symb = "";
+    var AccCategory:RsbAccCategory;
+    var AccountCard:string;
+    var AccountLORO:string;
+    var Carry:RsbPaymTransaction;
+    var ErrorMessage;
+    var Err;
+    file pmpaym(pmpaym) key 0;
+    record pm(pmpaym);
+
+    params = makeArray(SQLParam( "p_ID_Operation", 1 ),
+                       SQLParam( "p_Oper", {oper} ));
+    retval = execStoredFunc( "WLD_KVIT.KvitPmTrn", V_INTEGER, params);
+
+    if(retval)
+        MemoryError(retval);
+        return 1;
+    end;
+
+    execSQL( "UPDATE doprtemp_tmp "
+                "SET t_SkipDocument = 2 "
+              "WHERE t_SkipDocument = 0 "
+                "and t_ErrorStatus = 0" );
+
+    select = " SELECT oprtmp.t_OrderID, oprtmp.t_ID_Operation, oprtmp.t_ID_Step, conf.t_Description, kvtlnk.t_type"+
+               " FROM doprtemp_tmp oprtmp, dwlkvtlnk_tmp kvtlnk, dwlconf_dbt conf, dpmpaym_dbt pmpaym, dpmprop_dbt pmprop "+
+              " WHERE oprtmp.t_OrderID = kvtlnk.t_PaymentID "+
+                " AND oprtmp.t_ErrorStatus = 0 "+
+                " AND pmpaym.t_PaymentID = oprtmp.t_OrderID "+
+                " AND pmpaym.t_Purpose <> 32 /* PM_PURP_MULTI */ "+
+                " AND pmprop.t_PaymentID = oprtmp.t_OrderID and pmprop.t_Group = 1 and pmprop.t_IsSender = 'X' " +
+                " and conf.t_ConfID = kvtlnk.t_ConfID " +
+                " and (kvtlnk.t_type = ? or " +
+                       " (kvtlnk.t_ValueDate = pmpaym.t_ValueDate and " +
+                       " pmprop.t_TransferDate = kvtlnk.t_TransferDate))";
+    rs = execSQLselect( select, makeArray(SQLParam("", KVIT_CANCEL)) );
+
+    while(rs.moveNext)
+
+        if(rs.value("t_type") == KVIT_NORMAL ) /*Обаработка успешно сквитованных*/
+
+            execSQL( string( "SAVEPOINT CarryNormalKvit" ) );
+            /*проведение проводок в планируемые*/
+            if(CB_CarryPlanDocuments( rs.value("t_OrderID") ,date(0,0,0),rs.value("t_ID_Operation"),rs.value("t_ID_Step")))
+
+                /* Если проводка неудачная, откатываемся до SAVEPOINT'а */
+                execSQL( string( "ROLLBACK TO SAVEPOINT CarryNormalKvit" ) );
+                /* и исключаем документ из дальнейшей обработки */
+                execSQL( "update doprtemp_tmp set t_ErrorStatus = 1, t_ErrorMessage = :ErrorMessage where t_OrderID = :PaymentID",
+                         makeArray( SQLParam( "ErrorMessage", "Ошибка при помещении планируемых проводок в проведенные" ),
+                                    SQLParam( "PaymentID",    rs.value("t_OrderID") ) ) );
+            end;
+
+        elif(rs.value("t_type") == KVIT_CANCEL )    /*Обработка документов, сквитованных отказом*/
+
+            Err = 0;
+            execSQL( string( "SAVEPOINT CancelKvit", rs.value("t_OrderID") ) );
+
+            /*удаление проводок*/
+            if( not DeleteAllPaymCarry(rs.value("t_OrderID"),rs.value("t_ID_Operation"),rs.value("t_ID_Step")))
+                execSQL( string( "ROLLBACK TO SAVEPOINT CancelKvit" ) );
+                execSQL( "update doprtemp_tmp set t_ErrorStatus = 1, t_ErrorMessage = :ErrorMessage where t_OrderID = :PaymentID",
+                         makeArray( SQLParam( "ErrorMessage", "Ошибка при удалении проводок " ),
+                                    SQLParam( "PaymentID",    rs.value("t_OrderID") ) ) );
+                Err = 1;
+            end;
+
+            /*Вставить примечание "Причина отказа(возврата) платежа"*/
+            if( not Err )
+                ClearRecord(pm);
+                pm.PaymentID = rs.value("t_OrderID");
+                if(AddNoteForObject( OBJTYPE_PAYMENT,
+                                     makeObjectID(OBJTYPE_PAYMENT, NULL, pm),
+                                     PM_NOTEKIND_DENIALGROUND,
+                                     rs.value("t_Description"),
+                                     {curdate},
+                                     rs.value("t_ID_Operation"),
+                                     rs.value("t_ID_Step")))
+                    execSQL( string( "ROLLBACK TO SAVEPOINT CancelKvit", rs.value("t_OrderID") ) );
+                    execSQL( "update doprtemp_tmp set t_ErrorStatus = 1, t_ErrorMessage = :ErrorMessage where t_OrderID = :PaymentID",
+                             makeArray( SQLParam( "ErrorMessage", "Ошибка при установке примечания" ),
+                                        SQLParam( "PaymentID",    rs.value("t_OrderID") ) ) );
+                end;
+            end;
+        end;
+    end;
+
+    retval = execStoredFunc( "WLD_KVTINSTEP.MassKvitInStepExecute", V_INTEGER );
+
+    return retval;
+end;
+
+
+macro PostMassExecuteStep()
+    return 0;
+end;
+
+
+macro CheckStepAction( mes )
+    DebugBreak;
+    var MultyPaymID;
+    var select;
+    var params:TArray = TArray();
+    VAR rs:RsdRecordset;
+    var flag = false;
+
+    if( mes == OP_BACKOUT_STEP )
+        if(PaymentObj.Purpose == PM_PURP_MULTI)
+            select = "select pm.t_PaymentID, pm.t_DocKind"+
+                     "  from dpmlink_dbt link, dpmpaym_dbt pm"+
+                     " where link.t_InitialPayment = :PaymentID"+
+                     "   and link.t_LinkKind = 9" +
+                     "   and pm.t_PaymentID = link.t_PurposePayment";
+            params = makeArray(SQLParam( "PaymentID", PaymentObj.PaymentID ));
+            rs = execSQLselect( select, params, TRUE );
+
+            while(rs.moveNext)
+                if(Opr_IsStepExecuteSymb( rs.value(0), rs.value(1), "w" ))
+                    flag = true;                                        
+                end;
+            end;
+
+            if(flag)
+                if(RsbGetTrue( False,False,"Платеж является сводным и имеет включенные платежи.| При откате шага квитовки, откат для включенных платежей произведен не будет.|Продолжить?")==false)
+                    return 1;
+                end;
+            end;
+        end;
+    end;
+
+    return 0;
+end;
+
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+end;

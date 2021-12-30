@@ -1,0 +1,1117 @@
+/*****************************************************************************/
+/* ОТЧЕТ "Виды документов РКО, исполняемых с использованием ручной обработки"*/
+/*                                                                           */
+/* Юшманов Дмитрий                                                           */
+/* Начато 02.09.2013                                                         */
+/*                                                                           */
+/* C-22358 (C-19151-6)                                                       */
+/*                                                                           */
+/*****************************************************************************/
+
+import bankinter, RsbDataSet, rsexts, globals, RsbFormsInter, rslx;
+import "KeyCodes.mac", "fastexcel.mac";
+
+private const
+    TYPE_INTEGER = 1, //типы полей формы
+    TYPE_STRING = 7,
+    TYPE_DATE = 9,
+    TYPE_TIME = 10,
+    RES_SIZE = 8, //размер структуры массива результатов:
+                  //0 - код вида документа
+                  //1 - наименование вида документа
+                  //2 - код источника поступления
+                  //3 - наименование источника поступления
+                  //4 - прочие характеристики документа
+                  //5 - список шагов с ручной обработкой
+                  //6 - количество обраб. документов
+                  //7 - paymentid документов
+    DOCKIND_SIZE = 4, //размер структуры массива видов документов
+    SOURCE_SIZE = 3,  //размер структуры массива источников документов
+    SCHEME_SIZE = 3,  //размер структуры массива схем расчетов
+    CIPHER_SIZE = 3,  //размер структуры массива шифров документов
+    CONST_ROBOLIST = "10000,10001,20000,20001,20002,20003,20004,20005,20006,20007,20008,20009,20010,20011,20012,20013,20014,20050,20201,22222,13666,20015",
+    CONST_ORIGLIST = "15,16,17,18,27,70,201,202,203,400,410,420,430", //виды документов, обрабатываемые процедурой ea.getOrigin
+    REP_NAME = "Виды документов РКО, исполняемых с использованием ручной обработки",
+    REP_NAME_UPPER = "ВИДЫ ДОКУМЕНТОВ РКО, ИСПОЛНЯЕМЫХ С ИСПОЛЬЗОВАНИЕМ РУЧНОЙ ОБРАБОТКИ";
+
+private var
+    aDockind = TArray(),
+    aSource = TArray(),
+    aScheme = TArray(),
+    aCipher = TArray(),
+    aResult = TArray(),
+    startDate : Date = {curdate} - 30,
+    endDate : Date = {curdate},
+    startTime : Time = "00:00:00",
+    endTime : Time = "23:59:59",
+    strDayExists : string = "",
+    formRun : bool = false,
+    debugMode : bool = false,
+    debugNumDocs : integer = 10;
+
+//диалоговая панель с параметрами фильтра
+private class (TRsbPanel) RslPanel(caption: string)
+/*----------------------------------------------------------------------------*/
+var endOfMultiSelect : bool = false,
+    ctrlName : string = "";
+/*----------------------------------------------------------------------------*/
+    //добавление на панель текстовой метки
+    macro addLabelField(name: string, x: integer, y: integer)
+    var m_label: TRSBLabel;
+
+        m_label = TRSBLabel(x, y, name);
+        addLabel(m_label);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель поля ввода
+    macro addEditField(name: string, dataType: integer, val: variant, textLen: integer, editFlag: bool, 
+                       focusFlag: bool, posX: integer, posY: integer, sizeX: integer, sizeY: integer)
+    var m_edit: TRSBEditField = TRsbEditField(dataType);
+
+        m_edit.name = name;
+        m_edit.setPosition(posX, posY);
+        m_edit.setSize(sizeX, sizeY);
+        m_edit.textLength = textLen;
+        m_edit.editable = editFlag;
+        m_edit.focusable = focusFlag;
+        m_edit.value = val;
+        addControl(m_edit);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель чекбокса
+    macro addCheckBox(name: string, posX: integer, posY: integer)
+    var m_checkbox: TRSBCheckBox = TRSBCheckBox();
+
+        m_checkbox.name = name;
+        m_checkbox.setPosition(posX, posY);
+        m_checkbox.checked = false;
+        addControl(m_checkbox);
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработка выбора элемента скроллинга
+    macro scrollElement (ctrlName, rs, pArray, structSize, offset, cmpStr)
+    var i : integer = 0;
+
+        for (i, 0, pArray.size/structSize)
+            if (pArray[structSize*i+offset] == rs.value(cmpStr))
+                pArray[structSize*i] = (pArray[structSize*i] == false); //инвертируем флаг выбора элемента
+            end;
+        end;
+
+        return pArray;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработчик событий скроллингов
+    macro scrollEvent (rs, cmd, id, key)
+    var i : integer = 0;
+
+        if (cmd == DLG_INIT)
+            endOfMultiSelect = false;
+            addMultiAction(rs, KEY_ENTER);
+
+        elif (cmd == DLG_MSEL)
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, 1, "t_dockind");
+            elif (ctrlName == "formSourceEdit")
+                aSource = scrollElement(ctrlName, rs, aSource, SOURCE_SIZE, 2, "srcname");
+            elif (ctrlName == "formCipherEdit")
+                aCipher = scrollElement(ctrlName, rs, aCipher, CIPHER_SIZE, 1, "t_shifr_oper");
+            elif (ctrlName == "formSchemeEdit")
+                aScheme = scrollElement(ctrlName, rs, aScheme, SCHEME_SIZE, 1, "csnumber");
+            end;
+            return CM_MSEL_CONT_CLEAR;
+
+        elif (cmd == DLG_MSELEND)
+            endOfMultiSelect = true;
+
+        elif ((cmd == DLG_KEY) and (endOfMultiSelect))
+            return CM_CANCEL;
+
+        elif ((cmd == DLG_KEY) and (key == KEY_ENTER))
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, 1, "t_dockind");
+            elif (ctrlName == "formSourceEdit")
+                aSource = scrollElement(ctrlName, rs, aSource, SOURCE_SIZE, 2, "srcname");
+            elif (ctrlName == "formCipherEdit")
+                aCipher = scrollElement(ctrlName, rs, aCipher, CIPHER_SIZE, 1, "t_shifr_oper");
+            elif (ctrlName == "formSchemeEdit")
+                aScheme = scrollElement(ctrlName, rs, aScheme, SCHEME_SIZE, 1, "csnumber");
+            end;
+            return CM_SELECT;
+        end;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //вспомогательное заполнение массива для построения скроллинга
+    macro addCol (ar, ind, fld, head, width, rdonly)
+        ar.value (ind * 6) = fld;
+        ar.value (ind * 6 + 1) = head;
+        ar.value (ind * 6 + 2) = width;
+        ar.value (ind * 6 + 3 ) = 2;  // fldType
+        ar.value (ind * 6 + 4 ) = -1; // decPoint
+        ar.value (ind * 6 + 5 ) = 0;  // reserv
+    end;
+/*----------------------------------------------------------------------------*/
+    //общие для скроллингов действия
+    macro quickScroll(rs, col, numCols, pArray, structSize, ctrlName)
+    var tempstr : string = "",
+        moreThanOne : bool = false,
+        i : integer = 0;
+
+        RunScroll(rs, numCols, col, Null, R2M(this, "scrollEvent"));
+
+        //пересчёт содержимого "подвала" для выбранного фильтра
+        for (i, 0, pArray.size/structSize)
+            if (pArray[structSize*i])
+                if (tempstr == "")
+                    tempstr = pArray[structSize*i+2];
+                else
+                    moreThanOne = true;
+                end;
+            end;
+        end;
+        if (tempstr == "") tempstr = "ВСЕ" end;
+        if (moreThanOne) tempstr = "Несколько" end;
+
+        getControl(ctrlName).value = tempstr;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработчик события "нажатие клавиши" для всей экранной формы
+    macro onKeyPress (RsbEvent: object)
+    var i : integer = 0;
+
+        //сброс выбранного параметра фильтра
+        if (RsbEvent.KeyCode == KEY_F4)
+
+            ctrlName = RsbEvent.source.name;
+
+            if   (ctrlName == "formDockindEdit")
+                for (i, 0, aDockind.size/DOCKIND_SIZE) aDockind[DOCKIND_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            elif (ctrlName == "formSourceEdit")
+                for (i, 0, aSource.size/SOURCE_SIZE) aSource[SOURCE_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            elif (ctrlName == "formSchemeEdit")
+                for (i, 0, aScheme.size/SCHEME_SIZE) aScheme[SCHEME_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            elif (ctrlName == "formCipherEdit")
+                for (i, 0, aCipher.size/CIPHER_SIZE) aCipher[CIPHER_SIZE*i] = false; end;
+                getControl(ctrlName).value = "ВСЕ";
+            end;
+
+        //запуск скроллингов для параметров фильтров
+        elif (RsbEvent.KeyCode == KEY_F3)
+        var col = TArray(),
+            tempstr : string = "",
+            rs;
+
+            ctrlName = RsbEvent.source.name;
+
+            if (ctrlName == "formDockindEdit")
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "t_dockind", "Код вида документа", 15, true);
+                addCol(col, 2, "t_name", "Вид документа", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aDockind.size/DOCKIND_SIZE-1)
+                    if (aDockind[DOCKIND_SIZE*i]) tempstr = tempstr + "," + aDockind[DOCKIND_SIZE*i+1] end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when t_dockind in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                    "select " + tempstr, 
+                    "\n     t_dockind, ",
+                    "\n     t_name, ",
+                    "\n     substr(t_strorigin, ",
+                    "\n            length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+                    "\n from ",
+                    "\n ( select t.t_dockind, ",
+                    "\n          t.t_name, ",
+                    "\n          replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+                    "\n     from doprkdoc_dbt t ",
+                    "\n    where CONNECT_BY_ISLEAF = 1 ",
+                    "\n      and t_dockind != 320 ", //у 320-ого документа нет справочника происхождений, исправлено ниже
+                    "\n    start with t.t_dockind = 29 ",
+                    "\n  connect by prior t_dockind = t_parentdockind ",
+                    "\n    UNION ",
+                    "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+                    "\n     from doprkdoc_dbt w ",
+                    "\n    where w.t_dockind = 200 ",
+                    "\n    UNION ",
+                    "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+                    "\n     from doprkdoc_dbt w ",
+                    "\n    where w.t_dockind = 320) ",
+                    "\n order by t_dockind " ),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aDockind, DOCKIND_SIZE, ctrlName);
+
+            elif (ctrlName == "formSchemeEdit")
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "csnumber", "Номер корсхемы", 15, true);
+                addCol(col, 2, "csname", "Корсхема", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aScheme.size/SCHEME_SIZE-1)
+                    if (aScheme[SCHEME_SIZE*i]) tempstr = tempstr + "," + aScheme[SCHEME_SIZE*i+1] end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when csnumber in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                  "select " + tempstr + " a1.* from ( ",
+                  " SELECT '-1' csnumber, ",
+                  "        'Внутренний' csname ",
+                  " FROM dual ",
+                  "    UNION ",
+                  " SELECT to_char(cs.t_number) csnumber, ",
+                  "        cs.t_name csname ",
+                  " FROM dcorschem_dbt cs ",
+                  " WHERE cs.t_dogclosedate = '01.01.0001' ) a1 ",
+                  " ORDER BY to_number(csnumber) " ),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aScheme, SCHEME_SIZE, ctrlName);
+
+            elif (ctrlName == "formCipherEdit")
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "t_shifr_oper", "Код шифра документа", 15, true);
+                addCol(col, 2, "t_comment", "Шифр документа", 60, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aCipher.size/CIPHER_SIZE-1)
+                    if (aCipher[CIPHER_SIZE*i]) tempstr = tempstr + ",''" + aCipher[CIPHER_SIZE*i+1] + "''" end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when t_shifr_oper in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                    "select " + tempstr + " t.* from ("
+                    " SELECT to_char(t_shifr_oper) t_shifr_oper, t_comment FROM dcipher_dbt ",
+                    " UNION ",
+                    " SELECT chr(1), '(Шифр не проставлен)' FROM dual ) t "),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aCipher, CIPHER_SIZE, ctrlName);
+
+            elif (ctrlName == "formSourceEdit")
+            var strDockind : string = "";
+
+                for (i, 0, aDockind.size/DOCKIND_SIZE)
+                    if (aDockind[DOCKIND_SIZE*i] == true)
+                        strDockind = strDockind + "," + aDockind[DOCKIND_SIZE*i+1];
+                    end;
+                end;
+
+                if (strDockind != "")
+                    strDockind = " and t.t_dockind in (" + substr(strDockind,2) + ") ";
+                end;
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "srcname", "Источник документа", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aSource.size/SOURCE_SIZE-1)
+                    if (aSource[SOURCE_SIZE*i]) tempstr = tempstr + ",'" + aSource[SOURCE_SIZE*i+2] + "'"; end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when big.srcname in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                  "select distinct ",
+                  "\n " + tempstr,
+                  "\n       big.* ",
+                  "\n  from ( ",
+                  "\n       select lval.t_name srcname ",
+                  "\n         from ( ",
+                  "\n              select t_dockind, ",
+                  "\n                     t_name, ",
+                  "\n                     substr(t_strorigin, length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+                  "\n                from ( ",
+                  "\n                     select t.t_dockind, ",
+                  "\n                            t.t_name, ",
+                  "\n                            replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+                  "\n                       from doprkdoc_dbt t ",
+                  "\n                      where CONNECT_BY_ISLEAF = 1 ",
+                  "\n                        and t.t_dockind != 320 ", //у 320-ого документа нет справочника происхождений, исправлено ниже
+                  "\n                      start with t.t_dockind = 29 ",
+                  "\n                    connect by prior t_dockind = t_parentdockind ",
+                  "\n                     UNION ",
+                  "\n                     select w.t_dockind, ",
+                  "\n                            w.t_name, ",
+                  "\n                            '/1660' t_strorigin ",
+                  "\n                       from doprkdoc_dbt w ",
+                  "\n                      where w.t_dockind = 200 ",
+                  "\n                     UNION ",
+                  "\n                     select w.t_dockind, ",
+                  "\n                            w.t_name, ",
+                  "\n                            '/1660' t_strorigin ",
+                  "\n                       from doprkdoc_dbt w ",
+                  "\n                      where w.t_dockind = 320 ) ",
+                  "\n              ) t, ",
+                  "\n              dllvalues_dbt lval ",
+                  "\n        where t.t_origin = lval.t_list ",
+                  "\n " + strDockind,
+                  "\n       ) big "),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 2, aSource, SOURCE_SIZE, ctrlName);
+
+            end;
+
+        //запуск отчёта
+        elif (RsbEvent.KeyCode == KEY_F2)
+            startDate = getControl("formDateStart").value;
+            endDate   = getControl("formDateEnd").value;
+            startTime = getControl("formTimeStart").value;
+            endTime   = getControl("formTimeEnd").value;
+            debugMode = getControl("formIDsCheckBox").checked;
+            debugNumDocs = int(getControl("formIDsEdit").value);
+            formRun = true;
+            close(1);
+        end;
+
+    end;
+/*----------------------------------------------------------------------------*/
+//заполнение экранной формы
+    macro init(caption: string)
+    var formDockindArr = TArray(),
+        formSourceArr = TArray(),
+        formSchemeArr = TArray(),
+        formCipherArr = TArray(),
+        editString = 9000,
+        editLength = 25,
+        editHeight = 1,
+        dateLen = 9,
+        alLeft = 4, 
+        Line = 2,
+        alStartDate = alLeft + 20,
+        alFinDate = alLeft + 32,
+        alCombo = alLeft + 16;
+
+        setCaption(caption);
+        setposition(15,5);
+        setsize(48,10);
+        addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "onKeyPress"));
+        setStatus("F2: Запуск отчёта, F3: Список значений, F4: Сброс поля");
+
+        //инициализация массивов параметров фильтра:
+        //вид первичного документа
+        var rs = RsdRecordSet(string(
+        "   select t_dockind, ",
+        "\n        t_name, ",
+        "\n        substr(t_strorigin, ",
+        "\n               length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+        "\n from ",
+        "\n ( select t.t_dockind, ",
+        "\n          t.t_name, ",
+        "\n          replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+        "\n     from doprkdoc_dbt t ",
+        "\n    where CONNECT_BY_ISLEAF = 1 ",
+        "\n      and t.t_dockind != 320 ",
+        "\n    start with t.t_dockind = 29 ",
+        "\n  connect by prior t_dockind = t_parentdockind ",
+        "\n    UNION ",
+        "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+        "\n     from doprkdoc_dbt w ",
+        "\n    where w.t_dockind = 200 ",
+        "\n    UNION ",
+        "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+        "\n     from doprkdoc_dbt w ",
+        "\n    where w.t_dockind = 320 )" ));
+        var i : integer = 0;
+        while (rs.moveNext)
+            aDockind[DOCKIND_SIZE*i]   = false;
+            aDockind[DOCKIND_SIZE*i+1] = rs.value("t_dockind");
+            aDockind[DOCKIND_SIZE*i+2] = rs.value("t_name");
+            aDockind[DOCKIND_SIZE*i+3] = rs.value("t_origin");
+            i = i + 1;
+        end;
+
+        //происхождение документа
+        rs = RsdRecordSet(string(
+        "   SELECT distinct lval.t_element, ",
+        "\n                 lval.t_name srcname ",
+        "\n   FROM dllvalues_dbt lval, ",
+        "\n        doprkdoc_dbt kdoc ",
+        "\n  WHERE lval.t_list = kdoc.t_origin "));
+        i = 0;
+        while (rs.moveNext)
+            aSource[SOURCE_SIZE*i]   = false;
+            aSource[SOURCE_SIZE*i+1] = rs.value("t_element");
+            aSource[SOURCE_SIZE*i+2] = rs.value("srcname");
+            i = i + 1;
+        end;
+
+        //корсхемы
+        rs = RsdRecordSet(string(
+          " SELECT '-1' csnumber ",
+          "       ,'Внутренний' csname ",
+          " FROM dual ",
+          "    UNION ",
+          " SELECT to_char(cs.t_number) csnumber ",
+          "       ,cs.t_name csname ",
+          " FROM dcorschem_dbt cs ",
+          " WHERE cs.t_dogclosedate = '01.01.0001' ",
+          " ORDER BY csnumber" ));
+        i = 0;
+        while (rs.moveNext)
+            aScheme[SCHEME_SIZE*i]   = false;
+            aScheme[SCHEME_SIZE*i+1] = rs.value("csnumber");
+            aScheme[SCHEME_SIZE*i+2] = rs.value("csname");
+            i = i + 1;
+        end;
+
+        //шифры
+        rs = RsdRecordSet(string(
+          //" SELECT '''' || to_char(t_shifr_oper) || '''' t_shifr_oper, t_comment FROM dcipher_dbt ",
+          " SELECT to_char(t_shifr_oper) t_shifr_oper, t_comment FROM dcipher_dbt ",
+          " UNION ",
+          " SELECT chr(1), '(Шифр не проставлен)' FROM dual "));
+        i = 0;
+        while (rs.moveNext)
+            aCipher[CIPHER_SIZE*i]   = false;
+            aCipher[CIPHER_SIZE*i+1] = rs.value("t_shifr_oper");
+            aCipher[CIPHER_SIZE*i+2] = rs.value("t_comment");
+            i = i + 1;
+        end;
+
+        //создание элементов экранной формы
+        addLabelField("Дата окончания обработки:", alLeft, Line);
+        addLabelField("с", alStartDate-2, Line);
+        addEditField("formDateStart", TYPE_DATE, startDate, 10, true, true, alStartDate, Line, dateLen, editHeight);
+        addLabelField("по", alFinDate-2, Line);
+        addEditField("formDateEnd", TYPE_DATE, endDate, 10, true, true, alFinDate, Line, dateLen, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Время поступления:", alLeft, Line);
+        addLabelField("с", alStartDate-2, Line);
+        addEditField("formTimeStart", TYPE_TIME, startTime, 10, true, true, alStartDate, Line, dateLen, editHeight);
+        addLabelField("по", alFinDate-2, Line);
+        addEditField("formTimeEnd", TYPE_TIME, endTime, 10, true, true, alFinDate, Line, dateLen, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Вид документа:", alLeft, Line);
+        addEditField("formDockindEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Источник поступления:", alLeft, Line);
+        addEditField("formSourceEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Схема расчетов:", alLeft, Line);
+        addEditField("formSchemeEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Шифр документа:", alLeft, Line);
+        addEditField("formCipherEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Со списком id документов", alLeft, Line);
+        addCheckBox("formIDsCheckBox", alStartDate - 2, Line);
+        addLabelField("Количество id:", alCombo + 10, Line);
+        addEditField("formIDsEdit", TYPE_STRING, "10", editString, true, true, alFinDate + 5, Line, 4, editHeight);
+
+    end;
+/*----------------------------------------------------------------------------*/    
+    InitTRsbPanel();
+    init(caption);
+/*----------------------------------------------------------------------------*/
+end;
+
+
+/*----------------------------------------------------------------------------*/
+//проверка массива параметра фильтра на наличие выбранных элементов
+private macro arrIsEmpty(pArr:TArray, pStr:integer)
+var isEmpty : bool = true,
+    i : integer = 0;
+    while ((i < pArr.size/pStr) and isEmpty)
+        isEmpty = (not pArr[pStr*i]);
+        i = i + 1;
+    end;
+    return isEmpty;
+end;
+/*----------------------------------------------------------------------------*/
+//простейшая сортировка для массива результатов
+private macro sortme(pArr:TArray, pStr:integer)
+var t, i, j, k;
+    for (j, 1, pArr.size/pStr-1)
+        for (i, 1, pArr.size/pStr-1)
+            if ((pArr[pStr*(i)+0] < pArr[pStr*(i-1)+0])
+            or  ((pArr[pStr*(i)+0] == pArr[pStr*(i-1)+0]) and (pArr[pStr*(i)+2] < pArr[pStr*(i-1)+2])))
+                for (k, 0, pStr-1)
+                    t = pArr[pStr*(i)+k];
+                    pArr[pStr*(i)+k] = pArr[pStr*(i-1)+k];
+                    pArr[pStr*(i-1)+k] = t;
+                end;
+            end;
+        end;
+    end;
+    return pArr;
+end;
+/*----------------------------------------------------------------------------*/
+//макрос удаления дублирующихся подстрок в строке
+private macro strDelDups(in_str:string)
+var out_str:string = "",
+    arr:TArray,
+    i:integer = 0;
+
+    arr = split(in_str,";");
+
+    while (i < arr.size)
+        if (index(out_str,arr[i]) == 0) 
+            out_str = out_str + "; " + arr[i];
+        end;
+
+        i = i + 1;
+    end;
+
+    return substr(out_str, 3);
+end;
+/*----------------------------------------------------------------------------*/
+//подготовка строки для вставки в запрос
+private macro strFill (arr, structSize, pos, compl_table, isString)
+var i : integer = 0,
+    str : string = "";
+
+    for (i, 0, arr.size/structSize-1)
+        if (arr[structSize*i] == true)
+            if (isString)
+                str = str + ",'" + arr[structSize*i+pos] + "'";
+            else 
+                str = str + "," + arr[structSize*i+pos];
+            end;
+        end;
+    end;
+
+    if (substr(str,1,1) == ",")
+        str = substr(str,2);
+    end;
+
+    if (str != "")
+        str = "\n and " + compl_table + " in (" + str + ") ";
+    end;
+
+    return str;
+
+end;
+/*----------------------------------------------------------------------------*/
+//подготовка строки для вставки в запрос (для массива источников)
+private macro strFillSource (arr, cmpStr1, cmpStr2)
+var i : integer = 0,
+    str : string = "",
+    rs;
+
+    if ((arrIsEmpty(aSource,SOURCE_SIZE)) and (arrIsEmpty(aDockind,DOCKIND_SIZE)))
+
+        //если виды документов не выбраны, указываем все виды
+        for (i, 0, aDockind.size/DOCKIND_SIZE-1)
+            str = str + ","+ aDockind[DOCKIND_SIZE*i+1];
+        end;
+        return("\n and st.t_dockind in (" + substr(str,2) + ") ");
+
+    elif (arrIsEmpty(aSource,SOURCE_SIZE))
+
+        //если источники и ивды не выбраны, в запросе достаточно указать виды документов
+        return strFill(aDockind, DOCKIND_SIZE, 1, "st.t_dockind", false);
+
+    else
+
+        rs = RsdRecordSet(string(
+            " select distinct t.t_dockind dockind, ",
+            "\n      t.t_name dkndname, ",
+            "\n      lval.t_element element, ",
+            "\n      lval.t_name srcname ",
+            "\n from (select t_dockind, ",
+            "\n              t_name, ",
+            "\n              substr(t_strorigin, length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+            "\n          from ",
+            "\n           (SELECT t.t_dockind, ",
+            "\n                   t.t_name, ",
+            "\n                   replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+            "\n              FROM doprkdoc_dbt t ",
+            "\n              WHERE CONNECT_BY_ISLEAF = 1 ",
+            "\n                AND t.t_dockind != 320 ", //заглушка до выяснения
+            "\n              START WITH t.t_dockind = 29 ",
+            "\n              CONNECT BY PRIOR t_dockind = t_parentdockind)) t, ",
+            "\n      dllvalues_dbt lval ",
+            "\n where t.t_origin = lval.t_list ",
+            strFill(aDockind, DOCKIND_SIZE, 1, "t.t_dockind", false),
+            strFill(aSource, SOURCE_SIZE, 1, "lval.t_element", false),
+            "\n order by t.t_dockind, lval.t_element " ));
+
+        while (rs.moveNext)
+            str = str + "or (" + cmpStr1 + " = " + rs.value("dockind") + 
+                       " and " + cmpStr2 + " = " + rs.value("element") + ") ";
+        end;
+
+        if (substr(str,1,2) == "or")
+            str = substr(str,3);
+        end;
+
+        if (str != "")
+            str = "\n and (" + str + ") ";
+        end;
+
+        return str;
+
+    end;
+
+end;
+/*----------------------------------------------------------------------------*/
+//основные расчёты статистики: подготовка и выполнение запроса, заполнение массива результатов
+private macro core()
+    var rs,
+        cmd,
+        query,
+        j : integer = 0,
+        i : integer = 0,
+        dayExists : bool = false,
+        resultSize : integer = 0,
+        progressCounter : integer = 0,
+        curDate : Date = startdate,
+        strDockind : string = "",
+        strCipher : string = "",
+        strSource : string = "",
+        strSchemeDeb : string = "",
+        strSchemeCred : string = "",
+        strTime : string = "",
+        roboList,
+        errCode : integer = 0;
+
+    //в случае неверного ввода меняем даты местами
+    if (startDate > endDate)
+        curDate   = startDate;
+        startDate = endDate;
+        endDate   = curDate;
+        curDate   = startDate;
+    end;
+
+    //подготовка строк с параметром "схема расчетов" для вставки в запрос
+    strSchemeDeb = strFill(aScheme, SCHEME_SIZE, 1, "prd.t_corschem", false);
+    strSchemeCred = strFill(aScheme, SCHEME_SIZE, 1, "prc.t_corschem", false);
+
+    //подготовка строки с параметром "шифр документа" для вставки в запрос
+    strCipher = strFill(aCipher, CIPHER_SIZE, 1, "rm.t_shifroper", true);
+
+    //подготовка строки с параметром "происхождение документа" для вставки в запрос
+    strSource = strFillSource(aSource, "st.t_dockind", "st.origin");
+
+    if ((startTime != "00:00:00") and (endTime != "23:59:59"))
+        strTime = "\n   and op.t_syst_time between to_date('01.01.0001 " + startTime + "','dd.mm.yyyy hh24:mi:ss') "
+                 +"\n                          and to_date('01.01.0001 " + endTime   + "','dd.mm.yyyy hh24:mi:ss') ";
+    end;
+
+    //промежуточное окно для этапа подсчёта документов
+    InitProgress(1, "Идёт подсчёт документов...", REP_NAME);
+
+    //массив инициализируется с ненулевым размером, хотя по факту он пуст. Исправляем.
+    aResult.size = 0;
+
+    //считываем список операционистов-роботов
+    if (not getRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS", V_STRING, roboList, errCode, false))
+        msgbox("Значение настройки реестра 'PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS' не задано. Будет использовано значение по умолчанию.");
+        roboList = CONST_ROBOLIST;
+    end;
+
+    //подсчитываем количество документов согласно параметрам фильтра, полученное значение используется в прогрессбаре
+    rs = RsdRecordSet(string(
+    "\n select count(*) pid from (",
+    "\n     select b.t_paymentid",
+    "\n     from (",
+    "\n     select st.t_paymentid",
+    "\n           ,st.t_dockind",
+    "\n           ,st.origin",
+    "\n           ,st.t_id_operation",
+    "\n       from (select step.*, op.*",
+    "\n               from doprstep_dbt step,",
+    "\n                   (select oper.t_id_operation id_op, pm.t_paymentid, pm.origin",
+    "\n                      from doproper_dbt oper,",
+    "\n                           (select paym.*,",
+    "\n                                   case when (paym.t_dockind in (" + CONST_ORIGLIST + "))",
+    "\n                                        then decode( user_ea.getOrigin(paym.t_docKind, paym.t_paymentID),",
+    "\n                                                     9999, decode( paym.t_primdocorigin, 9999, paym.t_origin, paym.t_primdocorigin ),",
+    "\n                                                     user_ea.getOrigin(paym.t_docKind, paym.t_paymentID) )",
+    "\n                                        else decode( paym.t_primdocorigin, 9999, paym.t_origin, paym.t_primdocorigin )",
+    "\n                                   end origin",
+    "\n                              from (select * from dpmpaym_dbt",
+    "\n                                     where t_paymstatus in (100, 32000)"
+    "\n                                       and t_closedate between to_date('" + startDate + "') and to_date('" + endDate + "')"
+    "\n                                   ) paym",
+    "\n                           ) pm",
+    "\n                     where lpad(pm.t_paymentid, 34, '0') = oper.t_documentid",
+    "\n                       and pm.t_dockind = oper.t_dockind",
+    "\n                   ) op",
+    "\n              where op.id_op = step.t_id_operation",
+    "\n            ) st",
+    "\n           ,doprostep_dbt ost",
+    "\n           ,usr_doprstep_robot_dbt rst",
+    "\n           ,dpmrmprop_dbt rm",
+    "\n           ,(select * from dpmprop_dbt where t_debetcredit = 0) prd",
+    "\n           ,(select * from dpmprop_dbt where t_debetcredit = 1) prc",
+    "\n      where st.t_blockid = ost.t_blockid",
+    "\n        and st.t_number_step = ost.t_number_step",
+    "\n        and st.t_id_operation = rst.t_id_operation(+)",
+    "\n        and st.t_number_step = rst.t_number_step(+)",
+    "\n        and st.t_paymentid = rm.t_paymentid",
+    "\n        and st.t_paymentid = prd.t_paymentid",
+    "\n        and st.t_paymentid = prc.t_paymentid",
+    "\n        and st.t_oper not in (" + roboList + ")",
+    "\n        and nvl(rst.t_is_robot_step, chr(0)) != chr(88)",
+    "\n        and nvl(rst.t_program, 'X') != 'ate.exe'",
+    strTime,
+    strSource,
+    strCipher,
+    strSchemeDeb,
+    strSchemeCred,
+    "\n        group by st.t_paymentid, st.t_dockind, st.origin, ost.t_name, st.t_symbol, st.t_id_operation,",
+    "\n                 rm.t_shifroper, prd.t_corschem, prc.t_corschem",
+    "\n        order by st.t_paymentid",
+    "\n     ) b",
+    "\n     group by b.t_paymentid",
+    "\n )"
+    ));
+
+    rs.moveNext;
+    j = rs.value("pid");
+
+    RemProgress();
+    InitProgress( j, "Идёт обработка документов...", REP_NAME);
+
+    query = string(
+    "\n select b.t_paymentid",
+    "\n       ,b.t_dockind",
+    "\n       ,b.origin",
+    "\n       ,max(b.params) params",
+    "\n       ,listagg(b.t_name || decode(b.t_symbol, chr(0), '', ' (' || b.t_symbol || ')'), ';') ",
+    "\n                within group (order by b.t_id_operation, b.id_step) steps",
+    "\n   from (",
+    "\n   select st.t_paymentid",
+    "\n         ,st.t_dockind",
+    "\n         ,st.origin",
+    "\n         ,ost.t_name",
+    "\n         ,st.t_symbol",
+    "\n         ,st.t_id_operation",
+    "\n         ,min(st.t_id_step) id_step",
+    "\n         ,'(' || decode(rm.t_shifroper,chr(1),'нет шифра',rm.t_shifroper) || ') ' || sfr.t_comment || '; ' ||",
+    "\n           '"+ startTime +"' || ' - ' || '"+ endTime +"' ||",
+    "\n           case when (prd.t_corschem = prc.t_corschem)",
+    "\n                then '; (' || prd.t_corschem || ') ' || csd.t_name",
+    "\n                else '; (' || prd.t_corschem || ') ' || csd.t_name || ', (' || prc.t_corschem || ') ' || csc.t_name",
+    "\n           end params",
+    "\n     from (select step.*, op.* ",
+    "\n             from doprstep_dbt step,",
+    "\n                 (select oper.t_id_operation id_op, pm.t_paymentid, pm.origin",
+    "\n                    from doproper_dbt oper,",
+    "\n                         (select paym.*,",
+    "\n                                 case when (paym.t_dockind in (" + CONST_ORIGLIST + "))",
+    "\n                                      then decode( user_ea.getOrigin(paym.t_docKind, paym.t_paymentID),",
+    "\n                                                   9999, decode( paym.t_primdocorigin, 9999, paym.t_origin, paym.t_primdocorigin ),",
+    "\n                                                   user_ea.getOrigin(paym.t_docKind, paym.t_paymentID) )",
+    "\n                                      else decode( paym.t_primdocorigin, 9999, paym.t_origin, paym.t_primdocorigin )",
+    "\n                                 end origin",
+    "\n                            from (select * from dpmpaym_dbt "
+    "\n                                   where t_paymstatus in (100,32000) "
+    "\n                                     and t_closedate = ? ) paym",
+    "\n                         ) pm",
+    "\n                   where lpad(pm.t_paymentid, 34, '0') = oper.t_documentid ",
+    "\n                     and pm.t_dockind = oper.t_dockind",
+    "\n                 ) op",
+    "\n            where op.id_op = step.t_id_operation",
+    "\n          ) st",
+    "\n         ,doprostep_dbt ost",
+    "\n         ,usr_doprstep_robot_dbt rst",
+    "\n         ,dpmrmprop_dbt rm",
+    "\n         ,(select * from dpmprop_dbt where t_debetcredit = 0) prd",
+    "\n         ,(select * from dpmprop_dbt where t_debetcredit = 1) prc",
+    "\n         ,(select t_shifr_oper, t_comment from dcipher_dbt) sfr",
+    "\n         ,(select t_number, t_name, t_fiid from dcorschem_dbt union select -1, 'Внутренний', 0 from dual) csd",
+    "\n         ,(select t_number, t_name, t_fiid from dcorschem_dbt union select -1, 'Внутренний', 0 from dual) csc",
+    "\n    where st.t_blockid = ost.t_blockid ",
+    "\n      and st.t_number_step = ost.t_number_step ",
+    "\n      and st.t_id_operation = rst.t_id_operation(+) ",
+    "\n      and st.t_number_step = rst.t_number_step(+) ",
+    "\n      and st.t_paymentid = rm.t_paymentid",
+    "\n      and rm.t_shifroper = sfr.t_shifr_oper(+)",
+    "\n      and st.t_paymentid = prd.t_paymentid",
+    "\n      and prd.t_corschem = csd.t_number",
+    "\n      and decode(prd.t_corschem, -1, 0, prd.t_payfiid) = csd.t_fiid",
+    "\n      and st.t_paymentid = prc.t_paymentid",
+    "\n      and prc.t_corschem = csc.t_number",
+    "\n      and decode(prc.t_corschem, -1, 0, prc.t_payfiid) = csc.t_fiid",
+    "\n      and st.t_oper not in (" + roboList + ") ",
+    "\n      and nvl(rst.t_is_robot_step, chr(0)) != chr(88)",
+    "\n      and nvl(rst.t_program, 'X') != 'ate.exe'",
+    strTime,
+    strSource,
+    strCipher,
+    strSchemeDeb,
+    strSchemeCred,
+    "\n      group by st.t_paymentid, st.t_dockind, st.origin, ost.t_name, st.t_symbol, st.t_id_operation,",
+    "\n               rm.t_shifroper, sfr.t_comment, prd.t_corschem, prc.t_corschem, csd.t_name, csc.t_name",
+    "\n      order by st.t_paymentid",
+    "\n   ) b",
+    "\n   group by b.t_paymentid, b.t_dockind, b.origin, b.t_id_operation"
+        );
+
+    //запрос выполняется для каждого дня в отдельности, т.к. нужна статистика по дням с отсутствующими платежами
+    while (curDate != endDate + 1)
+
+        cmd = RSDCommand(query);
+        cmd.addParam("currentDate", RSDBP_IN, curDate);
+        rs = RSDRecordset(cmd);
+
+        dayExists = false;
+
+        while (rs.moveNext)
+            dayExists = true;
+            i = 0;
+            resultSize = aResult.size/RES_SIZE;
+
+            useProgress(progressCounter);
+            progressCounter = progressCounter + 1;
+
+            //ищем существующую запись с полученными параметрами
+            while (not (
+                (    (aResult[RES_SIZE*i] == rs.value("t_dockind"))
+                 and (aResult[RES_SIZE*i+2] == rs.value("origin"))
+                 and (aResult[RES_SIZE*i+4] == rs.value("params"))
+                )
+                or (i == resultSize) ))
+                    i = i + 1;
+            end;
+
+            //Инициализация структуры, если встретился следующий тип документа или источника
+            if (i == resultSize)
+
+                j = 0; //поиск наименования
+                while (aDockind[DOCKIND_SIZE*j+1] != rs.value("t_dockind"))
+                    j = j + 1;
+                end;
+                aResult[RES_SIZE*i] = rs.value("t_dockind"); //вид документа
+                aResult[RES_SIZE*i+1] = aDockind[DOCKIND_SIZE*j+2]; //наименование вида документа
+
+                j = 0; //поиск происхождения
+                while (aSource[SOURCE_SIZE*j+1] != rs.value("origin"))
+                    j = j + 1;
+                end;
+                aResult[RES_SIZE*i+2] = aSource[SOURCE_SIZE*j+1]; //происхождение документа
+                aResult[RES_SIZE*i+3] = aSource[SOURCE_SIZE*j+2]; //наименование происхождения документа
+
+                aResult[RES_SIZE*i+4] = rs.value("params"); //прочие характеристики документа
+                aResult[RES_SIZE*i+5] = rs.value("steps");  //список шагов с ручной обработкой
+                aResult[RES_SIZE*i+6] = 0;  //количество обраб. документов
+                aResult[RES_SIZE*i+7] = ""; //paymentid документов
+
+            end;
+
+            aResult[RES_SIZE*i+5] = aResult[RES_SIZE*i+5] + ";" + rs.value("steps");
+            aResult[RES_SIZE*i+6] = aResult[RES_SIZE*i+6] + 1;
+
+            if (debugMode)
+                if (aResult[RES_SIZE*i+6] < debugNumDocs + 1)
+                    aResult[RES_SIZE*i+7] = aResult[RES_SIZE*i+7] + "," + rs.value("t_paymentid");
+                end;
+            end;
+
+        end;
+
+        if (not dayExists)
+            strDayExists = strDayExists + ", " + curDate;
+        end;
+
+        curDate = curDate + 1;
+    end;
+
+    //перегруппируем массив результатов: может возникнуть ситуация, когда запись с новым значением источника 
+    //для существующего значения вида документа оторвана от группы предыдущих записей с этим видом документа
+    if (aResult.size >= RES_SIZE+1) aResult = sortme(aResult, RES_SIZE); end;
+
+    if (strDayExists != "")
+        strDayExists = "За следующие дни платежи отсутствуют: " + substr(strDayExists,3);
+    end;
+
+    RemProgress();
+    Message("Формирование Excel-файла...");
+end;
+/*----------------------------------------------------------------------------*/
+//x - строка, y - столбец
+
+private macro Put_Cell_Border(Lst, x, y, string, al)
+    if (valtype(al) == V_UNDEF) al = 3 end;
+    Lst.Cells(x, y).NumberFormat = "@";
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = al;
+    Lst.Cells(x, y).Borders.LineStyle = 1;
+end; /*End Of Put_Cell_Border*/
+
+private macro Put_Cell(Lst, x, y, string, al)
+    if (valtype(al) == V_UNDEF) al = 3 end;
+    Lst.Cells(x, y).NumberFormat = "@";
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = al;
+end; /*End Of Put_Cell*/
+
+private macro MakeExcelRep(ComObj)
+    var i : integer = 0,
+        rs,
+        List = ComObj.Sheets(1),
+        tempstr : string = "",
+        alLeft = 2,
+        alRight = 4,
+        alCenter = 3;
+
+    List.Columns("A:A").ColumnWidth  = 11;
+    List.Columns("B:B").ColumnWidth  = 28;
+    List.Columns("C:C").ColumnWidth  = 30;
+    List.Columns("D:D").ColumnWidth  = 35;
+    List.Columns("E:E").ColumnWidth  = 35;
+    List.Columns("F:F").ColumnWidth  = 11;
+
+    List.Range("A2:F2").Merge;
+    List.Range("A2:F2").Font.Bold = True;
+    Put_Cell(List, 2, 1, REP_NAME_UPPER);
+
+    List.Range("A4:C4").Merge;
+    List.Range("A4:C4").Value = string("Подразделение (Банк): " + {Name_Bank});
+
+    List.Range("D4:F4").Merge;
+    List.Range("D4:F4").Value = string("За период с " + startDate + " по " + endDate);
+
+    List.Range("A6:C6").Merge;
+    List.Range("A6:C6").Value = string("Дата, время формирования отчёта: " + date + " " + time);
+
+    List.Range("D6:F6").Merge;
+    List.Range("D6:F6").Value = "Параметры фильтра:";
+
+    rs = RsdRecordSet(string("select t_name from dperson_dbt where t_oper = " + {oper}));
+    rs.movenext;
+
+    List.Range("A8:C8").Merge;
+    List.Range("A8:C8").Value = string("Исполнитель: {" + {oper} + "} " + rs.value("t_name"));
+
+    tempstr = "";
+    for (i, 0, aDockind.size/DOCKIND_SIZE)
+        if (aDockind[DOCKIND_SIZE*i] == true) tempstr = tempstr + ", " + aDockind[DOCKIND_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+    
+    List.Range("D8:F8").Merge;
+    List.Range("D8:F8").Value = string("Вид документа:" + tempstr);
+
+    tempstr = "";
+    for (i, 0, aSource.size/SOURCE_SIZE)
+        if (aSource[SOURCE_SIZE*i] == true) tempstr = tempstr + ", " + aSource[SOURCE_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+
+    List.Range("D9:F9").Merge;
+    List.Range("D9:F9").Value = string("Источник поступления: " + tempstr);
+
+    List.Range("D10:F10").Merge;
+    List.Range("D10:F10").Value = string("Время поступления: " + startTime + " - " + endTime);
+
+    tempstr = "";
+    for (i, 0, aScheme.size/SCHEME_SIZE)
+        if (aScheme[SCHEME_SIZE*i] == true) tempstr = tempstr + ", " + aScheme[SCHEME_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+
+    List.Range("D11:F11").Merge;
+    List.Range("D11:F11").Value = string("Схема расчетов: " + tempstr);
+
+    tempstr = "";
+    for (i, 0, aCipher.size/CIPHER_SIZE)
+        if (aCipher[CIPHER_SIZE*i] == true) tempstr = tempstr + ", " + aCipher[CIPHER_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+
+    List.Range("D12:F12").Merge;
+    List.Range("D12:F12").Value = string("Шифр документа: " + tempstr);
+
+    List.Range("A14:F14").Interior.Color = #B5B5B5;
+    List.Range("A14:F14").WrapText = True;
+
+    Put_Cell_Border(List,14,1,string("Код вида документа")); 
+    Put_Cell_Border(List,14,2,string("Наименование вида документа"));
+    Put_Cell_Border(List,14,3,string("Источник поступления"));
+    Put_Cell_Border(List,14,4,string("Прочие характеристики документов"));
+    Put_Cell_Border(List,14,5,string("Список шагов, на которых использовалась ручная обработка"));
+    Put_Cell_Border(List,14,6,string("Количество документов"));
+
+    if (debugMode)
+        List.Columns("G:G").ColumnWidth = 17;
+        Put_Cell_Border(List,14,7,string("ID платежей"));
+    end;
+
+    if (aResult.size/RES_SIZE != 0)
+        for (i, 0, aResult.size/RES_SIZE-1)
+            Put_Cell(List, 15+i, 1, aResult[RES_SIZE*i], alRight);   //код вида
+            Put_Cell(List, 15+i, 2, aResult[RES_SIZE*i+1], alLeft);  //наим. вида
+            Put_Cell(List, 15+i, 3, aResult[RES_SIZE*i+3], alLeft);  //источник
+            Put_Cell(List, 15+i, 4, aResult[RES_SIZE*i+4], alLeft);  //прочие характеристики
+            Put_Cell(List, 15+i, 5, strDelDups(aResult[RES_SIZE*i+5]), alLeft);  //список шагов
+            Put_Cell(List, 15+i, 6, aResult[RES_SIZE*i+6], alRight); //кол-во документов (всего)
+            if (debugMode) Put_Cell(List, 15+i, 7, substr(aResult[RES_SIZE*i+7],2), alLeft); end;  //id платежей
+        end;
+    end;
+
+    List.Cells(15+aResult.size/RES_SIZE+2,1).Value = strDayExists;
+end; /*End Of MakeExcelRep*/
+
+Macro OpenExcel()
+    var ExObj;
+    var ComObj;
+      
+    ExObj  = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+    ComObj = ExObj.CreateComObject ("Excel.Application", False);
+    ComObj.Application.DisplayAlerts = True;
+    ComObj.Workbooks.Add();
+
+    MakeExcelRep(ComObj);
+    
+    ComObj.Visible = True;
+    
+End; /* End Of OpenExcel */
+
+
+
+macro main();
+    var form: TRsbPanel = RslPanel(REP_NAME);
+    form.run();
+    if (formRun)
+        Message("Обработка результатов запроса...");
+        core();
+        Message("Формирование Excel-файла...");
+        OpenExcel();
+    end;
+end;
+                               
+main();
+exit(1);

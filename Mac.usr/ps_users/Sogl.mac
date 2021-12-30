@@ -1,0 +1,172 @@
+import PaymInter;
+import "AvtoTypePayment.mac", "ppp.mac", "pschkrst.mac", lib_pm_check, op_lib;
+import OprInter, oralib; //Jushmanov 2014-02-20 C-19151
+import "likepy.mac";
+
+var PaymentObj:RsbPayment;
+private var obj:object;
+private var PrichSogl="";
+/*SDA - для KS  */    
+private const fgBank = fg_life_subject({OurBank});
+private const err_payacc_J = "Счет-плательщика имеет тип J";
+private const err_has_duplicates = "найден аналогичный документ";
+
+MACRO ExecuteStep( doc, payorder, DocKind:integer, ID_Operation:integer, ID_Step:integer  )
+    debugbreak;
+    var stat:integer = 0;
+    var Direct     = GetOprStatus(OPR_PAYM_DIRECT);
+    debugbreak;
+  
+    //VV C-17836 18.02.13
+    //Gurin S. 15.03.2013 только для "01"
+    if ((PaymentObj.ShifrOper == "01") and (CheckValuedate(PaymentObj)))
+        RejectPayment( PaymentObj, "Дата документа отстает от текущей более чем на 11 дней" );
+        return 1;
+    end;
+    //TAM 17.09.2012 I-00253600-2
+    if (ВходитВГруппу({oper},160)) //160 - Обработчики
+        return 1;
+    end;
+    /*if (({oper}>=20000)or // KS 12.03.2012 Обработчикам данный шаг выполнять нельзя
+        ({oper}==10001))
+      return 1;
+    end;*/
+
+    If(GetTrue(true,"Документ требует согласования, проводить?"));
+        //Gurin S. 23.10.2013 C-24064-6
+        var payacc = RSL_Account(PaymentObj.PayerAccount, PaymentObj.PayerFIID);
+
+        if (((PaymentObj.ShifrOper=="02") or (PaymentObj.ShifrOper=="06")) and payacc.check_type_account("О") and (PM_GetRest(PaymentObj.PayerAccount) < PaymentObj.PayerAmount))
+            //В PM_RESTFUN.CheckFreeAmountForPayment запретим для этих документов списание за счет овердрафта
+            var sql = "INSERT INTO usr_ipptfromsogl_log (t_paymentid, t_valuedate) "
+                      "VALUES (:p_paymentid, :p_valuedate) ";
+            execSql (sql, makeArray (SQLParam ("p_paymentid", PaymentObj.PaymentID), SQLParam ("p_valuedate", PaymentObj.Valuedate)));
+
+            stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );
+        end;
+
+        PaymentObj.ValueDate = {curdate};
+
+        if (PaymentObj.OutTransferDate < {curdate} )
+            PaymentObj.OutTransferDate = {curdate};
+        end;
+
+        /*SDA 06.04.2012 */
+        // zmp 27.11.2013 I-00446573 
+        if (PaymentObj.DocKind != 202)
+            SetMFORule(PaymentObj.PaymentID);
+        end;  
+
+        stat = УстановитьСтатусыПлатежа(118,1);
+
+        //zmp 26.04.2012 документы с происхождением файн-ридер должны идти на автоконтроль
+        if( DocKind == PS_PAYORDER )
+            obj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+            if(Obj.Origin == PSPO_OR_FINEREADER)
+                return stat;
+            end;
+        end;
+
+        if (stat == 0)
+        /* EVG 15/06/2012 По просьбе Nadezhda E Loginova, заявка I-00207710-1 для валютных 
+           платежей открывается шаг "Контроль" после согласования. */
+            if( not PaymentObj.BaseFIID )
+                /*SDA 26.03.2012 - документы после согласования не нужно ставить на контроль */
+                stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL );
+            else
+                stat = УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL );
+            end;
+        end;
+        /*SDA - для KS  */
+        //TAM 14.09.2012 I-00250673-2 - раз для KS, то пусть будут конкретные доки, а не все с J
+        PaymentObj.readnote(123,PrichSogl);
+
+        if (PM_IsPaymentERC(PaymentObj))         
+            stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );
+        end;
+
+        //VV C-24133
+        if(     (fgBank.is_PRBB) 
+            and (PaymentObj.PayerAmount>=90000)
+            and (  (PaymentObj.NumberPack==7005)
+                or (PaymentObj.NumberPack==3005)
+                or (PaymentObj.NumberPack==1002)
+                or (PaymentObj.NumberPack==1003)
+                or (PaymentObj.NumberPack==8002) )
+            and (  (PaymentObj.ShifrOper=="02") or
+                   (PaymentObj.ShifrOper=="06") )  )
+                stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );
+        end;       
+
+        //VV C-22956 09.09.13
+        if( (fgBank.is_VUZ)  and
+                 ( (PaymentObj.Origin == 3300)   or
+                   (PaymentObj.Origin == 2100  ) or
+                   (PaymentObj.Origin == 19  ) ) and
+                 ( (PaymentObj.ShifrOper=="02") or
+                   (PaymentObj.ShifrOper=="06") ) )
+            stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );   
+        end;
+
+        /* 01.02.2013 Golovkin I-00319590 проверка остатка */
+        if( (fgBank.is_EXV) 
+             and ( (PaymentObj.Origin == 3300) or
+                   (PaymentObj.Origin == 19  ) )
+             and ( index(PrichSogl,err_payacc_J) )
+          )
+            stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );
+        end;
+
+        // Golovkin 16.07.2014 C-22939 поиск задвоенных документов
+        if((PaymentObj.ShifrOper == "06") and inList(PaymentObj.NumberPack,1003,1002,7005,8002) and fgBank.is_PRBB() and index(PrichSogl,err_has_duplicates))
+            stat = PS_CheckAccRest( PaymentObj, ID_Operation, ID_Step );
+        end;
+
+        /*joy 24-10-2013 C-24098-6 По платежным поручениям ручного ввода появилась ед. комиссия*/
+        /*joy 06-11-2013 R-278975  Перенесла проверку в общий макрос*/
+        if ( PaymentObj.DocKind == PS_PAYORDER )
+            var psobj = GenObject( "RsbPsPayOrder", PaymentObj.DocumentID );
+            var checkneedpzo = execMacroFile ("lib_pm_check.mac", "GoToPZO", psobj);
+            if (checkneedpzo)
+                УстановитьСтатусыПлатежа( OPR_PAYM_PZO, OPR_PAYM_ST_PZO_NEED );
+            end;
+        end;
+
+
+//На шагах блока 11000119 "Доп. Контроль (согласование)" может быть установлено значение 3 "Картотека 2" сегмента статуса операции 304 "Картотека"
+//На шагах блока 11000119 "Доп. Контроль (согласование)" не может быть установлено значение 1 "Нет" сегмента статуса операции 304 "Картотека"
+//На шагах блока 11000119 "Доп. Контроль (согласование)" может быть установлено значение 9 "Ожидание" сегмента статуса операции 304 "Картотека"
+//На шагах блока 11000119 "Доп. Контроль (согласование)" может быть установлено значение 4 "Зачисление" сегмента статуса операции 292 "Документооборот"
+//На шагах блока 11000119 "Доп. Контроль (согласование)" может быть установлено значение 1 "Проведен по счетам МФР" сегмента статуса операции 293 "ЦАБС"
+//На шагах блока 11000119 "Доп. Контроль (согласование)" может быть установлено значение 2 "Требуется " сегменат статуса ПЗО (т.е. ед.комиссия)
+
+        return stat;
+    End;
+
+    return 1;
+end;
+
+//Jushmanov 2014-02-20 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(logquery, null, false);
+    end;
+
+    return 0;
+
+end;

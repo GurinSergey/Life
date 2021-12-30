@@ -1,0 +1,186 @@
+// -------------------------------------------------------------------------------------------------
+// @filename : fns_export.mac
+// @author   : Lavrenov A.A. 
+// @desc     : Обработка выгруженых сообщений ФНС
+// @request  : C-12440-6 
+// @revision : 1.0 12.07.2012
+//           : 1.1 Chesnokov D.S. 02.10.2012 по заявке I-00261902
+// -------------------------------------------------------------------------------------------------
+import bankinter, rsbdataset, globals, rsexts;
+
+private macro normalizePath(path)
+   if (SubStr(path, StrLen(path), 1)!="\\")
+      path = path + "\\";
+   end;
+   return path;
+end;
+
+//Создаем папку для архива
+private macro get_archive_path(path, filedate)
+   var strdate, dd, mm, yyyy, retpath;
+
+   datesplit(filedate,dd,mm,yyyy);
+
+   if(dd<=9)
+      dd = "0" + dd;
+   end;
+
+   if(mm<=9)
+      mm = "0" + mm;
+   end;
+
+   strdate = string(yyyy) + string(mm) + string(dd); //I-00261902
+   retpath = path + "\\" + strdate; 
+   //Создаем папку, если такая уже есть, то вернем ее имя
+   MakeDir (retpath);
+   return retpath + "\\";
+end;
+
+//Получаем либо создаем логфайл 
+private macro get_logfile_name(oper, path, dont_create)
+   var file_name, i = 1;
+  
+   file_name = path+"Batch_"+OPER+"_"+i+".txt"; 
+   while( existfile( file_name ))
+      i = i + 1;
+      file_name = path+"Batch_"+OPER+"_"+i+".txt"; 
+   end;
+   
+   //в файл суем шапку   
+   if(not dont_create)
+      setoutput(file_name,true);
+      [       Сообщения, выгруженные из RS-Bank
+        Операционистом: #####  за дату: ########## ##########
+        
+       =====                                             ]
+      ({oper}, date, time);
+      setoutput(null,true);
+   end;
+   return file_name;
+end;
+
+
+private macro export_mes()
+   var errCode, ARCHIVE_PATH, EXPORT_DIR, EXPORT_DIR_USR, SERVER_TMP_DIR;
+   var copy_from, copy_to, logfile_name;
+   var i=0, j=0;
+   var DirList;
+ 
+   //Читаем настройку каталога архивации
+   GetRegistryValue("PRBB\\FNS\\ARCHIVE_PATH", V_STRING, ARCHIVE_PATH, errCode,null,9999);
+   if ( errCode > 0 )
+      ARCHIVE_PATH = "";
+   else
+      // Lavrenov: к настройке добавляем Export
+      ARCHIVE_PATH = ARCHIVE_PATH + "\\EXPORT";
+      if (not existfile(ARCHIVE_PATH))
+         MakeDir (ARCHIVE_PATH);
+      end;
+      ARCHIVE_PATH = get_archive_path(ARCHIVE_PATH, date);
+   end;  
+
+   //Читаем настройку каталога выгрузки для пользователя 9999 (подразумеваем общую настройку), так как у него полюбасу не будет собственной настройки
+   GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ", V_STRING, EXPORT_DIR_USR, errCode);
+   if ( errCode > 0 )
+      msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ");
+      return;
+   else
+      EXPORT_DIR_USR = normalizePath(EXPORT_DIR_USR);
+   end;  
+
+   //Читаем настройку каталога выгрузки для текущего пользователя
+   GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ", V_STRING, EXPORT_DIR, errCode, null, 9999);
+   if ( errCode > 0 )
+      msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ");
+      return;
+   else   
+      EXPORT_DIR = get_archive_path(EXPORT_DIR, date);
+   end;  
+  
+   //Читаем настройку временного каталога
+   GetRegistryValue("PRBB\\FNS\\SERVER_DIR", V_STRING, SERVER_TMP_DIR, errCode);
+   if ( errCode > 0 )
+      msgbox("Проверьте наличие настройки: PRBB\\FNS\\SERVER_DIR");
+      return;
+   else
+      SERVER_TMP_DIR = normalizePath(SERVER_TMP_DIR);
+   end;  
+
+   //Получаем список файлов 
+   DirList = TDirList(EXPORT_DIR_USR + "*.*","F");    
+
+   if(DirList.Count == 0)
+      msgbox("В папке "+EXPORT_DIR_USR+" сообщения отсутствуют");
+      return;
+   else
+      //Получаем имя логфайла
+      logfile_name =  get_logfile_name({oper}, SERVER_TMP_DIR, false);  
+
+      initprogress(DirList.Count,"Копирование файлов...","Копирование файлов...");
+      //Бежим по файлам
+      while (i < DirList.Count)
+     
+         useProgress(i);
+         //Если копирование идет с машины пользователя, то следующая строка эффекта не возымеет
+         run(Getenv("windir")+"\\system32\\attrib.exe ","-r "+EXPORT_DIR_USR+DirList.Name(i));
+         
+         copy_from = EXPORT_DIR_USR + DirList.Name(i);
+         copy_to   = EXPORT_DIR + DirList.Name(i);
+         
+         errCode = "";
+         if(existfile( copy_to ))
+            msgbox("Файл существует, проверьте правильность формирования");
+            errCode = "- Файл существует, проверьте правильность формирования";
+         else
+            if (not CopyFile(copy_from, copy_to))
+               errCode = "- Не получилось скопировть файл";
+            else
+               if(errCode == "")
+                  //Если прочитать настройку не удалось или в ней пусто то не архивируем.
+                  if(ARCHIVE_PATH != "")
+                    
+                     copy_to = ARCHIVE_PATH + DirList.Name(i);
+                    
+                     //Если файл уже есть добавляем префикс к нему
+                     j = 0;
+                     while( existfile( copy_to ))
+                        j = j + 1;
+                        copy_to =  ARCHIVE_PATH + DirList.Name(i) + "_" + String( j );
+                     end;
+                  
+                     //Если скопировать не удалось возвращаем ошибку
+                     if (not CopyFile(copy_from, copy_to))
+                        println("- Не получилось скопировть файл");
+                     end;
+                  end;
+              
+                  if (not removeFile(copy_from))
+                     errCode = "- Не получилось удалить файл";
+                  end;
+               end;
+            end;
+         end;
+         //пишем в протокол
+         setoutput(logfile_name,true);
+         println(copy_from + " " + errCode);
+         setoutput(null,true);
+        
+         i = i + 1;
+      end;
+      remProgress();
+      //Показываем протокол
+      viewfile(logfile_name);
+
+      if(ARCHIVE_PATH != "")
+         //Копируем протокол в ARCHIVE_PATH
+         copy_to = get_logfile_name({oper}, ARCHIVE_PATH, true); 
+         if (not CopyFile(logfile_name, copy_to))
+           println("Не получилось скопировть файл " + logfile_name + " в " + copy_to);
+         end;
+         //Убиваем протокол
+         removefile(logfile_name);
+      end;
+   end; 
+end;
+
+export_mes();

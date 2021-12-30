@@ -1,0 +1,154 @@
+/* ╔══════════════════════════════════════════════════════════════════╗ */
+/*         Автоматизированная банковская система RS-Bank v6.0           */
+/*                 Copyright (c) R-Style Software Lab 2004              */
+/*                                                                      */
+/*  Имя файла  : reqcrsv.mac                                            */
+/*                                                                      */
+/*  Описание   : Операция - 3030 - "Открытие лицевого счета"            */
+/*               Шаг      - 20   - "Создание договора обслуживания"     */
+/*  Изменен    : Gurin S. 03.04.2013 I-00351495-2                       */
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+/* ╚══════════════════════════════════════════════════════════════════╝ */
+IMPORT InsCarryDoc, reqinter, SfInter, PSInter;
+import oralib, likepy;
+
+var ReqOpenAccObj:RsbReqOpenAcc;
+
+private file SfCntrOld( "sfcontr.dbt" );
+private file SfSsi    ( "sfssi.dbt"   );
+private file SettAcc  ( "settacc.dbt" );
+
+RECORD RecordAcc    ( account ); 
+record attr  (account);
+
+private macro Get_FeeTypeAndNumber( ComissCode, FType, FNumber )
+
+  var select    :string;
+  var params    :TArray;
+  var rs        :object;
+  var FeeType   :integer;
+  var FeeNumber :integer;
+
+  select = " select comiss.T_FeeType, comiss.T_Number " +
+           " from   dsfcomiss_dbt comiss              " +
+           " where  comiss.t_Code = :ComissCode       "; 
+
+  params = makeArray( SQLParam( "ComissCode", ComissCode ) );
+  rs     = execSQLselect( select, params, FALSE );
+
+  if( rs AND rs.moveNext() ) 
+    FeeType   = rs.value(0);
+    FeeNumber = rs.value(1);
+  else
+    FeeType   = 0;
+    FeeNumber = 0;
+  end;
+
+  SetParm( 1, FeeType   );
+  SetParm( 2, FeeNumber );
+
+end;
+
+//Gurin S. 03.04.2013 I-00351495-2
+private macro GetAccCode(m_account)
+    var cmd, rs;
+    cmd = RSDCommand("SELECT USR_GenerateAccCode(:acc) acccode from dual");
+    cmd.AddParam("acc", RSDBP_IN, m_account);
+    cmd.execute;
+
+    rs = RsdRecordset(cmd);
+    if (rs and rs.movenext()) return rs.value("acccode") else return ""; end;
+end;
+
+macro GetPartyIDByCode( CodeKind, Code )
+  FILE partcode (partcode) key 1;
+  partcode.CodeKind = CodeKind;
+  partcode.Code     = Code;
+  if( GetEQ( partcode ) )
+    return partcode.PartyID;
+  else
+    return {OurBank};
+  end;
+end;
+
+/* Выполнение шага */
+MACRO ExecuteStep( doc, reqacc )
+
+  const OurBank  = 0;
+  var   ZeroDate = Date( 0, 0, 0 );
+  var   OldSfID  = 0;
+  var   sfssidl  = TArray;
+  var   UContrID = -1;//ID сводного ДО
+
+  record SfCntr  ( "sfcontr.dbt", "bank.def" );
+
+  ClearRecord( SfCntr );
+ 
+  /* Если существует договор для счета - просто выходим */
+  if( ExistSfForAccount( ReqOpenAccObj.Code_Currency, ReqOpenAccObj.Account ) )
+    return 0;    
+  end;
+
+  SfCntr.ID           = 0;                                      /* Идентификатор */
+  SfCntr.objectType   = SF_ACCOUNT;                             /* Тип объекта начисления SfObjectTypes */
+  SfCntr.FIID         = ReqOpenAccObj.Code_Currency;            /* Валюта объекта начисления */
+  SfCntr.dateBegin    = ReqOpenAccObj.Date;                     /* Дата начала */
+  SfCntr.dateProlong  = ZeroDate;                               /* -- пролонгации */
+  SfCntr.dateClose    = ZeroDate;                               /* -- закрытия */
+  SfCntr.DateConc        = ReqOpenAccObj.SfContrDate;              /* -- заключения */
+  SfCntr.ServKind     = PTSK_PAY;                               /* TPTSERVKINDS */
+  SfCntr.number       = ReqOpenAccObj.SfContrNum;               /* Номер договора */
+  SfCntr.payMethod    = ReqOpenAccObj.SfPayMethod;              /* Метод формирования оплат */
+  SfCntr.partyID      = ReqOpenAccObj.ClientID;                 /* Идентификатор клиента */
+  SfCntr.ContractorID = {OurBank};
+  SfCntr.Department   = ReqOpenAccObj.AccountDepartment;        /* Филиал */
+  SfCntr.Branch       = ReqOpenAccObj.AccountBranch;            /* ВСП */
+  SfCntr.object          = ReqOpenAccObj.Account;                  /* Объект начисления */
+  SfCntr.Name            = "Договор №" + ReqOpenAccObj.SfContrNum;              /* Название договора обслуживания */
+  //SfCntr.AccCode         = ReqOpenAccObj.SfAccCode;                /* Код договора в номере счета */
+  //Gurin S. 03.04.2013 I-00351495-2 
+  if (ReqOpenAccObj.SfAccCode == "") 
+      SfCntr.AccCode      = GetAccCode(ReqOpenAccObj.Account); 
+  else
+      SfCntr.AccCode         = ReqOpenAccObj.SfAccCode;
+  end; 
+
+  /* EVG Метод формирования оплат ТО = "Плат. требование" */
+  SfCntr.InvMethod       = 2;              /* Способ оплаты ТО */
+  SfCntr.Invoiceduration = ReqOpenAccObj.SfInvoiceDuration;        /* Срок действия ТО */
+  SfCntr.SetaccSearchAlg = ReqOpenAccObj.SfSetAccSearchAlg;        /* Алгоритм поиска СПИ в ДО */
+  SfCntr.PayFIId         = ReqOpenAccObj.SfPayFIID;                /* Валюта оплаты ТО */
+  /*FIV Принудительно ставим курс ЦБ*/
+  SfCntr.PayRateId       = 7;              /* Вид курса валюты ТО */
+  SfCntr.PayRatePercent  = ReqOpenAccObj.SfPayRatePercent;         /* Процент к курсу оплаты ТО */
+  SfCntr.PayRateDateKind = ReqOpenAccObj.SfPayRateDateKind;        /* Вид даты курса оплаты ТО */
+  
+  if( ReqOpenAccObj.SfPlanID != 0 )
+    ReqOpenAccObj.SfComGroup = 0;
+  end;
+  
+                  
+  /* Заполнить параметры для СПИ REQOPENA*/ 
+  sfssidl[0]               = TRecHandler("sfssidl.str", "bank.def" );
+  sfssidl[0].rec.BankID    = {OurBank};
+  sfssidl[0].rec.Chapter   = 1;
+  sfssidl[0].rec.FIID      = ReqOpenAccObj.Code_Currency; /* валюта плательщика */
+  sfssidl[0].rec.FeeType   = 0;
+  sfssidl[0].rec.FeeNumber = 0;
+  sfssidl[0].rec.Account   = ReqOpenAccObj.Account;       /* счет плательщика   */
+
+  if( ReqOpenAccObj.CreateUC == "X" )
+    UContrID = 0;
+  elif( ReqOpenAccObj.UnionContrID > 0 )
+    UContrID = ReqOpenAccObj.UnionContrID;
+  end;
+
+  if( not InsertSfContract( SfCntr, ReqOpenAccObj.SfComGroup, sfssidl, OldSfID, ReqOpenAccObj.SfPlanID, 
+                            IfThenElse( UContrID >= 0, UContrID, NULL ), ReqOpenAccObj.ProductID ) )
+    MsgBox( "Ошибка при открытии договора обслуживания " + ReqOpenAccObj.SfContrNum );
+    return  1;
+  end;
+
+  return 0;
+
+END;

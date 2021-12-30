@@ -1,0 +1,352 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: soa_account.mac v.2
+// @author  : 2013-05-01 zip_z. 
+// @desc    : ТК Life - лицевые счета
+// -------------------------------------------------------------------------------------------------
+import bankinter;
+import soa_core,"op_lib.mac", "lib_fg.mac";
+
+// @desc  : найти подразделение опера
+// @return: V_INTEGER 
+macro getOperBranch( _oper )
+    var cmd, rs;
+    cmd = rsdCommand( " SELECT   T_CODEDEPART "
+                      "   FROM   DPERSON_DBT "
+                      "  WHERE   T_OPER = :OPER " );
+    cmd.addparam( "", RSDBP_IN, _oper );
+
+    rs = rsdRecordset( cmd );
+
+    if( rs.movenext ) return rs.value( "T_CODEDEPART", NULL, V_INTEGER );
+    else              return {operdprtnode};
+    end;
+onerror return {operdprtnode};              
+end;
+
+// @desc  : проверка на допустимость ввода счета, ЭВ только
+// @return: V_BOOL 
+private macro banAccount ( _account, _oper )
+     if ( not  _bank.is_EXV_Saratov ) return false; end;
+
+     var cmd = rsdCommand( "SELECT * FROM DUAL "+
+                           "WHERE REGEXP_LIKE (:ACC,'^1060[3,5]| "+
+                           "                         ^31[5-6]|^32[2,3,9]| "+ 
+                           "                         ^423|^43[1-9]|^440|^46[4-9]|^47[0-3]|^474[07,08,22,23,25]|^4742[6,7]| "+
+                           "                         ^50[1-3]|^50[5,7]|^514|^5260[1,2]| "+
+                           "                         ^91[314,419]|^9160[3,4]|^93[3,5,9]|^96[3,5,9]|^941|^971') " ); 
+
+     cmd.addparam( "ACC", RSDBP_IN, _account);  
+
+     var rs = rsdRecordset( cmd );
+     return ( rs.moveNext() and (substr( _account, 10, 2 ) == "76") and (_oper != "18888") );
+end;
+
+// @desc  : создать лицевой счёт
+// @return: V_INTEGER 
+macro usr_create_account ( p_client   :integer  // partyId клиента по л/счету 
+                          ,dep        :object   // блок данных "подразделение"
+                          ,acc        :object   // блок данных "описание лицевого счета"
+                          ):integer;
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    const ERR_NO_SFPLAN = 1; // ТП Фронта не найден в таблице соответствий
+    var stat, errm;
+    var cod_curr;
+    
+    // ПРОВЕРКИ ПАРАМЕТРОВ
+    
+    // 1. Ключ счета - до реализации запроса 196885
+    if (notnull (acc.account) and (getKey (acc.account, {mfo_bank}) != acc.account))
+        runError ("Ключ счёта неверен");
+    end;
+    
+    // 2. Наименование счета
+    if (isnull(safeGetPropMandatory (acc, "accName", V_INTEGER))) 
+        runError ("Отсутствует обязательный параметр - наименование счета");
+    end;
+    
+    // 3.LAO определение валюты счета, 
+    //если код валюты в номере счета будет отличаться от переданного кода, мы все равно получим ошибку
+    //Пример: счет 40702 810* а  внешн. сторона передала валюту 840 - возникнет ошибка "Символы 6-8 номера лицевого счета не содержат кода валюты"
+    if (isnull(safeGetProp (acc, "Currency", V_BOOL))) 
+        cod_curr = Acc_GetFiidByAccount (acc.account);
+    else
+   //     cod_curr = Acc_GetFiidByAccount (acc.account);
+        cod_curr = Acc_GetFiidByCode (Acc.Currency);
+    end;
+
+    // 4. VDN Проверка на допустимость создать счет, только ЭВ, R-621993
+    if ( banAccount ( acc.account, nvl_ex ( safeGetProp (acc, "oper", V_INTEGER) , {oper} ) ) )
+        runError ("Данная маска счетов БББББВВВК76ХХХХХХХХХ занята операций с ЦБ");
+    end;
+
+    // проверки пройдены, инициализируемся 
+    record daccount_dbt ("account.dbt"); clearrecord (daccount_dbt);
+    record daccblnc_dbt ("accblnc.dbt"); clearrecord (daccblnc_dbt);
+    
+    daccount_dbt.code_currency   = cod_curr;//LAO берем из внешней системы Acc_GetFiidByAccount (acc.account);
+    daccount_dbt.kind_account    = Acc_GetKindByAccount (acc.account);
+    
+    daccount_dbt.balance         = daccblnc_dbt.balance0 = Acc_GetBalanceByAccount (acc.account); 
+    daccount_dbt.account         = daccblnc_dbt.account  = acc.account;
+    daccount_dbt.chapter         = daccblnc_dbt.chapter  = nvl_ex (safeGetProp(acc, "chapter", V_INTEGER), Acc_GetChapterByAccount (acc.account));
+    
+    
+    daccount_dbt.department      = nvl_ex (safeGetProp (dep, "department" , V_INTEGER) ,{operdprt}     );
+    daccount_dbt.oper            = nvl_ex (safeGetProp (acc, "oper"       , V_INTEGER) ,{oper}         );
+    daccount_dbt.type_account    = nvl_ex (safeGetProp (acc, "accType"    , V_INTEGER) ,EMPTY_STRING   );
+    daccount_dbt.usertypeaccount = nvl_ex (safeGetProp (acc, "accUserType", V_INTEGER) ,EMPTY_STRING   );
+    daccount_dbt.nameaccount     = nvl_ex (safeGetProp (acc, "accName"    , V_INTEGER) ,EMPTY_STRING   );
+    daccount_dbt.open_date       = nvl_ex (safeGetProp (acc, "opendate"   , V_DATE   ) ,{curdate}      );
+   
+    daccount_dbt.client          = nvl_ex (p_client, {ourbank} );   
+    daccount_dbt.Sort            =substr(daccount_dbt.Account,1,5)+IfThenElse(substr(daccount_dbt.Account,6,3)=="810","###",substr(daccount_dbt.Account,6,3))+substr(daccount_dbt.Account,10,11);
+    // 04.12.2013 Golovkin R-296067 по-умолчанию подразделение надо брать от опера 
+    daccount_dbt.branch = nvl_ex (safeGetProp (dep, "branch", V_INTEGER), getOperBranch( daccount_dbt.oper ));
+    
+    // открытие счёта (bankinter::create_account)
+    stat = Create_Account (daccount_dbt, daccblnc_dbt, errm);
+    if (stat != RSL_EXIT_SUCCESS) 
+        runError (errm);
+    end;
+
+    // если нужно использовать выгруженный тарифный план (C-6046), пытаемся это сделать
+    if (safeGetProp(acc, "planid", V_INTEGER) !=0 )
+        var parm = makeArray (SQLParam ("p_client"     , daccount_dbt.client                  )
+                             ,SQLParam ("p_planfrontid", safeGetProp(acc, "planid", V_INTEGER))
+                             ,SQLParam ("p_department" , daccount_dbt.department              )
+                             ,SQLParam ("p_open_date"  , daccount_dbt.open_date               ));
+                           
+        // если ХП вернула ошибку - выбрасываем runError и прекращаем работу
+      //  if (ERR_NO_SFPLAN == 
+        execStoredFunc ("sf_connectfrontcontrplan", V_INTEGER, parm);
+        //    runError ("Счёт открыт без выгрузки ТП. Отсутствует привязка ТП Фронт (" + acc.planid + ") к ТП RS"); 
+       // end;
+    end;
+    
+  //  var table_name = iif (daccount_dbt.code_currency == 0, "daccount_dbt", "daccount$_dbt");
+  //  var table_name = iif (daccount_dbt.code_currency == 0, "daccount_dbt", "daccount$_dbt");
+    var sql = "select t_accountid from daccount_dbt where t_account = :account and t_chapter = :chapter and t_code_currency = :code_currency";
+    
+    //sql  = strsubst (sql, "$table_name$", table_name);
+    parm = makeArray (SQLParam ("account"       ,daccount_dbt.account       )
+                     ,SQLParam ("chapter"       ,daccount_dbt.chapter       )
+                     ,SQLParam ("code_currency" ,daccount_dbt.code_currency ));
+
+    sql = execSqlSelect (sql, parm, true);
+    if (sql.moveNext ())
+        return sql.value ("t_accountid", null, V_INTEGER);
+    end;
+    return 0;
+
+end;
+
+// @desc  : закрыть лицевой счёт
+// @return: V_BOOL (true = success)
+macro usr_close_account (p_chapter     :integer  // глава  
+                        ,p_account     :string   // номер л/счета
+                        ,p_close_date  :date     // дата закрытия 
+                        ):bool
+    // Vaschenko D. обнуляем опера
+    initSessionData();
+
+    // проверка обязательных параметров
+    if (isNull (p_account))
+        runError ("Не задан номер счета");
+    end;
+    
+    // дозаполняем непереданные параметры 
+    p_chapter    = nvl_ex (p_chapter, Acc_GetChapterByAccount (p_account));
+    p_close_date = nvl_ex (p_close_date, {curdate});
+    
+    // транзакция закрытия счета
+    var errm;
+    var stat = CB_CloseAccount (p_chapter, Acc_GetFiidByAccount (p_account), p_account, p_close_date, errm );
+    if (RSL_EXIT_SUCCESS == stat)
+        return true;
+    /*else
+      stat =   Update_Account (p_chapter
+                              ,Acc_GetFiidByAccount (p_account)
+                              ,p_account
+                              ,{oper}
+                              ,null
+                              ,ACC_TYPE_CLOSE
+                              ,null
+                              ,ACC_TYPE_AREST_Ct +ACC_TYPE_AREST_Dt
+                              ,p_close_date);
+   
+      if (stat != RSL_EXIT_SUCCESS)
+          runError (RSL_GetSystemError (stat)); 
+      end; 
+      return true;
+    end;       */
+    else
+        runError (errm); 
+    end;
+// пользовательский перехват исключений
+// onerror (e) catchUserError (e);
+end;
+
+// @desc  : обновить параметры лицевого счёта
+// @return: V_BOOL (true = success)
+macro usr_update_account (p_chapter  :integer  // глава 
+                         ,p_account  :string   // номер л/счета
+                         ,acc        :object   // структура параметров л/счета для овердрафта
+                         ):bool
+    // инициализация
+    var ac = RSL_Account (p_account);
+    var v_type_account : string = EMPTY_STRING;
+    var over = nvl_ex (safeGetProp (acc, "overdraft" , V_STRING), OVERDRAFT_ACTION_SET); //LAO В рамках ТЗ признак овердрафта не обязательный параметр, по умолчанию "SET"
+   
+    if (ac.rec.account!=p_account)
+        runError("Счет не найден:"+ p_account);
+    end;
+       
+    v_type_account = ac.rec.type_account;
+
+    
+     // установка признака лимита овердрафта
+    if   ( strupr (over) == OVERDRAFT_ACTION_SET )
+        if ( index (ac.rec.type_account, ACC_TYPE_OVERDRAFT) == 0)
+            v_type_account = ac.rec.type_account + ACC_TYPE_OVERDRAFT;
+        end;
+    
+    // очистка признака лимита овердрафта
+    elif ( strupr (over) == OVERDRAFT_ACTION_CLR )
+        v_type_account = strsubst (ac.rec.type_account, ACC_TYPE_OVERDRAFT       , EMPTY_STRING);
+        v_type_account = strsubst (v_type_account, ACC_TYPE_OVERDRAFT_CREDIT, EMPTY_STRING);
+    
+    // прилетело что-то еще: выбрасываем исключение и прекращаем работу
+    else
+        runError ("Неверное значение вида действия с овердрафтом");
+    end;
+    
+    // обновление параметров счёта (bankinter::Update_Account)
+    var stat = Update_Account (ac.rec.chapter
+                              ,ac.rec.code_currency
+                              ,ac.rec.account
+                              ,ac.rec.oper
+                              ,null
+                              ,null
+                              ,iif ((strupr (over) == OVERDRAFT_ACTION_CLR), $0, safeGetProp (acc, "limit", V_MONEY))
+                              ,v_type_account
+                              ,nvl_ex (safeGetProp (acc, "valuedate" , V_DATE) ,{curdate})
+                              );
+    
+    Acc_SetLimit(ac.rec.account, 
+                 iif ((strupr (over) == OVERDRAFT_ACTION_CLR),$0, safeGetProp (acc, "limit", V_MONEY)), 
+                 nvl_ex (safeGetProp (acc, "valuedate" , V_DATE) ,{curdate})); /*end;*/ //zmp 28.02.2014 Update_Account лимит в 31 патче не проставляет (
+
+    if (stat != RSL_EXIT_SUCCESS)
+        runError (RSL_GetSystemError (stat)); 
+    end;
+    
+    return true;
+end;
+
+/*05.09.2013 по аналогии с простым обновлением счета LAO C-14927-6*/
+macro usr_Update_Account_type(p_account,p_funct,p_acc_type)
+
+    file AccR("account.dbt") key 0;
+  //  file AccV("account$.dbt") key 0;
+
+    var AccFile; 
+    var ErrorMessage = "";
+    var stat;
+    var TypeAccount,func_upd,symbol_type;
+    private var cmd,rs;
+    private var AccTable;
+    const USR_TYPEACCOUNT_RUR = 2;
+    const USR_TYPEACCOUNT_CUR = 5;
+    const CODECURRENCY_RUR    = "810";
+    var inter_mode;
+
+
+    var Account        = p_account;
+    var Code_Currency  = Acc_GetFiidByAccount(p_account);
+    var Chapter        = Acc_GetChapterByAccount(p_account);        
+    
+
+   
+    
+
+    
+    if (Code_Currency != -1)
+        
+       // if (Code_Currency == 0)
+            AccTable = "account.dbt";
+       // else 
+       //     AccTable = "account$.dbt";
+       // end;
+
+        AccFile = TBFile(AccTable, "R", 0);
+ 
+        AccFile.Clear();
+
+        AccFile.rec.Account = Account;
+        AccFile.rec.Chapter = Chapter;
+        AccFile.rec.Code_Currency = Code_Currency;
+
+        if (AccFile.GetEQ())
+            TypeAccount    = AccFile.rec.UserTypeAccount;
+            func_upd       = p_funct;//1 - добавить, 2 - удалить 
+            symbol_type    = p_acc_type;//тип добавляемого -удаляемого счета
+            
+            cmd = RsdCommand("SELECT T_TYPE_ACCOUNT FROM  dtypeac_dbt WHERE t_inumtype = DECODE (SUBSTR (?, 6, 3), ?, ?, ?) AND t_type_account = ?");
+            cmd.addparam( "acc"     , RSDBP_IN,Account);
+            cmd.addparam( "code_rur", RSDBP_IN,CODECURRENCY_RUR);
+            cmd.addparam( "type_rur", RSDBP_IN,USR_TYPEACCOUNT_RUR);
+            cmd.addparam( "type_cur", RSDBP_IN,USR_TYPEACCOUNT_CUR);
+            cmd.addparam( "type_acc", RSDBP_IN,symbol_type);
+
+    
+
+            rs  = RsdRecordSet(cmd);
+            if( not rs.movenext() )
+                ErrorMessage="Ошибка при обновлении счета: не найден пользовательский тип: " + symbol_type;
+                Close(AccFile);
+                runError(ErrorMessage);
+            end;
+            
+            
+            if (func_upd == 1)
+                if (Index(TypeAccount, symbol_type) == 0)
+                    TypeAccount = TypeAccount + symbol_type; 
+                end;               
+            elif (func_upd == 2)
+                if (Index(TypeAccount, symbol_type) != 0)
+                    TypeAccount = StrSubst(TypeAccount, symbol_type, "");
+                end;
+            else 
+                TypeAccount = "";
+            end;
+
+        //    InitError();//обнуляем системную ошибку Golovkin 20.09.2012
+            stat = Update_Account(Chapter, Code_Currency, Account, AccFile.rec.Oper, null, TypeAccount, null, null, date());
+        
+            if (stat != RSL_EXIT_SUCCESS)
+                ErrorMessage =RSL_GetSystemError (stat); 
+                ErrorMessage = "Ошибка #" + stat + " при обновлении счета " + Account + " : " + ErrorMessage;
+            //    Close(AccFile);
+            //    runError (ErrorMessage); 
+            end;
+        else
+            ErrorMessage = "Ошибка при обновлении счета: не найден счет " + Account;
+         //   Close(AccFile);
+         //   runError (ErrorMessage); 
+        end;
+
+        Close(AccFile);
+    else
+        ErrorMessage = "Ошибка при обновлении счета: не определена валюта по счету " + Account;
+       // runError(ErrorMessage); 
+    end;
+    
+    if (ErrorMessage!="")
+        runError(ErrorMessage); 
+    else    
+        return (stat==RSL_EXIT_SUCCESS);
+    end;
+   
+end;

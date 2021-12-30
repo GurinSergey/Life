@@ -1,0 +1,234 @@
+/**
+ *                                                    |\ /\        
+ * @author: Vladimir N Golovkin       __              |,\(_\_      
+ * @desc  : Генерация отладочного    ( (              |\,`   `-^.  
+ *          макроса по запросу из ТК  \ \             :    `-'   ) 
+ *                                     \ \             \        ;  
+ *                                      \ \             `-.   ,'   
+ *                                       \ \ ____________,'  (     
+ *                                        ; '                ;     
+ *                                         \                 /___,-.
+ *                                          `,    ,_____|  ;'_____,'
+ *                                        ,-" \  :      | :
+ *                                       ( .-" \ `.__   | |
+ *                                        \__)  `.__,'  |__)  
+ *                                   
+ */
+import RsExts, rcw, rsd;
+import "likepy.mac";
+
+macro checkValue( _val, _type )
+
+    /**
+     * Проверка на NULL
+     */
+    if( index( strUpr( _type ), "NULL" ) != 0 ) 
+        return "NULL";
+
+    /**
+     * Проверка на STRING
+     */
+    elif( index( strUpr( _type ), "STRING" ) != 0 ) 
+
+        /**
+         * Подстановка ковычек и экранирование ковычек в самой строке
+         */
+        return "\"" + strSubst( _val, "\"", "\\\"" ) + "\"";
+
+    /**
+     * Проверка на DATE
+     */
+    elif( index( strUpr( _type ), "DATE" ) != 0 ) 
+
+        /**
+         * Преобразование формата даты yyyy-mm-dd в date(dd,mm,yyyy)
+         */
+        return "date(" + split(_val,"-")[2] + "," + split(_val,"-")[1] + "," + split(_val,"-")[0] + ")";
+    else
+        return _val;
+    end;
+end;
+
+var xmlParser:object = activeX( "MSXML.DOMDocument" );
+
+var xmlTestStr;
+var requestID;
+
+getString( requestID, "Введите id запроса" );
+
+/**
+ * Загрузка данных из лога
+ */
+var cmd = rsdCommand( " SELECT   XLOG.T_MESSAGE MESSAGE, LENGTHB (XLOG.T_MESSAGE) REQ_SIZE "
+                      "   FROM   DXR_LOG_DBT XLOG "
+                      "  WHERE   XLOG.T_REQID = :REQID AND XLOG.T_KIND = 1 " );
+
+    cmd.addparam( "", RSDBP_IN, requestID );
+
+var rs = rsdRecordSet( cmd );
+
+if( rs.movenext )
+    var clobSize     = rs.value( "REQ_SIZE", NULL, V_INTEGER );
+    rs.blobLimitSize = clobSize;
+    rs.fld( "MESSAGE" ).read( xmlTestStr, clobSize );
+else
+    runError( "Request not found" );
+end;
+
+xmlParser.loadXML( xmlTestStr );
+
+/**
+ * Установка префикса "ns" для пространства имен
+ */
+xmlParser.setProperty( "SelectionNamespaces", "xmlns:ns=\"http://www.softlab.ru/xml-rpc/schema\"" );
+
+/**
+ * Получаем названия макроса и процедуры
+ */
+var macroName = split( xmlParser.selectNodes( "//ns:methodName" ).item(0).text, "." )[1]; // макрос
+var procName  = split( xmlParser.selectNodes( "//ns:methodName" ).item(0).text, "." )[2]; // процедура
+
+var procParam      = TArray; // массив параметров, которые будут передаваться в метод
+var procParamClass = TArray; // массив классов
+
+println( "/**                                                 " + "\n"
+         " *                                                  " + "\n"
+         " * Created automatically                            " + "\n"
+         " *                                                  " + "\n"
+         " * Debugmacro for " + strUpr( procName ) + " method " + "\n"
+         " * reqId:" + requestID + "                          " + "\n"
+         " *                                                  " + "\n"
+         " */" );
+/**
+ * Делаем импорт макроса
+ */
+println( "import \"" + macroName + ".mac\";" ); 
+
+var params = xmlParser.selectNodes( "//ns:param" );
+var i;
+
+var paramName = ""; 
+var paramValue;
+var nonStructCount = 0;
+
+println( " " );
+
+/**
+ * Описание переменных
+ * Разбираем параметры
+ */
+println( "/**          " + "\n"
+         " *           " + "\n"
+         " * Variables " + "\n"
+         " *           " + "\n"
+         " */" );
+for( i, 0, params.length - 1 )
+    paramName  = params.item(i).selectNodes( "./ns:value" ).item(0).firstChild.nodeName;
+    paramValue = params.item(i).selectNodes( "./ns:value" ).item(0).firstChild.text;
+
+    /**
+     * Структуры парсятся позже
+     */
+    if( index( paramName, "struct" ) == 0 )
+
+        /**
+         * Объявление переменной
+         */
+        println( "private var param" + i + " = " + checkValue( paramValue, paramName ) + ";" );
+        procParam[i] = "param" + i; 
+        nonStructCount = nonStructCount + 1;
+    end;
+end;
+
+println( " " );
+
+/** 
+ * Описание классов
+ * Теперь разбираются структуры
+ */
+if( params.length != nonStructCount )
+    println( "/**        " + "\n"
+             " *         " + "\n"
+             " * Classes " + "\n"
+             " *         " + "\n"
+             " */" );
+    for( i, 0, params.length - 1 )
+        paramName  = params.item(i).selectNodes( "./ns:value" ).item(0).firstChild.nodeName;
+
+        if( index( paramName, "struct" ) != 0 )
+            var members = params.item(i).selectNodes( "./ns:value" ).item(0).selectNodes( "./ns:struct/ns:member" );
+            var j;
+
+            /**
+             * Собственно описание класса
+             */
+            println( "class class" + i );
+            procParamClass[procParamClass.size] = i;
+
+            for( j, 0, members.length - 1 )
+                var memberName  = members.item(j).selectNodes( "./ns:name"  ).item(0).text;
+                var memberValue = members.item(j).selectNodes( "./ns:value" ).item(0).firstChild.text;
+                var memberType  = members.item(j).selectNodes( "./ns:value" ).item(0).firstChild.nodeName;
+
+                /**
+                 * Заполняем свойство класса
+                 */
+                println( "    var " + memberName + " = " + checkValue( memberValue, memberType ) + ";" );
+            end;
+
+            println( "end;" );
+        end;
+    end;
+
+    println( " " );
+end;
+
+/**
+ * Создание объектов
+ */
+if( procParamClass.size != 0 )
+    println( "/**        " + "\n"
+             " *         " + "\n"
+             " * Objects " + "\n"
+             " *         " + "\n"
+             " */" );
+    for( i, 0, procParamClass.size - 1 )
+        println( "var object" + procParamClass[i] + " = class" + procParamClass[i] + ";" );
+        procParam[procParamClass[i]] = "object" + procParamClass[i];
+    end;
+
+    println( " " );
+end;
+
+/**
+ * Вызов макропроцедуры
+ */
+println( "/**               " + "\n"
+         " *                " + "\n"
+         " * Procedure call " + "\n"
+         " *                " + "\n"
+         " */" );
+println( "debugbreak; " );
+print( procName + "(" );
+
+var paramsStr = "";
+
+for( i, 0, procParam.size - 1 )
+    paramsStr = paramsStr + procParam[i] + ",";
+end;
+
+/**
+ * Надо откусить запятую....
+ */
+if( subStr( paramsStr, strLen( paramsStr ) ) == "," )
+    paramsStr = subStr( paramsStr, 1, strLen( paramsStr ) - 1 );
+end;
+
+println( paramsStr + ");" );
+
+println( "/**             " + "\n"
+         " *              " + "\n"
+         " * Good Luck ;) " + "\n"
+         " *              " + "\n"
+         " */" );
+exit(0);

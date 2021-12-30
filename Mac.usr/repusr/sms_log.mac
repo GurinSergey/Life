@@ -1,0 +1,563 @@
+// 13.06.2012 vihrov без заявки. Отчет по выводу лога СМС оповещений...
+
+import rsexts;
+import RsbDataSet, globals, календарь;
+import "KeyCodes.mac";
+import "VBAconst.mac";
+import ptinter;
+import cb_sql;
+
+const TEXTDIR_REESTR		= "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+const LBRDIR_REESTR         = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR";
+const LBR_NAME				= "sms_log.lbr";
+
+record party (party); // для выбора клиента из списка
+var client_id:integer = 0;
+var tempFileName:string = "", tempFileNameBezPuti:string ="";
+private var dd:date, tt:time, ii:integer, ss:string;  // это переменные для использования FileInfo
+var kolwo_strok=0;// кол-во строк в файле данных.
+var ex_strok_end:integer=1,ex_strok_begin:integer=0; 
+
+var 	exst, i, i_old, page, flag, ex, ob, out, f, countlist,
+		output="osv.xlsx",
+		fulloutput, obBook, obsheet;
+
+var begindate, enddate, chapter, che, acc_mask;
+
+var account_bal,restinA_bal,restinP_bal,debet_bal,kredit_bal,restoutA_bal,restoutP_bal;
+
+var SheetBalance= false;
+che = 3;
+countlist = 1;
+var _i=0,bal2="",bal="";    
+
+var new_bal2:string= "", old_bal2:string="", strok_bal2:integer=0;
+var all_act:numeric=0, all_pass:numeric=0;
+
+var Full_path_lbr, lbr_dir;
+
+macro chekReestrRead(m_name:string, m_status:integer, m_err:integer)
+	if ((m_status == V_UNDEF) or (m_err != 0))
+    	msgbox("Ошибка получения значения настройки реестра " + m_name + " \n Процедура GetRegistryValue вернула код ошибки "+m_err);
+   		exit(0);
+	end;
+end;
+
+macro dayString(m_reestrName:string):string
+	private var m_errCode			:integer = NULL;
+	private var m_statusGetRegistry :integer = NULL;
+    private var m_zna4enie          :string  = NULL;
+	if (m_reestrName == "")
+		msgbox("При чтении реестра не задана строка реестра");
+		exit(0)
+	end;
+	m_statusGetRegistry=GetRegistryValue(m_reestrName, V_STRING, m_zna4enie, m_errCode);
+	chekReestrRead(m_reestrName, m_statusGetRegistry, m_errCode);
+	return(m_zna4enie);
+end;
+
+
+
+lbr_dir=daystring(LBRDIR_REESTR);
+Full_path_lbr = FindPath(lbr_name, lbr_dir);
+if (not Full_path_lbr)
+	msgbox("Не найдена LBR "+lbr_name+" \nпоиск производился в директориях:"+lbr_dir);
+	exit();
+end;
+
+var dlg = TRecHandler("panel", full_path_lbr, TRUE); 
+
+
+
+ /*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key)
+   var const_mess = " ~F3~ Выбор значения из списка ~F2~ Продолжить ~ESC~ Выход ",
+   SQLQuery, SQLQuery1, rsrec, cmd1;
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dlg.rec.date_begin = {curdate};
+      dlg.rec.date_end = {curdate};
+      dlg.rec.client_name = "по всем клиентам"; 
+      UpdateFields(dlg); 
+   end;
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+	  message(const_mess);
+   end;
+   if (cmd == DLG_REMFOCUS)
+      /*Проверка корректности дат отчета*/
+      UpdateFields(dlg); 
+   end;
+   if (cmd == DLG_KEY)
+      /*Выход из диалогового окна формирования отчета*/
+      if (KEY == KEY_ESC)
+         return CM_CANCEL;
+      elif (KEY == KEY_ENTER)
+      	 return CM_IGNORE;
+      /*Выбор данных из списка*/
+      elif ( KEY == KEY_F3)
+         if (FldName(dlg,id) == "date_begin")
+            dlg.rec.date_begin = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "date_end")
+            dlg.rec.date_end = GetDateByCalendar ({curDate});
+         end;
+         if (FldName(dlg,id) == "client_name")
+            if  (listpt(party, 1, client_id, PTLIST_ALLCLIENT, 0, PTCK_ALL)) //возвращает код типа 1 в переменную client_id - оно нам нафиг не надо
+            	dlg.rec.client_name = party.name;
+            	client_id = party.partyid; // а вот патиид надо
+            	if (client_id == 0) dlg.rec.client_name = "по всем клиентам";  end;
+            	UpdateFields(dlg); 
+            end;
+         end;
+      elif ( KEY == KEY_F2 )          //Проверки при вводе
+         if ( dlg.rec.date_begin > {curDate} )
+            MsgBox("Дата начала периода должна быть не больше текущей даты");
+            return CM_IGNORE;
+         end;
+         if ( dlg.rec.date_begin > dlg.rec.date_end )
+            MsgBox("Дата начала периода должна быть не больше конечной даты");
+            return CM_IGNORE;
+         end;
+         Return CM_SAVE;
+      end;
+   else
+      Return CM_IGNORE;
+   end;
+END;
+
+macro calculate(id, bd, ed)
+	var query, data;
+	query = "SELECT	* " + 
+      "  FROM	usr_vpaym_dbt t " +
+      " WHERE	t.carrydate BETWEEN TO_DATE ('"+bd+"', 'dd.mm.rrrr') AND TO_DATE ('"+ed+"', 'dd.mm.rrrr') " ;
+	if (id != 0)
+		query = query + "  AND (t.payerid = "+id+" OR t.receiverid = "+id+") " ;
+	end;
+	message("Строится множество данных ...");
+	data = TRsbDataset(query);
+	return data;
+end;    
+    
+
+
+macro writeHead()
+	private var m_range:string="A3:q3";
+	obSheet.Cells(1,1).Value= "СМС таблица (клиент: "+dlg.rec.client_name+")";	
+	obSheet.Cells(2,1).Value= "За период с " + dlg.rec.date_begin + " по " + dlg.rec.date_end;
+	obSheet.Cells(3,1).Value= "ID платежа";	
+	obSheet.Cells(3,2).Value= "Счет плательщика";
+	obSheet.Cells(3,3).Value= "Счет получателя";
+	obSheet.Cells(3,4).Value= "Сумма";
+	obSheet.Cells(3,5).Value= "Дата проводки";
+	obSheet.Cells(3,6).Value= "Основание ";
+	obSheet.Cells(3,7).Value= "NN док-та";
+	obSheet.Cells(3,8).Value= "Дата вставки в таблицу";
+	obSheet.Cells(3,9).Value= "Признак документа";
+	obSheet.Cells(3,10).Value= "Статус оповещения";
+	obSheet.Cells(3,11).Value= "ID оповещения";
+	obSheet.Cells(3,12).Value= "Тип оповещения";
+	obSheet.Cells(3,13).Value= "Дата отправки оповещ.";
+	obSheet.Cells(3,14).Value= "Кол-во попыток отправки";
+	obSheet.Cells(3,15).Value= "Последняя отправка оповещ.";
+	obSheet.Cells(3,16).Value= "Остаток на счете плательщика";
+	obSheet.Cells(3,17).Value= "Остаток на счете получателя";
+
+   obSheet.Range(m_range).Borders.Weight=2;
+   obSheet.Range(m_range).interior.color=4035000;
+	obSheet.Range(m_range).HorizontalAlignment = xlCenter;
+	obSheet.Range(m_range).font.Name = "Calibri";
+	obSheet.Range(m_range).font.FontStyle = "bold";
+	obSheet.Range(m_range).font.Size = 12;
+
+    obSheet.Columns("A:A").ColumnWidth = 10;
+    var format_str:string = "# ##0" + ex.International(3) + "00";
+    obSheet.Columns("D:D").NumberFormat = format_str;
+    obSheet.Columns("P:Q").NumberFormat = format_str;
+    obSheet.Columns("E:E").ColumnWidth = 8.8;
+    obSheet.Columns("F:F").ColumnWidth = 30;
+    obSheet.Columns("B:D").EntireColumn.AutoFit;
+    obSheet.Columns("G:G").EntireColumn.AutoFit;
+    obSheet.Columns("H:H").ColumnWidth = 8.8;
+    obSheet.Columns("M:M").ColumnWidth = 8.8;
+    obSheet.Columns("O:O").ColumnWidth = 10;
+
+    obSheet.Range(m_range).wraptext = true;
+//    obsheet.Range("a1").Select;
+end;
+
+
+
+macro createUniqueFile()
+	private var ff:string = "sms__"+client_id+"_"+date+"_"+time;
+	private var file_ext:string = ".txt";
+	tempFileName = dayString(TEXTDIR_REESTR);
+	tempFileName 		= tempFileName + "\\" + ff;
+	tempFileNameBezPuti = ff;
+	tempFileName = StrSubst ( tempFileName, ".", "_" );
+	tempFileName = StrSubst ( tempFileName, ":", "_" );
+	tempFileName = StrSubst ( tempFileName, " ", "_" );
+	tempFileName = tempFileName + file_ext;
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ".", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, ":", "_" );
+	tempFileNameBezPuti = StrSubst ( tempFileNameBezPuti, " ", "_" );
+	tempFileNameBezPuti = tempFileNameBezPuti + file_ext;
+	if (substr(tempFileName,1,2) == "__")
+		tempFileName=".."+substr(tempFileName,3)
+	end;
+end;
+
+
+
+macro write_data_2_file(data)
+	private var payid:string="xx",	acc_pay:string="xx",acc_rec:string="",	summa:string="xx",	dd:string="xx",		osnov:string="xx",
+				ndoc:string="xx",	edd:string="xx",	reason:string="xx",	stat:string="xx",	nid:string="xx",	ntp:string="xx",
+				bic_p:string="xx",	bic_r:string="xx",	corr_p:string="xx",	corr_r:string="xx",	bank_p:string="xx",	bank_r:string="xx",
+				name_p:string="xx",	name_r:string="xx",	inn_p:string="xx",	inn_r:string="xx",	id_p:string="xx",	id_r:string="xx",
+				not_dd:string="xx",	c_send:string="xx",	last:string="xx",	rest_p:string="xx",	rest_r:string="xx";
+	InitProgress(-1, "Отобранные ранее SMS выводятся в файл", "СМС отчет");
+	createUniqueFile();
+	FILE aa () txt write;
+	open(aa, tempFileName);
+	aa.str = " "; insert(aa); //если ничего в файле не будет то он может не создастся и не переслаться на терминал и пользователь получит неверную ошибку.
+
+	while (data.movenext)
+		payid = data.value("paymentid");acc_pay=data.value("PAYERACCNUMBER"); acc_rec=data.value("RECIPIENTACC");summa=data.value("SUM");	dd=string(date(data.value("CARRYDATE")));		
+		osnov=strsubst(strsubst(StrSubst(string(data.value("GROUND")),"|",""), strfor(10),""),strfor(13),"");
+		ndoc=data.value("DOCUMENTNUMBER");	edd=ternary(valtype(data.EVENTDATE) != V_UNDEF,data.EVENTDATE,"");	reason=data.value("REASON");	stat=data.value("STATUS");	nid=string(data.value("NOTIFICATION_ID", true,1));	ntp=data.value("NOTIFICATION_TYPE");
+		bic_p=data.value("PAYERBIC");	bic_r=data.value("RECEPIENTBIC");	corr_p=data.value("PAYERCORRACC");	corr_r=data.value("RECEIVERCORRACC");	bank_p=data.value("PAYERBANK");	bank_r=data.value("RECEIVERBANKNAME");
+		name_p=data.value("PAYERNAME");	name_r=data.value("RECEIVERNAME");	inn_p=data.value("PAYERINN");	inn_r=data.value("RECEIVERINN");	id_p=data.value("PAYERID");	id_r=data.value("RECEIVERID");
+		not_dd=ternary(ValType(data.NOTIFICATION_DATETIME) != V_UNDEF,data.NOTIFICATION_DATETIME,"");	c_send=data.value("COUNTSEND",true,1);	last=data.value("LASTTIMESEND");	
+		rest_p=string(ternary(valtype(data.value("PAYERACCREST",true,4)) != V_UNDEF,data.value("PAYERACCREST",true,4), ""));
+		rest_r=strinG(ternary(valtype(data.value("RECEIVERACCREST", true,4)) != V_UNDEF, data.value("RECEIVERACCREST", true,4), ""));
+        debugbreak;
+		aa.str = payid + "|" + acc_pay + "|" + acc_rec + "|" + summa + "|" + dd + "|" + osnov + "|" + ndoc + "|" + edd +
+				"|" + reason + "|" + stat + "|" + nid + "|" + ntp + "|"  + not_dd + "|" + c_send + "|" + last + "|" + rest_p + "|" +  rest_r ;
+		aa.str = toansi(aa.str, true);
+		insert(aa); kolwo_strok = kolwo_strok + 1; 
+		UseProgress(kolwo_strok);
+   end;
+   close(aa);
+   RemProgress();
+end;
+
+macro copyToMe()
+	private var m_path: string = "";
+	m_path = "$" + tempFileNameBezPuti;
+	if (not CopyFile(tempFileNameBezPuti, m_path, TRUE))
+		println ("НЕ СМОГ скопировать файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+	else 
+		println ("УСПЕШНО скопирован файл с сервера приложений на терминал. исходный файл: "+tempFileNameBezPuti+" файл назначения: " + m_path);
+		if (not removeFile(tempFileName))
+			println("Не смог удалить файл "+tempFileName+" с сервера приложений. ничего сташного, продолжаем работу.");
+		else
+			println("удален файл "+tempFileName+" с сервера приложений.");
+		end;
+	end;
+end;
+
+macro format_data(b:integer, e:integer)
+	private var m_range:string="a"+b+":q"+e;
+	obSheet.range(m_range).Borders(xlEdgeLeft).LineStyle = xlContinuous;
+    obSheet.range(m_range).Borders(xlDiagonalDown).LineStyle = xlNone;           
+    obSheet.range(m_range).Borders(xlDiagonalUp).LineStyle = xlNone;             
+    obSheet.range(m_range).Borders(xlEdgeLeft).LineStyle = xlContinuous;         
+    obSheet.range(m_range).Borders(xlEdgeLeft).Weight = xlThin;                  
+    obSheet.range(m_range).Borders(xlEdgeLeft).ColorIndex = xlAutomatic;         
+    obSheet.range(m_range).Borders(xlEdgeTop).LineStyle = xlContinuous;          
+    obSheet.range(m_range).Borders(xlEdgeTop).Weight = xlThin;                   
+    obSheet.range(m_range).Borders(xlEdgeTop).ColorIndex = xlAutomatic;          
+    obSheet.range(m_range).Borders(xlEdgeBottom).LineStyle = xlContinuous;       
+    obSheet.range(m_range).Borders(xlEdgeBottom).Weight = xlThin;                
+    obSheet.range(m_range).Borders(xlEdgeBottom).ColorIndex = xlAutomatic;       
+    obSheet.range(m_range).Borders(xlEdgeRight).LineStyle = xlContinuous;        
+    obSheet.range(m_range).Borders(xlEdgeRight).Weight = xlThin;                 
+    obSheet.range(m_range).Borders(xlEdgeRight).ColorIndex = xlAutomatic;        
+    obSheet.range(m_range).Borders(xlInsideVertical).LineStyle = xlContinuous;   
+    obSheet.range(m_range).Borders(xlInsideVertical).Weight = xlThin;            
+    obSheet.range(m_range).Borders(xlInsideVertical).ColorIndex = xlAutomatic;   
+    obSheet.range(m_range).Borders(xlInsideHorizontal).LineStyle = xlContinuous; 
+    obSheet.range(m_range).Borders(xlInsideHorizontal).Weight = xlThin;          
+    obSheet.range(m_range).Borders(xlInsideHorizontal).ColorIndex = xlAutomatic; 
+end;
+
+macro go_Excel()
+	var data;
+	begaction(2000, "Производится отбор SMS, ждите...", false); message("Производится отбор счетов, ждите...");
+	data = calculate(client_id, dlg.rec.date_begin, dlg.rec.date_end);
+	endaction();
+	write_data_2_file(data);
+	message("Файл с данными пересылается на терминал");
+	copyToMe();
+    message("запускается EXCEL");
+	ob = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+	ex = ob.CreateComObject ("Excel.Application", True);
+	ex.visible=false;
+
+   if (not(GetFileInfo("$"+tempFileNameBezPuti,@dd,@tt,@ii,@ss))); //ss- то что надо. полный путь абсолютный локальный
+	   msgbox("не мог найти на локальном диске файл "+tempFileNameBezPuti+"          \n останавливаюсь");
+	   exit(0);
+   end;
+   ss = substr(ss,2); // откусили первый знак бакса
+
+   var aw=tarray;
+   var w1=tarray;
+   var w2=tarray;
+   var w3=tarray;
+   var w4=tarray;
+   var w5=tarray;
+   var w6=tarray;
+   var w7=tarray;
+   var w8=tarray;
+   var w9=tarray;
+   var w10=tarray;
+   var w11=tarray;
+   var w12=tarray;
+   var w13=tarray;
+   var w14=tarray;
+   var w15=tarray;
+   var w16=tarray;
+   var w17=tarray;
+/*   var w18=tarray;
+   var w19=tarray;
+   var w20=tarray;
+   var w21=tarray;
+   var w22=tarray;
+   var w23=tarray;
+   var w24=tarray;
+   var w25=tarray;
+   var w26=tarray;
+   var w27=tarray;
+   var w28=tarray;
+   var w29=tarray;*/
+   
+
+   w1(0)=1; w1(1)=2; //формат столбца 1-general, 2-text, 4-data(DMY)
+   w2(0)=2; w2(1)=2; //формат столбца 
+   w3(0)=3; w3(1)=2;//формат столбца 
+   w4(0)=4; w4(1)=1;//формат столбца - General
+   w5(0)=5; w5(1)=5;//формат столбца - 
+   w6(0)=6; w6(1)=2;//формат столбца - General
+   w7(0)=7; w7(1)=2;//формат столбца - General
+   w8(0)=8; w8(1)=1;//формат столбца - текст
+   w9(0)=9; w9(1)=2;//формат столбца - текст
+   w10(0)=10; w10(1)=2;
+   w11(0)=11; w11(1)=2;
+   w12(0)=12; w12(1)=2;
+   w13(0)=13; w13(1)=2;
+   w14(0)=14; w14(1)=2;
+   w15(0)=15; w15(1)=2;
+   w16(0)=16; w16(1)=1;
+   w17(0)=17; w17(1)=1;
+/*   w18(0)=18; w18(1)=2;
+   w19(0)=19; w19(1)=2;
+   w20(0)=20; w20(1)=2;
+   w21(0)=21; w21(1)=2;
+   w22(0)=22; w22(1)=2;
+   w23(0)=23; w23(1)=2;
+   w24(0)=24; w24(1)=2;
+   w25(0)=25; w25(1)=2;
+   w26(0)=26; w26(1)=2;
+   w27(0)=27; w27(1)=2;
+   w28(0)=28; w28(1)=2;
+   w29(0)=29; w29(1)=2; */
+
+   aw(0)=w1;
+   aw(1)=w2;
+   aw(2)=w3;
+   aw(3)=w4;
+   aw(4)=w5;
+   aw(5)=w6;
+   aw(6)=w7;
+   aw(7)=w8;
+   aw(8)=w9;
+   aw(9)=w10;
+   aw(10)=w11;
+   aw(11)=w12;
+   aw(12)=w13;
+   aw(13)=w14;
+   aw(14)=w15;
+   aw(15)=w16;
+   aw(16)=w17;
+/*   aw(17)=w18;
+   aw(18)=w19;
+   aw(19)=w20;
+   aw(20)=w21;
+   aw(21)=w22;
+   aw(22)=w23;
+   aw(23)=w24;
+   aw(24)=w25;
+   aw(25)=w26;
+   aw(26)=w27;
+   aw(27)=w28;
+   aw(28)=w29; */
+
+	aw.MarshalByVal =true; // работает только так. передача по значению через @aw вызывает ошибку
+	w1.MarshalByVal =true;
+	w2.MarshalByVal =true;
+	w3.MarshalByVal =true;
+	w4.MarshalByVal =true;
+	w5.MarshalByVal =true;
+	w6.MarshalByVal =true;
+	w7.MarshalByVal =true;
+	w8.MarshalByVal =true;
+	w9.MarshalByVal =true;
+	w10.MarshalByVal =true;
+	w11.MarshalByVal =true;
+	w12.MarshalByVal =true;
+	w13.MarshalByVal =true;
+	w14.MarshalByVal =true;
+	w15.MarshalByVal =true;
+	w16.MarshalByVal =true;
+	w17.MarshalByVal =true;
+/*	w18.MarshalByVal =true;
+	w19.MarshalByVal =true;
+	w20.MarshalByVal =true;
+	w21.MarshalByVal =true;
+	w23.MarshalByVal =true;
+	w24.MarshalByVal =true;
+	w25.MarshalByVal =true;
+	w26.MarshalByVal =true;
+	w27.MarshalByVal =true;
+	w28.MarshalByVal =true;
+	w29.MarshalByVal =true; */
+
+	begaction(2000, "Файл с данными загружается в EXCEL", false); message("файл с данными загружается в EXCEL");
+	obBook = ex.Workbooks.opentext(ss,1251,1,1,2,false,false,false,false,false,true,"|",aw,1,"."," ",true,true);
+	endaction;
+	ex.visible =  true;
+	ex_strok_begin = 2; //поскольку первой строкой идет пустой пробел в файле данных всегда, то начальная строка вторая
+
+/*
+Name Required/Optional Data Type Description 
+Filename Required String Specifies the file name of the text file to be opened and parsed. 
+имя файла
+
+Origin Optional Variant Specifies the origin of the text file. Can be one of the following XlPlatform constants: xlMacintosh, xlWindows, or xlMSDOS. Additionally, this could be an integer representing the code page number of the desired code page. For example, "1256" would specify that the encoding of the source text file is Arabic (Windows). If this argument is omitted, the method uses the current setting of the File Origin option in the Text Import Wizard. 
+кодировка
+
+StartRow Optional Variant The row number at which to start parsing text. The default value is 1. 
+с какой строки начинать грузить данные. не строка в экселе (в экселе всегда с первой будет грузить),а строка файла данных какая.
+
+DataType Optional Variant Specifies the column format of the data in the file. Can be one of the following XlTextParsingType constants: xlDelimited or xlFixedWidth. If this argument is not specified, Microsoft Excel attempts to determine the column format when it opens the file. 
+текст с разделителями или фиксированной ширины (1 - с разделителями, 2- фикс. ширина)
+
+TextQualifier Optional XlTextQualifier Specifies the text qualifier. 
+обозначатель текста. вобще не понял для фига он. 1="  2=' -4142=нет определителя
+
+ConsecutiveDelimiter Optional Variant True to have consecutive delimiters considered one delimiter. The default is False. 
+true - объединить несколько идущих подряд разделителей в один, false =не делать
+
+Tab Optional Variant True to have the tab character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это табуляция. false = не табуляция
+
+Semicolon Optional Variant True to have the semicolon character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это ; false = не ; (точка с запятой)
+
+Comma Optional Variant True to have the comma character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это , false = не , (запятая)
+
+Space Optional Variant True to have the space character be the delimiter (DataType must be xlDelimited). The default value is False. 
+true= разлелитель колонок это пробел false = не пробел
+
+Other Optional Variant True to have the character specified by the OtherChar argument be the delimiter (DataType must be xlDelimited). The default value is False. 
+true = есть другой символ для определения разделителя колонок false = нет другого символа.
+
+OtherChar Optional Variant (required if Other is True). Specifies the delimiter character when Other is True. If more than one character is specified, only the first character of the string is used; the remaining characters are ignored. 
+определяет этот самый "другой символ" для разделителя колонок.
+
+FieldInfo Optional Variant An array containing parse information for individual columns of data. The interpretation depends on the value of DataType. When the data is delimited, this argument is an array of two-element arrays, with each two-element array specifying the conversion options for a particular column. The first element is the column number (1-based), and the second element is one of the XlColumnDataType constants specifying how the column is parsed. 
+пары чисел, определящие номер столбца и тип данных. В доке сказано, что порядок не имеет значения, но у меня получилось только все по порядку, т.е. строго столько элементов массива, сколько колонок
+например счет если выгружать в эксель по дефолту - он будет как число и хвост забьет нулями. нужно указывать этот столбец как текст.
+
+TextVisualLayout Optional Variant The visual layout of the text. 
+какое-то визуальное оформление текста. не понял чо это такое. может быть имеется в виду зеленый трегольничек в левом верхнем углу ячейки. ставлю единицу
+
+DecimalSeparator Optional Variant The decimal separator that Microsoft Excel uses when recognizing numbers. The default setting is the system setting. 
+офигенски важный параметр. разделитель целой и дробной части в файле данных. 
+а вот как надо форматировать текст, например: 
+    var format_str:string = "# ##0" + ex.International(3) + "00";
+    obSheet.Columns("D:D").NumberFormat = format_str;
+   ex.DecimalSeparator; - брать нельзя, т.к. может стоять галочка в офисе "использовать региональные настройки".
+  А вот ex.International(3) - вернет то что надо, независимо от того, стоит эта галочка или нет.
+
+ThousandsSeparator Optional Variant The thousands separator that Excel uses when recognizing numbers. The default setting is the system setting. 
+символ - разделитель разрядов для удобочитаемости. надо бы оставить дефолтный, т.е. пропустить параметр, но я не знаю как.
+
+TrailingMinusNumbers Optional Variant Specify True if numbers with a minus character at the end should be treated as negative numbers. If False or omitted, numbers with a minus character at the end are treated as text. 
+true = минус вначале числа будет пониматься как отрицательное число, false = это будет просто текст.
+
+Local Optional Variant Specify True if regional settings of the machine should be used for separators, numbers and data formatting. 
+true - использовать региональные сеттинги, толком не понял эту фигню, но ставлю true. По дефолту вроде false оно, упускать нельзя, надо явно прописать.
+
+XlTextParsingType Enumeration 
+xlDelimited 1 Default. Indicates that the file is delimited by delimiter characters. 
+xlFixedWidth 2 Indicates that the data in the file is arranged in columns of fixed widths. 
+
+ 
+XlTextQualifier Enumeration 
+xlTextQualifierDoubleQuote 1 Double quotation mark ("). 
+xlTextQualifierNone -4142 No delimiter. 
+xlTextQualifierSingleQuote 2 Single quotation mark ('). 
+
+XlColumnDataType can be one of these XlColumnDataType constants. 
+xlGeneralFormat. General 
+xlTextFormat. Text  
+xlMDYFormat. MDY Date 
+xlDMYFormat. DMY Date 
+xlYMDFormat. YMD Date 
+xlMYDFormat. MYD Date 
+xlDYMFormat. DYM Date 
+xlYDMFormat. YDM Date 
+xlEMDFormat. EMD Date 
+xlSkipColumn. Skip Column 
+You can use xlEMDFormat only if Taiwanese language support is installed and selected. The xlEMDFormat constant specifies that Taiwanese era dates are being used.
+The column specifiers can be in any order. If a given column specifier is not present for a particular column in the input data, the column is parsed with the xlGeneralFormat setting. This example causes the third column to be skipped, the first column to be parsed as text, and the remaining columns in the source data to be parsed with the xlGeneralFormat setting. 
+Array(Array(3, 9), Array(1, 2))
+
+
+
+*/
+
+//   ex.visible =true;
+   
+   obSheet=ex.Sheets(1);
+   ex.Sheets(1).Rows("1:1").Insert(-4121); ex_strok_begin = ex_strok_begin +1; 
+   ex.Sheets(1).Rows("1:1").Insert(-4121); ex_strok_begin = ex_strok_begin +1; 
+
+
+   begaction(2000,"Данные загружены в EXCEL, производится форматирование...", false); message("Данные загружены в EXCEL, производится форматирование...");
+   writeHead();
+   format_data(ex_strok_begin, ex_strok_begin+kolwo_strok-1);
+   endaction;
+
+   println;
+   println("Отчет по СМС сформирована в EXCEL успешно. Для продолжения нажмите ESC ");
+	ex.visible=true;
+
+/*
+expression.Insert(Shift)
+
+expression Required. An expression that returns one of the objects in the Applies To list.Shift   Optional XlInsertShiftDirection . Specifies which way to shift the cells.
+XlInsertShiftDirection can be one of these XlInsertShiftDirection constants. 
+xlShiftToRight 
+xlShiftDown 
+If this argument is omitted, Microsoft Graph decides based on the shape of the range.
+ 
+XlInsertShiftDirection Enumeration 
+xlShiftDown -4121 Shift cells down. 
+xlShiftToRight -4161 Shift cells to the right. 
+
+*/
+
+end;
+
+/*Точка входа в макрос*/
+
+if (RunDialog(dlg, "Event"))                  
+	go_excel;
+end; 
+exit(0);
+
+
+                                              

@@ -1,0 +1,415 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*               Экспорт сообщений УФЭБС                                    */
+/*                                                                          */
+/*  Имя файла: wlufbout.mac                                                 */
+/*  Создан:  05.10.04                                           BARS        */
+/****************************************************************************/
+/*SDA адаптация для 31-й */
+import "wlexport.mac", "ufgenmes.mac", "wlufsign.mac", oralib, likepy, "bnk_common.mac", lib_fg;
+
+const CONTEXTID_SET_SIGN_UFBS      = "ТранспортМБР|9|Экспорт_файла";
+const CONTEXTID_SET_ZK_UFBS        = "ТранспортМБР|9|ЗК_для_ЭД";
+const CONTEXTID_SET_ZK_EPD_UFBS    = "ТранспортМБР|9|ЗК_для_ПЭД";
+const CONTEXTID_SET_ZK_ED_EPD_UFBS = "ТранспортМБР|9|ЗК_для_ЭД_ПЭД";
+
+const ОформлятьСлужебныйПакет = false;
+
+var ver_st = 1;
+private var unload = False; //Gurin S. 15.10.2015 R-624168-2
+
+/* Получить имя формы УФЭБС текущего сообщения wlmes */
+private macro UFBSMesFormName
+  var strSQL : string = "select wlmesfrm.t_Name " +
+                        "from   dwlmesfrm_dbt wlmesfrm, dwlmesrls_dbt wlmesrls " +
+                        "where  wlmesrls.t_RlsFormID = " + wlmes.RlsFormID +
+                        "  and  wlmesfrm.t_FormID = wlmesrls.t_FormID ";
+  var rs : RsdRecordSet = RsdRecordSet( strSQL );
+  if ( (rs) and (rs.MoveNext()) )
+    return substr( rs.value(0), 1, 5 ); // первые пять символов wlmesfrm.Name
+  else    
+    return "";
+  end;
+end;
+
+//Gurin S. 26.03.2015 HF2031_19_25_148
+private macro set_xmlns(node : object)
+  if(ver_st == 1)
+    node.setAttribute("xmlns", "urn:cbr-ru:ed:v1.1");
+  else
+    node.setAttribute("xmlns", "urn:cbr-ru:ed:v2.0");
+  end;
+end;
+
+private macro CreateElementEDxxx(node : @object, IsPack)
+  var mes:object = ActiveX("Microsoft.XMLDOM");    
+  var str1 = UFBSMesFormName();
+  if (str1)
+    node = mes.createElement(str1);
+
+    if (not IsPack)
+      set_xmlns(node);
+    end;
+
+    return true;
+  else
+    ErrExport("Не удалось определить форму сообщения ");
+    return false;
+  end;
+end;
+
+/* Записать поля сообщения в файл */
+macro ЗаписатьСообщение( СуммаДокумента, obj:object, IsPack, НуженЗКдляЭД, НуженЗКдляЭДПЭД )
+  var field, buff, block, err, str1;
+  var mes:object = ActiveX("Microsoft.XMLDOM");    
+  var node, child;
+
+  СуммаДокумента = 0;
+
+  while( СчитатьПоле( field, buff, block ) )
+    if ( field=="xml" )
+       if(IsPack)
+         /*Если пакетно, то в родительском узле уже задан namespace, здесь его надо удалить*/
+         str1 = SubStr(buff,index(buff,"xmlns=\"") + strlen("xmlns=\""));
+         buff = SubStr(buff,1,index(buff,"xmlns")-1) + SubStr(str1,index(str1,"\"") + 1);
+       end;
+
+       if ( not mes.LoadXML(buff) )
+          ErrExport("Ошибка чтения строки xml: " + string(buff));
+          return false;
+       end;         
+
+       if ( mes.selectSingleNode("//@Sum") )
+           СуммаДокумента = СуммаДокумента + double( mes.selectSingleNode("//@Sum").nodeValue );
+       end;
+
+       node = mes.firstChild;
+    elif(field == "CreditTransferTrans")
+       if ( not mes.LoadXML(buff) )
+          ErrExport("Ошибка чтения строки xml: " + string(buff));
+          return false;
+       end;
+
+       if(node)
+         node.appendChild(mes.firstChild);
+       else // такого не должно быть, но на всякий случай
+         node = mes.firstChild;
+       end;
+    else // в релизе много полей
+
+      // корень
+      if( not CreateElementEDxxx(@node, IsPack) ) 
+           return false;
+         end;
+
+      // первое поле
+         node.SetAttribute(field, buff);
+
+      // остальные поля
+      var AllFldsAreRead : bool = false;
+      if( not ExportMesToXmlNode(@node, wlmes, @AllFldsAreRead) )
+        return false;
+         end;
+      if(AllFldsAreRead)
+        break;
+       end;
+      
+    end;
+  end;
+
+  if (node)
+    obj.appendChild(node);
+  end;  
+        
+  SetParm( 0, СуммаДокумента );
+
+  if ( IsPack )
+     if ( НуженЗКдляЭДПЭД)
+        if(not ПодписаниеЗК( CONTEXTID_SET_ZK_ED_EPD_UFBS, obj ))
+           ErrExport("Ошибка подписи сообщения ЗК");
+           return false;
+        end;
+     end;
+  else
+     if ( НуженЗКдляЭД)
+        if(not ПодписаниеЗК( CONTEXTID_SET_ZK_UFBS, obj ))
+           ErrExport("Ошибка подписи сообщения ЗК");
+           return false;
+        end;
+     end;
+  end;
+  return true;
+end;
+
+macro GetCurrentDateTime()
+  var q = "select cast( (systimestamp at time zone 'UTC') as date ) as SysdateInUTC "
+          "  from dual ";
+
+  var rs : RsdRecordset = execSQLselect(q);
+  if(rs and rs.moveNext())
+    var dt : date = date( rs.value("SysdateInUTC") );
+    var tm : time = time( rs.value("SysdateInUTC") );
+    return string( YYYYMMDD(dt), "T", StrSubst(string(tm)," ","0"), "Z" );
+  else
+    RunError("Ошибка при определении даты и времени создания сообщения");
+  end;
+end;
+
+macro ОформитьСлужебныйПакет( xmlIni:object )
+   var envelope:object, Header:object, MesInfo:object;
+   var item:object, body:object, child:object;
+   var xml:object = ActiveX("Microsoft.XMLDOM");
+   var i;
+
+   //HF_81 24.06.2013 TAM
+   xml.appendChild( xml.createProcessingInstruction("xml", " version='1.0' encoding='Windows-1251'") );
+   //xml.appendChild( xml.createProcessingInstruction("xml",   " version='1.0' encoding='UTF-8'") );
+
+   envelope = xml.createElement("Envelope");
+   envelope.setAttribute("xmlns", "http://www.w3.org/2003/05/soap-envelope");
+   Header = xml.createElement("Header");
+   MesInfo = xml.createElement("MessageInfo");
+   
+   if(ver_st == 1)
+      MesInfo.setAttribute("xmlns", "urn:cbr-ru:msg:props:v1.1");
+   else
+      MesInfo.setAttribute("xmlns", "urn:cbr-ru:msg:props:v1.2");
+   end;
+   
+   item = xml.createElement("To");
+   item.appendChild(xml.createTextNode("uri") );
+   MesInfo.appendChild( item );
+   item = xml.createElement("From");
+   item.appendChild(xml.createTextNode("uri") );
+   MesInfo.appendChild( item );
+   item = xml.createElement("MessageID");
+   item.appendChild(xml.createTextNode("uri") );
+   MesInfo.appendChild( item );
+   item = xml.createElement("MessageType");
+   item.appendChild(xml.createTextNode("1") );
+   MesInfo.appendChild( item );
+   item = xml.createElement("Priority");
+   item.appendChild(xml.createTextNode("1") );
+   MesInfo.appendChild( item );
+   item = xml.createElement("CreateTime"); //DAI Hotfix HF2031_19_25_12
+   item.appendChild(xml.createTextNode(GetCurrentDateTime())); 
+   MesInfo.appendChild( item );
+   Header.appendChild(MesInfo);
+   envelope.appendChild(Header);
+   body = xml.createElement("Body");  
+
+   i=0;
+   while( i < xmlIni.childNodes.length )
+     child = xmlIni.childNodes.item(i);
+     if( child and (child.nodeType==CHILD_NODE) )
+        body.appendChild(child);
+        i = xmlIni.childNodes.length;
+     end;
+     i = i+1;
+   end;
+
+   envelope.appendChild(body);
+   xml.appendChild(envelope);
+
+   setParm(0,xml);
+end;
+
+//Gurin S. 26.03.2015 HF2031_19_25_148
+private macro GetEDReceiverForExport(wlmes) : string
+  var EDReceiver : string = "";
+
+    EDReceiver = GetEDAuthor(wlmes.OutsideAbonentID);
+
+  return EDReceiver;
+end;
+
+private macro CreatePacket(PacketName : string, HasParentNode : bool) : object
+  var xml:object = ActiveX("Microsoft.XMLDOM");
+  var packet : object = xml.createElement(PacketName);
+  if(not HasParentNode)
+    set_xmlns(packet);
+  end;
+
+  var WlSessUID = EDNoDateAuthor();
+  WlSessUID.ConstructByTrn(wlSess.SessUID);
+  var EDDate : date = date();
+    
+  packet.setAttribute("EDNo",     WlSessUID.EDNo );
+  packet.setAttribute("EDDate",   YYYYMMDD( EDDate ) );
+  packet.setAttribute("EDAuthor", WlSessUID.EDAuthor );
+    
+  if( PacketName != "PacketEPD" )
+    packet.setAttribute( "EDReceiver", GetEDReceiverForExport(wlmes) );
+  else
+    /* Признак системы обработки SystemCode: Обязателен к заполнению для одиночных ЭПД и пакетов. 
+       Не должен быть заполнен для ЭПД в составе пакета. */ 
+    packet.setAttribute("SystemCode", GetEDSystemCode(wlmes.TpSchemID));
+  end;
+
+  return packet;
+end;
+
+//Gurin S. 15.10.2015 R-624168-2
+private macro messageAlreadySent(mesid)
+   var sql = execSqlSelect("SELECT 1 FROM dwlmeslnk_dbt lnk, dwlpm_dbt wlpm, dwlexphist_dbt hist WHERE lnk.t_mesid = :mesid AND lnk.t_objid = wlpm.t_wlpmid AND wlpm.t_paymentid = hist.t_paymentid",
+                           makeArray (SQLParam ("mesid", mesid)));
+   return (sql and sql.movenext());
+onError
+   return False;
+end;
+
+/***************************************************************************/
+/* Макрос экспорта                                                         */
+/***************************************************************************/
+macro UFBSOutProc( fileName, addrSess )
+  var continue0 = TRUE, Документов = 0, err;
+  var xml:object = ActiveX("Microsoft.XMLDOM");
+  var doc:object, packet:object;
+  var obj:object, item:object, subItem:object;
+  var СуммаДокументов = 0, СуммаДокумента = 0;
+  var НужнаЭЦП, НуженЗКдляЭД, НуженЗКдляПЭД, НуженЗКдляЭДПЭД, IsPack;
+  var CryptoAPI = RsCryptoAPI();
+  var MaxExpMes : integer = 0, PacketType : integer = 0;
+  var IsEPD     = true;
+  var WlSessUID = null;
+  var rs, cmd;
+
+  НужнаЭЦП        = CryptoAPI.IsCryptoActionNeeded( CONTEXTID_SET_SIGN_UFBS,      370 );
+  НуженЗКдляЭД    = CryptoAPI.IsCryptoActionNeeded( CONTEXTID_SET_ZK_UFBS,        370 );
+  НуженЗКдляПЭД   = CryptoAPI.IsCryptoActionNeeded( CONTEXTID_SET_ZK_EPD_UFBS,    370 );
+  НуженЗКдляЭДПЭД = CryptoAPI.IsCryptoActionNeeded( CONTEXTID_SET_ZK_ED_EPD_UFBS, 370 );
+
+  SetBuff( wlSess, addrSess );
+
+  // HF_81 24.06.2013 TAM
+  xml.appendChild( xml.createProcessingInstruction("xml"," version='1.0' encoding='Windows-1251'") );  
+  //xml.appendChild( xml.createProcessingInstruction("xml"," version='1.0' encoding='UTF-8'") );
+
+  /* Определяем, есть ли сообщения, подлежащие выгрузке */
+  if( not СчитатьЗапись( wlmes, err ) )
+    if ( not err )
+       ErrExport("Не найдено ни одного сообщения для отправки");
+    else
+       ErrExport("Ошибка чтения сообщения");
+    end;
+    return false;
+  end; 
+
+  //Козина проверка на наличие старых платежей среди выгружаемых. I-063798                                                                                         
+  cmd=RSDCommand(" SELECT pm.t_paymentid                                                 "+
+                 "FROM dwlpm_dbt wpm, dpmpaym_dbt pm, dwlmes_dbt mes, dwlmeslnk_dbt lnk  "+
+                 "WHERE mes.t_mesid = ?                                                  "+
+                 "AND mes.t_RlsFormID != 363                                             "+ //TAM 01.11.12 к ЕД274 нет платежей
+                "AND mes.t_mesid = lnk.t_mesid                                           "+
+                "AND lnk.t_objkind IN (501, 505)                                         "+
+                "AND wpm.t_wlpmid = lnk.t_objid                                          "+
+                "AND pm.t_chapter = 1                                                    "+
+                "AND pm.t_paymentid = wpm.t_paymentid                                    "+
+                "AND pm.t_valuedate < (TO_DATE ('"+{curdate}+"', 'dd.mm.yyyy') - 10)");
+  cmd.AddParam("mesid", RSDBP_IN, wlmes.mesid);
+  rs = RSDRecordset(cmd);
+  if ( rs.MoveNext())
+    if(not Gettrue(true,"Дата платежа с ID "+rs.value(0)+" меньше текущей на 10 дней. Выгружать в сообщение?"))
+      return false;
+    end;
+  end;
+
+  /* Используем ли пакеты ЭПД/ЭСИД */
+  //Gurin S. 26.03.2015 HF2031_19_25_148
+  if( not GetModePacketEPD_ESID( wlmes, @IsPack, @PacketType, @MaxExpMes ) )
+    ErrExport( "Ошибка при определении режима использования пакетов ЭПД/ЭСИД" );
+    return false;
+  end;
+
+    if (wlmes.tpschemid == 57) 
+      IsPack = false;   
+    end;
+    
+    if ( wlmes.Kind != MESKIND_PAYMENT )
+      IsPack = false;   
+    end;
+
+    // Gurin S. 08.07.2015 
+    if ( wlmes.RlsFormID == 363 ) //Сообщение ED274
+      IsPack = true;   
+      // Gurin S. 13.01.2016 I-00588841-2
+      if (PacketType == 0)
+         PacketType = 3; //PacketEID
+      end;
+    end;
+
+  /* Формирование пакета */
+  if( IsPack )
+    var PacketName : string = Bnk_GetLLValuesName(OBJTYPE_PACKETTYPE_MESFRM, PacketType);
+    packet = CreatePacket(PacketName, false);
+
+    doc = xml.appendChild(packet);
+  else
+    doc = xml;
+  end;
+  
+  /* Последовательно считываем сообщения и формируем файл экспорта */
+    while( continue0 )
+      //Gurin S. 15.10.2015 R-624168-2
+      if ((wlmes.Kind == MESKIND_PAYMENT) and messageAlreadySent(wlmes.mesid) and (not unload) and _bank.is_EXV)
+         if( not GetTrue( true, "В сеансе есть сообщения, которые уже выгружались ранее. | Продолжить выгрузку?" ))
+            msgbox("В сеансе есть сообщения, которые уже выгружались ранее. | Проверьте выписку РКЦ");
+            RunError("В сеансе есть сообщения, которые уже выгружались ранее. | Проверьте выписку РКЦ");
+         else
+            unload = True;
+         end;
+      end;
+      if( not ЗаписатьСообщение( СуммаДокумента, doc, IsPack, НуженЗКдляЭД, НуженЗКдляЭДПЭД) )
+        return false;
+      end;
+      if( not СчитатьЗапись( wlmes, err, false ) )
+         if ( not err )
+            continue0 = FALSE;
+         else
+            ErrExport("Ошибка чтения сообщения");
+            return false;
+         end;
+      end;
+      Документов = Документов + 1;
+      СуммаДокументов = СуммаДокументов + СуммаДокумента;
+      message( "Идет выгрузка документов. Отправлено: ", Документов );
+    end;  
+
+  if ( IsPack and (PacketName == "PacketEPD") )
+    packet.setAttribute("EDQuantity", Документов );
+    packet.setAttribute("Sum", СуммаДокументов );
+  end;
+
+  if ( IsPack and НуженЗКдляПЭД)
+     if(not ПодписаниеЗК( CONTEXTID_SET_ZK_EPD_UFBS, doc ))
+        ErrExport("Ошибка подписи пакета ЗК");
+      return false;
+  end;
+  end;
+
+  if(НужнаЭЦП)
+     if(not ПодписаниеЭЦП( CONTEXTID_SET_SIGN_UFBS, xml ))
+        ErrExport("Ошибка подписи файла ЭЦП");
+      return false;
+     end;
+  end;
+
+  if ( ОформлятьСлужебныйПакет )
+     ОформитьСлужебныйПакет(xml);
+  end;
+
+  xml.Save(fileName); 
+
+  return true;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ErrExport(String(er.Message, "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+end;
+
+macro UFBSOutProcV2( fileName, addrSess )
+  ver_st = 2;
+  return UFBSOutProc( fileName, addrSess );
+end;

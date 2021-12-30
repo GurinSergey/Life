@@ -1,0 +1,715 @@
+/**************************************************************************************************/
+/*                       Файл    Account.mac                                                      */
+/* Изменен: Gurin S. N.    23.01.2012 I-00144824                                                  */
+/* Изменен: Gurin S. N.    30.03.2012 I-00159149                                                  */
+/* Изменен: Dyldina        13.04.2012 I-00171399                                                  */
+/* Изменен: zip_z.         13.07.2012 без заявки                                                  */
+/* Изменен: zip_z.         08.08.2012 I-00232857                                                  */
+/* Изменен: Gurin S.       24.09.2012 R-105584-3                                                  */
+/* Изменен: zmp            24.10.2012 Добавлен отчет по денежным чекам за период(C-12502)         */
+/* Изменен: VV             09.04.2013 C-18454 - Доработка справки об отсутствии картотеки2        */
+/* Изменен: TAM            22.05.2013 C-17621 - Список договоров на постоянные перечисления       */
+/* Изменен: Gurin S.       04.08.2013 C-22396 - Остатки ссудных средств                           */
+/* Изменен: TAM            08.10.2013 C-23305 - Список договоров на заранее данные акцепты        */
+/* Изменен: Chesnokov D.S. 15.11.2013 R-282279 - Отправка письма в ИК                             */
+// KS 25.11.2013 Адаптация под 31ю сборку
+//VV 24.01.2014 C-24809 for 2031
+//RR 12.02.2014 Адаптация C-24538 под 31
+/* Изменен: VV             17.04.2014 C-28707                                                     */
+/* joy 06.10.2014 I-00518705-2 При закрытии в прошлом оп.дне проверяем наличие проводок в след.днях*/
+/**************************************************************************************************/
+/*Макросы справок для клиентов*/
+import "SprAcc.mac", "UpddateAcc.mac", "svodynmemorder.mac",RslX, "podtv_ost_proc.mac";
+import "sfcomcat.mac";
+import ZubRunScroll;
+
+import RsbDataSet;
+// KS 01.03.2012 Для корректировки сконвертированных претензий
+import "acs_func.mac","RepCheckRevs.mac", "lib_access.mac","lib_const.mac";
+//TAM 22.05.2013 C-17621
+import "ContractScroll.mac";
+//Gurin S. 04.08.2013 C-22396
+import "show_ssud_rest.mac";
+//TAM 08.10.2013 C-23305
+import "AcptInAdvanceScroll.mac";
+import "lib_account.mac", "lib_oper.mac";//TAM 28.05.2014 R-385048-2
+import lib_fg;
+
+private Record Счет( account );
+private Record СтарыйСчет( account );
+
+private Record БалансовыеСчета( accblnc );
+private Record СтарыеБалансовыеСчета( accblnc );
+
+private Record  Субсчет (ACCSUB);
+private Record  СтарыйСубсчет (ACCSUB);                                
+
+private Record  ПроводкаСубсчета (ACCSUBDC);
+private Record  СтараяПроводкаСубсчета (ACCSUBDC);
+
+private macro Новый_счет()
+    return  0;
+end;
+
+//zmp 28.11.2014 C-26329
+macro Press_EnterFor365P(cmd, rsd, id, key)               
+   var scroll = ZUBScroll;           
+   scroll.ScrollReadOnly = true;
+   scroll.ScrollHead = "Список ответов";
+   scroll.Columns.Add ("OUTSIDEMES" , "Ответы на запрос",     90, ZUB_SCR_COL_NONEDITABLE);
+   scroll.SqlText = "SELECT T_OUTSIDEMES OUTSIDEMES  FROM   dmes365_log_dbt LOG WHERE   T_REQID  = " + rsd.value("reqid");
+   scroll.Scroll();
+end;          
+
+
+         
+
+/*
+    Возможные значения параметра Режим
+      OBJ_INSERT      - создание нового счета из списка лицевых счетов. Заполнены буферы Счет, БалансовыеСчета.
+      OBJ_UPDATE      - обновление существующего счета из списка лицевых счетов. Заполнены буферы Счет, БалансовыеСчета, СтарыйСчет, СтарыеБалансовыеСчета.
+      OBJ_CLOSE       - закрытие лицевого счета из списка лицевых счетов. Заполнены буферы Счет, БалансовыеСчета.
+      OBJ_OPEN_CLOSED - закрытие лицевого счета из списка лицевых счетов. Заполнены буферы Счет, БалансовыеСчета.
+ */
+
+private macro CreateWordApplication()
+  var startAX, WordApplication;
+  if (isStandAlone())
+    return ActiveX("Word.Application");
+  else
+    startAX = CreateObject("rsax", "TRsAxServer", "LoansAxServer", isStandalone());
+    WordApplication = startAX.CreateComObject("Word.Application");
+    WordApplication.Visible = false;
+    return WordApplication;
+  end;
+end;
+  
+private macro ShowReportOnTerminal( WordApp, WordDoc )
+  var DocFileName : string, TermFileName : string;
+  DocFileName = SplitFile( GetTxtFileName("") );
+  DocFileName = MergeFile( DocFileName, "date_prolong_" + string(UserNumber), ".doc" );
+  DocFileName = MergeFile( GetCurDir(), DocFileName );
+  WordApp.visible = true; 
+end;
+
+private macro Проверить_счет( Режим )
+  var SQL, cmd, rs;
+  if (substr(Счет.account,1,5)=="40821") 
+    var sql1= "SELECT 1 FROM dnotetext_dbt dn WHERE dn.t_notekind = 153 AND dn.t_objecttype = 4 AND dn.t_documentid = CONCAT ('010000000',:acc1)";
+    var cmd1 = RsdCommand (sql1);
+    cmd1.AddParam ("acc1", RSDBP_IN, Счет.account); 
+    cmd1.execute();
+ 
+    var rs1 = RsdRecordset( cmd1 );
+    if (rs1 and not rs1.movenext)
+      var notetext = "Согласование с Палагиной Еленой (тел.99-30-52) - счет платежного агента/субагента/поставщика";
+      if (_bank.is_GEB)
+         notetext = "Счет платежного агента/субагента/поставщика";
+      end;
+      var sql2="INSERT INTO dnotetext_dbt"
+               "       (t_objecttype, t_documentid, t_notekind, t_oper, t_date," 
+               "        t_text, t_validtodate, "
+               "        t_branch, t_numsession) "
+               "VALUES (4, concat('010000000',:acc2), 153, RSBSESSIONDATA.oper," "rsbsessiondata.curdate,"
+               "        UTL_RAW.cast_to_raw (:notetext), TO_DATE ('31.12.9999'), "
+               "        rsbsessiondata.operdprtnode, 0)";
+
+      var cmd2 = RsdCommand (sql2);
+      cmd2.AddParam ("acc2", RSDBP_IN, Счет.account); 
+      cmd2.AddParam ("notetext", RSDBP_IN, notetext); 
+      cmd2.execute();
+    end;
+  end;
+
+  // FIV I-065633  10.09.2010 Если изменился ВСП клиента, то меняем его и в договоре по счету
+  // 2012-07-12 zip_z. Параметризация
+  if (Счет.Branch != СтарыйСчет.Branch )
+    SQL = "UPDATE dsfcontr_dbt SET t_branch = :branch WHERE t_fiid = 0 AND t_objecttype = 1 AND t_servkind = 3 AND t_object = :acc";
+    cmd = RSDCommand(SQL);
+    cmd.AddParam ("branch", RSDBP_IN, Счет.Branch ); 
+    cmd.AddParam ("acc",    RSDBP_IN, Счет.Account); 
+     cmd.Execute;
+  end;
+
+  // 2012-07-12 zip_z. Отступы. Кто знает, тот поймёт
+  //Тихомиров А.Н. По заявке I-005622 - Проверка ключа парного счета
+  if (strlen(Счет.pairaccount) > 0 )
+    var GoodKey = GetKey(Счет.pairaccount,{MFO_BANK});
+    if(GoodKey!=Счет.pairaccount)   
+      if ( gettrue(true,"Неверный ключ парного счета, правильный счет: "+GoodKey+"|Изменить?"))
+        Счет.pairaccount = GoodKey;
+      else
+        UpdateFields();
+        return 1;
+      end;
+    end;
+  end;
+
+
+  /* Коркин Иван: проверка на дату закрытия счета */
+  // 2012-07-12 zip_z. Исправление бреда
+  if (Режим == OBJ_UPDATE)
+    // 2012-08-08 zip_z I-00232857-1
+    // if (Счет.Close_Date < СтарыйСчет.Close_Date ) 
+    if ((Счет.Close_Date < СтарыйСчет.Close_Date ) and (Счет.Close_Date != date (0,0,0)))
+      if (счет.Close_Date < счет.Final_Date)
+        Счет.Close_Date = счет.Final_Date;
+        msgbox ("Дата закрытия счёта меньше даты последней проводки по счёту");
+        updateFields();
+        return 1 ; 
+      end;
+    end;
+    /*zmp 18.02.2013 C-13303-6 -->*/
+    if((СтарыйСчет.Close_Date != date (0,0,0)) and (Счет.Close_Date == date (0,0,0)) )
+      SQL = " SELECT   1                                            "+
+            " FROM   dreqclosa_dbt t,                               "+
+            "   doprdocs_dbt odocs,                                 "+
+            "   dwlmes_dbt wlm,                                     "+
+            "   doproper_dbt opr                                    "+
+            " WHERE                                                 "+
+            "   opr.t_dockind = 231                                 "+
+            "   AND OPR.T_DOCUMENTID = LPAD (t.t_requestid, 34, '0')"+
+            "   AND opr.t_id_operation = ODOCS.T_ID_OPERATION       "+
+            "   AND ODOCS.T_DOCkind = 370                           "+
+            "   AND TRIM (ODOCS.T_DOCUMENTID) = WLM.T_MESID         "+
+            "   AND WLM.T_STATE >= 40                               "+
+            "   AND T.T_CODE_CURRENCY = 0                           "+
+            "   AND T.T_ACCOUNT = ?                                 ";
+      cmd = RsdCommand(SQL);
+      cmd.AddParam ("0", RSDBP_IN,Счет.account); 
+      rs  = RsdRecordset(cmd);
+      if (rs and rs.moveNext())
+        if(ACS_CheckGroupOper(ACS_GRP_MSG_FNS_ROLLBACK,{oper},false)) 
+          if(not (getTrue(true,"Сообщение по заявлению на закрытие счета уже доставленно адресату. | Продолжить открытие счета?")))
+            return RSL_EXIT_FAILURE;
+          end;
+        else
+          msgBox("Открытие счета запрещено. | Сообщение по заявлению на закрытие счета уже доставленно адресату.");
+          return RSL_EXIT_FAILURE;
+        end;
+      end;
+    end;
+        /*<-- zmp 18.02.2013 C-13303-6*/
+  end;
+  //VV C-24809>>
+  debugbreak;
+  if((Счет.Close_Date != date (0,0,0))  and (substr(Счет.account,1,5)=="90902") ) 
+     var rss,cmm;
+     rss= "update daccount_dbt set t_open_close=chr(0),t_type_account=chr(1),t_close_date=to_date('01.01.0001','dd.mm.yyyy') where t_ACCOUNT ='"+Счет.Account+"' " ;
+     cmm = rsdcommand(rss);
+     cmm.execute;
+     cmm = rsdcommand("commit");
+     cmm.execute;
+     msgbox("Счет открыт");
+  end;  
+
+  //Gurin S. R-456980-2
+  if ((_bank.is_GO) and (Счет.kind_account == "0"))
+     Счет.kind_account = "-";   
+  end;
+  // joy 06.10.2014 I-00518705-2 Если пользователь пытается закрыть счет в прошлом дне, проверяем наличие проводок
+  if  (Режим == OBJ_CLOSE ) 
+    var CheckTrn = "  select   * " +
+                   "    from   dacctrn_dbt trn " +
+                   "    where   (trn.t_account_payer = :1 or trn.t_account_receiver = :2) and trn.t_date_carry > :3 ";
+    cmd = RsdCommand (CheckTrn);
+    cmd.AddParam ("1", RSDBP_IN, Счет.account); 
+    cmd.AddParam ("2", RSDBP_IN, Счет.account); 
+    cmd.AddParam ("3", RSDBP_IN, {curdate}); 
+    rs  = RsdRecordset(cmd);
+    if (rs and rs.moveNext())
+        msgBox("Закрытие счета датой" + {curdate} +" невозможно. По счету были проводки после указанной даты");
+        return 1;
+    end;
+  end;
+  // --- end joy
+
+  return  0;
+end;
+
+private macro ФункцияПользователяСчет( )
+
+   var main: TArray = TArray(); //Gurin S. 24.09.2012 R-105584-3
+   array mnu;
+   array mifns;
+   array inffns;
+   
+   var вариант, date1;
+   var varmain;
+   var вариант1;
+   var вариант_фнс;
+
+   var rs,str,cmd;   //Gurin S. N. 23.01.2012 I-00144824-1
+   var dateprolong; //Dyldina 13.04.2012 I-00171399-2
+   var user = RSL_Person ({oper}); //TAM 28.05.2014 R-385048-2
+   const ARM_AUDITOR = 1033;
+   file SfContr( "sfcontr.dbt") key 1;  
+
+  
+   /*Основное меню справок */
+   main(main.size()) = "Справки для клиентов";
+   main(main.size()) = "Cправки ответов на запросы ИФНС для клиентов"; 
+   //Gurin S. 24.09.2012 R-105584-3
+   rs = ExecSqlSelect ("select 1 count  from  dacsgroupoper_dbt where t_oper = :oper and (t_groupid = :id1 or t_groupid = :id2 ) having (count(*)) = 2", makeArray (SQLParam ("oper", {oper}), SQLParam ("id1", 123), SQLParam ("id2", 146)));
+   if (rs.moveNext ())
+      main(main.size()) = "Изменение даты открытия счета";
+   end;
+   main(main.size()) = "Сводный мем. ордер"; 
+   main(main.size()) = "Формирование подтверждения остатков на конец года";
+   if(user.armnumber != ARM_AUDITOR) //TAM 28.05.2014
+      main(main.size()) = "Изменение даты пролонгации договора обслуживания"; //Dyldina 13.04.2012 I-00171399-2
+      main(main.size()) = "Информационные сообщения для ФНС";
+   end;
+   main(main.size()) = "ФИО операциониста";   //Gurin S. N. 23.01.2012 I-00144824-1
+   main(main.size()) = "Контроль даты пролонгации"; //Tovpeko C-387
+
+   //rs = ExecSqlSelect ("select 1 from dacsgroupoper_dbt where t_groupid = :id and t_oper = :oper", makeArray (SQLParam ("id", 176), SQLParam ("oper", {oper})));
+   //if (rs.moveNext ())
+   //     main(main.size()) = "Корректировка сумм действующих претензий"; // KS 01.03.2012 Для корректировки сконвертированных претензий
+   //end;
+   // < 2012-08-02 zip_z.
+   //TAM 22.05.2013 C-17621
+   main(main.size()) = "Список договоров к счету на постоянные перечисления";
+   //Gurin S. 04.08.2013 C-22396 
+   main(main.size()) = "Остатки ссудных средств";
+   //TAM 08.10.2013 C-23305
+   main(main.size()) = "Список договоров к счету на заранее данные акцепты";
+   //Chesnokov D.S. 15.11.2013 R-282279 Отправка письма в ИК
+   if(user.armnumber != ARM_AUDITOR) // TAM 28.05.2014
+      main(main.size()) = "Отправить сообщение в Интербанк";
+   end;
+   //RR 06.12.2013 C-24538
+   if(user.armnumber != ARM_AUDITOR) // TAM 28.05.2014
+      main(main.size()) = "Отправка уведомлений об открытии счета в LN"; 
+      main(main.size()) = "Изменение лимита по счету"; 
+   end;
+   main(main.size()) = "Открытие счетов дебиторской задолженности ПЗО";
+   //Gurin S. 08.10.2014 R-466931-2 
+   if ((_bank.is_GO) and (Acc_GetKindByAccount(Счет.Account) == "0"))
+      main(main.size()) = "Сменить вид счета";
+   end;
+   main[main.size()] = "Запросы на выписку по счету по 365-П";
+
+
+   /*Справки для клиентов*/
+   mnu(0) = "Справка о выдаче средств на з/п";
+   mnu(1) = "Справка об остатке на счете";
+   mnu(2) = "Справка подтверждения о наличие расчетного счета";
+   mnu(3) = "Справка подтверждения о наличие счетов";
+   mnu(4) = "Справка об оборотах по счету";
+   mnu(5) = "Справка об оборотах по счету с остатками";
+   /* EVG 9/6/2015 Справка об отсутствии К2 доработана: в случае наличия картотеки 2 или ОР, печатается отдельная справка,
+      как когда-то и хотели сделать для ЭВ, но почему-то не доделали. Название пункта меню тоже скорректируем в соответствии
+      с новой функциональностью справки.
+   mnu(6) = "Справка об отсутствии очереди неисполненных в срок распоряжений (Картотека №2)";  /* VV 09.04.2013  C-18454 - Доработка справки об отсутствии картотеки2  */ //C-28707
+   */
+   mnu(6) = "Справка о наличии / отсутствии очереди неисполненных в срок распоряжений (Картотека №2, ОР)";
+
+   /*Cправки ИФНС для клиентов*/
+   mifns(0) = "Справка о наличии/отсутсвии счетов";
+   mifns(1) = "Справка об остатках денежных средств на счетах";
+   mifns(2) = "Выписка по операциям на счете организации";
+   mifns[3] = "Отчет по денежным чекам за период";
+   /*Информационные сообщения ФНС*/
+   inffns(0) = "Справка о наличии счетов";
+   inffns(1) = "Сведения об остатках денежных средств на счете";
+   inffns(2) = "Выписка по операциям на счете";
+   inffns(3) = "Подтверждение в ФНС";
+
+   varmain = Menu (main,"Меню выбора справок");
+
+    if(varmain < 0)
+        return 0;
+    end;
+
+        if (main(varmain) == "Справки для клиентов")
+            вариант = Menu (mnu, "Справки для клиентов");
+            if (вариант == 0) 
+                SprAccDialog(Счет.Account, 
+                             Счет.Branch,
+                             Счет.Client,
+                             Счет.Chapter,
+                             Счет.Code_Currency,
+                             Счет.Oper); 
+            elif (вариант == 1)
+                SpLimAcc(Счет.Account, 
+                         Счет.Branch,
+                         Счет.Client,
+                         Счет.Chapter,
+                         Счет.Code_Currency,
+                         Счет.Oper);
+           
+            //вызов макроса Справка подтверждения о наличие расчетного счета
+            elif (вариант == 2)
+                ConfAccDialog(Счет.Account, 
+                              Счет.Branch, 
+                              Счет.Client,
+                              Счет.Open_Date, 
+                              Счет.Open_Close, 
+                              Счет.Balance,
+                              Счет.Chapter,
+                              Счет.Code_Currency,
+                              Счет.Oper); 
+           
+            //вызов макроса Справка подтверждения о наличие счетов                  
+            elif (вариант == 3)
+                AccconfexDialog(Счет.Account, 
+                                Счет.Branch, 
+                                Счет.Client,
+                                Счет.Open_Date, 
+                                Счет.Open_Close, 
+                                Счет.Balance,
+                                Счет.Chapter,
+                                Счет.Code_Currency,
+                                Счет.Oper); 
+            elif (вариант == 4) 
+                SprTurnoverDialog(Счет.Account, 
+                                  Счет.Branch, 
+                                  Счет.Client, 
+                                  Счет.Chapter, 
+                                  Счет.Code_Currency,
+                                  Счет.Oper);
+
+            elif (вариант == 5)
+                SprTurnoverDialogSld(Счет.Account, 
+                                     Счет.Branch, 
+                                     Счет.Client, 
+                                     Счет.Chapter, 
+                                     Счет.Code_Currency,
+                                     Счет.Oper);
+
+            //вызов макроса Справка об отсутствии картотеки 2
+            elif (вариант == 6) 
+                Ref2AccDialog(Счет.Account, 
+                              Счет.Branch, 
+                              Счет.Client,
+                              Счет.Open_Date, 
+                              Счет.Open_Close, 
+                              Счет.Balance,
+                              Счет.Chapter,
+                              Счет.Code_Currency,
+                              Счет.Oper);   
+           end;
+ 
+
+        elif (main(varmain) == "Cправки ответов на запросы ИФНС для клиентов")
+            вариант1 = Menu (mifns, "Справки ИФНС для клиентов");
+            /*Автор Новиков С. С.*/
+            /*Создание отчета  Справка о наличии/отсутсвии счетов*/
+            if (вариант1 == 0)
+                RefprAbsAccDialog(Счет.Account,
+                                  Счет.Branch,
+                                  Счет.Client,
+                                  Счет.Balance,
+                                  Счет.Chapter,
+                                  Счет.Code_Currency,
+                                  Счет.Oper); 
+            
+            /*Автор Новиков С. С.*/
+            /*Cозданию отчета Справка об остатках денежных средств на счетах */ 
+            elif(вариант1 == 1)
+                RemAcc(Счет.Account,
+                       Счет.Branch, 
+                       Счет.Client,
+                       Счет.Balance,
+                       Счет.Chapter,
+                       Счет.Code_Currency,
+                       Счет.Oper);
+         
+            elif (вариант1 == 2)         
+                SprIFNSDialog( Счет.Account, 
+                               Счет.Balance,
+                               Счет.Branch, 
+                               Счет.Client, 
+                               Счет.Chapter, 
+                               Счет.Code_Currency,
+                               Счет.Oper);
+            elif (вариант1 == 3)
+                 CheckRevs(Счет.Account,Счет.Client);
+            end;
+
+        elif (main(varmain) == "Изменение даты открытия счета")
+            date1 = date(Счет.Open_Date);
+            if (getdate(date1, "Выберите дату"))
+                if (date(Счет.Open_Date) <= date(date1))
+                    msgbox("Дата открытия счета меньше или равна введенной дате");
+                    return 0;
+                end;
+                
+                updacc(счет.account, date1)
+            end;
+
+        elif (main(varmain) == "Сводный мем. ордер")
+            SvMemOrd(Счет.Account, 
+                     Счет.Branch,
+                     Счет.Client,
+                     Счет.Chapter,
+                     Счет.Code_Currency,
+                     Счет.Oper); 
+
+        elif (main(varmain) == "Формирование подтверждения остатков на конец года")
+            Accept_rest (Счет.Client); /* Ярмольчук. Отчет по подтверждению остатков на конец года */
+
+        //Dyldina 13.04.2012 I-00171399-2
+        elif (main(varmain) == "Изменение даты пролонгации договора обслуживания" )    
+            str = "SELECT t_id, t_dateprolong " +
+               "  FROM dsfcontr_dbt t " +
+               " WHERE t_object = '"+Счет.Account+"' " +
+               "   AND t_objecttype = 1 " +
+               "   AND t_servkind = 3 " +
+               "   AND t_fiid = "+ Счет.Code_Currency;
+            rs = trsbdataset (str);
+            if(rs and rs.movenext)
+                dateprolong = date(rs.t_dateprolong);
+                if(getdate(dateprolong,"Введите дату пролонгации"))
+                    str = "UPDATE dsfcontr_dbt t " +
+                        "   SET t_dateprolong = TO_DATE ('"+dateprolong+"', 'dd.mm.yyyy') " +
+                        " WHERE t_id = "+rs.t_id ;
+                    cmd = rsdcommand(str);
+                    cmd.execute;
+
+                    cmd = rsdcommand("commit");
+                    cmd.execute;
+                    msgbox("Все сделано :)");
+                else
+                    msgbox("Изменения не внесены.");
+                end;
+            else
+                msgbox("Не найден договор обслуживания!");
+            end;
+        //End Dyldina
+             
+    elif (main(varmain) == "Информационные сообщения для ФНС")
+      вариант_фнс = Menu(inffns, "Информационные сообщения");
+      if (вариант_фнс == 0)
+        //Сообщение о наличии счетов
+        ExecMacroFile("FNS_BNS.mac", "GenFnsBNS", Счет.Account, Счет.Branch, Счет.Client, Счет.Balance, Счет.Chapter, Счет.Code_Currency, Счет.Oper);
+      elif (вариант_фнс == 1)
+        //Сообщение об остатках на счетах
+        ExecMacroFile("FNS_BOS.mac", "GenFnsBOS", Счет.Account, Счет.Branch, Счет.Client, Счет.Balance, Счет.Chapter, Счет.Code_Currency, Счет.Oper);
+      elif (вариант_фнс == 2)
+        //Сообщение об операция по счетам
+        ExecMacroFile("FNS_BV.mac", "GenFnsBV", Счет.Account, Счет.Branch, Счет.Client, Счет.Balance, Счет.Chapter, Счет.Code_Currency, Счет.Oper);
+      elif (вариант_фнс == 3)
+        //Сообщение о подтверждении в ФНС
+        ExecMacroFile("FNS_P.mac", "GenFnsP", Счет.Account, Счет.Branch, Счет.Client, Счет.Balance, Счет.Chapter, Счет.Code_Currency, Счет.Oper);
+      else
+        msgbox("Вы отказались от выбора пункта меню.");
+        return 1;
+      end;
+     
+    elif (main(varmain) == "ФИО операциониста")
+        str = "SELECT t_name FROM dperson_dbt WHERE t_oper = "+ счет.oper;
+        rs = trsbdataset (str);
+        if(rs and rs.movenext)
+            msgbox(rs.name);
+        else
+            msgbox("Не найден");
+        end;
+        
+    //elif (main(varmain) == "Корректировка сумм действующих претензий") // KS 01.03.2012 Для корректировки сконвертированных претензий
+    //    MsgBox(КорректировкаСуммПр(Счет.Account));
+    
+    //TAM 22.05.2013 C-17621
+    elif (main(varmain) == "Список договоров к счету на постоянные перечисления")
+      show_contracts(Счет.Account, Счет.Client);
+    //end TAM C-17621
+    //Gurin S. 04.08.2013 C-22396
+    elif (main(varmain) == "Остатки ссудных средств")
+       //ExecMacroFile("show_ssud_rest.mac", "show_ssud_rest", Счет.Account);
+       show_ssud_rest(Счет.Account);
+    //TAM 08.10.2013 C-23305
+    elif (main(varmain) == "Список договоров к счету на заранее данные акцепты")
+      show_zdacontracts(Счет.Account, Счет.Client);
+    //begin TAM перенос Tovpeko C-387
+    elif(main(varmain) == "Контроль даты пролонгации")
+        var claim, RegParam, Templ, temppath, WordApp, WordDoc, row, tbl, query, sql, date_beg, date_end, TxtFileName, txtDir, err;
+        if (getdate(date_beg,"Введите дату начала периода"))
+            if (getdate(date_end,"Введите дату конца периода"))
+                if (date_beg <= date_end)
+                    GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+                    Templ = "date_prolong.dot";
+                    temppath = findpath(Templ,RegParam); 
+                    if (not temppath)
+                        msgbox("Не найдена LBR");
+                        exit();
+                    end;
+                    WordApp = CreateWordApplication();
+                    if (WordApp)
+                        WordDoc = WordApp.Documents.Add( temppath );
+                    end;
+                    row = 2;
+                    WordDoc.Bookmarks("Date_begin").Range.Text  =  date_beg;
+                    WordDoc.Bookmarks("Date_end").Range.Text    =  date_end;
+                    query = "SELECT   AC.T_DEPARTMENT," +
+                            "(SELECT   dp.t_name "+
+                            "   FROM   ddp_dep_dbt dp "+
+                            "  WHERE   dp.t_code = ac.t_branch) "+
+                            "     AS dpname," +
+                            "         AC.T_ACCOUNT,"+
+                            "         AC.T_BALANCE,"+
+                            "         AC.T_NAMEACCOUNT,"+
+                            "         AC.T_KIND_ACCOUNT,"+
+//                            "         AC.T_R0,"+
+                            "         rsb_account.restac(AC.t_account,AC.t_code_currency,to_date('"+date_end+"','dd.mm.yyyy'),AC.t_chapter,0) T_R0,"+
+//                            "         AC.T_PLANREST,"+
+                            "         rsi_rsb_account.planrestac(AC.t_account,AC.t_code_currency,to_date('"+date_end+"','dd.mm.yyyy'),AC.t_chapter) T_PLANREST,"+
+                            //Gurin S. 22.06.2015 I-00572591-3
+                            "         NVL(ac.t_index2,chr(0)) t_index2,"+
+                            "(SELECT   COUNT ( * ) "+
+                            "   FROM   dacclaim_dbt claim "+
+                            "  WHERE   CLAIM.T_ACCOUNT = AC.T_ACCOUNT) "+
+                            "     AS   pret,"+
+                            "         AC.T_OPEN_CLOSE,"+
+                            "         AC.T_OPEN_DATE,"+
+                            "         CONTR.T_DATEPROLONG"+
+                            "  FROM   daccount_dbt ac, dsfcontr_dbt contr"+
+                            " where contr.t_dateprolong between to_date ('"+date_beg+"', 'dd.mm.yyyy')"+
+                            "                               and to_date ('"+date_end+"', 'dd.mm.yyyy')"+
+                            "   and ac.t_account like '40%'"+
+                            "   and AC.T_OPEN_CLOSE <> 'З'"+
+                            "   and AC.T_ACCOUNT = CONTR.T_OBJECT"+
+                            "   order by CONTR.T_DATEPROLONG";
+                    sql = ExecSqlSelect (query, null, true);
+                    if (sql.moveNext)
+                        sql.moveLast;
+                        tbl = WordApp.ActiveDocument.Tables.item(1);
+                        if( WordDoc )
+                            while (sql.moveNext)
+                                if (sql.value("pret") > 0)
+                                    claim = "X";
+                                else claim = " ";
+                                end;
+                                tbl.Cell(row, 1).Range.Text  = sql.value ("T_DEPARTMENT");
+                                tbl.Cell(row, 2).Range.Text  = sql.value ("dpname");
+                                tbl.Cell(row, 3).Range.Text  = sql.value ("T_ACCOUNT");
+                                tbl.Cell(row, 4).Range.Text  = sql.value ("T_BALANCE");
+                                tbl.Cell(row, 5).Range.Text  = sql.value ("T_NAMEACCOUNT");
+                                tbl.Cell(row, 6).Range.Text  = sql.value ("T_KIND_ACCOUNT");
+                                tbl.Cell(row, 7).Range.Text  = sql.value ("T_R0");
+                                tbl.Cell(row, 8).Range.Text  = sql.value ("T_PLANREST");
+                                tbl.Cell(row, 9).Range.Text  = sql.value ("T_INDEX2");
+                                tbl.Cell(row, 10).Range.Text = claim;
+                                tbl.Cell(row, 11).Range.Text = date(sql.value ("T_OPEN_DATE"));
+                                tbl.Cell(row, 12).Range.Text = date(sql.value ("T_DATEPROLONG"));
+                                tbl.Rows.Add();
+                                row = row + 1;
+                            end;
+                        end;
+                        if( IsStandAlone() )
+                            WordApp.Visible = TRUE;
+                        else
+                            ShowReportOnTerminal( WordApp, WordDoc );
+                        end; 
+                    else
+                        msgbox ("Нет данных");
+                    end;
+                end;
+            end;
+        end;
+    //Chesnokov D.S. 15.11.2013 R-282279 - Отправка письма в ИК
+    elif(main(varmain) == "Отправить сообщение в Интербанк")
+      ExecMacroFile("Send_IC_text.mac", "Send_text_ic", Счет.Client);
+    //RR 06.12.2013 C-24538
+    elif(main(varmain) == "Отправка уведомлений об открытии счета в LN")
+      SendLotusNoticeAccOpen(Счет.account,Счет.nameaccount);
+    elif(main(varmain) == "Изменение лимита по счету")
+      /*VDN R-568464, R-567754*/
+      if( not ВходитВГруппу ( {oper}, 115 ) )
+         msgbox("Вы не включены в группу \"115 - Редактирование поля ЛИМИТ в карточке счета\" ");
+         return false;
+      end;
+
+      var new_limit_acc = 0;
+      str = " SELECT t_limit" +
+            " FROM dacclimit_dbt t " +
+            " WHERE t.t_account = '"+Счет.Account+"' " +
+            "   AND t.T_LIMITDATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy')";
+      rs = trsbdataset (str);
+      if(rs and rs.movenext) new_limit_acc= rs.t_limit; end;
+
+      if (GetNumeric ( new_limit_acc,"Сумма Лимита"))
+        Acc_SetLimit(Счет.Account,new_limit_acc);
+      end;
+    elif (main(varmain) =="Открытие счетов дебиторской задолженности ПЗО")
+
+       /*Определить счета начисления комиссий accFromComiss, accFromNDS, accToNDS по соответсвующим КУ*/
+
+       SfContr.ObjectType = 1;
+       SfContr.FIID = 0;
+       SfContr.Object = Счет.Account;
+       SfContr.ServKind = 3;   
+
+       if( not getEQ( SfContr ) )
+          MsgBox("Не найден договор обслуживания");
+          return false;
+       end;
+
+       var SfComPD = SfComPrimDoc( 150 , SfContr );
+       var SfConComPD = SfComPrimDoc( 52 , SfContr );
+
+       SfComPD.FindAndOpenAccount( PlusCalc_CatCode, {curdate}, 0 );
+       SfConComPD.FindAndOpenAccount( PlusCalcNDS_CatCode, {curdate}, 0 );
+
+    //Gurin S. 08.10.2014 R-466931-2 
+    elif (main(varmain) == "Сменить вид счета")
+       var m_list    = makeArray ("0                ", "-                 ");
+       var m_acckind = menu (m_list, null, "Выберите вид счета");
+
+       if (m_acckind != -2) // -2 = пользователь вышел по esc
+           cmd = RSDCommand ("update daccount_dbt set t_kind_account = :m_acckind where t_accountid = :m_accountid");
+           cmd.addParam ("m_acckind",   RSDBP_IN, trim(m_list(m_acckind)));
+           cmd.addParam ("m_accountid", RSDBP_IN, Счет.Accountid);
+           cmd.execute ();
+           msgbox ("Выполнено успешно. | Для обновления списка нажмите Ctrl + R");
+       end;
+    //zmp 28.11.2014 C-26329
+    elif (main(varmain) == "Запросы на выписку по счету по 365-П")
+       var scroll = ZUBScroll;           
+           debugbreak;
+           scroll.ScrollReadOnly = true;
+           scroll.Columns.Add ("INSIDEMES"      , "Номер запроса",     100, ZUB_SCR_COL_NONEDITABLE);
+           scroll.SqlText = "SELECT LOG.T_REQID REQID, LOG.T_INSIDEMES INSIDEMES  FROM   usr_365P_client_link lnk, dmes365_log_dbt LOG WHERE   LNK.REQID = LOG.T_REQID AND LNK.CLIENTID = " + Счет.Client + " GROUP BY   LOG.T_INSIDEMES , LOG.T_REQID";
+           scroll.ScrollHead = "Список запросов ZNO";
+           scroll.ScrollPrompt = "~Esc~ Выход ~Enter~ Просмотр";
+           Scroll.SetMacroOnKeys(13, "Press_EnterFor365P");
+           Scroll.Scroll;
+    end;
+    //end TAM
+    return 0;
+end;
+
+private macro Новая_ПроводкаСубсчета()
+    return  0;
+end;
+
+// Режимы: 
+// OBJ_INSERT - вставка
+// OBJ_UPDATE - редактирование
+// OBJ_DELETE - удаление 
+private macro Проверить_ПроводкуСубсчета( Режим )
+    return  0;
+end;
+
+private macro Новый_Субсчет()
+    return  0;
+end;
+
+// Режимы: 
+// OBJ_INSERT - вставка
+// OBJ_UPDATE - редактирование
+// OBJ_DELETE - удаление 
+private macro Проверить_Субсчет( Режим )
+    return  0;
+end;
+
+/*
+  Режимы работы скроллинга:
+  Chapter - глава, для которой открывается список;
+  Open_Close - открытые/закрытые счета;
+  PartyID - != 0, если в режиме счетов клиента;
+  Balance - != "", если в режиме счетов балансового счета.
+*/
+private macro УстановитьПодсказку(Chapter, Open_Close, PartyID, Balance)
+  return "";
+end;

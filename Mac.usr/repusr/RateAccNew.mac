@@ -1,0 +1,427 @@
+/*Несоответствие проводок курсовой разницы                                    */
+/*                                                                            */
+/*                                                                            */
+/*Суть: если есть разница между фактическими оборотами в рублях по счету      */
+/* и рассчитанными оборотами (по остаткам на текущую и предыдущую             */
+/* даты), следовательно на эту разницу должна по счету покрытия               */
+/* пройти переоценка. Если эта сумма не совпадает с суммой, что               */
+/* прошла по сч. покрытия (виды проводок 18,83,82,84), то                     */
+/* отчет выводит эту разницу                                                  */
+/*                                                                            */
+/*Тихомиров А.Н. 24.02.2009                  Версия 1.1      */
+/*Изменения:*/
+/*14-02-2013 Жаворонкова Н. joy I-00324846-2 для 30-ки нужен еще вид проводки 83 + параметризирована часть запросов */
+/*16.04.2014 DPN По инициативе Вараксина Е., убрал 83-й вид проводки и изменил результирующее условие на '!='       */
+ 
+import globals, oralib, bankinter, likePy, lib_lang, rsexts, FIinter;
+
+import RSD,rcw, rslx, Календарь, rsbdataset, CurrInter;
+var  n, i, reportdate, chapter, chap, restvalue, fii, fi, Chaptername, dprt_v, und = 0.05;
+var calcsum_all, factsum_all, unduesum_all,calcsum= $0.00,calcsum1= $0.00,calcsum2= $0.00,factsum1=$0.00,factsum2=$0.00,factsum, unduesum;
+var maxs:integer, k:integer;
+
+var fulloutput = GetTxtFileName("rateacc");
+
+const  KEY_F1      =315;
+const  KEY_F2      =316;
+const  KEY_F3      =317;
+const KEY_ESC      = 27;
+const KEY_SPACE    = 32;
+const KEY_ENTER    = 13;
+
+record Department ("dp_dep.dbt");
+record Chapt ("obchaptr.dbt");
+var Fulloutputl, outl, outputl="rateacc.lbr";                    
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+var dlg = TRecHandler("rateacc", fulloutputl, TRUE); 
+
+var branch, DateBegin,
+    DateEnd,
+    Office:double  = 0,
+    OfficeName = "По всем офисам";
+array fiidcode, rate1, rate2;
+
+import "fg_Life_parm.mac";
+var fgBank = fg_life_subject({OurBank});
+if (fgBank.is_go)
+    und = 0;
+end;
+
+private macro RestC(acc,dat)
+var sl = "select * from drestdat$_dbt where t_account= :acc and t_date_value < :dat order by t_date_value desc";
+var  DataS=execSQLSelect (sl, makeArray (SQLParam ("acc", acc), 
+                                         SQLParam ("dat", dat  )));
+    if (datas.movenext())
+        return DataS.value("t_rest");
+    else
+        return 0;
+    end;
+END;
+
+private macro fiid(fiid)
+var sl = "select t_codeinaccount as cia from dfininstr_dbt where t_fiid= :fiid";
+var DataS=execSQLSelect (sl, makeArray (SQLParam ("fiid", fiid) ));
+    if (datas.movenext())
+        return DataS.value("cia");
+    end;
+END;
+
+private macro fiidname(fiid)
+var sl = "select name from dfininstr_dbt where t_fiid= :fiid";
+var DataS=execSQLSelect (sl, makeArray (SQLParam ("fiid", fiid) ));
+    if (datas.movenext())
+        return DataS.value("name");
+    end;
+END;
+
+
+private macro curdate(dat)
+var sq = "select * from dcurdate_dbt where t_curdate <= :dat order by t_curdate desc ";
+var DataS=execSQLSelect (sq, makeArray (SQLParam ("dat", dat) ));
+    while (datas.movenext())
+        if (DataS.value("t_curdate") == dat)
+            datas.movenext();
+            return (DataS.value("t_curdate", NULL, V_DATE));
+        end;
+    end;
+END;
+
+
+private macro curdat(dat)
+var sq = "select * from dcurdate_dbt where t_curdate < :dat order by t_curdate desc";
+var DataS=execSQLSelect (sq, makeArray (SQLParam ("dat", dat) ));
+    if (datas.movenext())
+        if (datas.value ("t_isclosed")=="X")
+            return true;
+        else 
+            return false;
+        end;
+        msgbox ("На вашем стенде нет предыдущего операционного дня.");
+        exit;
+    end;
+END;
+
+/*Найдем имя по Partyid*/
+private macro GetClientName(id)
+var  sl=string(" select t_name from dparty_dbt t where t.t_PartyID= :id");
+var  DataS = execSQLSelect (sl, makeArray (SQLParam ("id", id) ));
+    if( DataS.moveNext())
+        return DataS.value("t_name");
+    else
+        if (id !=0)
+            msgbox("Субъект не найден в party.dbt");
+            return 0;
+        else
+            return "ОАО АКБ Пробизнесбанк";
+        end;
+    end;
+END;
+
+private macro acct (acc, dat)
+    var sq = "select count(*) as cnt from daccount_dbt where t_account= :acc and t_type_account not like '%U%' and t_type_account not like '%Н%'";
+    var datasq = execSQLSelect (sq, makeArray (SQLParam ("acc", acc) ));
+    return ((datasq.movenext() and (datasq.value ("cnt") > 0)));
+onError return false;
+END;
+
+
+//Тихомиров А.Н. - Доработка для нескольких проводок по просьбе Паньковой Е.
+private macro arhd (acc, dat)
+/*Виды проводок
+18-проводка переоценки
+82-переоценка исходящего остатка
+84-доп.переоценка при выполнениии операций
+83-курсовая разница в мультивалютной проводке
+*/
+    var sum = $0.00;
+    var sq = "select t_sum, t_account_receiver, t_account_payer "+
+             "from darhdoc_dbt where t_date_carry = :dat and (t_account_payer = :accp "+ 
+             " or t_account_receiver = :accr) and t_result_carry in (18, 84, 82)"; //14-02-2013 Жаворонкова Н. joy I-00324846-2 для 30-ки нужен еще вид проводки 83
+                                                                                   // 16.04.2014 DPN Убрал вид проводки 83 - отчёт показывает к.р. и без него, а с ним тянутся лишние проводки
+
+    var datasq = execSQLSelect (sq, makeArray (SQLParam ("dat", dat),
+                                               SQLParam ("accp", acc), 
+                                               SQLParam ("accr", acc)));
+    while (datasq.movenext())
+        if (datasq.value ("t_account_payer")  == acc)
+            sum = sum - round(datasq.value ("t_sum"),2,1);
+        elif (datasq.value ("t_account_receiver") == acc)
+            sum = sum + round(datasq.value ("t_sum"),2,1);
+        end;
+    end;
+return sum;
+END;
+
+
+
+private macro rate(rateid,dat)
+    var sq = "select t_sincedate, t_rate, t_point, t_scale from dratedef_dbt where t_rateid= :rateid";
+    var datasq = execSQLSelect (sq, makeArray (SQLParam ("rateid", rateid)));
+    if (datasq.movenext())
+        if (datasq.value ("t_sincedate") ==dat)
+            return (datasq.value ("t_rate")/((pow(10,datasq.value ("t_point")))*datasq.value ("t_scale")));
+        end;
+    end;
+    
+    sq = "select * from dratehist_dbt where t_rateid= :rateid and t_sincedate <= :dat  order by t_sincedate desc";
+
+    datasq = execSQLSelect (sq, makeArray (SQLParam ("rateid", rateid),
+                                           SQLParam ("dat", dat)));
+    if (datasq.movenext())
+        return (datasq.value ("t_rate")/((pow(10,datasq.value ("t_point")))*datasq.value ("t_scale")));
+    else
+        return -1;
+    end;
+END;
+
+
+private macro outall()
+
+initprogress(-1, "Отбираются счета, ждите...", "Отбираются счета");
+
+    if( chapter != 0 )
+        chap = "and acc.t_chapter = " + chapter;
+    else
+        chap = "";
+    end;
+
+var sql = " SELECT count(*)  "
+          "   FROM daccount_dbt acc "
+          "  WHERE (acc.t_open_close = CHR(0) OR acc.t_close_date > :rep_date) "
+          + chap + branch +
+          "    AND acc.t_code_currency != 0 "
+          "    AND instr(acc.t_type_account, 'U') = 0 "
+          "    and instr(acc.t_type_account, 'Н') = 0 ";
+
+var cmd = rsdCommand( sql );
+    cmd.addparam( "rep_date", RSDBP_IN, reportdate );
+var rsCount = rsdRecordset( cmd );
+    rsCount.movenext();
+
+maxS = int( rsCount.value(0) );
+    sql = " SELECT acc.*, "
+          "        USR_DiffRateReport.calcRateDiff(t_account, "
+          "                                        t_chapter, "
+          "                                        t_code_currency, "
+          "                                        :rep_date1) calcSum, "
+          "        USR_DiffRateReport.calcRateDiffCarry(t_account,:rep_date2) carrySum "
+          "   FROM daccount_dbt acc "
+          "  WHERE (acc.t_open_close = CHR(0) OR acc.t_close_date > :rep_date3) "
+          + chap + branch +
+          "    AND acc.t_code_currency != 0 "
+          "    and instr(acc.t_type_account, 'U') = 0 "
+          "    and instr(acc.t_type_account, 'Н') = 0 "
+          " ORDER BY acc.t_code_currency, acc.t_account ";
+cmd = rsdCommand( sql );
+
+cmd.addparam( "rep_date1", RSDBP_IN, reportdate );
+cmd.addparam( "rep_date2", RSDBP_IN, reportdate );
+cmd.addparam( "rep_date3", RSDBP_IN, reportdate );
+
+var rsDiffRateAccs = rsdRecordset( cmd );
+
+useprogress();
+remprogress();
+
+calcsum_all  = 0;
+factsum_all  = 0;
+unduesum_all = 0;
+
+i   = 0;
+k   = 0;
+fii = 0;
+
+initprogress( maxs, "Производится расчет, ждите...", "Несоответствие проводок курсовой разницы" );
+
+[Ведомость несоотвествия проводок курсовой разницы рублевых покрытий на дату ########## г.
+По главе # #####################
+по подразделению ##################################################
+┌──────┬───┬────────────────────┬──────────────────┬────────────────┬─────────────────┐
+│Валюта│Тип│        Счет        │Сумма проводки    │Курсовая разница│       Сумма     │
+│      │сч.│                    │курсовой разницы  │    (расчетная) │  несоответствия │
+├──────┼───┼────────────────────┼──────────────────┼────────────────┼─────────────────┤]
+
+(reportdate, chapter, Chaptername, officename);
+n=0;
+
+var calcSum = 0, carrySum = 0, diffSum = 0;
+
+while( rsDiffRateAccs.movenext )
+    fi = fiid( rsDiffRateAccs.value( "t_code_currency" ) );
+
+    calcSum  = rsDiffRateAccs.value( "calcSum"  );
+    carrySum = rsDiffRateAccs.value( "carrySum" );
+    diffSum  = round( calcSum, 2, 2 ) - carrySum;
+
+    if( round( abs( diffSum ), 2, 2 ) > und )
+        [│######│###│####################│##################│################│#################│]
+        (fi, rsDiffRateAccs.value( "t_kind_account" ), rsDiffRateAccs.value( "t_account" ), money( carrySum ), money( calcSum ), money( diffSum ) );
+        calcsum_all  = calcsum_all  + calcSum;
+        factsum_all  = factsum_all  + carrySum;
+        unduesum_all = unduesum_all + diffSum;
+        n = n + 1;
+    end;
+
+    i = i + 1;
+    useprogress( i );
+end;
+
+[└──────┴───┴────────────────────┴──────────────────┴────────────────┴─────────────────┘];
+
+remprogress(i);
+[                                                                       ###############]
+( money( unduesum_all ) );
+[Итого по документам курсовой разницы (факт) ############### ]
+( money( factsum_all ) );
+[Итого по документам курсовой разницы (расч) ###############]( money( calcsum_all ) );
+[                                            ###############]( money( calcsum_all - factsum_all ) );
+[Итого количество документов  #################](n);
+
+sql =   "SELECT * "+
+        "   FROM dratedef_dbt "+
+        "  WHERE t_type != 7 AND t_isdominant = CHR(88) ";
+
+var dataset=TRsbDataSet(sql);
+
+i=0;
+[ ];[ ];
+    while (dataset.movenext())
+        [Внимание! Для валюты ##### ########################## в качестве основного курса определен курс отличный от ЦБ РФ. Проверка несоответствия проводок курсовой разницы по счетам в этой валюте не выполнялась]
+        (fiid(dataset.otherfi), dataset.definition);
+    end;
+ setoutput(null,true);
+END;
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key) 
+
+var const_mess = "~F2~ Продолжить ~SPACE~ По всем офисам ~ESC~ Выход ";
+var const_mess2 = "~F2~ Продолжить ~SPACE~ ~ESC~ Выход ";
+
+   /*Первоначальная инициализация полей*/
+    if(cmd == DLG_INIT)
+        dprt_v = 0;
+        dlg.rec.dprt_code  ="";
+        dlg.rec.und  = round(und,2);
+        dlg.rec.dprt_name = officename;
+        dlg.rec.ReportDate = {curDate};
+        dlg.rec.chapter = 0;
+        dlg.rec.chaptername="По всем главам";
+        UpdateFields(dlg); 
+    end;
+   
+   /*Установка подсказок в строке состояния*/
+    if (cmd==DLG_SETFOCUS)
+        if (FldName(dlg,id)=="dprt_code") 
+            message(" ~F3~ Список подразделений "+const_mess);
+        elif (FldName(dlg,id)=="ReportDate")
+            message(" ~F3~ Выбор даты из календаря "+const_mess2);
+        elif (FldName(dlg,id)=="Chapter")
+            message(" ~F3~ Выбор главы счетов "+const_mess2);
+        end;
+    end;
+   
+    if (cmd == DLG_REMFOCUS)
+     /*Проверка корректности дат отчета*/
+        if (FldName(dlg,id) == "ReportDate")
+            if ( dlg.rec.ReportDate > {curdate} )
+                MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+                return CM_CANCEL;
+            end;
+        end;
+        UpdateFields(dlg); 
+    end;
+
+    if (cmd == DLG_KEY)
+        /*Выход из диалогового окна формирования отчета*/
+        if (KEY == KEY_ESC)
+            return exit(1);//CM_CANCEL;
+        /*Выбор данных из списка*/
+        elif ( KEY == KEY_F3)
+            /*Выбор подразделения банка из списка подразделений */
+            if (FldName(dlg,id) == "dprt_code")
+                if (ListDepartment (Department))
+                    dprt_v = department.code; 
+                    dlg.rec.dprt_code = Department.Code;
+                    dlg.rec.dprt_name = GetClientName(Department.PartyID);
+                    message(" ~F3~ Список подразделений "+const_mess);
+                    UpdateFields(dlg);
+                end;
+            end;
+            if (FldName(dlg,id) == "Chapter")
+                if (ListChapter (Chapt))
+                    dlg.rec.chapter = chapt.chapter;
+                    dlg.rec.Chaptername = chapt.name;
+                    message(" ~F3~ Список глав счетов "+const_mess);
+                    UpdateFields(dlg);
+                end;
+            end;
+        
+            /*Выбор даты из календаря*/
+            if (FldName(dlg,id) == "ReportDate")
+                dlg.rec.ReportDate = GetDateByCalendar ({curDate});
+            end;
+        
+        elif (KEY == KEY_SPACE)
+            /*Сброс установок в поле офис банка*/
+            if (dlg.rec.dprt_code != 0 ) 
+                dlg.rec.dprt_code="";
+                dprt_v = 0;
+                dlg.rec.dprt_name = "По всем офисам";
+                UpdateFields(dlg);
+            end;
+            if (dlg.rec.chapter!=0)
+                dlg.rec.chapter = 0;
+                dlg.rec.chaptername="По всем главам";
+                UpdateFields(dlg);
+            end;
+            if (dlg.rec.dprt_code == "По всем офисам") 
+                message(" ~F3~ Список подразделений "+const_mess);
+                UpdateFields(dlg);
+            end;
+
+        elif (( KEY == KEY_F2 ) /* or (KEY == KEY_ENTER) */ )         //Проверки при вводе
+            if ( dlg.rec.ReportDate > {curdate} )
+                MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+                return CM_IGNORE;
+            end;
+            if ((strlen(dlg.rec.dprt_code) != 0) and (dlg.rec.dprt_name != "По всем офисам"))
+                if (department.nodetype == 2)                   
+                    branch = "and acc.t_branch = " + dprt_v;
+                    officename=dlg.rec.dprt_name;
+                else
+                    branch = "and acc.t_department = " + dprt_v;
+                    officename=dlg.rec.dprt_name;
+                end;   
+
+            elif (dlg.rec.dprt_Name == "По всем офисам") 
+                branch = "";
+                officename=dlg.rec.dprt_name;
+            elif (dprt_v==0)
+                branch = "";
+                officename=dlg.rec.dprt_name;
+            end;
+            ReportDate  = dlg.rec.ReportDate;
+            chapter = dlg.rec.chapter;
+            und = round(dlg.rec.und,2);
+            Chaptername=dlg.rec.Chaptername;
+            if (curdat(ReportDate))    
+                Return CM_SAVE;
+            elif (gettrue(true,"Операционный день предшествующий текущему не закрыт. \n Остатки на счетах могут измениться. Продолжить?"))
+                Return CM_SAVE;
+            end;
+        else
+            Return CM_DEFAULT;
+        end;
+    end;
+        
+END;
+
+/*Точка входа в макрос*/
+if (RunDialog(dlg, "Event"))
+    OutAll;
+end;
+
+end;

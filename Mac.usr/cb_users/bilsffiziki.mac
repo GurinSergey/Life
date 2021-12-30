@@ -1,0 +1,921 @@
+/*********************************************************/
+/*                                                       */
+/*       макрос генерации сводных счетов-фактур          */
+/*                                                       */
+/*Генерация по мемордерам что попадают из фронтов        */
+/*                 по физикам                            */
+/*          МЕМОРДЕРА ОТБИРАЮТСЯ ПО ПАЧКЕ 7              */
+/*          (счета в дебете: 474*, 423*, 202*)           */
+/* Заявки: A37793, I-001359                              */
+/* (с) Diver                                             */
+/*                                                       */
+/*********************************************************/
+/* 
+  Основополагающая работы макроса такова: каждому меморику своя фактура.
+*/
+/*17.03.2014 zmp C-24221 сделана обертка точки вызова макроса для его использования процедурой автом. генерации СФ */
+
+import ptinter,rsd,rsbdataset,  bankinter , FIinter;
+import BilFacturaInter, SfInter, adress, sfgetcat, rsexts;
+import globals;
+
+/* EVG */
+import acs_func, lib_pm_check;
+import diver;
+
+private const  KEY_F2      =316;
+private const  KEY_F3      =317;
+private const KEY_ESC      = 27;
+private const KEY_SPACE    = 32;
+private const KEY_ENTER    = 13;
+
+
+private var Genmesl, outl, outputl="Diver.lbr";                    
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Genmesl = FindPath(outputl, outl);
+        if (not Genmesl)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+private var dlg = TRecHandler("F_BLFRMP", Genmesl, TRUE); 
+
+record dpdep(dp_dep);
+file party (party);
+private var ВСП, ДатаУслуги, ДатаСФ, ВМемордерах;
+private var DprtName, DprtNodeName = "";
+
+
+
+var protFileName = "",
+    prnFileName  = "",
+    TxtPath = "", eCode;
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TxtPath, eCode);
+if ( eCode > 0 )
+   TxtPath = "..\\TxtFile";
+  else 
+//   if (({oper} == 336) or ({oper} == 10246))
+   /* Diver
+    У некоторых пользователей в конце на экран не выходит отчет(ViewFile). Приходится передавать
+    полный путь относительно установленого РСБанка на СП
+    Заявки: I-003131, I-002301
+   */
+   TxtPath = substr(GetCurDir(false),1,index(StrUpr(GetCurDir(false)),"\\OBJ")) + substr(TxtPath,4);
+   //msgbox(StrUpr(GetCurDir(false)));
+   //msgbox(TxtPath);
+//   end;
+
+end;
+
+protFileName = TxtPath + "\\bilsfgenfizPrn." + UserNumber;
+prnFileName  = TxtPath + "\\alterBilsffizPrn." + UserNumber;
+
+  /* EVG Для очистки файла*/
+  SetOutPut(prnFileName, false);
+  SetOutPut(null, true);
+ // println("──────────────────────────────── "+date()+" "+time()+" ───── "+{oper}+" ──────────────────────────────────── ");
+/* EVG end */   
+
+
+
+private MACRO FillTmpTable( DprtID, DprtNodeID, ServDate )
+  debugbreak;
+  var sqlString, rs, cmd, SQL;
+
+  cmd = RsdCommand("TRUNCATE TABLE dbilsfgen_tmp");
+  cmd.execute();
+  
+  /* EVG 12/11/2011 Сделал запрос удобочитаемым, добавил выборку по банковским ордерам, вынес Select отдельной переменной */
+  var selectClause =     " SELECT pm.t_department, acc.t_branch, pm.t_payer, pm.t_payfiid, " +
+                         "        0, 0, min(SUBSTR(rmpr.t_Ground, 1, 80)), " + 
+                         "        115, " + //Комиссия взята в ручную
+                         "        pm.t_paymentid, " + //Возьмем в КомИд засуним ПейментИд. Таким образом получим и сразу идентификатор платежа и не сгруппируются все платежи по ПейерИД
+                         "        max(arhCom.t_sum_natcur), min(arhCom.t_sum_natcur), 18, 0 \n" ;
+
+    //Нам не нужно собирать в одну СФ док-ты оплаты, группируя по плательщику.
+    //Я бы сказал даже так: нам нужно на каждый МО создать свою СФ. Причем плательщик на МО везде один и тот же!!!!!
+    sqlString = "INSERT INTO dbilsfgen_tmp( t_Dprt, t_DprtNode, t_PayerID, t_PayFIID, " +
+                "                           t_FeeType, t_CommNumber, t_ComissName, t_ProductID, t_ComID, t_ComSum, t_ComSumNDS, t_NDSRateValue, t_invoiceID ) \n" +
+    selectClause +
+
+    /* Мемордера */
+    " FROM dpmpaym_dbt   pm, " +
+    "      dpmrmprop_dbt rmpr, " +
+    "      daccount_dbt  acc, " +
+    "      dcb_doc_dbt   mo, " +
+    "      doprdocs_dbt  oprdoc, " +
+    "      doproper_dbt  oprop, " +
+    "      dacctrn_dbt   arhCom \n" +
+    " WHERE pm.t_numberpack                = 7 " +
+    "   AND mo.t_state                     = 50 " +
+    "   AND pm.t_dockind                   = 70 --закрытый мемордер с пачкой 7 \n" +
+    "   AND pm.t_documentid                = mo.t_documentid \n" + 
+    "   AND pm.t_valuedate                 = to_date('" + ДатаУслуги + "', 'DD.MM.YYYY') \n" + 
+    "   AND rmpr.t_PaymentID               = pm.t_PaymentID " +
+    "   AND acc.t_account                  = pm.t_payeraccount " +
+    "   AND acc.t_chapter                  = 1 " +
+    "   AND acc.t_code_currency            = pm.t_payfiid \n" +
+    "   AND oprop.t_documentid             = LPAD(pm.t_documentid, 34, '0') " +
+    "   AND oprop.t_dockind                = 70 " +
+    "   AND oprdoc.t_id_operation          = oprop.t_id_operation \n" +
+    "   AND oprdoc.t_acctrnid              = arhCom.t_acctrnid \n " +
+    //"   AND substr(oprdoc.t_documentid, 6) = arhCom.t_Applicationkey -- связь проводок с шагом документа \n" +
+    /* EVG 22.11.2010 Как оказалось, бывают и проводки с t_Iapplicationkind = 5. Убираем эту фильтрацию.
+    "   AND arhCom.t_Iapplicationkind = 4 \n" +*/
+    "   AND NOT EXISTS ( SELECT 1 FROM DBILRECONCILE_DBT WHERE t_dockind = pm.t_dockind AND t_docid = pm.t_documentid ) \n";
+    if( DprtID != DprtNodeID )
+      SQLstring = SQLstring + " AND acc.t_branch = " + DprtNodeID;
+    end;
+    SQLstring = SQLstring + "\n GROUP BY pm.t_department, acc.t_branch, pm.t_payer, pm.t_payfiid, pm.t_paymentid ";
+
+    SQLstring = SQLstring + " UNION ALL " +
+    
+    /* Банковские ордера */
+    selectClause +
+    " FROM dpmpaym_dbt   pm, " +
+    "      dpmrmprop_dbt rmpr, " +
+    "      daccount_dbt  acc, " +
+    "      doprdocs_dbt  oprdoc, " +
+    "      doproper_dbt  oprop, " +
+    "      dacctrn_dbt   arhCom \n" +
+    " WHERE pm.t_numberpack                = 7 " +
+    "   AND pm.t_dockind                   = 286 \n" +                                          // банковский ордер
+    "   AND pm.t_valuedate                 = to_date('" + ДатаУслуги + "', 'DD.MM.YYYY') \n" + 
+    "   AND pm.t_paymstatus                = 32000 " +
+    "   AND rmpr.t_PaymentID               = pm.t_PaymentID " +
+    "   AND acc.t_account                  = pm.t_payeraccount " +
+    "   AND acc.t_chapter                  = 1 " +
+    "   AND acc.t_code_currency            = pm.t_payfiid \n" +
+    "   AND oprop.t_documentid             = LPAD(pm.t_documentid, 34, '0') " +
+    "   AND oprop.t_dockind                = 286 " +
+    "   AND oprdoc.t_id_operation          = oprop.t_id_operation \n" +
+    "   AND oprdoc.t_acctrnid              = arhCom.t_acctrnid \n " +
+    //"   AND substr(oprdoc.t_documentid, 6) = arhCom.t_Applicationkey -- связь проводок с шагом документа \n" +
+    /* EVG 22.11.2010 Как оказалось, бывают и проводки с t_Iapplicationkind = 5. Убираем эту фильтрацию.
+    "   AND arhCom.t_Iapplicationkind = 4 \n" +*/
+    "   AND NOT EXISTS ( SELECT 1 FROM DBILRECONCILE_DBT WHERE t_dockind = pm.t_dockind AND t_docid = pm.t_documentid ) \n";
+    if( DprtID != DprtNodeID )
+      SQLstring = SQLstring + " AND acc.t_branch = " + DprtNodeID;
+    end;
+    SQLstring = SQLstring + "\n GROUP BY pm.t_department, acc.t_branch, pm.t_payer, pm.t_payfiid, pm.t_paymentid ";
+
+  
+  if ({oper}==10199) 
+    //println(sqlString);
+  end;
+  cmd =  RsdCommand( sqlString );
+  
+
+  cmd.execute();
+
+
+END;
+
+
+private macro ResultLogBF_Success( FacturaID, BillDate )
+  debugbreak;
+  file factura (bilfactura) key 0;
+  var FacturaNumber = "";
+  factura.FacturaID = FacturaID;
+  if( getEQ(factura) )
+    FacturaNumber = factura.FacturaNumber;
+  end;
+
+[     Сформирован СФ № ################################## от ########## ](FacturaNumber, BillDate);
+end;
+
+private macro ResultLogEntryBook_NotSuccess()
+[            Необходимые записи книг продаж не сформированы.             ];
+end;
+
+private macro ResultLogBF_NotSuccess( ErrMsg )
+  debugbreak;
+  var i = 1;
+  array StringArray;
+
+  /* EVG Чтобы не было Undefined */
+  if (strlen(ErrMsg) == 0)
+     ErrMsg = " ";
+  end;
+
+  StrSplit( StrSubst(ErrMsg, "|", " " ), StringArray, 37);
+
+[            СФ не сформирован. ###############################################](StringArray(0));
+
+  while ( StrLen(StringArray(i) ) > 0)
+[                        ###############################################]
+    ( StringArray(i) );
+    i = i + 1;
+  end;  
+end;
+
+
+private macro ResultLogClientName( ClientName )
+[                                                                       ];
+[     Клиент: #######################################################   ](ClientName);
+
+end;
+
+
+
+private macro FillPartyInfo( PartyID, PartyName:@string, PartyINN:@string )
+  debugbreak;
+  record party(party);
+  if( ПолучитьСубъекта( PartyID, party ) == 0 )
+    PartyName = party.Name;
+    PartyINN = GetPartyINN( PartyID, 1 );
+  end;
+
+end;
+
+private macro SetPartyAddress( PartyID, Adress:@string )
+  debugbreak;
+  record RecordAdress ( adress  );  
+  ClearRecord( RecordAdress );
+
+  Adress = "";
+
+  var bFounded = НайтиАдресСубъекта( PartyID, PTADDR_LEGAL, RecordAdress );
+//msgbox (PartyID, "|", bFounded, "|", RecordAdress.Adress);
+  if( bFounded )
+    Adress = RecordAdress.Adress;
+  end;
+
+  if( (bFounded == false) OR (Adress == "") )
+    if( НайтиАдресСубъекта(PartyID, PTADDR_REAL, RecordAdress) )
+       Adress = RecordAdress.Adress;
+    end;
+  end;
+
+end;
+
+
+private macro GetFacturaLines( BillDate, Dprt, DprtNode, PayerID, PayFIID, PaymID )
+  debugbreak;
+  var sqlString, rs, cmd, i = 0;
+  var facturaLineAr = TArray;  
+  var feeType, comissName, productID, taxSchema, comID, comSum, comSumNDS, NDSRateValue;
+
+
+  
+  sqlString = " SELECT bil.t_FeeType, bil.t_CommNumber, bil.t_ComissName, bil.t_ProductID, " + 
+              " (SELECT t_TaxSchema FROM dbilproduct_dbt pr WHERE pr.t_ProductID = bil.t_ProductID) TaxSchema, " +
+              " bil.t_ComID, bil.t_ComSum, bil.t_ComSumNDS, bil.t_NDSRateValue " +
+              " FROM dbilsfgen_tmp bil " + 
+              " WHERE bil.t_Dprt = ? AND bil.t_DprtNode = ? AND bil.t_PayerID = ? AND bil.t_PayFIID = ? " +
+//Все верхнее что в WHERE фигня, главное следующее условие
+              "\n AND bil.t_ComID = " + PaymID + "-- Выходим из того что каждой СФ должен соответсвовать лишь один МО";
+
+  cmd = RSDCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, Dprt );
+  cmd.addParam( "", RSDBP_IN, DprtNode );
+  cmd.addParam( "", RSDBP_IN, PayerID );
+  cmd.addParam( "", RSDBP_IN, PayFIID );
+
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )
+
+    feeType = rs.value("t_FeeType");
+    /*rs.value("t_CommNumber");*/
+    comissName = rs.value("t_ComissName");
+    productID  = rs.value("t_ProductID");
+    taxSchema  = rs.value("TaxSchema");
+    comID = 999; //rs.value("t_ComID"); Здесь у нас PaymentId на самом деле
+    //По этому поставим сюда несуществующую комиссию.
+    comSum = rs.value("t_ComSum");
+    comSumNDS = rs.value("t_ComSumNDS");
+    NDSRateValue = rs.value("t_NDSRateValue");
+        
+    /*Заполняем спецификацию СФ*/
+    facturaLineAr[i] = TRecHandler("bilfacturaline.dbt");
+    facturaLineAr[i].Clear();    
+    
+    facturaLineAr[i].rec.LineNo = 1;    
+
+    if (ValType(productID) != 26) 
+      facturaLineAr[i].rec.ProductID = productID;    
+    end;
+
+
+
+    /* EVG Вместо даты СФ поставим дату/период комиссии.
+    facturaLineAr[i].rec.ProductName = comissName + ", " + string(BillDate);*/
+    facturaLineAr[i].rec.ProductName = comissName;
+    
+    if( taxSchema != NULLVAL )
+      facturaLineAr[i].rec.TaxSchema = taxSchema;
+    end;   
+    
+    facturaLineAr[i].rec.Amount   = comSum;         
+    facturaLineAr[i].rec.AmountWithNDS = comSum + comSumNDS;    
+    facturaLineAr[i].rec.NDSAmount     = comSumNDS;
+    
+    if( NDSRateValue != 0 )
+      facturaLineAr[i].rec.NDSRate       = NDSRateValue;
+    else
+      if( (comSumNDS != $0) AND (comSum != $0) )
+        facturaLineAr[i].rec.NDSRate  = double( round(comSumNDS/comSum) ) * 100.0;
+      end;
+    end;
+    
+    facturaLineAr[i].rec.ComisID      = comID; //Влепим несуществующий номер комиссии
+
+    if (ValType(feeType) != 26) //Да тут и недолжно быть значения у нас
+      facturaLineAr[i].rec.ComisType    = feeType;
+    end;
+    
+    i = i + 1; 
+  end;
+
+  return facturaLineAr;
+
+end;
+
+/* EVG Печать СФ */
+private macro PrintBill ( FacID, FacLineAr )
+  debugbreak;
+  var factura = TBFile ("bilfactura.dbt", "R", 0);
+  var ReceiverAccount = "";
+
+  factura.rec.FacturaID = FacID;
+  if ( factura.getEQ() )
+
+     SetOutPut (prnFileName, true);
+     
+     /* Вызов функции определения счёта-получателя из макроса bilsfprn.mac */
+     ReceiverAccount = ExecMacroFile ("bilsfprn.mac", "FakturaReceiverAcc", factura.rec.FacturaID);
+     //msgbox (ReceiverAccount);
+	 if (date(factura.rec.RegDate) > date("24.01.2012"))
+		 //msgbox("!");
+		 debugbreak;
+		 ExecMacroFile ("svodsf.mac", "printSvodBilf", factura.rec, FacLineAr );
+     else
+		 ExecMacroFile ("alterBilsfPrn.mac", "AlternativeBillPrinting", factura.rec.FacturaNumber,
+																		factura.rec.RegDate,
+																		factura.rec.SupplierName,
+																		factura.rec.SupplierAddress,
+																		factura.rec.SupplierINN,
+																		factura.rec.ReceiverName,
+																		factura.rec.ReceiverAddress,
+																		factura.rec.ReceiverINN,
+																		ReceiverAccount,
+																		factura.rec.Shipper,
+																		factura.rec.Consignee,
+																		factura.rec.PaymentNumber,
+																		factura.rec.PaymantDate,
+																		FacLineAr );
+	end;																		
+
+     SetOutPut (null, true);
+  end;
+
+end;
+
+
+
+private macro ToFullDocID( ID:string )
+  debugbreak;
+  const DocIdSize = 34;  
+  var DocID = mkstr( "0", DocIdSize - strlen(ID) ) + ID;
+
+  return DocID;
+end;
+
+
+private macro GetBilfDocs( Dprt, DprtNode, PayerID, PayFIID, PaymID )
+  debugbreak;
+  var bilfDocArray = TArray;
+  var i = 0;
+
+  const PM_FINISHED = 32000;
+    
+  var sqlString, rs, cmd;  
+  var docKind, paymentID, pmAmount, pmFIID;
+
+
+
+  /* Здесь разделение на обычные документы и частичные оплаты не требуется, т.к. картотеки
+     тут не бывает (только введённые вручную МО полной оплаты комиссии). */
+  var SQL;
+  SQL = " SELECT pm.t_dockind dockind, TO_CHAR (pm.t_paymentid) pmid, ";
+  SQL = SQL + "       pm.t_amount pmamount, pm.t_fiid pmfiid ";
+  /* EVG 11/12/201 Не нужно mo
+  SQL = SQL + "  FROM dbilsfgen_tmp bil, dpmpaym_dbt pm, dcb_doc_dbt mo ";*/
+  SQL = SQL + "  FROM dbilsfgen_tmp bil, dpmpaym_dbt pm ";
+  SQL = SQL + " WHERE bil.t_dprt     = " + Dprt;
+  SQL = SQL + "   AND bil.t_dprtnode = " + DprtNode;
+  SQL = SQL + "   AND bil.t_payerid  = " + PayerID;
+  SQL = SQL + "   AND bil.t_payfiid  = " + PayFIID;
+  SQL = SQL + "   AND bil.t_feetype  = 0 ";
+  /* EVG 11/12/2011 Добавил выборку по банковским ордерам
+  SQL = SQL + "   AND pm.t_dockind   = 70 ";*/
+  SQL = SQL + "   AND pm.t_dockind  in ( 70, 286 ) ";
+  SQL = SQL + "   AND pm.t_paymentid = bil.t_comid ";//Не забыли что в КомИД засунули ПейментИД при поиске МО для формирования СФ?
+  /* EVG 11/12/201 Не нужно mo
+  SQL = SQL + "   AND pm.t_paymentid = mo.t_documentid ";*/
+  SQL = SQL + "   AND pm.t_paymstatus >= " + PM_FINISHED;
+  SQL = SQL + "\n AND bil.t_ComID = " + PaymID + "-- Выходим из того что каждой СФ должен соответсвовать лишь один МО";
+
+  /*
+  /* EVG 11/12/2011 Добавил выборку по банковским ордерам */
+  SQL = SQL + " SELECT pm.t_dockind dockind, TO_CHAR (pm.t_paymentid) pmid, ";
+  SQL = SQL + "       pm.t_amount pmamount, pm.t_fiid pmfiid ";
+  SQL = SQL + "  FROM dbilsfgen_tmp bil, dpmpaym_dbt pm, dcb_doc_dbt mo ";
+  SQL = SQL + " WHERE bil.t_dprt     = " + Dprt;
+  SQL = SQL + "   AND bil.t_dprtnode = " + DprtNode;
+  SQL = SQL + "   AND bil.t_payerid  = " + PayerID;
+  SQL = SQL + "   AND bil.t_payfiid  = " + PayFIID;
+  SQL = SQL + "   AND bil.t_feetype  = 0 ";
+  SQL = SQL + "   AND pm.t_dockind = 70 ";
+  SQL = SQL + "   AND pm.t_paymentid = bil.t_comid ";//Не забыли что в КомИД засунули ПейментИД при поиске МО для формирования СФ?
+  SQL = SQL + "   AND pm.t_paymentid = mo.t_documentid ";
+  SQL = SQL + "   AND pm.t_paymstatus >= " + PM_FINISHED;
+  SQL = SQL + "\n AND bil.t_ComID = " + PaymID + "-- Выходим из того что каждой СФ должен соответсвовать лишь один МО";
+    */
+  rs = RsdRecordset( SQL );
+  //msgbox (sql);
+  //println (sql);
+  while( rs.moveNext() )
+    
+    bilfDocArray[i] = TRecHandler("bilf_doc.rec");
+    bilfDocArray[i].Clear();
+
+    bilfDocArray[i].rec.DocKind = rs.value("docKind");    
+    bilfDocArray[i].rec.DocID  = rs.value("pmID");
+    bilfDocArray[i].rec.Amount = rs.value("pmAmount");
+    bilfDocArray[i].rec.FIID   = rs.value("pmFIID");
+    //msgbox (rs.value("pmID"), "|", rs.value("pmAmount"));
+
+    Opr_GetLastExecStep( bilfDocArray[i].rec.DocKind, ToFullDocID(bilfDocArray[i].rec.DocID), 
+                           bilfDocArray[i].rec.OperationId, bilfDocArray[i].rec.StepId );
+
+    i = i + 1;
+  end;
+  
+  
+  return bilfDocArray;
+end;
+
+
+/* EVG Функция возвращает номер и дату документа оплаты.
+   Если документа оплаты нет, то ничего не возвращает; если их много - возвращает только дату. */
+macro GetBilfDocNumberDate (DocsAr, DocNumber:@String, DocDate:@Date)
+  debugbreak;
+  var i = 0, query, rs;
+  var onlyDate = false;
+
+   if ( DocsAr.Size == 0 )
+      return;
+   elif ( DocsAr.Size > 1 )
+      onlyDate = true;
+   end;
+
+   query = " Select prop.t_Number, paym.t_ValueDate " +
+           "   From DPmpaym_dbt paym, DPmRmProp_dbt prop " +
+           "  Where paym.t_DocKind    = " + DocsAr[0].rec.DocKind +
+           "    and paym.t_DocumentID = " + DocsAr[0].rec.DocID +
+           "    and prop.t_PaymentID  = paym.t_PaymentID ";
+   rs = rsdRecordSet(query);
+
+   if (rs and rs.MoveNext())
+      if (not onlyDate)
+         DocNumber  = rs.Value(0, null, V_STRING);
+      end;
+      DocDate    = rs.Value(1, null, V_DATE);
+   end;
+
+end;
+
+
+
+/* EVG 15.02.2011 Перенесено в diver.mac для возможности использовать данную функцию
+   в других макросах (в частности, в bilsfgen.mac).
+
+macro UpdateRefOnMem(PaymID)
+  /*
+   Что бы при попытке нажать на мемике Ctrl+F сразу сообщалось что фактура уже есть
+   Система при этом ожидает что в dbilreconcile.t_isauto находиццо 'X', но используемая 
+   системная функция ставит тута 'Z'
+  */
+  var updsql = "UPDATE DBILRECONCILE_DBT SET t_isauto = 'X' " +
+               "WHERE t_dockind = 70 AND t_docid = " + PaymID;
+  var cmd;
+  cmd =  RsdCommand( updsql );
+  cmd.execute();
+end;*/
+
+
+private macro CreateBilFacturaForClient( ClientName, BillDate, Dprt, DprtNode, PayerID, PayFIID, 
+                                         facturaID:@integer, bilfDocArray:@TArray,
+                                         /* EVG Возврат массива строк спецификации и количества не включенных в книгу */
+                                         facturaLines:@TArray, NoBook_Count:@integer, 
+                                         PaymID )
+  debugbreak;
+  var retVal = false;
+  const BILTYPE_BILFAC = 1;
+  const SFTYPE_DISTRIBUTED = 1;
+
+  record factura("bilfactura.dbt");
+  ClearRecord(factura);
+  
+  factura.SfTypeID = BILTYPE_BILFAC;
+    
+  factura.Department = Dprt;  
+  if( DprtNode > 0 )
+    factura.Branch = DprtNode;
+  else
+    factura.Branch = Dprt;
+  end;
+  factura.BankDate = {curdate};
+  
+  factura.SysDate = date();  
+  factura.SysTime = time();  
+  factura.Oper = {oper};  
+  
+  factura.Direction = SFTYPE_DISTRIBUTED;
+  
+  factura.CreationDate = BillDate;
+  factura.AcquisitionDate = BillDate;
+  factura.RegDate = BillDate;
+  
+  factura.SupplierID = {HeadBankID};  
+  FillPartyInfo( factura.SupplierID, @factura.SupplierName, @factura.SupplierINN );
+  /* EVG Ошибка
+  SetPartyAddress( factura.SupplierID, factura.SupplierAddress );*/
+  SetPartyAddress( factura.SupplierID, @factura.SupplierAddress );
+  
+  factura.ReceiverID = PayerID;
+//  FillPartyInfo( factura.ReceiverID, @factura.ReceiverName, @factura.ReceiverINN );  
+  factura.ReceiverName = ClientName;//Извне могут название клиента вставить реального физика.
+  factura.ReceiverINN = "0000000000000"; //Присвоим чонить
+  /* EVG Ошибка
+  SetPartyAddress( factura.ReceiverID, factura.ReceiverAddress );*/
+  SetPartyAddress( factura.ReceiverID, @factura.ReceiverAddress );
+  //msgbox (factura.SupplierAddress, "|", factura.ReceiverAddress);
+  factura.ReceiverAddress = "Нет информации";
+    
+  factura.FIID = PayFIID;
+  factura.Status = 1;
+  
+  factura.Assignment = 1;
+
+  var facturaLineAr = GetFacturaLines( BillDate, Dprt, DprtNode, PayerID, PayFIID , PaymID);
+    
+
+  /* Поиск документа оплаты */
+  var bilbeID = 0, DocNumber = "", DocDate = date(0,0,0);
+  bilfDocArray = GetBilfDocs( Dprt, DprtNode, PayerID, PayFIID, PaymID );
+  /* EVG Номер и длата заполняются только если документ оплаты один */
+  if( bilfDocArray.Size == 1 )
+    /* EVG Получение номера и даты документа оплаты */
+    GetBilfDocNumberDate( bilfDocArray, @DocNumber, @DocDate );
+    factura.PaymentNumber = DocNumber;
+    factura.PaymantDate   = DocDate;
+  end;
+  /* EVG */
+
+  
+  if( BFCreateBilFactura(factura, facturaLineAr, facturaID) )   
+//    UpdateDefComisses( facturaID, Dprt, DprtNode, PayerID, PayFIID );
+    ResultLogBF_Success( facturaID, BillDate );
+    retVal = true;
+  end;  
+  
+
+  /* EVG Из macro GenerateCompositeBills() */
+  if( bilfDocArray.Size > 0 )
+    //msgbox (facturaID, " - ", bilfDocArray.size, " - ", BillDate, " - ", bilbeID);
+    if( not BFCreateBilBookEntry(facturaID, bilfDocArray, BillDate, bilbeID ) )
+      NoBook_Count = NoBook_Count + 1;
+      ResultLogEntryBook_NotSuccess( GetErrMsg() );      
+    end;
+    UpdateRefOnMem(PaymID);//по сути имзеним Z на X
+  end;
+    
+  /* EVG Печать сформированных счетов-фактур */
+  PrintBill ( facturaID, facturaLineAr );
+
+  /* Уже не нужно.
+  /* EVG Передача массива в вызывающую процедуру */
+  facturaLines = facturaLineAr;
+  */
+
+  //ResultIntoLog( ClientName, factura.FacturaNumber, factura.CreationDate );  
+
+  return retVal;
+end;
+
+
+
+private macro GenerateCompositeBills( BillDate, BF_Count:@integer, NoBF_Count:@integer, NoBook_Count:@integer )
+  debugbreak;
+  var sqlString, rs, cmd;  
+  var Dprt, DprtNode, PayerID, PayFIID, ClientName;
+
+  /* EVG */
+  var facturaLineAr = TArray;
+  
+  var facturaID = 0, bilbeID = 0, bilfDocArray = TArray;
+
+  sqlString = " SELECT  bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID, " +
+//              " (SELECT t_ShortName FROM dparty_dbt p WHERE p.t_PartyID = bil.t_PayerID) ClientName, " +
+              " (SELECT T_PayerName From dpmrmprop_dbt pmrm WHERE pmrm.t_PaymentID = bil.t_ComID) ClientName, " + //Нигзя никак забывать что в ComID засунули ИД платежа
+              " bil.t_ComID " + //помним что здесь на самом деле хранится ID платежа
+              " FROM dbilsfgen_tmp bil ";// + 
+//По сути на каждый мемик нужно СФ (плательщик PayerID у всех одинаков) " GROUP BY bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID ";  
+
+  cmd = RSDCommand( sqlString );
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )
+    
+    Dprt = rs.value("t_Dprt");    
+
+    if( rs.value("t_DprtNode") == NULLVAL )
+      DprtNode = 0;
+    else
+      DprtNode = rs.value("t_DprtNode");
+    end;
+
+    PayerID  = rs.value("t_PayerID");
+    PayFIID  = rs.value("t_PayFIID");
+    ClientName = rs.value("ClientName");
+
+    ResultLogClientName( ClientName );
+
+    /* EVG Получение массива строк спецификации */
+    if( CreateBilFacturaForClient(ClientName, BillDate, Dprt, DprtNode, PayerID, PayFIID, @facturaID, /* EVG */ @bilfDocArray, @facturaLineAr, @NoBook_Count, rs.value("t_ComID") ) )
+
+      BF_Count = BF_Count + 1;
+
+      /* EVG Перенесено в CreateBilFacturaForClient()
+      bilfDocArray = GetBilfDocs( Dprt, DprtNode, PayerID, PayFIID, facturaID );
+
+      if( bilfDocArray.Size > 0 )
+        if( not BFCreateBilBookEntry(facturaID, bilfDocArray, BillDate, bilbeID ) )
+          NoBook_Count = NoBook_Count + 1;
+          ResultLogEntryBook_NotSuccess( GetErrMsg() );      
+        end;
+
+        debugbreak;
+        /* EVG Печать сформированных счетов-фактур */
+        PrintBill ( facturaID, facturaLineAr );
+
+      end;
+      */
+     
+    else
+      NoBF_Count = NoBF_Count + 1;
+      ResultLogBF_NotSuccess( GetErrMsg() );
+    end;  
+  end;
+   
+end;
+
+
+
+private macro PrintLogHeader( DprtName, DprtNodeName, ServDate, BillDate, Источник )
+  
+
+[            Протокол формирования сводных СФ по услугам банка         
+                                                                        ];
+[     Дата формирования:   ##########                                   ](date());
+[     Время формирования:  ########                                     ](time());
+[     Операционист:        ##### ###################################### ]({oper}, {Name_Oper});
+[     Подразделение банка: ############################################ ]({Name_Bank});
+[          
+      Параметры запуска:                                                ];
+[     Филиал:             ############################################  ](DprtName);
+[     Подразделение ТС:   ############################################  ](DprtNodeName);
+[     Дата оказания услуги:  ##########                                 ](ServDate);
+[     Дата счета-фактуры: ##########                                    ](BillDate);
+[     На основании: ##################################################  ](Источник);
+[                                                                       ];
+[     Результаты выполнения:                                            ];
+  
+
+end;
+
+private macro PrintLogFooter(BF_Count, NoBF_Count, NoBook_Count)
+[                                                                       ];
+[     Итоговый результат:                                               ];
+[     Сформировано СФ:    #######                                       ](BF_Count); 
+[     Не сформировано СФ: #######                                       ](NoBF_Count);
+[     СФ, по которым не удалось сформировать записи книги продаж: ######](NoBook_Count);
+end;
+
+
+MACRO ФОРМИРУЕМФАКТУРЫНЕМЕДЛЯ;
+ debugbreak;
+ var BF_Count = 0, NoBF_Count = 0, NoBook_Count = 0;
+ var Источник = "";
+
+  /*Diver Через текстовый файл передадим дату вводимую в форме (поле Дата счета-фактуры)*/
+/* Заявка A51181*/
+  var NameFile_monValueForRef = TxtPath + "\\monValueForRef." + UserNumber;
+  FILE monValueForRef() txt write;
+  open(monValueForRef,NameFile_monValueForRef);
+  insert(monValueForRef,string(ДатаСФ)); 
+  close(monValueForRef);
+
+
+  if (ВМемордерах)
+   Источник = "мемордеров с номером пачки 7";
+   else
+       Источник = "кассовых док-ов с номером пачки 7";
+  end;
+
+  SetOutPut(protFileName, false);
+  println("     ─── "+date()+" "+time()+" ───── "+{oper}+" ───");     
+
+  PrintLogHeader( DprtName, DprtNodeName, ДатаУслуги, ДатаСФ, Источник );
+  FillTmpTable( 1, ВСП, ДатаУслуги );
+  GenerateCompositeBills( ДатаСФ, @BF_Count, @NoBF_Count, @NoBook_Count );
+  SetOutPut(protFileName, true);
+  PrintLogFooter( BF_Count, NoBF_Count, NoBook_Count );
+
+  /* EVG Вывод протокола (преждевременный) */
+  SetOutPut(null, true);
+//if (({oper} == 336)  or ({oper} == 10246))
+  if (RSL_IsIdentProgram("У"))
+  ViewFile (protFileName);
+  end;   
+/* else
+  Open(report, protFileName);
+  ViewFile (report);
+  Close(Report);
+end;
+*/
+
+ 
+  /* EVG Вывод печати счетов-фактур */
+  if (RSL_IsIdentProgram("У"))
+  if ( (BF_Count > 0) and getTrue(true, "Вывести на экран сформированные счета-фактуры?") )
+     ViewFile (prnFileName);
+  end;
+  end;
+
+  DelFile(NameFile_monValueForRef); // KS 03.05.2011 Удаляю буферный файл
+
+  //Exit(1);
+
+
+END;
+
+/*Найдем имя по Partyid*/
+private MACRO GetClientName(id)
+debugbreak;
+var  sl=" select part.t_name from dparty_dbt part where part.t_partyid="+id;
+var  DataS=TRsbDataSet(sl);
+
+  if( DataS.moveNext())
+    return DataS.name;
+  else
+    if (id !=0)
+       msgbox("Субъект не найден в party.dbt");
+       return 0;
+    else
+      /* EVG
+      return "ОАО АКБ Пробизнесбанк";*/
+      return {Name_Bank};
+    end;
+  end;
+
+END;
+
+/*13.12.2013 zmp C-24221 ф-я обертка для автоматической генерации СФ*/
+macro ControlProtocolRBS2(oProtocol1     :@String,
+                          oProtocol2     :@String)                           
+   ДатаУслуги  = {curdate};
+   ДатаСФ      = {curdate};
+   ВСП         = 1;
+   DprtName    = {NAME_BANK};
+   ВМемордерах = true;   
+   ФОРМИРУЕМФАКТУРЫНЕМЕДЛЯ;     
+   SetParm(0, protFileName);
+   SetParm(1, prnFileName);   
+end;
+
+
+MACRO ОпределитьВСПОпера(oper, vid);
+var select, cmd, rs;  
+var rez = "";
+
+    select = "select dp.t_code, opr.t_oper, dp.t_name as t_kod, p.t_name from dperson_dbt opr, ddp_dep_dbt dp, dparty_dbt p " + 
+             " where opr.t_codedepart = dp.t_code and p.t_partyid = dp.t_partyid " + 
+             " and opr.t_oper = " + oper;
+    cmd = RSDCommand(select);
+    rs = rsdRecordSet(cmd);
+    If (rs and rs.MoveNext())
+        If (STRLWR(vid) == "name")
+          rez = rs.value("t_name");
+          elif(STRLWR(vid) == "kod")
+          rez = rs.value("t_kod");
+          else
+          rez = rs.value("t_code");
+        End;
+    End;
+
+    return rez;
+
+END;
+
+
+MACRO EventDlg (dlg, cmd, id, key) 
+   var code="";
+   var const_mess = "~F2~ Продолжить ~ESC~ Выход ";
+
+   /*Первоначальная инициализация полей*/
+   if(cmd == DLG_INIT)
+      dlg.rec.filial  = "000";
+      /* EVG
+      dlg.rec.filial_n = "ОАО \"ГАЗЭНЕРГОБАНК\"";*/
+      dlg.rec.filial_n = {Name_Bank};
+      dlg.rec.VSP = ОпределитьВСПОпера({oper},"kod");
+      dlg.rec.VSP_n = ОпределитьВСПОпера({oper},"name");
+      ВСП = ОпределитьВСПОпера({oper},"id");
+      dlg.rec.date_usl = {CurDate};
+      dlg.rec.date_factur = {CurDate};
+      dlg.rec.mem = "X";
+      UpdateFields(dlg);
+   end;
+   
+   /*Установка подсказок в строке состояния*/
+   if (cmd==DLG_SETFOCUS)
+     if (FldName(dlg,id)=="filial") 
+       message(" ~F3~ Справочник филиалов "+const_mess);
+      elif (FldName(dlg,id)=="filial_n")
+       message(" ~F3~ Справочник подразделений "+const_mess);
+     end;
+   end;
+   
+   if (cmd == DLG_REMFOCUS)
+     /*Проверка корректности */
+//      UpdateFields(dlg); 
+   end;
+
+   if (cmd == DLG_KEY)
+     /*Выход из диалогового окна*/
+     if (KEY == KEY_ESC)
+       return exit(1);//CM_CANCEL;
+     /*Выбор данных из списка*/
+     elif ( KEY == KEY_F3)
+        if (FldName(dlg,id) == "VSP")
+          if (ListDepartment (dpdep))
+           dlg.rec.VSP = dpdep.name;
+           dlg.rec.VSP_n = GetClientName(dpdep.partyid);
+           ВСП = dpdep.code;
+           UpdateFields(dlg);
+          end;
+        end;
+
+
+     elif (KEY == KEY_SPACE)
+         if (FldName(dlg,id) == "mem")
+            if (dlg.rec.mem == "X")
+             dlg.rec.mem = "";
+             dlg.rec.kas = "X";
+             else
+              dlg.rec.mem = "X";
+              dlg.rec.kas = "";
+            end; 
+            UpdateFields(dlg);
+         end;
+     elif (( KEY == KEY_F2 )  /*or ( KEY == KEY_ENTER )*/)         //Проверки при вводе
+           ДатаУслуги = dlg.rec.date_usl;
+           ДатаСФ = dlg.rec.date_factur;
+           DprtName = dlg.rec.filial_n;
+           DprtNodeName = dlg.rec.VSP_n;
+           if (dlg.rec.mem == "X")
+             ВМемордерах = true;
+            else
+             ВМемордерах = false; 
+             msgbox("Автоматизировано пока лишь для мемордеров!");
+             Return CM_IGNORE;
+           end;
+           Return CM_SAVE;
+     end;
+   end;
+        
+END;
+
+
+
+
+/*Точка входа*/
+/*13.12.2013 zmp C-24221 сделана проверка на подсистему для использования макроса в безинтерфейсном режиме*/
+if (RSL_IsIdentProgram("У"))
+ IF (RunDialog(dlg, "EventDlg"))
+   /* EVG */
+   if ( ВходитВГруппу( {oper}, 193 )  or
+                   // Иванова          // Власова          // Тест
+        ({oper} == 7091) or ({oper} == 7158) or ({oper} == 10199)/*or ({oper} == 10246)*/ )
+     ФОРМИРУЕМФАКТУРЫНЕМЕДЛЯ;
+     Exit(1);
+   else
+     msgbox("К сожалению, процедуру могут запускать только пользователи, входящие в группу № 193");  /*VV 05.02.2013 R-150763*/
+   end;
+
+   end;
+end;   

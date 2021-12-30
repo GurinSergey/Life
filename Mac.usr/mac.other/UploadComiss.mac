@@ -1,0 +1,283 @@
+/**********************************************************************************/
+/*              Выгрузка списанных комиссий 2.2.0 и 2.2.1. из RS-Bank             */
+/*                                                                                */
+/*   Дата: 26.08.2011                                                             */
+/*   Модификация: C-4378                                                          */
+/*   Заказчик: Григорьев Василий Валерьевич                                       */
+/*   Исполнитель: Чесноков Д.С.                                                   */
+/*                                                                                */
+/*   Описание: макрос производит выгрузку данных о списанных                      */
+/*             комиссиях в текстовый файл                                         */
+/*   Изменения:                                                                   */
+/*   rev. 1.01: 02.09.2011 Чесноков Д.С.Реализованна возможнсть вызова модуля из  */
+/*              командного файла, внесены изменения в механзм выборки данных      */
+/*   rev. 1.02: 09.09.2011 Чесноков Д.С. Убрал вывод сообщений в безинтерфесном   */
+/*              режиме                                                            */
+/*   rev. 1.03: 12.09.2011 Чесноков Д.С. Добавил формирования файла ошибок при    */
+/*              их наличии. Выгрузка файла ошибок происходит в директорию         */
+/*              Path + //Log                                                      */
+/*   rev. 1.04: 15.09.2011 Чесноков Д.С. Исправлен id комиссии 2.2.0 для ВУЗ,     */
+/*              формирование имени файла выгрузки всегда равно текущему ОД        */
+/* I-00141227   19.01.2012 вихров, савченко адаптация под 2030 */
+//RR 15.05.2013
+/**********************************************************************************/
+
+import "globals.mac", fg_Life_parm, rsexts;
+
+var CommNumber:string;
+var BeginDate, rs;
+var LifeBank = fg_life_subject();
+var Path:string;
+var LogPath:string; // Каталог файла ошибок
+var NameFile:string, NameFileLog:string, TxtFileDir:string;
+var dd:string, mm:string, yy:string;
+var ParmDate;
+var count:integer = 0;
+var BD, ED, BegDate, EndDate, SpecialBankCode;
+
+LifeBank.ConsrtuctByBic( {MFO_Bank} );
+
+if (LifeBank.is_PRBB())
+  CommNumber = ("'1002', '1073', '1102'");                                                     //2.2.0, 2.2.1, 2.2.2
+elif ( (LifeBank.is_EXV()) and ({MFO_bank} == "046311808") )                                   //Саратов
+  CommNumber = ("'1002', '1065', '1092'");                                                     //2.2.0, 2.2.1, 2.2.2
+elif ( (LifeBank.is_EXV()) and (({MFO_bank} == "042007755") or ({MFO_bank} == "047308902" )) ) //Воронеж или Ульяновск
+  CommNumber = ("'1002', '1064', '1091'");                                                     //2.2.0, 2.2.1, 2.2.2
+elif ( (LifeBank.is_EXV()) )                                                                   //Волгоград или Ставрополь
+  CommNumber = ("'1002', '1065', '1091'");                                                     //2.2.0, 2.2.1, 2.2.2
+elif (LifeBank.is_GEB())                                                                       //ГЭБ
+  CommNumber = ("'1060', '1076', '1104'");                                                     //2.2.0 гэб, 2.2.1 гэб, 2.2.2
+elif (LifeBank.is_VUZ())                                                                       //ВУЗ
+  CommNumber = ("'1002', '1060', '1096'");                                                     //2.2.1 , 2.2.2 , 2.2.4 
+end;
+
+private macro stDate(pDate:date)
+
+  var d, m, y, Day, Month, Year;
+  DateSplit( pDate, d, m, y );
+
+  if(m < 10)
+    Month = "0" + string(m);
+  else
+    Month = string(m);
+  end;
+  
+  if (d < 10)
+    Day = "0" + string(d);
+  else 
+    Day = string(d);
+  end;
+
+  Year = string(y);
+  return  Year + Month + Day;
+
+end;
+
+
+macro GetRecordSet(CommNumber, BeginDate, BD,ED)
+
+var sql, cmd;
+
+  sql =
+"	  SELECT                                                                                                "+
+"	        TO_NUMBER (SUBSTR ( (SELECT   cod.t_code	"+
+"	                               FROM   dpartcode_dbt cod	"+
+"	                              WHERE   cod.t_codekind = 1 AND cod.t_partyid = pm.t_payer),	"+
+"	3	"+
+"	                          )	"+
+"	                  )	"+
+"	              AS rscod,	"+
+"	           prop.t_payerinn AS inn,	"+
+"	           (SELECT   sfc.t_code	"+
+"	              FROM   dsfcomiss_dbt sfc	"+
+"	             WHERE   sfc.t_feetype = 1 AND sfc.t_number = defc.t_commnumber)	"+
+"	              AS TYPE,	"+
+"	           TO_CHAR (pm.t_closedate, 'dd.mm.yyyy'),	"+
+"	           pm.t_payamount AS SUM,	"+
+"	           TO_CHAR (DEFC.T_DATEPERIODEND, 'dd.mm.yyyy') dend, "+
+"	           PM.T_PAYERACCOUNT "+
+"	    FROM   dpmpaym_dbt pm, dsfdef_dbt defc, dpmrmprop_dbt prop, doproper_dbt opr	"+
+"	   WHERE   pm.t_closedate between ? and ?	"+
+"	       AND pm.t_defcomid != 0	"+
+"	       AND pm.t_feetype = 1	"+
+"	       AND pm.t_partpaymnumber = 0	"+
+"	       AND pm.t_paymentid = prop.t_paymentid	"+
+"	       AND defc.t_commnumber IN ("+commnumber+")	"+
+"	       AND defc.t_feetype = 1	"+
+"	       /*        AND pm.t_defcomid = defc.t_invoiceid	*/ "+
+"	       AND pm.t_defcomid = DEFC.T_ID	"+
+"	       AND opr.t_documentid = LPAD (pm.t_paymentid, 34, '0')	"+
+"	       AND opr.t_dockind = pm.t_dockind	"+
+"	       AND NOT EXISTS	"+
+"	              (SELECT   1	"+
+"	                 FROM   doproblck_dbt bl, doprblock_dbt block, doprstep_dbt step	"+
+"	                WHERE   step.t_id_operation = opr.t_id_operation	"+
+"	                    AND step.t_kind_operation = opr.t_kind_operation	"+
+"	                    AND step.t_blockid = bl.t_blockid	"+
+"	                    AND LOWER (block.t_name) = LOWER ('возврат из картотеки')	"+
+"	                    AND bl.t_blockid = block.t_blockid	"+
+"	                    AND bl.t_kind_operation = opr.t_kind_operation)	"+
+"	ORDER BY   rscod	";
+        
+  cmd = rsdcommand(sql);
+  if ( (valtype(BD)!= v_Undef) and (valtype(ED)!= v_Undef) )
+    cmd.AddParam("", RSDBP_IN, BD);
+    cmd.AddParam("", RSDBP_IN, ED);
+  else
+    cmd.AddParam("", RSDBP_IN, BeginDate);
+    cmd.AddParam("", RSDBP_IN, BeginDate);
+  end;
+  return rsdRecordSet(cmd);
+
+end;
+
+macro CreateFile(rs, BeginDate)
+
+var i = 1;
+var INN;
+
+ if   (LifeBank.is_PRBB())
+   SpecialBankCode = 252;
+ elif (LifeBank.is_VUZ())
+   SpecialBankCode = 2519;
+ elif (LifeBank.is_GEB())
+   SpecialBankCode = 1968;
+ elif ({MFO_bank} == "046311808")  //Саратов
+   SpecialBankCode = 133;
+ elif ({MFO_bank} == "042007755")  //Воронеж
+   SpecialBankCode = 9000;
+ elif ({MFO_bank} == "047308902" ) //Ульяновск
+   SpecialBankCode = 7743;
+ elif ({MFO_bank} == "041806835" ) //Волгоград
+   SpecialBankCode = 127;
+ elif ({MFO_bank} == "040702756" ) //Ставрополь
+   SpecialBankCode = 8484;
+ else
+   SpecialBankCode = "Код_не_определен";
+ end;
+ 
+Setoutput(TxtFileDir + "\\" + NameFile);
+
+initprogress(-1, "Выполняется выгрузка в файл", "Выполняется выгрузка в файл");
+
+  while(rs.MoveNext)
+    SplitFullINN(rs.value(1), INN);
+    println(i,                StrFor(9), //№
+            int(rs.value(0)), StrFor(9), //RSCode
+            INN,              StrFor(9), //INN
+            SpecialBankCode,  StrFor(9), //SpecialBankCode
+            rs.value(2),      StrFor(9), //Код комиссии
+            rs.value(3),      StrFor(9), //Дата списание
+            rs.value(4),      StrFor(9), //Сумма
+            rs.value(6),      StrFor(9), //Счет плательщика
+            rs.value(5),      StrFor(9)); //Дата окончания периода оплаты
+    UseProgress(i);
+    i = i + 1;
+  end;
+
+RemProgress;
+
+Setoutput(null, true);
+
+return i - 1;
+
+end;
+
+macro StartUpload(ParmDate, Path, BegDate, EndDate)
+var tBD, tED, BDate, EDate;
+var day, month, year;
+
+ if (GetCmdLineParm("BegDate", tBD, v_integer))
+     BD = string(tBD);
+     
+    if (strlen(BD) == 7)
+       BD = "0" + BD;
+     end;
+     
+     day   = substr(BD,1,2);
+     month = substr(BD,3,2);
+     year  = substr(BD,5,4);
+     BD    = day + "." + month + "." + year;
+     
+     BDate = date(BD);
+ end;
+
+ if (GetCmdLineParm("DateEnd", tED, v_integer))
+     ED =    String(tED);
+     
+     if (strlen(ED) == 7)
+       ED = "0" + ED;
+     end;
+     
+     day   = substr(ED,1,2);
+     month = substr(ED,3,2);
+     year  = substr(ED,5,4);
+     ED    = day + "." + month + "." + year;
+     
+     EDate = date(ED);
+ end;
+  
+ /*Получение и проверка значения даты из командного файла*/
+  if (GetCmdLineParm("ParmDate", ParmDate, v_integer))
+    if (ValType(ParmDate) == v_Undef)
+      BeginDate = {CurDate};
+      GetDate(BeginDate, "Введите дату  окончания выгрузки.");
+    elif ((ValType(ParmDate) == v_integer) and (Parmdate == 0))
+      BeginDate = {curdate};
+    elif ((ValType(ParmDate) == v_integer) and (Parmdate == 1))
+      BeginDate = {curdate} -1;
+    end;
+  else
+    BeginDate = {CurDate};
+    GetDate(BeginDate, "Введите дату окончания выгрузки.");
+  end;
+ 
+  /*Получение и проверка значения директории выгрузки из командного файла*/
+  if((not GetCmdLineParm("Path", Path, v_string)) or (strlen(Path) == 0));
+    GetRegistryValue("COMMON\\КОМИССИИ\\ВЫГРУЗКА СПИСАННЫХ КОМИССИЙ", 2, Path);
+    /*Добавим умолчания*/
+    if (valtype(Path) == v_Undef )
+      Path = "$C:\RSPAR";
+    end;
+  end;
+
+  if(ValType(Path) == v_Undef)
+    GetRegistryValue("COMMON\\КОМИССИИ\\ВЫГРУЗКА СПИСАННЫХ КОМИССИЙ", 2, Path);
+    /*Добавим умолчания*/
+    if (valtype(Path) == v_Undef )
+      Path = "$C:\RSPAR";
+    end;
+  end;
+  
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", 2, TxtFileDir);
+
+//  DateSplit(BeginDate, dd, mm, yy);
+
+  NameFile = stDate({Curdate}) + "." + {MFO_Bank};
+  NameFileLog = stDate({Curdate}) + "_" + {MFO_Bank} + ".log";
+  
+  rs = GetRecordSet(CommNumber, BeginDate, BDate, Edate);
+  count = CreateFile(rs, BeginDate);
+  
+  if (CopyFile(NameFile, Path+ "\\" + NameFile))
+    //msgbox("Файл с именем ", NameFile ," находится в папке ", Path, "| Для выхода нажмите ESC.");
+  else
+    //msgbox("Не удалось выгрузить файл в папку ", Path);
+  end;
+  
+  onerror(x);
+/*Обработка ошибок*/
+  if (IsEqClass("TRSLError", x))
+    Setoutput(TxtFileDir + "\\" + NameFileLog);
+    println("oшибка:"+x.module + "[" + x.line + "]:" + x.message);
+    Setoutput(null,true);
+    CopyFile(NameFileLog, Path+ "\\Log\\" + NameFileLog);
+  end;
+  
+end;
+
+debugbreak;
+/*Точка входа*/ 
+startupload(ParmDate, Path, BegDate, EndDate);
+
+exit(1);

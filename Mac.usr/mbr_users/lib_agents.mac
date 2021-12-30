@@ -1,0 +1,539 @@
+// ------------------------------------------------------------------------------------------------
+// @filename: lib_agents.mac
+// @author  : Gurin S. N
+// @desc    : Автоматизация процессов обработки платежей в АРМ Позиционера, oбщие функции 
+// @request : C-30151-7
+// -------------------------------------------------------------------------------------------------
+import OraLib, LikePy, PaymInter, CTInter;
+import lib_pm_check, Send_Lotus;
+
+//private var FilterArray: TArray = TArray();
+var CheckArr = TArray();
+
+class TCheckCurrentRecord ()
+    var m_paymid = null;
+    
+    // @desc: заполнить свойства класса согласно полям текущего RecordSet
+    macro Save (rs:RsdRecordSet)
+        this.m_paymid = rs.value ("paymid");
+    end;
+    
+    // @desc: сравнить ранее сохраненные свойства класса с текущей записью в RecordSet
+    macro Compare (rs:RsdRecordSet)
+        return (this.m_paymid == rs.value ("paymid"));
+    end;
+    
+    // @desc: свойства класса не бывают заполнены, если листалка инициализируется при первом запуске
+    macro IsNull ()
+        return (this.m_paymid == null);
+    end;
+end;
+
+
+macro Checks_LogProc(_paymid, _reason, _check_kind, _stopfrase, _koef_sovp)
+    if (isNull(_stopfrase)) _stopfrase = ""; end;
+    if (isNull(_koef_sovp)) _koef_sovp = ""; end;
+    return (execSql("INSERT INTO USR_ROBOT_CHECKS (PAYMID, REASON, CHECK_KIND, STOPFRASE, KOEF_SOVP) "+
+                    "VALUES (:paymid, :reason, :check_kind, :stopfrase, :koef_sovp)", 
+            makeArray (SQLParam ("paymid", _paymid), SQLParam ("reason", _reason), SQLParam ("check_kind", _check_kind),
+                       SQLParam ("stopfrase", _stopfrase), SQLParam ("koef_sovp", _koef_sovp))));
+end;
+
+
+macro Checks_LogProc_24_7(_paymid, _reason, _stopfrase, _koef_sovp)
+    if (isNull(_stopfrase)) _stopfrase = ""; end;
+    if (isNull(_koef_sovp)) _koef_sovp = ""; end;
+    return (execSql("INSERT INTO USR_PLAN_24_7_FZ_115 (PAYMID, REASON, STOPFRASE, KOEF_SOVP) "+
+                    "VALUES (:paymid, :reason, :stopfrase, :koef_sovp)", 
+            makeArray (SQLParam ("paymid", _paymid), SQLParam ("reason", _reason), SQLParam ("stopfrase", _stopfrase),
+                       SQLParam ("koef_sovp", _koef_sovp))));
+end;
+
+macro setNote(id, kind)
+    var sql = execSqlSelect("select 1 from dnotetext_dbt where T_DOCUMENTID = lpad(:id, 10, 0) and t_objecttype = 501 and t_notekind = :kind", makeArray (SQLParam ("id", id), SQLParam ("kind", kind)));
+    if (not sql.movenext())
+       execSql("INSERT INTO dnotetext_dbt"
+               "       (t_objecttype, t_documentid, t_notekind, t_oper, t_date," 
+                "        t_text, t_validtodate, "
+               "        t_branch, t_numsession) "
+               "VALUES (501, lpad(:id, 10, 0), :kind, RSBSESSIONDATA.oper, rsbsessiondata.curdate,"
+               "        UTL_RAW.cast_to_raw ('X'), TO_DATE ('31.12.9999'), rsbsessiondata.operdprtnode, 0)",
+       makeArray (SQLParam ("id", id), SQLParam ("kind", kind)));
+    end;
+    return true;
+onError
+    return false;
+end;
+
+macro setCtgVal(id, attrID, codeList, d)
+    if (codeList == 7/*Ручная обработка*/)
+       execsql("update USR_ROBOT_PAYMENT_TMP set isManual = chr(88) where paymid = :id",
+                makeArray (SQLParam ("id", id)));
+    end;
+    var paymObj = RsbPayment(id); 
+    paymObj.Categories.ConnectAttr(attrID, codeList, NULL, NULL, d);
+    return (paymObj.categories.Save() == 0);
+end;
+
+macro unsetCtgVal(id, attrID, codeList)
+    var paymObj = RsbPayment(id); 
+    paymObj.Categories.DisconnectAttr(attrID, codeList);
+    return (paymObj.categories.Save() == 0);
+
+onError
+end;
+
+macro getCtgValue(pid, gid, d) 
+   record ctgP   ( "objattr" ); //для записи категории
+   record rPmpaym( "pmpaym" );
+
+   var paymObj:Rsbpayment=Rsbpayment(pid);
+   rPmpaym.PaymentID = PaymObj.PaymentId;
+   var ctg = RsbObjCategories(OBJTYPE_PAYMENT, UniID (rPmpaym, OBJTYPE_PAYMENT));
+   ctg.GetFirst( gid, d, ctgP );
+   return ctgP.attrid;
+
+onError
+end;
+
+macro setStepState (id, dockind)
+    return (execSql("UPDATE doprstep_dbt SET t_isexecute = 'R' WHERE  t_id_operation = :id and t_blockid = 10000145 and t_number_step = 190", 
+             makeArray (SQLParam ("id", PM_Opr_GetIdOperation(id, dockind)))));
+end;
+
+macro ChangeStep (id, dockind)
+    return (execSql("UPDATE doprstep_dbt SET t_isexecute = 'R' WHERE t_id_operation = :id and t_blockid = 10000145 and t_number_step = 190 and t_isexecute = 'W'",
+             makeArray (SQLParam ("id", PM_Opr_GetIdOperation(id, dockind)))));
+end;
+
+macro addToTmp (id)
+    return (execSql("INSERT INTO USR_ROBOT_PAYMENT_TMP values (:id,null,CHR (0),null,CHR (1),CHR (0),CHR (0),null,CHR (88));",
+             makeArray (SQLParam ("id", id))));
+end;
+   
+
+macro DelFromTMP(id)
+    return (execSql("delete from USR_ROBOT_PAYMENT_TMP where paymid = :id", makeArray (SQLParam ("id", id))));
+end;
+
+macro DelFromLog(id, check_kind)
+    return (execSql("delete from usr_robot_checks where paymid = :id and check_kind = :check_kind", 
+                    makeArray (SQLParam ("id", id), SQLParam ("check_kind", check_kind))));
+end;
+
+macro IsExistsInLog(id, check_kind)
+    var sql = execSqlSelect("select 1 from usr_robot_checks where paymid = :id and check_kind = :check_kind", 
+                            makeArray (SQLParam ("id", id), SQLParam ("check_kind", check_kind)));
+    return sql.movenext();
+end;
+
+macro SendRequestFromMbrRobot(parallel)
+   return (execSql("begin Usr_AgentARM_SendRequest(:parallel); end;", makeArray (SQLParam ("parallel", parallel))));
+end;
+
+macro SearchAnswer()
+   var sql, _sql;
+   sql = execSqlSelect("select paymid, reqid from USR_ROBOT_PAYMENT_TMP where reqid != chr(1)");
+   while (sql.movenext())
+      _sql = execSqlSelect("select t_errorcode err from dxr_log_dbt where t_reqid = :reqid and t_kind = 3", 
+                                 makeArray (SQLParam ("reqid", sql.value("reqid"))));
+      if (_sql.movenext() and (_sql.value("err") == 0))
+         execsql("delete from USR_ROBOT_PAYMENT_TMP where paymid = :id AND ismanual = CHR(0)", makeArray (SQLParam ("id", sql.value("paymid")))); 
+      end;
+   end;
+end;
+
+macro UsrTimeSplit(sec,hh,mi) 
+   var _mi = 0, _hh = 0;
+   _mi = mod(sec,60);
+   _hh = (sec - _mi)/60;
+   SetParm(1, _hh);
+   SetParm(2, _mi);
+end;
+
+macro DelFilterSettingsRow(_id)
+   execSql("delete from USR_ROBOTS_FILTER_SETTINGS where id = :id", makeArray (SQLParam ("id", _id)));
+end;
+
+macro isPrint(id, stop, reason, check_kind)
+    return (execSql("update usr_robot_checks set isprint = chr(88) where paymid = :id and stopfrase = :stop and reason = :reason and check_kind = :check_kind", 
+                    makeArray (SQLParam ("id", id), SQLParam ("stop", stop), SQLParam ("reason", reason), SQLParam ("check_kind", check_kind))));
+end;
+
+macro isPrint_24_7(id, stop, reason)
+    return (execSql("update USR_PLAN_24_7_FZ_115 set isprint = chr(88) where paymid = :id and stopfrase = :stop and reason = :reason", 
+                    makeArray (SQLParam ("id", id), SQLParam ("stop", stop), SQLParam ("reason", reason))));
+end;
+
+macro SetChecked(id)
+    return (execSql("update usr_robot_payment_tmp set checked = chr(88) where paymid = :id", makeArray (SQLParam ("id", id))));
+end;
+
+macro getStat(cnt_all, sum_all, cnt_norm, sum_norm, cnt_rush, sum_rush, cnt_1, cnt_2, cnt_3, cnt_4, flg)
+    var sql;
+    if (flg == "1")
+       sql = execSqlSelect("SELECT 'Все' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE ismanual = CHR (0)"
+                           "union all "
+                           "SELECT 'Обычные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE paymkind != 'С' AND ismanual = CHR (0)"
+                           "union all "
+                           "SELECT 'Срочные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE paymkind = 'С' AND ismanual = CHR (0)");
+    elif (flg == "2")
+       sql = execSqlSelect("SELECT 'Все' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_LOG "
+                           " WHERE creationdate = :d1 AND ismanual = CHR (0) "
+                           "union all "
+                           "SELECT 'Обычные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_LOG "
+                           " WHERE creationdate = :d2 AND paymkind != 'С' AND ismanual = CHR (0)"
+                           "union all "                                   
+                           "SELECT 'Срочные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_LOG "
+                           " WHERE creationdate = :d3 AND paymkind = 'С' AND ismanual = CHR (0)",
+                           makeArray (SQLParam ("d1", {Curdate}), SQLParam ("d2", {Curdate}), SQLParam ("d3", {Curdate})) );
+    elif (flg == "3")
+       sql = execSqlSelect("SELECT 'Все' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE creationdate = :d1 AND ismanual = CHR (88)"
+                           "union all "
+                           "SELECT 'Обычные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE creationdate = :d2 AND paymkind != 'С' AND ismanual = CHR (88) "
+                           "union all "
+                           "SELECT 'Срочные' mark, COUNT (*) cnt, NVL(SUM (amount),0) SUM FROM USR_ROBOT_PAYMENT_TMP "
+                           " WHERE creationdate = :d3 AND paymkind = 'С' AND ismanual = CHR (88) ",
+                           makeArray (SQLParam ("d1", {Curdate}), SQLParam ("d2", {Curdate}), SQLParam ("d3", {Curdate})) );
+    elif (flg == "4")
+       sql = execSqlSelect("SELECT   'Все' mark, SUM (cnt) cnt, SUM (SUM) sum "
+                           "  FROM   (SELECT 'Все' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "            FROM USR_ROBOT_PAYMENT_TMP "
+                           "           WHERE creationdate = :d1 AND ismanual = CHR (88) "
+                           "          UNION ALL "
+                           "          SELECT 'Все' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "            FROM USR_ROBOT_PAYMENT_LOG "
+                           "           WHERE creationdate = :d2 AND ismanual = CHR (88)) "
+                           " UNION ALL "
+                           "SELECT   'Обычные' mark, SUM (cnt) cnt, SUM (SUM) sum "
+                           "  FROM   (SELECT 'Обычные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "             FROM USR_ROBOT_PAYMENT_TMP "
+                           "            WHERE creationdate = :d3 AND paymkind != 'С' AND ismanual = CHR (88) "
+                           "          UNION ALL "
+                           "          SELECT 'Обычные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "            FROM USR_ROBOT_PAYMENT_LOG "
+                           "           WHERE creationdate = :d4 AND paymkind != 'С' AND ismanual = CHR (88)) "
+                           "UNION ALL "
+                           "SELECT   'Срочные' mark, SUM (cnt) cnt, SUM (SUM) sum "
+                           "  FROM   (SELECT 'Срочные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "            FROM USR_ROBOT_PAYMENT_TMP "
+                           "           WHERE creationdate = :d5 AND paymkind = 'С' AND ismanual = CHR (88) "
+                           "          UNION ALL "
+                           "          SELECT 'Срочные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "            FROM USR_ROBOT_PAYMENT_LOG "
+                           "           WHERE creationdate = :d6 AND paymkind = 'С' AND ismanual = CHR (88))",
+                           makeArray (SQLParam ("d1", {Curdate}), SQLParam ("d2", {Curdate}), SQLParam ("d3", {Curdate}),
+                                      SQLParam ("d4", {Curdate}), SQLParam ("d5", {Curdate}), SQLParam ("d6", {Curdate})) );
+    elif (flg == "5")
+       sql = execSqlSelect("SELECT   'Все' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "  FROM   USR_ROBOT_PAYMENT_LOG usr, dwlpm_dbt pm, dwlmeslnk_dbt lnk, dwlmes_dbt mes "
+                           " WHERE       usr.paymid = pm.t_paymentid AND usr.creationdate = :d1 AND usr.ismanual = CHR (0) "
+                           "         AND pm.t_wlpmid = lnk.t_objid AND lnk.t_mesid = mes.t_mesid AND mes.t_state = 10 "
+                           "UNION ALL "
+                           "SELECT   'Обычные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "  FROM   USR_ROBOT_PAYMENT_LOG usr, dwlpm_dbt pm, dwlmeslnk_dbt lnk, dwlmes_dbt mes "
+                           " WHERE       usr.paymid = pm.t_paymentid AND usr.creationdate = :d2 AND paymkind != 'С' AND ismanual = CHR (0)"
+                           "         AND pm.t_wlpmid = lnk.t_objid AND lnk.t_mesid = mes.t_mesid AND mes.t_state = 10 "
+                           "UNION ALL "
+                           "SELECT   'Срочные' mark, COUNT ( * ) cnt, NVL (SUM (amount), 0) SUM "
+                           "  FROM   USR_ROBOT_PAYMENT_LOG usr, dwlpm_dbt pm, dwlmeslnk_dbt lnk, dwlmes_dbt mes "
+                           " WHERE       usr.paymid = pm.t_paymentid AND creationdate = :d3 AND paymkind = 'С' AND ismanual = CHR (0) "
+                           "         AND pm.t_wlpmid = lnk.t_objid AND lnk.t_mesid = mes.t_mesid AND mes.t_state = 10 ",
+                           makeArray (SQLParam ("d1", {Curdate}), SQLParam ("d2", {Curdate}), SQLParam ("d3", {Curdate})) );
+    elif (flg == "all")
+       sql = execSqlSelect("SELECT   'Проверка1' mark, COUNT (*) cnt "
+                           "  FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm "
+                           " WHERE       usr.paymid = dpm.t_paymentid AND usr.check_kind = 1 AND dpm.t_paymstatus NOT IN (32000) "
+                           "UNION ALL "
+                           "SELECT   'Проверка2' mark, COUNT (*) cnt "
+                           "  FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm "
+                           " WHERE       usr.paymid = dpm.t_paymentid AND usr.check_kind = 2 AND dpm.t_paymstatus NOT IN (32000) "
+                           "UNION ALL "
+                           "SELECT   'Проверка3' mark, COUNT (*) cnt "
+                           "  FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm "
+                           " WHERE       usr.paymid = dpm.t_paymentid AND usr.check_kind = 3 AND dpm.t_paymstatus NOT IN (32000) "
+                           "UNION ALL "
+                           "SELECT   'Проверка4' mark, COUNT (*) cnt "
+                           "  FROM   USR_ROBOT_CHECKS usr, dpmpaym_dbt dpm "
+                           " WHERE       usr.paymid = dpm.t_paymentid AND usr.check_kind = 4 AND dpm.t_paymstatus NOT IN (32000)");
+    end;
+    while (sql.movenext())
+       if (sql.value("mark") == "Все")
+          SetParm(0,int(sql.value("cnt")));   
+          SetParm(1,sql.value("sum"));   
+       elif (sql.value("mark") == "Обычные")
+          SetParm(2,int(sql.value("cnt")));   
+          SetParm(3,sql.value("sum"));   
+       elif (sql.value("mark") == "Срочные")
+          SetParm(4,int(sql.value("cnt")));   
+          SetParm(5,sql.value("sum"));   
+       elif (sql.value("mark") == "Проверка1")
+          SetParm(6,int(sql.value("cnt")));   
+       elif (sql.value("mark") == "Проверка2")
+          SetParm(7,int(sql.value("cnt")));   
+       elif (sql.value("mark") == "Проверка3")
+          SetParm(8,int(sql.value("cnt")));   
+       elif (sql.value("mark") == "Проверка4")
+          SetParm(9,int(sql.value("cnt")));   
+       end;
+    end;
+end;
+
+macro PrintReportCheck4(rs)
+   var reportName = getTxtFileName ("PrintReportCheck4");
+   SetOutput (reportName, false);
+   var sql, str, i;
+   [                                   Список документов, совпадающих с перечнем экстремистов и лиц причастных к терроризму за #
+
+   --------------T-------------T---------T--------------T------------------T--------------------------------------------------------------------------------T-------T-------------------------T---------┐
+   │ Код клиента │ Код клиента │  № Док. │     Дата     │      Сумма       │                             Стоп фраза                                         │  Коэф.│   Имя поля документа    │   Вид   │
+   │ плательщика │ получателя  │         │              │                  │                                                                                │       │                         │документа│
+   ]({Curdate}
+   );
+
+   InitProgress(CheckArr.size(),"Ждите... идет печать сообщений", "Массовая печать сообщений");
+   for (i, 0, CheckArr.Size - 1 )
+      if (rs.move(CheckArr[i][3], BOOKMARK))
+         [+-------------+-------------+---------+--------------+------------------+--------------------------------------------------------------------------------+-------+-------------------------+---------+
+          │#############│#############│#########│##############│##################│################################################################################│#######│                         │  #####  │]
+         ( CheckArr[i][2].value("payer"), CheckArr[i][2].value("receiver"), CheckArr[i][2].value("numdoc"), substr(string(CheckArr[i][2].value("dat")),1,10), 
+           CheckArr[i][2].value("amount"), CheckArr[i][2].value("stop"), CheckArr[i][2].value("koef"), CheckArr[i][2].value("dockind"):c );
+         [+-------------+-------------+---------+--------------+------------------+--------------------------------------------------------------------------------+-------+-------------------------+---------+];
+         sql = execSqlSelect("SELECT t.t_text text FROM dstop_dbt t WHERE t.t_str = :str order by t.t_text ",
+                        makeArray (SQLParam ("str", CheckArr[i][2].value("stop"))));
+         while (sql.movenext())
+            if (valtype(sql.value("text")) == 0) str = "";
+            else str = sql.value("text");
+            end;
+            [│             │             │         │              │                  │################################################################################│       │                         │         │]
+            (str:w);
+         end;
+         sql = null;
+
+         if   (CheckArr[i][1] == "Плательщик")  str = CheckArr[i][2].value("payname");    
+         elif (CheckArr[i][1] == "Получатель")  str = CheckArr[i][2].value("recname");
+         elif (CheckArr[i][1] == "Основание")   str = CheckArr[i][2].value("ground");
+         end;
+      
+         [+-------------+-------------+---------+--------------+------------------+--------------------------------------------------------------------------------+-------+-------------------------+---------+
+          │             │             │         │              │                  │################################################################################│       │ ####################### │         │]
+         (str:w, CheckArr[i][1]);
+      end;
+      isPrint(CheckArr[i][0], CheckArr[i][2].value("stop"), CheckArr[i][1], 4);
+      UseProgress(i);
+   end;
+   RemProgress();
+   [L-------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+];
+
+   SetOutput (NULL, true);
+   ViewFile(reportName);
+
+end;
+
+// @desc: _notify_kind == 1 - активность процесса
+//        _notify_kind == 2 - невозможность провести срочный платеж
+//        _notify_kind == 3 - превышение лимита очереди платежей на обработку
+//        _notify_kind == 4 - превышение лимита очереди платежей с признаком "Ручная обработка"
+//        _notify_kind == 5 - ошибка в dxr_log_dbt.t_message
+//        _notify_kind == 6 - другие ошибки
+macro Agent_Send_Letter(_notify_kind, _addresat, _id, _error):integer
+    var theme, letter, p, f, i = 0;
+    theme = String("АВТОМАТИЧЕСКАЯ ОБРАБОТКИ НАЧАЛЬНЫХ ПЛАТЕЖНЫХ ДОКУМЕНТОВ ПС ЦБ РФ, ", {Name_Bank});
+
+    if (_notify_kind == 1)
+       letter = String("Добрый день! ", "\n", "\n", 
+                       "Процесс активный!");
+
+    elif (_notify_kind == 2)
+       p = RSBPayment (_id);
+       letter  = string (
+               "Добрый день! ", "\n", "\n",
+               "Невозможно провести срочный платеж.", "\n", "\n",
+               "№ п/п               : ", p.number          , "\n", 
+               "Счёт плательщика    : ", p.payerAccount    , "\n", 
+               "Счёт получателя     : ", p.receiverAccount , "\n", 
+               "Сумма платежа       : ", p.baseAmount      , "\n", 
+               "Назначение платежа  : ", p.ground
+               );
+       p = Null;
+
+    elif (_notify_kind == 3)
+       letter = String("Добрый день! ", "\n", "\n", 
+                       "Превышен лимит очереди платежей на обработку!");
+
+    elif (_notify_kind == 4)
+       letter = String("Добрый день! ", "\n", "\n", 
+                       "Превышен лимит очереди платежей с признаком \"Ручная обработка\"!");
+
+    elif (_notify_kind == 5)
+       letter = String("Добрый день! ", "\n", "\n", 
+                       "Ошибка при выгрузке документа ", _id, " в МБР", "\n", "\n",
+                       _error
+                       );
+
+    elif (_notify_kind == 6)
+       letter = String("Добрый день! ", "\n", "\n", 
+                       "Ошибка в работе робота!", "\n", "\n",
+                       _error
+                       );
+
+    end;
+
+    if (_addresat == "") return RSL_EXIT_FAILURE; end;
+    f = split(_addresat, ",");
+    while (i < f.size(f))
+        if (trim(f(i)) != "")
+            Send_l(theme, letter, 73, trim(f(i)));
+        end;
+        i = i + 1;
+    end;
+    return RSL_EXIT_SUCCESS;
+
+onError()
+    return RSL_EXIT_FAILURE;
+end;
+
+//Send_Letter(1, "Sergey NGurin/IT/Probusiness Bank");
+//Send_Letter(2, "Sergey_N_Gurin/IT/Probusiness_Bank", 40511821);
+
+class TDialogFieldsTmp (Time_Begin, Time_End, Is_Holiday, Paym_Kind, Paym_Pack, Client_Code, Rec_Account, Rec_BIC, Tarif_Code, Priority, Paym_Shifr, TaxAuthorState,
+                        _Time_Begin, _Time_End, _Is_Holiday, _Paym_Kind, _Paym_Pack, _Client_Code, _Rec_Account, _Rec_BIC, _Tarif_Code, _Priority, _Paym_Shifr, _TaxAuthorState)
+   var oTime_Begin           = Time_Begin;
+   var oTime_End             = Time_End;
+   var oIs_Holiday           = Is_Holiday;
+   var oPaym_Kind            = Paym_Kind;
+   var oPaym_Pack            = Paym_Pack;
+   var oClient_code          = Client_Code;
+   var oRec_Account          = Rec_Account;
+   var oRec_BIC              = Rec_BIC;
+   var oTarif_Code           = Tarif_Code;
+   var oPriority             = Priority;
+   var oPaym_Shifr           = Paym_Shifr;
+   var oTaxAuthorState       = TaxAuthorState;
+   var prTime_Begin          = _Time_Begin;
+   var prTime_End            = _Time_End;
+   var prIs_Holiday          = _Is_Holiday;
+   var prPaym_Kind           = _Paym_Kind;
+   var prPaym_Pack           = _Paym_Pack;
+   var prClient_Code         = _Client_Code;
+   var prRec_Account         = _Rec_Account;
+   var prRec_BIC             = _Rec_BIC;
+   var prTarif_Code          = _Tarif_Code;
+   var prPriority            = _Priority;
+   var prPaym_Shifr          = _Paym_Shifr;
+   var prTaxAuthorState      = _TaxAuthorState;
+
+end;    
+
+macro CompareDialogFields_Agent (src)
+return (    
+          (src.oTime_Begin.value      == src.oTime_Begin.bindstring)
+      and (src.oTime_End.value        == src.oTime_End.bindstring)
+      and (src.oIs_Holiday.value      == src.oIs_Holiday.bindstring)
+      and (src.oPaym_Kind.value       == src.oPaym_Kind.bindstring)
+      and (src.oPaym_Pack.value       == src.oPaym_Pack.bindstring)
+      and (src.oClient_code.value     == src.oClient_code.bindstring)
+      and (src.oRec_Account.value     == src.oRec_Account.bindstring)
+      and (src.oRec_BIC.value         == src.oRec_BIC.bindstring)
+      and (src.oTarif_Code.value      == src.oTarif_Code.bindstring)
+      and (src.oPriority.value        == src.oPriority.bindstring)
+      and (src.oPaym_Shifr.value      == src.oPaym_Shifr.bindstring)
+      and (src.oTaxAuthorState.value  == src.oTaxAuthorState.bindstring)
+      and (src.prTime_Begin.value     == src.prTime_Begin.bindstring)
+      and (src.prTime_End.value       == src.prTime_End.bindstring)
+      and (src.prIs_Holiday.value     == src.prIs_Holiday.bindstring)
+      and (src.prPaym_Kind.value      == src.prPaym_Kind.bindstring)
+      and (src.prPaym_Pack.value      == src.prPaym_Pack.bindstring)
+      and (src.prClient_Code.value    == src.prClient_Code.bindstring)
+      and (src.prRec_Account.value    == src.prRec_Account.bindstring)
+      and (src.prRec_BIC.value        == src.prRec_BIC.bindstring)
+      and (src.prTarif_Code.value     == src.prTarif_Code.bindstring)
+      and (src.prPriority.value       == src.prPriority.bindstring)
+      and (src.prPaym_Shifr.value     == src.prPaym_Shifr.bindstring)
+      and (src.prTaxAuthorState.value == src.prTaxAuthorState.bindstring)
+     );                         
+end;
+
+/*Работа с фильтром*/
+//private class TFilterRecord(_RowName, _Value, _Priority, _NumSetting)
+//    var m_RowName      = _RowName;
+//    var m_Value        = _Value;
+//    var m_Priority     = _Priority;
+//    var m_NumSetting   = _NumSetting;
+//end;
+
+//private macro QSortProc(rec1, rec2):integer
+//   if (rec1.m_Priority < rec2.m_Priority)
+//      return -1;
+//   elif (rec1.m_Priority > rec2.m_Priority)
+//      return +1;
+//   end;
+//   return 0;     
+//END;
+
+//macro ApplyFilter()
+//   var sql, sql1, sql2, id = 1;
+//   sql1 = execSqlSelect( "SELECT TIME_BEGIN, TIME_END, IS_HOLIDAY, PAYM_KIND, PAYM_PACK, CLIENT_CODE, REC_ACCOUNT, "+
+//                         "       REC_BIC, TARIF_CODE, PRIORITY, PAYM_SHIFR, TAXAUTHORSTATE "+
+//                         "       FROM USR_ROBOTS_FILTER_SETTINGS WHERE ID = " + id);
+//   sql2 = execSqlSelect( "SELECT prTIME_BEGIN, prTIME_END, prIS_HOLIDAY, prPAYM_KIND, prPAYM_PACK, prCLIENT_CODE, prREC_ACCOUNT, "+
+//                         "       prREC_BIC, prTARIF_CODE, prPRIORITY, prPAYM_SHIFR, prTAXAUTHORSTATE "+ 
+//                         "       FROM USR_ROBOTS_FILTER_SETTINGS_PR WHERE id = " + id);
+//   if (sql1.movenext() and sql2.movenext())
+//      //if (valType (sql1.value("TIME_BEGIN"))!= 26)
+//      //   FilterArray(FilterArray.size()) = TFilterRecord("TIME_BEGIN",     sql1.value("TIME_BEGIN"),     sql2.value("prTIME_BEGIN"),     id);
+//      //end;
+//      //if (valType (sql1.value("TIME_END"))!= 26)
+//      //   FilterArray(FilterArray.size()) = TFilterRecord("TIME_END",       sql1.value("TIME_END"),       sql2.value("prTIME_END"),       id);
+//      //end;
+//      if (valType (sql1.value("IS_HOLIDAY"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("IS_HOLIDAY",     sql1.value("IS_HOLIDAY"),     sql2.value("prIS_HOLIDAY"),     id);
+//      end;
+//      if (valType (sql1.value("PAYM_KIND"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("PAYM_KIND",      sql1.value("PAYM_KIND"),      sql2.value("prPAYM_KIND"),      id);
+//      end;
+//      if (valType (sql1.value("PAYM_PACK"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("PAYM_PACK",      sql1.value("PAYM_PACK"),      sql2.value("prPAYM_PACK"),      id);
+//      end;
+//      if (valType (sql1.value("CLIENT_CODE"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("CLIENT_CODE",    sql1.value("CLIENT_CODE"),    sql2.value("prCLIENT_CODE"),    id);
+//      end;
+//      if (valType (sql1.value("REC_ACCOUNT"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("REC_ACCOUNT",    sql1.value("REC_ACCOUNT"),    sql2.value("prREC_ACCOUNT"),    id);
+//      end;
+//      if (valType (sql1.value("REC_BIC"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("REC_BIC",        sql1.value("REC_BIC"),        sql2.value("prREC_BIC"),        id);
+//      end;
+//      if (valType (sql1.value("TARIF_CODE"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("TARIF_CODE",     sql1.value("TARIF_CODE"),     sql2.value("prTARIF_CODE"),     id);
+//      end;
+//      if (valType (sql1.value("PRIORITY"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("PRIORITY",       sql1.value("PRIORITY"),       sql2.value("prPRIORITY"),       id);
+//      end;
+//      if (valType (sql1.value("PAYM_SHIFR"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("PAYM_SHIFR",     sql1.value("PAYM_SHIFR"),     sql2.value("prPAYM_SHIFR"),     id);
+//      end;
+//      if (valType (sql1.value("TAXAUTHORSTATE"))!= 26)
+//         FilterArray(FilterArray.size()) = TFilterRecord("TAXAUTHORSTATE", sql1.value("TAXAUTHORSTATE"), sql2.value("prTAXAUTHORSTATE"), id);
+//      end;
+//   end;
+
+   //Сортируем массив по возрастинию очередности поля (m_Priority)
+//   QSort(FilterArray, @QSortProc);
+
+//   while(FilterArray.size ())
+//      if (FilterArray(0).m_RowName == "PAYM_KIND")
+//         sql = " AND 1=1";
+//      elif (FilterArray(0).m_RowName == "IS_HOLIDAY")
+//         sql = " AND 1=1";
+      // ...
+//      end;
+//   end;
+
+//   return sql;
+//end;

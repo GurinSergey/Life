@@ -1,0 +1,816 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщения по SBC                                               */
+/*                                                                          */
+/*  Имя файла: mnsgmsbc.mac                                                 */
+/*  Создан:  02.12.04                                    Фомченкова Л.Н.    */
+// Lavrenov 06.06.2012 I-00204447-2
+/* Gurin S. N. 09.07.2012 I-00217981-2                                      */
+/* Gurin S. N. 25.12.2012 I-00274834-2                                      */
+/***************************************************************************/
+/*Kozina В сообщениях о закрытии старых счетов (счета открыты до 2003г), у которых отсутствует 
+ИНН или КПП отключена проверка на необходимость заполнения ИНН, КПП.
+Формирование таких сообщений доступно только пользователям 174ой группы СУД*/
+/*SDA 27.11.2013 адаптация на 31-ю сборку */
+// KS 15.05.2014 Должность и телефон и для Солидарности
+
+import "wlgenmes.mac", "wlmnstls.mac", OprInter, oralib, likepy, PSInter, "mnssbcal.mac";//TAM 04.09.2014 HF_74
+import "fg_Life_parm.mac"; //Lavrenov 02.11.11
+
+record Налогоплательщик(party);
+record reqopena(reqopena);
+record reqclosa(reqclosa);
+//record AccIn(account);
+//record AccOut(account);
+record GenAcc(account);
+
+
+//FILE reqlinka(reqlinka) key 0;
+FILE dp_dep( dp_dep ) key 0;
+FILE party( party ) key 0;
+FILE typeac( typeac ) key 0;
+//FILE adress( adress ) key 0;
+FILE persn( persn ) key 0;
+
+private const TA_SACNT  = 1;
+private const TA_SACNTC = 4;
+private const NATCUR = 0;
+private var fgBank = fg_life_subject({OurBank});
+
+/* EVG Функция возвращает текст типа счёта, предварительно отфильтровывая ненужные */
+macro GetAccType(TA, AccTypeStr:@string)
+   var n = 1,
+       err,
+       AccTypes,
+       CurSymbol;
+
+   AccTypes = "";
+   GetRegistryValue( "PS\\REQOPENACC\\OPERATION\\ТИПЫ_СЧЕТОВ", V_STRING, AccTypes, err );
+   if( (err != 0) or (AccTypes == "") )
+      AccTypes = "ЧXЯQ";
+   end;
+   
+   TA = strsubst(TA,"Х","X"); 
+   while (n <= strLen(TA))
+      CurSymbol = subStr(TA, n, 1);
+
+      if ( index(AccTypes, CurSymbol) > 0 )
+         // Выход из цикла
+         n = strLen(TA);
+      end;
+
+      n = n + 1;
+   end;
+
+  /* Значение сегмента typeac.iNumType определено ранее */
+  typeac.Type_Account = CurSymbol;
+  if (GetEQ(typeac))
+     AccTypeStr = typeac.Name_Type;
+     return true;
+  end;
+
+  return false;
+end;
+
+/* EVG Пользовательский аналог функци GetMessageNumber() */
+macro USR_GetMessageNumber( PartyID, AccNumber, CodeCurrency, PDBuff, NewMessageNumber:@string, NewMessageSeries:@string, Открытие);
+ var rs;
+ var AccountR = TBFile ("account.dbt"),
+     AccountC = TBFile ("account$.dbt");
+ var Stat, AccObj, LastNumber_Note, Send_trn,
+     RegNum, yy, RefID, RefValue, Err, AccOpenDate;
+
+    macro SaveNote( nText )
+
+       if ( AddNoteForObject(OBJTYPE_ACCOUNT, UniID(AccObj, OBJTYPE_ACCOUNT), 25, nText, {CurDate}) > 0 )
+          RunError(string("Ошибка сохранения номера сообщения в примечании к счёту"));
+       end;
+
+    end;
+   
+   AccObj = AccountR;
+   if (CodeCurrency > 0)
+      AccObj = AccountC;
+   end;
+
+   AccObj.Clear();
+   AccObj.rec.Chapter = 1;
+   AccObj.rec.Code_Currency = CodeCurrency;
+   AccObj.rec.Account = AccNumber;
+   if (not AccObj.GetEQ())
+      // Счёт не найден, будет формироваться новый номер
+      Stat = false;
+   end;
+
+   RegNum = ПолучитьКодСубъекта( PartyID, 13, Err );
+
+   debugbreak;
+   // Получим номер предыдкщего сообщения из примечания № 25 к счёту
+   if (Открытие)
+     LastNumber_Note = ReadNoteForObject( OBJTYPE_ACCOUNT, UniID(AccObj, OBJTYPE_ACCOUNT), 25 );
+   end;
+
+   if ( (valType(LastNumber_Note) != V_UNDEF) and (strLen(LastNumber_Note) > 0) )
+
+      // Проверки номера сообщения
+      stat = true;
+      // Первые 4 символа номера = первые 4 символа номера ОГРН
+      if ( subStr(LastNumber_Note, 1, 4) != subStr(RegNum, 1, 4) )
+         Stat = false;
+      end;
+
+      // Символы 5 - 8 номера = последние 4 символа номера ОГРН
+      if ( stat and (subStr(LastNumber_Note, 5, 4) != "0000") )
+         Stat = false;
+      end;
+
+      // Символы 9 - 10 имеют цифровое значение
+      if ( stat and (    (int(subStr(LastNumber_Note, 9, 2)) == 0)
+                     and (subStr(LastNumber_Note, 9, 2)      != "00") ))
+         Stat = false;
+      end;
+
+      // Символы 11 - 16 имеют цифровое значение
+      if ( stat and (    (int(subStr(LastNumber_Note, 11, 6)) == 0)
+                     and (subStr(LastNumber_Note, 11, 6)      != "000000") ))
+         Stat = false;
+      end;
+
+      // Символы 18 - 20 имеют значение больше 000
+      if ( stat and (int(subStr(LastNumber_Note, 18, 3)) <= 0) )
+         Stat = false;
+      end;
+
+      if (stat)
+         // Прибавляем 1 к последнему разряду
+         Send_trn = int(subStr(LastNumber_Note, strLen(LastNumber_Note))) + 1;
+
+         LastNumber_Note = substr(LastNumber_Note, 1, strLen(LastNumber_Note)-1) + string(Send_trn);
+         
+         NewMessageNumber = subStr(LastNumber_Note, 1, 16);
+         NewMessageSeries = subStr(LastNumber_Note, 18);
+
+         // Сохраняем в примечании
+         SaveNote(NewMessageNumber+","+NewMessageSeries);
+
+         return true;
+      end;
+
+   end;
+
+   // Если номера предыдущего сообщения нет, генерим его по референсу
+   GetRegistryValue("PS\\REQOPENACC\\OPERATION\\ОПИСАТЕЛЬ_РЕФЕРЕНСА", V_INTEGER, RefID, Err);
+   if (Err > 0)
+      RefID = 130;
+   end;
+   
+   AccOpenDate = AccObj.rec.Open_Date;
+   if ( (valType(AccOpenDate) != V_UNDEF) or (AccOpenDate == date(0,0,0)) )
+      AccOpenDate = PDBuff.Date;
+   end;
+
+   DateSplit(AccOpenDate, null, null, yy);
+   NewMessageNumber = subStr(RegNum, 1, 4) + "0000" + subStr(string(yy), 3);
+
+   if ( GenerateReference(RefID, RefValue) > 0 )
+      RunError("Ошибка получения значения референса \"Номера сообщений МНС в течение года\"!");
+      return false;
+   end;
+   
+   NewMessageNumber = NewMessageNumber + RefValue;
+   rs = rsdrecordset("select t_legalform from dparty_dbt where t_partyid = " + AccObj.rec.Client );
+   if(rs.movenext())
+     NewMessageSeries = string(rs.value(0))+"00";
+   end;
+
+   // Сохраняем в примечании
+   SaveNote(NewMessageNumber+","+NewMessageSeries);
+
+   return true;
+end;
+
+/*macro ПолучитьСчетСВалютой(buff, Открытие, Счет, Валюта )
+  Var ТипСчета; 
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  ТипСчета = GetAccountType();
+  if(ТипСчета == -1)
+    SetParm(2, buff.Account);
+    SetParm(3, buff.Code_Currency);
+    return;
+  end;
+  if(not Открытие)/*закрыт*/
+     AccIn.Chapter = 1;
+     AccIn.Account = buff.Account;
+     AccIn.Code_Currency = buff.Code_Currency;
+     select = "select t_AttrID from dobjlink_dbt where t_ObjectType = :OBJTYPE_ACCOUNT"+
+                    " and t_ObjectID = :OBID"
+                    " and t_GroupID = :TypeScore and t_AttrType = :OBJTYPE_ACCOUNT"; 
+
+     params = makeArray( SQLParam("OBJTYPE_ACCOUNT", OBJTYPE_ACCOUNT),
+                         SQLParam("OBID",UniID( AccIn, OBJTYPE_ACCOUNT )),
+                         SQLParam("TypeScore",ТипСчета ));
+     rs = execSQLselect( select, params, FALSE );
+     if( rs.MoveNext())
+        RestoreFromUniID(rs.Value(0), AccOut, OBJTYPE_ACCOUNT);
+        SetParm(2, AccOut.Account);
+        SetParm(3, AccOut.Code_Currency);
+     else
+        RunError("Не найден связанный счет");
+     end;
+  else
+     ClearRecord(reqlinka);
+     reqlinka.DocKind   = PS_REQOPENA;
+     reqlinka.RequestID = buff.RequestID;
+     reqlinka.GroupID   = ТипСчета;
+     reqlinka.Action    = 0;
+     if(not getEQ(reqlinka))
+        RunError("Не найден связанный счет");
+     else
+        SetParm(2, reqlinka.Account);
+        SetParm(3, reqlinka.Code_Currency);
+        if( ТипСчета == 6 )
+          buff.Type_Account = "Y";
+        end;
+     end;
+  end;
+end;  */
+
+/*macro ДатаРасторженияДоговора( DateClose, UnionContrID )
+
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  debugbreak;
+
+  if (SfCntr.unioncontrid == 0)                                                              //если нет сводного договора, 
+    ЗаписатьПолеЛог( "ДатаРастДог",ДатаДДpММpГГГГ(DateClose));                                //то заполняем ДатаРастДог
+  end;                                                                               
+
+  if(SfCntr.unioncontrid != 0)                                                     
+                                                                                   
+    select = "select t_DateClose from dsfunioncontr_dbt sfcontr"+ 
+             " where sfcontr.t_unioncontrid = :UNIONCONTRID"+                                //если у сводного договора дата закрытия заполнена,
+             " and sfcontr.t_DateClose <> to_date('01.01.0001', 'DD-MM-YYYY:HH24:MI:SS')";   //то заполняем ДатаРастДог
+
+    params = makeArray( SQLParam("UNIONCONTRID", UnionContrID) );
+    rs = execSQLselect( select, params, FALSE );
+  
+    if( rs.MoveNext() )
+      ЗаписатьПолеЛог( "ДатаРастДог",ДатаДДpММpГГГГ(DateClose));
+    
+    else                                                                           
+                                                                                   
+      select = "select t_DateClose from dsfcontr_dbt sfcontr"+ 
+               " where sfcontr.t_unioncontrid = :UNIONCONTRID"+                               //если у всех счетов сводного договора заполнена дата закрытия, 
+               " and sfcontr.t_DateClose = to_date('01.01.0001', 'DD-MM-YYYY:HH24:MI:SS')";   //то заполняем ДатаРастДог
+    
+      params = makeArray( SQLParam("UNIONCONTRID", UnionContrID) );
+      rs = execSQLselect( select, params, FALSE );
+
+      if( not( rs.MoveNext()) )
+        ЗаписатьПолеЛог( "ДатаРастДог",ДатаДДpММpГГГГ(DateClose));
+      else
+        ЗаписатьПолеЛог( "ДатаРастДог", " " );
+      end;
+    end;                    
+  end;
+end; */
+
+/* EVG */
+macro GetSenderData( OperID, sName:@String, sPost:@String, sPhone:@String )
+   var SQL, rs;
+   
+   SQL = " SELECT oper.t_name, NVL (sold.t_post, ''), NVL (sold.t_phonenumber, '') ";
+   SQL = SQL + "  FROM dperson_dbt oper, dpersn_dbt persn, dofficer_dbt sold ";
+   SQL = SQL + " WHERE oper.t_oper = " + OperID + " AND oper.t_partyid = persn.t_personid(+) ";
+   SQL = SQL + "       AND persn.t_personid = sold.t_personid(+) ";
+
+   rs = rsdRecordSet(SQL);
+   if (rs and rs.MoveNext())
+      sName = SQL_ConvTypeStr(rs.Value(0, null, V_STRING));
+      sPost = SQL_ConvTypeStr(rs.Value(1, null, V_STRING));
+      sPhone = SQL_ConvTypeStr(rs.Value(2, null, V_STRING));
+   end;
+end;
+
+macro GenMes( addrMes, buff, Открытие, addrOldMes, vers )
+  Var RespID, Error, ИдПол, Адрес, Год, ИНННП, ОГРННП, КодНОНП, ИДГНИКлиента, /*КодНОБ, ИДГНИБанка,*/КодВидаСчета, ОГРНКО,
+      Серия = "" , Номер = "", ДатаРегистрации = date(), Счет, Валюта,
+      ФДЛБанка, /*ТелБанка,*/ ИННКО = "", КППКО = "", НаимКО, КодСостДог, ИНН, 
+      /*ДолжнПрБ = "",*/ ФИОПрБ, НомФ, КППНП = " ", ФИОИП = "", СвидГР, СвидНУ, Нотариус, Адвокат,OldfnsMessageID,ВидРегОргана = 0,  БИК;
+  //private var НовыйСчет; /* SDA */
+  record OldMes(wlmes);
+
+  private var FIO, errCode; //Gurin S. N. 25.12.2012 I-00274834-2
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\ОТПР_ФИО", V_STRING, FIO, errCode);
+  //Gurin S. 14.05.2014
+  //if ((errCode > 0) or (errCode == 0))
+  if (errCode > 0)
+      FIO =" ";
+  end;
+
+
+ /* 
+  #139530  
+  if(not IsMacroInOperation())
+     RunError(string("|Данное сообщение МНС генерируется только на шаге операции"));
+  end;
+*/
+
+  SetBuff( wlmes,  addrMes );
+  SetBuff( OldMes,  addrOldMes );
+
+  var IsRecreate:bool = OldMes.MesID!=0; //Перегенерация?
+
+  PrintLog(2,"Генерация сообщения по SBC");
+  ПолучитьСчетСВалютой(buff, Открытие, Счет, Валюта );
+  if((not Открытие))
+     ПолучитьСчет(Валюта, Счет, GenAcc );
+  else
+     /* EVG */
+     if (not ПолучитьСчет(Валюта, Счет, GenAcc ))
+        GenAcc.Client = buff.ClientID;
+        GenAcc.Open_Date = buff.Date;
+        GenAcc.Type_Account = buff.Type_Account;
+        GenAcc.Department = buff.AccountDepartment;
+     end;
+  end;
+
+  /*Kozina определим год открытия счета*/
+  var RSD, OpenAccYear;
+  RSD = RSDRecordset( "Select to_char(t_open_date,'yyyy') from daccount_dbt "+
+                      "where t_account='"+Счет+"'" );
+
+  if( RSD.MoveNext() )
+    OpenAccYear = RSD.Value(0);
+  end;
+  //TAM 04.09.2014 HF_74  
+  var AccMsgKind : integer = IfThenElse(Открытие, ACCMSG_KIND_OPEN, ACCMSG_KIND_CLOSE);
+  var CommonSBC : TCommonDataGenSBC = TCommonDataGenSBC(GenAcc.Department, AccMsgKind, vers);
+
+  if( not CheckCorrectMes(GenAcc.Client, CommonSBC.КодНОБ, AccMsgKind) )
+    return false;
+  end;
+
+  dp_dep.Code = GenAcc.Department;
+  GetEQ( dp_dep );
+  party.PartyID = dp_dep.PartyID;
+  GetEQ( party );
+
+  /* EVG Получение информации по пользователю,
+     выгружающему сообщение. */
+  var OpAccount = "",
+      SenderName = "",
+      SenderPost = "",
+      SenderPhone = "";
+
+// KS 15.05.2014 Должность и телефон и для Солидарности
+//  if ( fgBank.is_EXV ) 
+  if ( ( fgBank.is_EXV ) or ( fgBank.is_SLD ) )
+      /* EVG 01/03/2011 В заявлениях на открытие и закрытие счетов поле называется
+         по-разному. */
+      if ( Открытие )
+         OpAccount = buff.OperAcc;
+      else
+         OpAccount = buff.Oper;
+      end;
+      GetSenderData( {Oper}, @SenderName, @SenderPost, @SenderPhone );
+      //msgbox(SenderPhone, " - ", SenderPost);
+  end;
+
+
+
+  DateSplit({curdate}, NULL, NULL, Год);
+  /*ИдФайл*/
+  ЗаписатьПолеЛог( "ИдФайл", CommonSBC.ИдФайл );
+  /*ТипИнФ*/
+  ЗаписатьПолеЛог( "ТипИнф", CommonSBC.ТипИнф );
+
+  /*ВерсПрог*/
+  ЗаписатьПолеЛог( "ВерсПрог", CommonSBC.ВерсПрог);
+  // KS 15.05.2014 Должность и телефон и для Солидарности
+  if ( ( fgBank.is_EXV ) or ( fgBank.is_SLD ) )
+      /* EVG 31/05/2011 Для ЭВ Воронеж фиксированный отправитель (Дима, прости :)...) */
+      if ( {MFO_Bank} == "042007755" )     // ЭВ Воронеж
+         /*ТелОтпр*/
+         ЗаписатьПолеЛог( "ТелОтпр", "(4732) 62-24-24" );
+         /*ДолжнОтпр*/
+         ЗаписатьПолеЛог( "ДолжнОтпр", "Главный бухгалтер" );
+         /*ФИООтпр*/
+         ЗаписатьПолеЛог( "ФамОтпр", FIO); //Gurin S. N. 25.12.2012 I-00274834-2 "ФамОтпр" заполняем с настройки реестра
+      else  
+         /* EVG 24/02/2011 Заполнение ТелОтпр и ДолжнОтпр возвращено по просьбе
+            В. Борзова, банк ЭВ.*/
+         /* EVG Вывод информации по пользователю.*/
+         /*ТелОтпр*/
+         ЗаписатьПолеЛог( "ТелОтпр", SenderPhone );
+         /*ДолжнОтпр*/
+         ЗаписатьПолеЛог( "ДолжнОтпр", SenderPost );
+         /*ФИООтпр*/
+         // KS 15.05.2014 ФамОтпр для Солидарности
+         if ( fgBank.is_SLD )
+           ЗаписатьПолеЛог( "ФамОтпр", SenderName );
+         else
+           ЗаписатьПолеЛог( "ФамОтпр", " " );
+         end;
+      end;
+  else
+     /*ТелОтпр*/
+     ЗаписатьПолеЛог( "ТелОтпр", CommonSBC.ТелОтпр );
+     /*ДолжнОтпр*/
+     ЗаписатьПолеЛог( "ДолжнОтпр", CommonSBC.ДолжнОтпр );
+     /*ФИООтпр*/
+     ЗаписатьПолеЛог( "ФамОтпр", CommonSBC.ФамОтпр );
+  end;
+  /*КолДок*/
+  ЗаписатьПолеЛог( "КолДок", CommonSBC.КолДок );
+  /*ВерсФорм*/
+  ЗаписатьПолеЛог( "ВерсФорм", CommonSBC.ВерсФорм );
+  /*НомСооб*/
+ if( vers == 501 )
+  Error = not GetMessageNumber(party.PartyID, Счет, "", Валюта, -1, Серия, Номер, IsRecreate, IfThenElse( Открытие == 1, true, false ) );  
+ elif( vers == 502 )
+    Error = not GetMessageNumber502(party.PartyID, Счет, "", 1, Валюта,  GenAcc.Client, Серия, Номер, IfThenElse( IsRecreate == true, OldMes.MesID, 0) );  
+  end; 
+  var ErrText:string;
+  if(Error)
+    ErrText = GetErrMsg();
+    if( not ErrText )
+      ErrText = "Ошибка при генерации номера сообщения";
+    end;
+    RunError( ErrText );
+  end;
+
+  ЗаписатьПолеЛог( "НомСооб", string(Серия,",",Номер) );
+
+  /*ИдДок*/
+  ЗаписатьПолеЛог( "ИдДок", CommonSBC.ИдДок);  
+  /*ДатаСооб*/
+  ЗаписатьПолеЛог("ДатаСооб", CommonSBC.ДатаСооб);
+  ЗаписатьПолеЛог( "КодНОБ", CommonSBC.КодНОБ );
+  ЗаписатьПолеЛог( "ДолжнПрБ", CommonSBC.ДолжнПрБ );
+  ЗаписатьПолеЛог( "ТелБанка", CommonSBC.ТелБанка );
+
+  if( GetKindActionFNS() !=  KIND_ACTION_FNS_NULL )
+      
+    /*НаимКО*/
+    НаимКО = ПолучитьНаимКо(dp_dep.Code);
+    ЗаписатьПолеЛог("НаимКО",НаимКО);
+    /*АдрКО*/
+    Адрес = ПолучитьАдрес(party.PartyID);
+    
+    if(Адрес != "")
+       ЗаписатьПолеЛог( "АдрКО", Адрес );
+    end;
+    /*РегНомКО*/
+    ЗаписатьПолеЛог("РегНомКО", string(int(SubStr(Серия,1,4))));
+    
+    if ( fgBank.is_EXV ) 
+        /*НомФ*/
+        // KS 27.04.2011 Тут и так все головные
+        if ((strlen(Серия) > 4)and(SubStr(Серия,5,4)!="0000"))
+          НомФ = string(int(SubStr(Серия,5,4)));
+          ЗаписатьПолеЛог("НомФ", НомФ );
+        /* EVG Иначе записывается пробел */
+        else
+          ЗаписатьПолеЛог("НомФ", " " );
+        end;
+    else
+    /*НомФ*/
+        if( not НашБанкГоловной(party.PartyID) )
+           НомФ = string(int(SubStr(Серия,5,4)));
+           ЗаписатьПолеЛог("НомФ", НомФ );
+        else
+           ЗаписатьПолеЛог("НомФ", " ");
+        end;
+    end;
+    /*БИК*/
+    БИК = ПолучитьКодСубъекта( party.PartyID, PTCK_BIC, Error, 1, 1);
+    ЗаписатьПолеЛог( "БИК", БИК );
+
+    /*ИННКО*/
+    ПроверитьИНН();
+    ИННКО = RemoveKPP(GetPartyINN(party.PartyID, 1) );
+    ЗаписатьПолеЛог( "ИННКО", ИННКО );
+    /*КППКО*/
+    КППКО = RemoveINN(GetPartyINN(party.PartyID, 1) );
+    ЗаписатьПолеЛог( "КППКО", КППКО );
+    
+    /*ОГРНКО*/
+    ОГРНКО = ПолучитьКодСубъекта(party.PartyID, PTCK_OGRN, Error, 0, 1 );
+    ЗаписатьПолеЛог( "ОГРНКО", ОГРНКО );
+
+    
+    /*НаимНП*/
+    /*ФИОИП*/
+      ПолучитьСубъекта(GenAcc.Client, Налогоплательщик);
+    ИНН = ПолучитьКодСубъекта(Налогоплательщик.PartyID, PTCK_INN, Error);
+    ИНННП = RemoveKPP(ИНН);
+    КППНП = RemoveINN(ИНН);
+    
+    if(strlen( ИНННП ) != 12)  
+      ЗаписатьПолеЛог("НаимНП",Налогоплательщик.Name);
+    else
+      ClearRecord(persn);
+      persn.PersonID = Налогоплательщик.PartyID;
+      if( getEQ(persn) )
+        ФИОИП =  string( persn.Name1 + "," + persn.Name2 + "," + persn.Name3);
+        if ( fgBank.is_EXV ) 
+            /* EVG 09/06/2011 По просьбе Galina N Pashkova - возможность добавления
+               в ФИОИП слов "Глава КФХ". */
+            if ( index( strLwr( Налогоплательщик.Name ), "глава кфх" ) > 0 )
+               ФИОИП = "Глава КФХ " + ФИОИП;
+            end;
+        end;
+        ЗаписатьПолеЛог("ФИОИП", ФИОИП);
+      end;
+    end;
+    
+    /*СвидГР*/
+    Серия = "";
+    Номер = "";
+    СвидГР = "";
+    CheckObjAttrPresence( Нотариус, OBJTYPE_PARTY, UniID( Налогоплательщик, OBJTYPE_PARTY ), 
+                          PARTY_ATTR_GROUP_PTTYPE, null, "", ТипСубъекта_Нотариус ); 
+    CheckObjAttrPresence( Адвокат,  OBJTYPE_PARTY, UniID( Налогоплательщик, OBJTYPE_PARTY ), 
+                          PARTY_ATTR_GROUP_PTTYPE, null, "", ТипСубъекта_Адвокат );
+                          
+    ИДГНИКлиента = ПолучитьИДГНИ(Налогоплательщик.PartyID, Серия, Номер, ДатаРегистрации, СвидетельствоГосРегистрации );
+
+    if ( fgBank.is_EXV ) 
+      if( (Серия != "") and (Номер != "") and (Налогоплательщик.NotResident != "X") and 
+        (not Нотариус) and (not Адвокат) // не является нотариусом или адвокатом
+      )
+         СвидГР =  string(Серия, ",", Номер);
+      end;
+       if(СвидГР != "")
+          ЗаписатьПолеЛог( "СвидГР", СвидГР);
+       else
+         /* EVG Сообщение об отсутствии свид-ва */
+         if ( not getTrue(true, "У клиента отсутствует свидетельство о гос. регистрации.|" +
+                                "Формировать сообщение без него?") )
+            return false;
+         end;
+         ЗаписатьПолеЛог( "СвидГР", " ");
+       end;
+    else
+       //RR  311-п  18.08.11 по заявке I-00086809-2
+       //TAM 25.08.11 по заявке I-00089118-2. Привожу в порядок необходимость спрашивать у пользователя 
+       //о продолжении генерации счета без заполненных полей. 
+       if( (Серия != "") and (Номер != ""))
+          СвидГР =  string(Серия, ",", Номер);
+          ЗаписатьПолеЛог( "СвидГР", СвидГР);
+       else
+          if ( not getTrue(true, "У клиента отсутствует свидетельство о гос. регистрации.|" +
+                                "Формировать сообщение без него?") )
+             return false;
+          end;
+          СвидГР =  string(Серия, ",", Номер);
+          ЗаписатьПолеЛог( "СвидГР", СвидГР);
+       end;
+    end;
+
+    /*СвидНУ*/
+    Серия = "";
+    Номер = "";
+    СвидНУ = "";
+    ИДГНИКлиента = ПолучитьИДГНИ(Налогоплательщик.PartyID, Серия, Номер, ДатаРегистрации, СвидетельствоОПостановкеНаУчет );
+    if( (Серия != "") and (Номер != "") )
+       СвидНУ =  string(Серия, ",", Номер);
+    end;
+
+    if(СвидНУ != "")
+       ЗаписатьПолеЛог( "СвидНУ", СвидНУ);
+    else
+       /* EVG Сообщение об отсутствии свид-ва */
+       if ( not getTrue(true, "У клиента отсутствует свидетельство о постановке на налоговый учёт.|" +
+                            "Формировать сообщение без него?") )
+          return false;
+       end;
+       ЗаписатьПолеЛог( "СвидНУ", " ");
+    end;
+
+    /*ИНННП*/
+        ЗаписатьПолеЛог( "ИНННП", ИНННП );
+    /*КППНП*/
+    if(StrLen(ИНННП) != 12) // клиент - юридическое лицо
+      ЗаписатьПолеЛог( "КППНП", IfThenElse( КППНП != "", КППНП, " " ) );
+    end;
+    if(StrLen(ИНННП) == 12)                // клиент - физическое лицо
+      ЗаписатьПолеЛог( "КППНП", " " );
+    end;
+
+    /*ОГРН*/
+    ОГРННП = pyOR( ПолучитьКодСубъекта( Налогоплательщик.PartyID, PTCK_OGRN, Error, 0, 1 ), " " );
+    /* Коркин  по заявке I-102657 */
+    if( (ОГРННП != "") and //(Налогоплательщик.NotResident != "X") and 
+        (not Нотариус) and (not Адвокат) // не является нотариусом или адвокатом
+      )
+      /* EVG */
+      if ((strLen(ОГРННП) != 13) and (strLen(ОГРННП) != 15))
+        if ( not getTrue(true, "Длина ОГРН клиента составляет " + StrLen(ОГРННП) + " символов (ОГРН = " + ОГРННП + ").|" +
+                              "Формировать сообщение с таким ОГРН?") )
+           return false;
+        end;
+      end;
+      ЗаписатьПолеЛог( "ОГРННП", ОГРННП );
+    else
+      /* EVG Сообщение об отсутствии ОГРН */
+      if ( not getTrue(true, "У клиента отсутствует ОГРН.|" +
+                            "Формировать сообщение без него?") )
+         return false;
+      end;
+      ЗаписатьПолеЛог( "ОГРННП", " ");
+    end;
+
+    /*КодСостДог*/
+    if(vers == 501)
+      if(Открытие)
+         КодСостДог = 1;
+      else
+         КодСостДог = 0;
+      end;
+    else
+      if(Открытие)
+         КодСостДог = 0;
+      else
+         //Gurin S. 27.06.2014 R-402440-2 (311-П)
+         if (buff.SubKind == 4)
+             КодСостДог = 2;
+         else
+             КодСостДог = buff.SubKind;
+         end;
+      end;
+    end;
+    ЗаписатьПолеЛог( "КодСостДог", string(КодСостДог));
+    
+    if(not Открытие)
+      var SfCntr : TRecHandler = TRecHandler("sfcontr.dbt"); // договор обслуживания для счета
+      var IsSfContr : bool = ( ПолучитьДоговорОбслуживания(Валюта, Счет, SfCntr) == 0 );
+       //ДатаРастДог
+       ЗаписатьПоле_ДатаРастДог( buff, IfThenElse(IsSfContr, SfCntr, null), vers );    
+       //НомерДог
+       if(SfCntr.rec.Number != "")
+         ЗаписатьПолеЛог( "НомерДог", SfCntr.rec.Number );
+       else
+         ЗаписатьПолеЛог( "НомерДог", " " );
+       end;
+    else 
+       ЗаписатьПоле_ДатаЗаклДог( buff.date, buff.unioncontrid, Счет, Валюта );
+       if( vers == 502 )
+         /*ДатаРастДог*/
+         ЗаписатьПолеЛог( "ДатаРастДог", " ");
+       end;
+       /*НомерДог*/
+         ЗаписатьПолеЛог( "НомерДог", buff.SFContrNum );
+       end;
+
+    /*КодСостСч*/
+    ЗаписатьПолеЛог( "КодСостСч", string(Открытие));
+    /*ВалСч*/
+    if( Валюта == NATCUR )
+       КодВидаСчета = "0";
+       typeac.iNumType = TA_SACNT;
+    else
+       КодВидаСчета = "1";
+       typeac.iNumType = TA_SACNTC;
+    end;
+    ЗаписатьПолеЛог("ВалСч", КодВидаСчета);
+    /*ВидСч*/
+  /* EVG Так тупо делать нельзя. В заявление уходит первый попавшийся
+     вид, установленный на счёте. Необходимо фильтровать виды.
+    typeac.Type_Account = GenAcc.Type_Account;
+    if(getEQ( typeac ))
+      ЗаписатьПолеЛог("ВидСч",typeac.Name_Type);
+    end;*/
+  var AccTypeStr = "";
+  if ( GetAccType(GenAcc.Type_Account, @AccTypeStr) )
+    ЗаписатьПолеЛог("ВидСч", AccTypeStr);
+  else
+    RunError("Не определен вид счета");
+    end;
+
+    //ДатаОткрСч
+    var OpenDate:date = date(0,0,0);
+    var NoteChToStlm = "";
+    var CloseDate:date = date(0,0,0);
+    if(Открытие)
+      if(IsRecreate)
+        debugbreak;
+        NoteChToStlm = ReadNoteForAccount(Счет, Валюта, 42); //42 = ACC_NOTE_KIND_DATE_CHANGE_TO_SETTLEMENT
+        if(NoteChToStlm != "") 
+          OpenDate = date(StrSubst(NoteChToStlm, " ", "0"));
+        else
+          if( GenAcc.Open_Date != date(0,0,0) )
+          OpenDate = GenAcc.Open_Date;
+        else
+            OpenDate = {curdate};
+        end;
+      end;
+      else
+        OpenDate = GenAcc.Open_Date;
+      end;
+
+      ЗаписатьПолеЛог( "ДатаОткрСч", ДатаДДpММpГГГГ(OpenDate) );
+    else
+      ЗаписатьПолеЛог( "ДатаОткрСч", ДатаДДpММpГГГГ(GenAcc.Open_Date) );
+      ЗаписатьПоле_ДатаЗакрСч(GenAcc.Close_Date);
+    end;
+
+    /*НомСч*/
+    ЗаписатьПолеЛог( "НомСч", Счет );
+  
+    /*ФИОПрБ*/
+    ФИОПрБ = "";
+    Error = GetRegValForOPENAC("ИМНС_ФИО", V_STRING, ФИОПрБ);
+      ФИОПрБ = РазделитьЗапятымиФИО( ФИОПрБ );
+    ЗаписатьПолеЛог( "ФИОПрБ", ФИОПрБ );
+
+    if(CommonSBC._ВидРегОргана)
+      ЗаписатьПолеЛог("_ВидРегОргана", CommonSBC._ВидРегОргана);
+    end;
+
+    if(CommonSBC._СпОбм)
+      ЗаписатьПолеЛог("_СпОбм", CommonSBC._СпОбм);
+    end;
+
+  else
+    OldfnsMessageID = GetOldfnsMessageID();
+    ЗаписатьПолеДляАннул( "НаимКО"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "АдрКО"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "РегНомКО"   , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "НомФ"       , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "БИК"        , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ИННКО"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "КППКО"      , OldfnsMessageID );    
+    ЗаписатьПолеДляАннул( "ОГРНКО"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "НаимНП"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ФИОИП"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "СвидГР"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "СвидНУ"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ИНННП"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "КППНП"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ОГРННП"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "КодСостДог" , OldfnsMessageID );
+       ЗаписатьПолеДляАннул( "ДатаРастДог", OldfnsMessageID);
+    if(Открытие)
+       ЗаписатьПолеДляАннул( "ДатаЗаклДог", OldfnsMessageID);
+    end;
+    ЗаписатьПолеДляАннул( "НомерДог"   , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "КодСостСч"  , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ВалСч"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ВидСч"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ДатаОткрСч" , OldfnsMessageID );
+    if(not Открытие)
+      ЗаписатьПолеДляАннул( "ДатаЗакрСч" , OldfnsMessageID );
+    end;
+    ЗаписатьПолеДляАннул( "НомСч"      , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "ФИОПрБ"     , OldfnsMessageID );
+    ЗаписатьПолеДляАннул( "_СпОбм"     , OldfnsMessageID );
+  end;
+
+  return TRUE; /* Успешное завершение */
+
+  OnError(er) /* обработка ошибок */
+    ExeptionMessage(er);
+    return FALSE;
+end;
+
+macro CheckObjC( addrReq )
+   SetBuff(reqclosa, addrReq);
+   return MNS_CheckObj( reqclosa, ACCMSG_KIND_CLOSE );
+end;
+
+macro CheckObjO( addrReq )
+   SetBuff(reqopena, addrReq);
+   return MNS_CheckObj( reqopena, ACCMSG_KIND_OPEN );
+end;
+
+
+macro GenMesO( addrMes, addrReq, addrOldMes )
+   SetBuff(reqopena, addrReq);
+   return GenMes(addrMes, reqopena, 1, addrOldMes, 501);
+end;
+
+
+macro GenMesC( addrMes, addrReq, addrOldMes )
+   SetBuff(reqclosa, addrReq);
+   return GenMes(addrMes, reqclosa, 0, addrOldMes, 501);
+end;
+
+macro GenMesO502( addrMes, addrReq, addrOldMes )
+   SetBuff(reqopena, addrReq);
+   return GenMes(addrMes, reqopena, 1, addrOldMes, 502);
+end;
+
+
+macro GenMesC502( addrMes, addrReq, addrOldMes )
+   SetBuff(reqclosa, addrReq);
+   return GenMes(addrMes, reqclosa, 0, addrOldMes, 502);
+end;

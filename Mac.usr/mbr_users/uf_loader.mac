@@ -1,0 +1,253 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: uf_loader.mac v.1
+// @author  : 2012-08-01 zip_z. C-12896
+// @desc    : Загрузчик файлов ED243
+// @changes : 2012-11-21 zip_z. внезапно оказалось, что имена загружаемых файлов могут быть неуникальны,
+//                              поэтому введена идентификация по набору {EdNo, EdDate, EdAuthor} из входящего
+//                              сообщения, заново переписан механизм загрузки и протоколирования 
+//            2013-01-13 zip_z. R-140841 переписана moveFile ()
+//            2013-05-14 Gurin S. C-18664 
+//            2014-03-29 Gurin S. Альбом УФЭБС v2.6.0
+// -------------------------------------------------------------------------------------------------
+
+import BankInter, RsExts;
+import OraLib, LikePy, TReport, UF_Common;
+
+private const ERR_EXIT_SUCCESS = 0;
+private const ERR_EXIT_FAILURE = 1;
+
+private var _flag = False, _fileName = "", _xmlData = "";
+
+private class EDLoaderReport ()
+    var m_fileName;
+    var m_result;
+end;
+
+// @desc: Загрузчик входящих файлов ED
+class EDLoader ()
+    var params :EDParams = EDParams (); // параметры обработки ED
+    var reportName = getTxtFileName ("uf_loader");
+    
+    // В RSL до сих пор нет функции перемещения файла. Недоязык.
+    macro moveFile (src:string, dst:string)
+        var m_copy   = copyFile (src, dst);
+        var m_remove = removeFile (src);
+        return (m_copy and m_remove);
+    end;
+    
+    macro readSingleEDFile (m_fileName)
+        file f () txt;
+        var ret = "";
+        
+        if (not _flag)
+            if (not open (f, string (params.m_txtdir_import, "/", m_fileName))) 
+                ret = "Невозможно открыть файл для чтения "; 
+            end;
+            
+            var m_xmlData = "";
+            while (next (f))
+                m_xmlData = m_xmlData + f.str;
+            end;
+        else
+            m_xmlData = _xmlData;
+        end;
+
+        // @readme: http://docs.oracle.com/cd/B19306_01/server.102/b14200/functions027.htm#sthref1166
+        // в convert второй параметр - куда конвертить, третий - откуда!!!
+        // Кроме того, при разборе "dsig:SigValue" могут возникнуть ошибки типа ORA-19202: Error occurred in XML processing 
+        // или LPX-00216: invalid character 206 (0xCE), поэтому преобразовываем кодировку в расово правильную
+        //Gurin S. 04.04.2014 Что-то с кодировкой
+        //var sql = "insert into usr_uf_container_tmp (fname, xmldata) values (trim (:fname), xmltype (convert (:xmldata ,'RU8PC866' ,'CL8MSWIN1251')))";
+        var sql = "insert into usr_uf_container_tmp (fname, xmldata) values (trim (:fname), xmltype (:xmldata))";
+        var par = makeArray (SQLParam ("fname", m_fileName), SQLParam ("xmldata", m_xmlData));
+        if (0 != execSQL (sql, par, false))
+            ret = ERR_EXIT_SUCCESS;
+        else
+            ret = ERR_EXIT_FAILURE;
+        end;
+
+        if (not _flag)
+            return ret;
+        end;
+    end;
+    
+    macro importEDFiles ()
+
+        var dir, fullPath = "", fullPathOldMes = "";
+        var i; // счетчик для for 
+        
+        //RSLDefCon.BeginTrans ();
+        
+        // на случай, если во временной таблице что-то осталось ...
+        var sql = "delete usr_uf_container_tmp";
+        execSQL (sql);
+
+        if (not _flag)
+            dir = TDirList (string (params.m_txtdir_import, "/", "*.*"), "f");
+            dir.sort (0);
+        
+            // читаем файлы и заполняем временную таблицу (usr_uf_container_tmp)
+            for (i, 0, dir.count - 1)
+                fullPath       = string (params.m_txtdir_import, "/", dir.name (i));
+                fullPathOldMes = string (params.m_txtdir_oldmsg, "/", dir.name (i));
+            
+                readSingleEDFile (dir.name (i));
+                moveFile (fullPath, fullPathOldMes);
+            end;
+        else
+            readSingleEDFile (_fileName);
+        end;
+    end;
+    
+    macro UpdateTmpTable ()
+        // ------- дозаполнение данных временной таблицы -------
+        // поиск связанных платежей по коду
+        var sql = "update usr_uf_container_tmp t " + "\n" +
+              "set paymentid = " + "\n" +
+              "       nvl ( " + "\n" +
+              "          (select t_paymentid " + "\n" +
+              "           from dwlpm_dbt wl, dwlmeslnk_dbt lnk, dwlmes_dbt mes " + "\n" +
+              "           where wl.t_wlpmid = lnk.t_objid and lnk.t_mesid = mes.t_mesid " + "\n" +
+              "                 and mes.t_trn = " + "\n" +
+              "                          substr (extractvalue (t.xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 3, 2) " + "\n" +
+              "                       || substr (extractvalue (t.xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 6, 2) " + "\n" +
+              "                       || substr (extractvalue (t.xmldata, '/ED243/OriginalEPD/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 9, 2) " + "\n" +
+              "                       || extractvalue (t.xmldata, '/ED243/OriginalEPD/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') " + "\n" +
+              "                       || extractvalue (t.xmldata, '/ED243/OriginalEPD/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0') " + "\n" +
+              "                 and t_objkind = 501), " + "\n" +
+              "          0 " + "\n" +
+              "       )";
+        execSQL (sql);
+        
+        // проставление флага "платеж найден"
+        sql = "update usr_uf_container_tmp set is_payment_found = chr (88) where paymentid != 0";
+        execSQL (sql);
+
+        // причесанные строки временной таблицы вставляем в постоянную. Следим, чтобы {EdNo, EdDate, EdAuthor}
+        // при этом не повторялись. Также проверяем сообщения на соответствие формату, ибо в ПРББ были случаи, когда
+        // сюда нежданно прилетал пакет ED273 - и делайте с ним что хотите :(
+        //Gurin S. add fname_ed244
+        sql = "insert into usr_uf_container (fname, fname_ed244, xmldata, eddate_idx, is_ib_notify, is_sent_file, is_payment_found, "     + "\n" +
+              "                              is_answer_made, is_word_letter_printed, xml_answer, paymentid) "   + "\n" +
+              "   select tmp.fname, null, tmp.xmldata, tmp.eddate_idx, tmp.is_ib_notify, tmp.is_sent_file, tmp.is_payment_found, " + "\n" +
+              "          tmp.is_answer_made, tmp.is_word_letter_printed, tmp.xml_answer, tmp.paymentid "    + "\n" +
+              "   from usr_uf_container_tmp tmp " + "\n" +
+              "  left join usr_uf_container t "   + "\n" +
+              "     on (extractvalue (tmp.xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = extractvalue (t.xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') " + "\n" +
+              "         and to_date (extractvalue (tmp.xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 'yyyy-mm-dd') = " + "\n" +
+              "               to_date (extractvalue (t.xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 'yyyy-mm-dd')   " + "\n" +
+              "         and extractvalue (tmp.xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0') = extractvalue (t.xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0'))    " + "\n" +
+              "   where t.fname is null and tmp.xmldata.extract ('/ED243', 'xmlns=urn:cbr-ru:ed:v2.0').getstringval () is not null";
+        execSQL (sql);
+        
+        //RSLDefCon.CommitTrans ();
+        execSQL ("commit");
+    end;
+    
+    
+    macro printImportRep ()
+    
+        SetOutput (reportName);
+        
+        println (string ("Отчет о выполнении процедуры импорта ED243"):c:70);
+        println (string ("Дата - ", date, ", время - ", time):c:70);
+        
+        var sql = "with vw " + "\n" +
+                  "       as (select fname, " + "\n" +
+                  "                  to_char (extractvalue (xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0')) eddate, " + "\n" +
+                  "                  to_char (extractvalue (xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0')) edauthor, " + "\n" +
+                  "                  to_char (extractvalue (xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')) edno, " + "\n" +
+                  "                  regexp_substr (t.xmldata.extract ('/', 'xmlns=urn:cbr-ru:ed:v2.0').getstringval (), 'ED[0-9]{3}') format, " + "\n" +
+                  "                  case " + "\n" +
+                  "                     when exists " + "\n" +
+                  "                             (select 1 " + "\n" +
+                  "                              from usr_uf_container tmp " + "\n" +
+                  "                              where (extractvalue (tmp.xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0') = extractvalue (t.xmldata, '/ED243/@EDAuthor', 'xmlns=urn:cbr-ru:ed:v2.0')" + "\n" +
+                  "                                     and to_date (extractvalue (tmp.xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 'yyyy-mm-dd') =" + "\n" +
+                  "                                           to_date (extractvalue (t.xmldata, '/ED243/@EDDate', 'xmlns=urn:cbr-ru:ed:v2.0'), 'yyyy-mm-dd')" + "\n" +
+                  "                                     and extractvalue (tmp.xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0') = extractvalue (t.xmldata, '/ED243/@EDNo', 'xmlns=urn:cbr-ru:ed:v2.0')))" + "\n" +
+                  "                     then" + "\n" +
+                  "                        1" + "\n" +
+                  "                     else" + "\n" +
+                  "                        0" + "\n" +
+                  "                  end" + "\n" +
+                  "                     res" + "\n" +
+                  "           from usr_uf_container_tmp t)" + "\n" +
+                  "select fname, eddate, edauthor, edno, format," + "\n" +
+                  "       case" + "\n" +
+                  "          when res = 0 and format = 'ED243' then 'Загружено'" + "\n" +
+                  "          when res = 1 and format = 'ED243' then 'Пропущено'" + "\n" +
+                  "          else '!!! Не соответствует формату'" + "\n" +
+                  "       end" + "\n" +
+                  "          res" + "\n" +
+                  "from vw" + "\n" +
+                  "order by res";
+        
+        sql = execSQLSelect (sql);
+        var table = CTableReport();
+        
+        table.addColumn ("Имя файла",              25, AL_LEFT);
+        table.addColumn ("EDDate",                 10, AL_LEFT);
+        table.addColumn ("EDAuthor",               10, AL_LEFT);
+        table.addColumn ("EDNo",                   10, AL_LEFT);
+        table.addColumn ("Формат",                  3, AL_LEFT);
+        // table.addColumn ("Счёт плательщика",       20, AL_LEFT);
+        // table.addColumn ("ID платежа",              7, AL_LEFT);
+        table.addColumn ("Результат обработки",    55, AL_LEFT);
+        
+        table.printHead ();
+        var i = 0;
+            
+        while (sql.moveNext ())
+            table.printStringTransferByWord ( sql.value ("fname"), sql.value ("EdDate"), 
+                                              sql.value ("EdAuthor"), sql.value ("EdNo"), 
+                                              sql.value ("format"), /*sql.value ("t_payeraccount")
+                                              sql.value ("paymentid", null, V_INTEGER), */  sql.value ("res") );
+            i = i + 1;
+        end;
+            
+        table.printSeparator ();
+        table.printStringTransferByWord ("Всего файлов:", i);
+        table.printBottom ();
+        
+        SetOutput (NULL, true);
+    end;
+    
+    macro ViewReport ()
+        file fp () txt;
+        if (open (fp, this.reportName)) viewFile (fp); else MsgBox ("Не удалось открыть файл протокола"); end;
+    end;
+    
+    macro selfInit (name, data, flag)
+        //flag == True - обработка сообщения с МБР/Входящие/Сообщения/Принятые
+        if (flag == null) flag = False; else _flag = True; end;
+
+        if (name != null) _fileName = name; end;
+        if (data != null) _xmlData = data; end;
+
+        // 1. Установка параметров работы процедуры
+        params.readEDParams (); 
+        
+        // 2. Импорт и подготовка отчета
+        this.importEDFiles ();  
+        
+        // 3. Печать отчета
+        if (not _flag)
+            this.printImportRep ();
+        end;
+
+        this.UpdateTmpTable ();
+        
+        if (not _flag)
+            this.ViewReport ();
+        end;
+    onError (e)
+        if ((e.code == 47) and (not _flag))// Error: Файл данных или таблица не открыты
+           msgbox ("В директории загрузки |" + params.m_txtdir_import + "|отсутствуют файлы ED243 для импорта");
+        end;
+        exit (1);
+    end;
+end;
+
+
+//EDLoader.selfInit ();

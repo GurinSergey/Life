@@ -1,0 +1,300 @@
+/*                                                                               */
+/*                                                                               */
+/* Seleznev : распоряжение по транзитному счету макрос шага валютного контроля   */
+/* Teleshova 27.10.2014 Adaptation 2031                                          */
+
+import PaymInter, PSInter,rsd, globals, "trn_order_common.mac","cbsttls.mac";
+import op_lib, exvComLib;
+
+var PaymentObj:RsbPayment;
+var oper2docs;
+
+macro check_execdocs
+   var cmd, rs, sum;
+   cmd = RSDCommand(
+                      "select   1 " +
+                      "  from   (select   sell_sum, " +
+                      "                   transf_sum, " +
+                      "                   nvl ( (select   t_paymstatus " +
+                      "                            from   dpmpaym_dbt " +
+                      "                           where   t_paymentid = sell_docid), -1) " +
+                      "                      sell_stat, " +
+                      "                   nvl ( (select   t_paymstatus " +
+                      "                            from   dpmpaym_dbt " +
+                      "                           where   t_paymentid = transf_docid), -1) " +
+                      "                      transf_stat " +
+                      "            from   usr_trnsf_order t " +
+                      "           where   PaymentId = ? ) " +
+                      " where   (sell_sum > 0 and sell_stat <> 32000) or (transf_sum > 0 and transf_stat <> 32000) "
+                     );
+   cmd.addparam("PaymentId", RSDBP_IN, PaymentObj.PaymentID);
+   rs = RSDRecordset(cmd);
+   sum = PaymentObj.ReceiverAmount - getusedsum(PaymentObj.PaymentID);
+   if (sum != 0 )
+      MsgBox("По платежу зарегистрированы не все распоряжения, не распределенная сумма "+sum);
+      return 1;
+   elif (rs.movenext)
+      Msgbox("По платежу не проведены все документы исполнения распоряжений");
+      return 1;
+   end;
+   return 0;
+
+end;
+
+macro create_doc(order_rec:rsdrecordset)
+   debugbreak;
+   var BcOrder:object;
+   var PSOrder:object;
+   var Payment:RsbPayment;
+   var prim_payment = RSBPayment(order_rec.value("payment_id"));
+   var stat, cmd;
+   //TAM I-00171465-2 05.04.2012
+   var rs, bank_name; //06.11.12 TAM I-00280438-3
+   cmd = RsdCommand("select t_addname from dparty_dbt where t_partyid = ?");
+   cmd.AddParam("partyid", RSDBP_IN, {OurBank});
+   rs = RsdRecordSet( cmd );
+   if ( rs and rs.MoveNext() )
+      bank_name = rs.Value(0);
+   end;
+
+   if ((order_rec.value("sell_sum") > 0) and (order_rec.value("sell_docid") == 0))
+      BcOrder = GenObject( "RsbBuyCurrencyOrder", 0 );
+      Payment = BcOrder.Payment;
+
+      BcOrder.BCOrdKind        = PSBCKIND_PAY;
+      BcOrder.ConvOper         = KINDOPCONV_BUY;
+      BcOrder.Oper             = oper2docs;//PaymentObj.Oper;
+      BcOrder.State            = PSBCORD_ST_DEFERRED;
+      BcOrder.BankFunds        = true;
+      BcOrder.Origin           = 2000;//Продажа на основании распоряжения к транзитному счету
+
+      Payment.Oper             = BcOrder.Oper;
+      Payment.Number           = order_rec.value("order_num");
+      Payment.ClientDate       = 
+      Payment.Date             = 
+      Payment.ValueDate        = {curdate};//order_rec.value("date_value");
+                         
+      Payment.DocKind          = PS_BUYCURORDER;
+      Payment.Purpose          = PM_PURP_PSBCCONV;
+
+      Payment.PayerFIID        = prim_payment.receiverfiid;
+      Payment.ReceiverFIID     = NATCUR;
+
+      Payment.PayerAmount      = order_rec.value("sell_sum");
+      Payment.BaseAmount       = order_rec.value("sell_sum");
+      Payment.ReceiverAmount   = order_rec.value("sell_sum")*order_rec.value("sell_rate")/order_rec.value("sell_scale");
+
+      Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                          {OurBank}, 
+                          0, 
+                          "", 
+                          "",
+                          "",
+                          prim_payment.receiverfiid, 
+                          1/*CHAPT1*/, 
+                          order_rec.value("pay_acc"), 
+                          0, 
+                          "", 
+                          "" );
+
+      Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                          0, 
+                          PTCK_BIC, 
+                          rs_nvl(order_rec.value("sell_bik"),""),
+                          "",
+                          "",
+                          0, 
+                          1/*CHAPT1*/, 
+                          order_rec.value("sell_account"), 
+                          0, 
+                          "", 
+                          "" );
+
+      Payment.BaseFIID = prim_payment.receiverfiid;
+
+      Payment.IsFixPayerAmount = "X";
+      Payment.LinkPayment(prim_payment, 2000, order_rec.value("order_num"));
+      Payment.Ground = "Продажа валюты на основании распоряжения по транзитному счету N"+order_rec.value("order_num")+" от "+date(order_rec.value("date_value"));
+      BcOrder.LaunchOper = true;
+   end;
+
+   if ((order_rec.value("transf_sum") > 0) and (order_rec.value("transf_docid") == 0))
+
+      PSOrder = GenObject( "RsbPSCpOrder", 0 );
+      Payment = PSOrder.Payment;
+
+      PSOrder.Oper             = oper2docs;//PaymentObj.Oper;
+      PSOrder.CurrentState     = PSPO_ST_DEFERRED;
+      PSOrder.Origin           = 2000;//Перечисление на основании распоряжения к транзитному счету
+
+      Payment.Oper             = PSOrder.Oper;
+      Payment.Purpose          = 7;
+      Payment.Number           = order_rec.value("order_num");
+      Payment.ClientDate       = 
+      Payment.Date             = 
+      Payment.ValueDate        = {curdate};//order_rec.value("date_value");
+                         
+      Payment.DocKind          = PS_CPORDER;
+
+      Payment.ReceiverFIID     = 
+      Payment.PayerFIID        = 
+      Payment.BaseFIID         = prim_payment.receiverfiid;
+
+      Payment.PayerAmount      = 
+      Payment.ReceiverAmount   = 
+      Payment.BaseAmount       = order_rec.value("transf_sum");
+
+      Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                          {OurBank}, 
+                          PTCK_SWIFT, 
+                          "", 
+                          bank_name, //TAM I-00171465-2 05.04.2012 "",
+                          "",
+                          prim_payment.receiverfiid, 
+                          1/*CHAPT1*/, 
+                          order_rec.value("pay_acc"),
+                          0, 
+                          "", 
+                          "" );
+
+      Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                          {OurBank}, 
+                          PTCK_SWIFT,
+                          "",
+                          bank_name, //TAM I-00171465-2 05.04.2012 "",
+                          "",
+                          prim_payment.receiverfiid, 
+                          1/*CHAPT1*/, 
+                          order_rec.value("transf_account"), 
+                          0, 
+                          "", 
+                          "" );
+
+      Payment.Ground = "Перевод валюты на основании распоряжения по транзитному счету N"+order_rec.value("order_num")+" от "+date(order_rec.value("date_value"));
+      // Установить признак автозапуска операции.
+      PSOrder.LaunchOper = true;
+   end;
+   return true;
+end;
+
+macro ExecuteStep( Kind_Operation, first, KindDoc, ID_Operation, Id_step )
+   debugbreak;
+   var cmd, rs, sum, stat = 1;
+   var vk_stat=2, usedsum = $0;
+   cmd = RSDCommand("select t_oper from doprstep_dbt where t_symbol = 'г' and t_isexecute = 'X' and t_ID_Operation = ?");
+   cmd.addparam("oprid", RSDBP_IN, ID_Operation);
+   rs = RSDRecordset(cmd);
+   rs.MoveNext;
+   oper2docs = rs.value(0);
+   cmd = RSDCommand  (
+                      "select   notify_num,   " +
+                      "         order_num,   " +
+                      "         date_value,   " +
+                      "         sell_sum,   " +
+                      "         sell_rate,   " +
+                      "         sell_scale,   " +
+                      "         sell_account,   " +
+                      "         sell_bik,   " +
+                      "         sell_docid,   " +
+                      "         transf_docid,   " +
+                      "         transf_sum,           " +
+                      "         transf_account,   " +
+                      "         origin, " +
+                      "         pay_acc,        " +
+                      "         payment_id " +  // EVG 11/03/2011 Добавил.
+                      "  from   (select   order_num,   " +
+                      "                   date_value,   " +
+                      "                   sell_sum,   " +
+                      "                   sell_rate,   " +
+                      "                   nvl(sell_account,' ') sell_account ,   " +
+                      "                   nvl(sell_bik, '"+{MFO_BANK}+"') sell_bik,   " +
+                      "                   transf_sum,  " +
+                      "                   nvl((select   pmr.t_paymentid from doprdocs_dbt st, dpmrmprop_dbt pmr   " +
+                      "                     where  st.t_id_operation = op.t_id_operation  " +
+                      "                             and t_dockind = 200  " +
+                      "                             and pmr.t_paymentid = st.t_documentid  " +
+                      "                             and pmr.t_number = order_num  " +
+                      "                             ),0)   " +
+                      "                      sell_docid,   " +
+                      "                   nvl((select   pmr.t_paymentid from doprdocs_dbt st, dpmrmprop_dbt pmr   " +
+                      "                     where  st.t_id_operation = op.t_id_operation  " +
+                      "                             and t_dockind = 202  " +
+                      "                             and pmr.t_paymentid = st.t_documentid  " +
+                      "                             and pmr.t_number = order_num),0)   " +
+                      "                      transf_docid,   " +
+                      "                   transf_account,   " +
+                      "                   decode (origin, 0, 'Создан вручную', 1, 'Интербанк', 'Неизвестно') orig_name,   " +
+                      "                   o.notify_num,   " +
+                      "                   origin,   " +
+                      "                   sell_scale, " +
+                      "                   nvl((select t_account from dpmaddpi_dbt where t_paymentid = n.payment_id ), " +
+                      "                   (select t_futurereceiveraccount from dpmpaym_dbt where t_paymentid = n.payment_id)) pay_acc,   " +
+                      "                   n.payment_id " +      // EVG 11/03/2011 Добавил.
+                      "            from   usr_trnsf_order o,  usr_trnsf_notify n, doproper_dbt op  " +
+
+                      "           where   o.PaymentID = ? " +
+                      "             and   n.Payment_ID = o.PaymentID " +
+                      "             and   op.t_documentid = lpad(o.PaymentID, 34 , '0') and op.t_dockind = 320 )  " +
+                      "where (sell_docid = 0 and sell_sum > 0) or (transf_docid = 0 and transf_sum > 0)  "
+                      );
+   cmd.AddParam("PaymentId", RSDBP_IN, PaymentObj.PaymentID);
+   rs = RSDRecordset(cmd);
+
+   usedsum = getusedsum(PaymentObj.PaymentID);
+
+   if (usedsum > PaymentObj.ReceiverAmount)
+      msgbox("Сумма распоряжений превышает сумму платежа");
+      return 1;
+   end;
+
+   while (rs.movenext)
+      stat = 0;
+      create_doc(rs);
+   end;
+
+   if (usedsum != PaymentObj.PayerAmount)
+      vk_stat = 1;
+      //зацикливаем обработку пока не все распоряжения исполнены
+   end;
+
+   if( УстановитьСтатусыПлатежа(119, vk_stat) ) //Исполнение распоряженния к тр. счету = требуется
+      MsgBox( "Возникла ошибка при смене статусов операции платежа" );
+      return 1;
+   else
+      stat = EXV_Execute_CC_CommissionChoice( PaymentObj, Id_step );
+   end;
+
+   if (stat == 0)
+      msgbox ("Документ проконтролирован ВК");
+   end;
+   return stat;
+end;
+
+macro PostStepAction( message,     /* данный параметр может принимать следующие */
+                             /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                             /* произошла ошибка                                */
+                FirstDoc,    /* указатель на первичный документ                 */
+                ID_Oper,     /* внутренний идентификатор операции               */
+                Number_Step, /* номер шага операции          */
+                KindOper,    /* номер вида операции                             */
+                KindDoc,     /* номер вида первичного документа                 */
+                KindStep,    /* вид шага операции                               */
+                ID_Step )    /* идентификатор шага операции                     */
+   var  SQL, cmd;
+   /*FIV при откате удаляем комиссии за ВК*/
+   if((message== OP_BACKOUT_STEP) AND (errTrn == 0))
+      SQL = " DELETE   usr_trnsf_comiss utc ";
+      SQL = SQL + " WHERE   utc.id_step = ? ";
+      SQL = SQL + "         AND utc.notify_num = ( SELECT notify_num ";
+      SQL = SQL + "                                  FROM usr_trnsf_notify ";
+      SQL = SQL + "                                 WHERE payment_id = (SELECT   LTRIM (oo.t_documentid, '0') ";
+      SQL = SQL + "                                                       FROM   doproper_dbt oo ";
+      SQL = SQL + "                                                      WHERE   oo.t_id_operation = ?) )";
+      cmd = rsdcommand(sql);
+      cmd.AddParam("", RSDBP_IN,ID_Step);
+      cmd.AddParam("", RSDBP_IN,ID_Oper);
+      cmd.Execute;
+   end;
+   return 0;
+end;

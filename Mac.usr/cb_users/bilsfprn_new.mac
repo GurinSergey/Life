@@ -1,0 +1,711 @@
+/*------------------------------------------------------------------------------
+                     Модуль СФ
+
+ Filename    : bilsfprn.mac
+ Description : 
+
+ Programmer  : 
+ 10.04.01    : Создан
+ 
+ //ORVPO 20090211 - ремонт вывода через локальный Excel
+  Особенность: 
+   файл шаблона "sfprn.xls" должен находиться в каталоге term\DotFile и иметь атрибут "только чтение".  
+   Можно настроить другой путь и переложить туда файл, изменив в коде значение:
+   var XlsFileName = "\\\\сервер\\term\\dotfile\\sfprn.xls";
+
+   zip_z.: 2009-06-10 - Исправлен механизм печати ставки НДС
+   ОЮФ 28.01.2010 - Доработана возможность печати в текст
+   TAM I-00067876-2 28.10.11 - удаление заяпятой при печати наименования услуги в СФ
+   TAM I-00083056-2 02.11.11 - корректное формирование наименования услуги для функций ВК
+------------------------------------------------------------------------------*/
+
+IMPORT rslx, BankInter, PtInter, FIInter,  rcw, "or_exl_h.mac", RSD, cur_bank, "fg_life_parm.mac";
+Import rsexts;
+import fileop;         /* объект для работv с файлами на сервере и терминале   */
+import "fastexcel.mac";
+/*для запросов*/
+Import rsbdataset;
+//import rsd;
+import "cb_sql.mac";
+// EVG 13/03/2012 
+import bilsfprn_lib;
+import globals;
+/* путь к файлу сообщения на терминале */
+debugbreak;
+
+private var fgBank = fg_life_subject({OurBank});
+
+private const TermFilePath = "";
+
+private var sheet_number = 1;
+
+private Var MassPrint = false;
+
+private FILE BILFACTURA     ("bilfactura.dbt");
+private var BILFACTURALINE = TBFILE("bilfacturaline.dbt");
+//FILE BILFACTURALINE ("bilfacturaline.dbt");
+
+private VAR
+    startAX          : Object = null,   /* объект для запуска ActiveX-приложений */
+    ExcelApplication : Object = null,   /* Приложение MS-Excel     */
+    ExcelDoc         : Object = null,
+    ActiveSheet      : Object = null,   /* Активная страница Excel */
+    ActiveDocument   : Object = null,   /* Активный документ Word  */
+    WordFilesDir     : String = "",     /* Путь к WORD-шаблонам    */
+    ExcelFilesDir    : String = "",     /* Путь к EXCEL-шаблонам   */
+    FormFieldsIndex = 0,
+    Row = 0,
+    DocRow = 0,
+    Range;
+
+//ORVPO 20090211
+//VAR XlsFileName = "..\\MAC\\CB\\sfprn.xls";
+//var XlsFileName = "\\\\сервер\\term\\dotfile\\sfprn.xls";
+//var XlsFileName = "\\\\MARSHALL\\DataBases2\\Probiznes\\6.00.020.2976\\Obj\\term\\dotfile\\sfprn.xls";
+// DAI приведение к дистрибутивному виду и нормальной технологии работы с Excel
+private VAR XlsFileName = "sfprnN.xlt";
+
+//Tikh Переносим настройку в реестр, для работы в других доменах
+private var output, out;                    
+
+        //GetRegistryValue("PRBB\\BILF\\PRINT",2,out);
+        /*DAI каталог шаблонов стандартный
+        output = "sfprn.xls";
+        XlsFileName = FindPath(output, out, null, false);                    
+        if (not XlsFileName)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+        */
+
+//var XlsFileName   = "\\\\Lapik_\\Stend_PRBB_2\\mac.usr\\Cb\\sfprn.xls";
+
+//ORVPO 20090211
+
+private VAR FullXLSFileName = "";
+
+private Array FormFields;    /* Массив полей текущего документа */
+private var err:object = null;
+
+
+private var xlDiagonalDown     =  5,
+            xlDiagonalUp       =  6,
+            xlEdgeLeft         =  7,
+            xlEdgeTop          =  8,
+            xlEdgeBottom       =  9,
+            xlEdgeRight        = 10,
+            xlInsideVertical   = 11,
+            xlInsideHorizontal = 12,
+            xlContinuous       = 1;
+
+
+PRIVATE MACRO GetDotFileName(TemplName)
+   var RegKey  :string  = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\MACRODIR"; // Ключ в реестре с путем к шаблонам
+   var DirName_Template = "";
+   var TempStr          = "";
+
+   // Найдем месторасположение шаблонов на сервере, они лежат в одном из путей прописанных в 
+   // "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEMPLSDIR"
+   GetRegistryValue( RegKey, V_STRING, DirName_Template, "" );
+
+   if( NOT DirName_Template )
+      MsgBox( "Ошибка!|Не задан путь до папки с шаблонами." );
+      return "";
+   end;
+
+   // Определим месторасположение каждого шаблона из списка
+   TempStr = FindPath(toANSI(TemplName), DirName_Template);
+   if( NOT TempStr )
+      MsgBox( "В путях <",DirName_Template, ">|не найден шаблон|<",TemplName,">!|",
+               "Поместите шаблон в указанный путь и повторите операцию." );
+      return "";
+   end;
+/*
+   // Если в строке пути есть знак ":" или "\\", то это абсолютный путь
+   if( Index(toAnsi(TempStr), ":") OR Index(toAnsi(TempStr), "\\\\") )
+       ;
+   else
+       // Добавим текущий путь
+       TempStr = GetCurDir(false)+"\\"+ TempStr;
+   end;
+*/
+
+   return TempStr;
+END;
+
+/*Основание платежа при отсутствии спецификации СФ*/
+//TAM 2.11.11 I-00083056-2
+//предыдущая функция была в корне ошибочной: всё время выводились данные по последнему докмуенту оплаты для СФ
+//теперь для строки спецификации CФ ищется корректное основание платежа
+private MACRO FakturaGround(ComissId)
+        debugbreak;
+        var select, rs, Grn;
+        var pos;
+        //TAM 28.08.12 I-00244397-2 исправлен запрос
+        select = " select t_ground from dpmrmprop_dbt" +
+                         " where t_paymentid in (select t_paymentid from dpmpaym_dbt pm where pm.t_feetype = 6 and pm.t_defcomid = " + ComissId + " )";
+        
+        rs = RSdRecordset(select);
+        if(rs.moveNext())
+                Grn = rs.value(0);
+        else
+                Grn = "";
+        end;
+        pos = Index(Grn, "за");
+        return StrUpr(Substr(Grn,pos+3),1);
+end;
+
+
+private MACRO getFICcy( FIID:integer ):string
+  private var finstr_code = 0;
+  record fi( "fininstr.dbt", "bank.def" );
+  if( FIID >= 0 )
+    if( ПолучитьФинИн( FIID, fi ) == 0 )
+
+      if (fi.iso_number == 810) 
+              finstr_code=643;
+        else 
+              finstr_code = fi.iso_number;
+        end;
+      return fi.Name + ", "+ finstr_code; 
+    end;
+  end;
+  return "";
+END;
+
+
+private MACRO ExcelError(err, SaveDoc:bool)
+
+   if (ValType(SaveDoc) != V_BOOL)
+      SaveDoc = false;
+   end;
+
+   if (ExcelApplication != null)
+      ExcelApplication.Visible = true;
+      ExcelApplication.DisplayAlerts = SaveDoc;
+      ExcelApplication.Quit;
+      ExcelApplication = null;
+   end;
+   MsgBoxEx("ОШИБКА: "+ Substr(err.Message, 7));
+   println(err.Message, ", строка:", err.Line, " в модуле ", err.Module);
+   println(err.AxMes);
+
+   return;
+END;
+
+/* дополнительная обработка для трехзвенки */
+private macro ShowReportOnTerminal( ExcelApp, Doc )
+ 
+  var DocFileName : string, TermFileName : string;
+  var Book;
+
+  DocFileName = SplitFile( GetTxtFileName("") );
+  DocFileName = MergeFile( DocFileName, "sfprn_" + string(UserNumber), ".xls" );
+
+  /* полный путь к формируемому документу */
+  DocFileName = MergeFile( GetCurDir(), DocFileName );
+
+//  Doc.SaveAs( DocFileName );
+  ExcelDoc.SaveAs( DocFileName );
+
+  ExcelDoc.Close;
+
+  ExcelApp.Quit;
+
+  /* формируем путь к документу на терминале */
+  TermFileName = MergeFile( GetCurDir(true), TermFilePath + "sfprn.xls" );
+
+  /* копируем отчет на терминал */
+  if( not CopyFile(DocFileName, "$" + TermFileName) )
+    RunError("Ошибка при передаче файла на терминал\n" + TermFileName );
+  else
+    RemoveFile(DocFileName);
+    CallRemoteRsl( "sfprn_term.mac", "ShowDoc", TermFileName );
+  end;
+end;
+
+
+
+private MACRO NewExcelWorkbook (Visible, ExcelFileName)
+ 
+//ORVPO 20090211
+//   ExcelApplication = ActiveX("Excel.Application", null, false);
+    var ob1 = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+    ExcelApplication = ob1.CreateComObject ("Excel.Application",false);
+//ORVPO 20090211
+
+   if (ValType (ExcelFileName) != V_STRING)
+      ExcelApplication.Workbooks.Add;
+   else
+          /* получаем полное имя шаблон */
+      //FullXLSFileName = MergeFile( GetCurDir(), ExcelFileName );
+         
+//ORVPO 20090211
+//DAI создаем новый файл на основании шаблона а не открываем
+      GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,out);
+      FullXLSFileName = FindPath(ExcelFileName,out);
+      if (not FullXLSFileName)
+         msgbox("Не найден шаблон");
+         exit();
+      end;
+      ExcelDoc = ExcelApplication.Workbooks.Add(FullXLSFileName);
+//    ExcelDoc = ExcelApplication.WorkBooks.open(ExcelFileName, false);
+//ORVPO 20090211
+        
+   end;
+   if (ValType (Visible) == V_BOOL)
+      ExcelApplication.Visible = Visible;
+   end;
+        
+
+
+   return true;
+
+   onError (err)             
+      ExcelError(err, false);
+      Exit(1);
+END;
+
+private MACRO CreateExcelWorkbook()
+  if (NOT NewExcelWorkbook (false , XlsFileName )) 
+        return false; 
+  else
+        msgbox("Новая страница");
+  end;
+  return true;
+END;
+
+private MACRO AddSheet()
+
+   ExcelApplication.Workbooks.Item(1).Sheets(1).Copy(ExcelApplication.Workbooks.Item(1).Sheets(1));
+//   ExcelApplication.Workbooks.Item(1).Sheets(1).Copy(ExcelApplication.Workbooks.Item(1).Sheets(1));
+     debugbreak;
+
+   ExcelApplication.Sheets(2).Activate();
+
+   ActiveSheet = ExcelApplication.ActiveSheet;
+END;
+
+MACRO DeleteSheetTemplate()
+ExcelApplication.DisplayAlerts = False;
+//      ExcelApplication.Workbooks.Item(1).Sheets(ExcelApplication.Workbooks.Item(1).Sheets().Count()).Delete();
+ExcelApplication.DisplayAlerts = True;
+END;
+
+MACRO ShowDocument()
+//ORVPO 20090211
+//   if( IsStandAlone() )
+   if(not IsStandAlone() )
+//ORVPO 20090211
+
+     ExcelApplication.Visible = true;
+   else
+     ShowReportOnTerminal( ExcelApplication, ActiveSheet );
+   end;
+END;
+
+
+/*
+   Краткое преобразование даты в строку: dd.mm.yyyy
+*/
+private MACRO DateToStringShort (IDate)
+   VAR day, month, year, ODate;
+   if ((ValType (IDate) != V_DATE) and (ValType (IDate) != V_UNDEF))
+      MsgBox ("Неверный формат даты: "+IDate);
+      return "";
+   end;
+   if ((ValType (IDate) == V_UNDEF) or (IDate == Date (0,0,0)))
+      return "00.00.0000";
+   end;
+   DateSplit (IDate, day, month, year);
+   if (day < 10)
+      day = String ("0"+day);
+   else
+      day = String (day);
+   end;
+   if (month < 10)
+      month = String ("0"+month);
+   else
+      month = String (month);
+   end;
+   return String (day+"."+month+"."+year);
+END;
+
+private MACRO MergeCells ( Row )
+  VAR  INX = 0;
+  ARRAY SS;
+  SS(0)=  "A";   SS(1)= "X";
+  SS(2)=  "Y";   SS(3)= "AH";
+  SS(4)=  "AI";  SS(5)= "AR";
+  SS(6)=  "AS";  SS(7)= "BF";
+  SS(8)=  "BG";  SS(9)= "BT";
+  SS(10)= "BU";  SS(11)= "CL";
+  SS(12)= "CM";  SS(13)= "CW";
+  SS(14)= "CX";  SS(15)= "DH";
+  SS(16)= "DI";  SS(17)= "DT";
+  SS(18)= "DU";  SS(19)= "EN";
+  SS(20)= "EO";  SS(21)= "EV";
+  SS(22)= "EW";  SS(23)= "FD";
+  SS(24)= "FE";  SS(25)= "FT";
+
+  WHILE(INX<=25)
+    Range = SS(INX)+String(Row)+":"+SS(INX+1)+String(Row);
+    ActiveSheet.Range (Range).Select;
+    ExcelApplication.Selection.MergeCells = true;
+    INX = INX + 2;
+  END;
+    
+END;
+
+private MACRO FindMeasure( iCode )
+    file    ff      ( "measure.dbt" )        KEY 0; /* Cod */
+    Var     szStr   = "";
+
+
+    ff.MeasureCode        = iCode;
+    if( GetEQ( ff ) )
+        szStr       = ff.Cnm; /* сокращенное наимонование */
+    end;
+
+    return szStr;
+END;
+
+private MACRO FindCountryNumCode(Name)
+
+  var sqlString, rs, cmd, i = 0;
+  var NumCode = "";
+
+  sqlString = " SELECT T_CODENUM3 FROM DCOUNTRY_DBT WHERE UPPER(T_NAME) = UPPER(?) ";
+
+  cmd = RSDCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, Name );
+
+  rs = RsdRecordset( cmd );
+  if( rs.moveNext() )
+    NumCode = STRING(rs.value("T_CODENUM3"));
+  end;
+
+  return NumCode;
+END;
+
+private MACRO FillSpace(str:String, num)
+  Var retstr:string = "";
+  Var i = 0;
+  Var mon: money = Money(0);
+    
+  if((str != "") and (str != string(mon)) and (str != "0" ))
+    retstr = str;
+  else
+    while(i<num)
+      retstr = retstr + "-";
+      i = i+1;
+    end;
+  end;
+
+  return retstr;
+END;
+
+private MACRO PrintDocumentOne( ncopy:integer ):bool
+  Var stat = 0;
+  Var NumPage  = 1 ;
+  Var Quantity, Price, Summa, strNDS, a :integer, b:integer, strMeasureNum, strExciseAmount, CountryNumCode;
+ //Kozina
+  var SellerName1, SellerName2, SellerAddress, CurName; 
+  
+    ClearRecord(BILFACTURA);
+    BILFACTURA.FacturaID = FacturaID;
+    if(not GetEQ(BILFACTURA))
+      return false;
+    end;
+ //Kozina наименование и адрес продавца как в 5.0/
+  If (_VOLGA_BANK() or _VOLGOGRAD_BANK() or _ENGELS_BANK() or _VORON_BANK() or _ULYANOVSK_BANK())         //ТЗ 3549
+      SellerName1    = "Закрытое акционерное общество Коммерческий межотраслевой банк стабилизации и развития \"ЭКСПРЕСС-ВОЛГА\"";
+      SellerName2    =  " ЗАО АКБ \"Экспресс-Волга\"";
+      SellerAddress = "Россия, 410002 г.Саратов, ул.Мичурина 166/168";
+  Elif (_PRBB_BANK())
+      SellerName1    = "АКЦИОНЕРНЫЙ КОММЕРЧЕСКИЙ БАНК \"ПРОБИЗНЕСБАНК\" (ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО)";
+      SellerName2    = "(ОАО АКБ \"Пробизнесбанк\")";
+      SellerAddress = BILFACTURA.SupplierAddress;
+  Elif (_VUZ_BANK())
+      SellerName1    = "Открытое акционерное общество \"ВУЗ-банк\"";
+      SellerName2    = "ОАО \"ВУЗ-банк\"";
+      SellerAddress = BILFACTURA.SupplierAddress;
+  Elif (_GEB_BANK())
+      SellerName1    = "КАЛУЖСКИЙ ГАЗОВЫЙ И ЭНЕРГЕТИЧЕСКИЙ БАНК \"ГАЗЭНЕРГОБАНК\" (ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО)";
+      SellerName2    = BILFACTURA.SupplierName;
+      SellerAddress = BILFACTURA.SupplierAddress;
+  else
+      SellerName1    = BILFACTURA.SupplierName;
+      SellerName2    = "";
+      SellerAddress = BILFACTURA.SupplierAddress;
+  End;
+
+    
+     /* Формирование отчёта */
+     DocRow = 3;
+     ActiveSheet.Cells (DocRow,  57).Value = BILFACTURA.FacturaNumber;
+        debugbreak;
+
+//     ExcelApplication.Sheets(1).Name = BILFACTURA.FacturaNumber;
+
+     ActiveSheet.Cells (DocRow,  85).Value = DateToStringShort (BILFACTURA.CreationDate);
+     DocRow = DocRow + 1;
+	 var sql_isprav = " SELECT   NT.T_NOTEKIND, " 
++"\n		 DECODE ( " 
++"\n            NT.T_NOTEKIND, " 
++"\n            101, " 
++"\n               ASCII (SUBSTR (UTL_RAW.cast_to_varchar2 (nt.t_text), 1, 1)) " 
++"\n            || '.' " 
++"\n            || ASCII (SUBSTR (UTL_RAW.cast_to_varchar2 (nt.t_text), 2, 1)) " 
++"\n            || '.' " 
++"\n            || (ASCII (SUBSTR (UTL_RAW.cast_to_varchar2 (nt.t_text), 3, 1)) " 
++"\n                + ASCII (SUBSTR (UTL_RAW.cast_to_varchar2 (nt.t_text), 4, 1)) " 
++"\n                  * 16 " 
++"\n                  * 16), " 
++"\n            102, " 
++"\n            UTL_RAW.cast_to_varchar2 (nt.t_text) " 
++"\n         ) " 
++"\n            t_text " 
++"\n  FROM   dnotetext_dbt nt " 
++"\n WHERE       NT.T_DOCUMENTID = LPAD ('"+BILFACTURA.FACTURAID+"', 10, 0) " 
++"\n         AND NT.T_OBJECTTYPE = 720 " 
++"\n         AND NT.T_NOTEKIND IN (101, 102); ";
+	var rsb_isprav = RSdRecordset(sql_isprav);
+	ActiveSheet.Cells (DocRow,  85).Value = FillSpace("", 1);
+	ActiveSheet.Cells (DocRow,  57).Value = FillSpace("", 1);
+	while (rsb_isprav.movenext())
+			if (rsb_isprav.value(0) == 102)
+				ActiveSheet.Cells (DocRow,  57).Value = string(rsb_isprav.value(1));
+			elif ((rsb_isprav.value(0) == 101))
+				ActiveSheet.Cells (DocRow,  85).Value = string(rsb_isprav.value(1));
+			end;
+	end;
+	 
+     DocRow = DocRow + 2;
+     ActiveSheet.Cells (DocRow,  14).Value = SellerName1;//BILFACTURA.SupplierName;
+     //DocRow = DocRow + 1;
+     //ActiveSheet.Cells (DocRow,  14).Value = SellerName2;//BILFACTURA.SupplierName;
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  10).Value = SellerAddress;//BILFACTURA.SupplierAddress;
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  25).Value = BILFACTURA.SupplierINN;
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  34).Value = FillSpace(BILFACTURA.Shipper, 20);   //грузоотправитель и его адрес
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  33).Value = FillSpace(BILFACTURA.Consignee, 20); //грузополучатель и его адрес
+	 DocRow = DocRow + 2;
+     ActiveSheet.Cells (DocRow,  42).Value = BILFACTURA.PaymentNumber;
+    If (BILFACTURA.CreationDate < BILFACTURA.PaymantDate) //Diver согласно заявки Журавлевой A51180
+		if (BILFACTURA.CreationDate != "")
+			ActiveSheet.Cells (DocRow,  90).Value = DateToStringShort (BILFACTURA.CreationDate);
+		else
+			ActiveSheet.Cells (DocRow,  90).Value = "";
+		end;
+    else
+		if (BILFACTURA.PaymantDate != "")
+			ActiveSheet.Cells (DocRow,  90).Value = DateToStringShort (BILFACTURA.PaymantDate);
+		else
+			ActiveSheet.Cells (DocRow,  90).Value = "";
+		end;
+    End;
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  16).Value = BILFACTURA.ReceiverName;  //11:16
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  10).Value = GetAdressBILF_ID(BILFACTURA.ReceiverId, BILFACTURA.ReceiverAddress); // KS 03.12.2010 I-097132 СФ Адрес надо длиннее
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  27).Value = FillSpace(BILFACTURA.ReceiverINN, 10);  
+     DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  32).Value = getFICcy( BILFACTURA.FIID );  
+	 DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  2).Value = "Номер счёта получателя: " + FakturaReceiverAcc(BILFACTURA.FacturaID);
+	 DocRow = DocRow + 1;
+     ActiveSheet.Cells (DocRow,  2).Value = " ";
+	 //msgbox(FakturaReceiverAcc(BILFACTURA.FacturaID));
+    /*------------------------------------------------------------------------*/ 
+    DocRow = 21;
+    ClearRecord(BILFACTURALINE);
+    BILFACTURALINE.rec.FacturaID = FacturaID;
+    BILFACTURALINE.AddFilter("T_FacturaID = " + FacturaID);
+
+    stat = BILFACTURALINE.GetGE();
+
+    if(stat)
+    while(stat)
+       
+      if(BILFACTURALINE.rec.Quantity == 0)
+         Quantity ="-";
+      else
+         Quantity = String(BILFACTURALINE.rec.Quantity);
+      end;
+
+      if(BILFACTURALINE.rec.Price = $0)
+         Price = "-";
+      else
+         Price = String(BILFACTURALINE.rec.Price);
+      end;
+
+      if(BILFACTURA.Assignment == 2)
+        Summa = "-";
+      else
+        Summa = String(BILFACTURALINE.rec.Amount);
+      end;
+      
+
+      if(BILFACTURALINE.rec.NDSRate > 0 )
+          /* EVG Банк печатает просто ставку.
+          a= Round(BILFACTURALINE.rec.NDSRate, 0);
+          b= Round(BILFACTURALINE.rec.NDSRate +100, 0);
+          strNDS = String(a) + "/" +String(b);
+          */
+          strNDS = String (Round(BILFACTURALINE.rec.NDSRate, 0):0:0);
+      else
+        if(BILFACTURALINE.rec.NDSRate == -1 )
+          strNDS ="без НДС";
+          else
+              strNDS ="0";
+          end;
+      end;
+
+      if(BILFACTURALINE.rec.Measure > 0)
+        strMeasureNum = StrSubst(String(BILFACTURALINE.rec.Measure:3), " ", "0" );
+      else
+        strMeasureNum = "";
+      end;
+
+      if(BILFACTURALINE.rec.ExciseAmount != $0)
+        strExciseAmount = String(BILFACTURALINE.rec.ExciseAmount);
+      else
+        strExciseAmount = "без акциза";
+      end;
+
+      if(BILFACTURALINE.rec.Country != "")
+        CountryNumCode = FillSpace(FindCountryNumCode(BILFACTURALINE.rec.Country), 5);
+      else
+        CountryNumCode =  FillSpace("", 5);           
+      end;
+
+      // -----------------------------------------------------------------------------------------
+      /*Основание платежа при отсутствии спецификации СФ*/
+                //TAM 2.11.11 I-00083056-2
+                //если это функции агента ВК
+//				msgbox(BILFACTURALINE.rec.productid);
+                //if(BILFACTURALINE.rec.productid == 8)
+//                        ActiveSheet.Cells(DocRow, 1).Value = FakturaGround(BILFACTURALINE.rec.comisid);//FakturaGround(BILFACTURA.FacturaID);
+//						msgbox(FakturaGround(BILFACTURALINE.rec.comisid));
+
+				var len = 0;
+				
+                if (BILFACTURALINE.rec.productid == 60)
+                        ActiveSheet.Cells(DocRow, 1).Value = FakturaGround(BILFACTURALINE.rec.comisid);//BILFACTURALINE.rec.ProductName;
+						len = (strlen(BILFACTURALINE.rec.ProductName) / 20) * 16;  //I-00176564   
+						ActiveSheet.Cells(DocRow, 1).VerticalAlignment = 2;
+//						msgbox(BILFACTURALINE.rec.comisid);
+                else
+                        if (BILFACTURALINE.rec.ProductName != "" )
+//							msgbox(BILFACTURALINE.rec.ProductName);	
+								ActiveSheet.Cells (DocRow,   1).Value = BILFACTURALINE.rec.ProductName;      // так было ранее
+								len = (strlen(BILFACTURALINE.rec.ProductName) / 20) * 16;  //I-00176564                
+								ActiveSheet.Rows(DocRow+":"+DocRow).RowHeight = len;	
+								ActiveSheet.Cells(DocRow, 1).VerticalAlignment = 2;
+                        else
+//							msgbox(BILFACTURALINE.rec.ProductName);	
+                                ActiveSheet.Cells (DocRow,   1).Value = FakturaGround(BILFACTURALINE.rec.comisid);// TAM  FakturaGround(BILFACTURA.FacturaID); // добавлено  
+								len = (strlen(FakturaGround(BILFACTURALINE.rec.comisid)) / 20) * 16;  //I-00176564                
+								ActiveSheet.Rows(DocRow+":"+DocRow).RowHeight = len;	
+								ActiveSheet.Cells(DocRow, 1).VerticalAlignment = 2;
+                        end;
+				end;
+      // ^^ productName нужно генерить свой (согласно реестру замечаний). 
+
+      
+	if (fgBank.is_GEB)
+		ActiveSheet.Cells (DocRow,  25).Value = "796";  
+		ActiveSheet.Cells (DocRow,  35).Value = "шт";
+		ActiveSheet.Cells (DocRow,   45).Value = "1";  
+		ActiveSheet.Cells (DocRow,   59).Value = String(Summa);
+	else
+		ActiveSheet.Cells (DocRow,  25).Value = FillSpace(FindMeasure(BILFACTURALINE.rec.Measure), 5);  
+		ActiveSheet.Cells (DocRow,  35).Value = FillSpace(strMeasureNum, 5);
+		ActiveSheet.Cells (DocRow,   45).Value = FillSpace(Quantity,5);  
+		ActiveSheet.Cells (DocRow,   59).Value = FillSpace(Price, 5);                                 
+	end;
+	  ActiveSheet.Cells (DocRow,   73).Value = String(Summa);
+      ActiveSheet.Cells (DocRow,   91).Value = strExciseAmount;
+      ActiveSheet.Cells (DocRow,  102).Value = String(strNDS);                                      
+      ActiveSheet.Cells (DocRow,  113).Value = String(BILFACTURALINE.rec.NDSAmount);                
+      ActiveSheet.Cells (DocRow,  125).Value = String(BILFACTURALINE.rec.AmountWithNDS);            
+      ActiveSheet.Cells (DocRow,  145).Value = CountryNumCode;           
+      ActiveSheet.Cells (DocRow,  153).Value = FillSpace(BILFACTURALINE.rec.Country, 5);           
+      ActiveSheet.Cells (DocRow,  161).Value = FillSpace(BILFACTURALINE.rec.GTDNumber, 20);         
+      DocRow = DocRow + 1;
+      stat = BILFACTURALINE.next();
+      if(stat)
+        ActiveSheet.Rows(Int(DocRow)).Insert;
+        MergeCells (DocRow);
+      end;
+    end;
+    else
+      DocRow = DocRow + 1;
+    end;
+
+    BILFACTURALINE.DropFilter();
+
+    Range = "A20:FE"+String (DocRow-1);
+    ActiveSheet.Range (Range).Select;
+    ExcelApplication.Selection.Borders (xlEdgeLeft).LineStyle       = xlContinuous;
+    ExcelApplication.Selection.Borders (xlEdgeTop).LineStyle        = xlContinuous;
+    ExcelApplication.Selection.Borders (xlEdgeBottom).LineStyle     = xlContinuous;
+    ExcelApplication.Selection.Borders (xlEdgeRight).LineStyle      = xlContinuous;
+    ExcelApplication.Selection.Borders (xlInsideVertical).LineStyle = xlContinuous;
+    ExcelApplication.Selection.Borders (xlInsideHorizontal).LineStyle = xlContinuous;
+
+    ActiveSheet.Cells (DocRow,  73).Value = String(BILFACTURA.TotalAmount);  
+    ActiveSheet.Cells (DocRow,  113).Value = String(BILFACTURA.TotalNDS);  
+    ActiveSheet.Cells (DocRow,  125).Value = String(BILFACTURA.TotalWithNDS);  
+
+/*строка "всего к оплате"*/
+    DocRow = DocRow + 2;
+    ActiveSheet.Cells (DocRow,  21).Value = CurToStrAlt(BILFACTURA.TotalWithNDS, null, null, getISOCode(BILFACTURA.FIID));
+
+    DocRow = DocRow + 2;
+    ActiveSheet.Cells (DocRow,   2).Value = Dolz_1;
+    ActiveSheet.Cells (DocRow+1,  51).Value = FIO_1;
+    ActiveSheet.Cells (DocRow,  89).Value = Dolz_2;
+    ActiveSheet.Cells (DocRow+1, 130).Value = FIO_2; 
+
+    DocRow = DocRow + 7;
+//    ActiveSheet.Cells (DocRow,   66).Value = "Cтраница " + NumPage+ " из " + NumPage;
+
+    ActiveSheet.Range ("A1").Select;
+
+  return true;
+END;
+
+MACRO PrintDocument_new( ncopy:integer ):bool
+  var RetVal :bool;
+  
+  /*ОЮФ 27.01.2010 Спрашиваем пользователя куда печатать отчет*/
+
+     if( ExcelApplication AND ActiveSheet)
+       AddSheet(); 
+     else
+       if (NOT NewExcelWorkbook (false , XlsFileName )) return false; end;
+       AddSheet(); 
+     end;
+
+     RetVal = PrintDocumentOne( ncopy );
+
+
+     if(not MassPrint)
+       DeleteSheetTemplate();
+       ShowDocument();
+     end;
+
+     return RetVal;
+ 
+  return RetVal;
+END;
+
+
+
+

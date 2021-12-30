@@ -1,0 +1,456 @@
+// RR 28.05.2012  Убрал 1 проверку из-за которой бралось две комиссии
+/*
+Макрос выполнения шага "Оплата" сервисной операции сопровождения ДО
+*/
+
+Import InsCarryDoc, "sfsrv_lib.mac";
+
+/* EVG 5/12/2011 Пришло из sfopr.mac */
+import "sf_prbb.mac";
+
+record SfContr("sfcontr.dbt");
+record SfConComRec("sfconcom.dbt");
+record SfComissRec("sfcomiss.dbt");
+
+record SfSrvDocRec("sfsrvdoc.dbt");
+
+
+/* EVG 6/12/2011 Поиск счёта-плательщика выделен в отдельную процедуру */
+macro ExecutePayerAccountChoice( defCom, srvDoc )
+
+   /* EVG 5/12/2011 Пришло из sfopr.mac */    
+   /*{MEV: Замена счёта в комиссии */
+   /* DONE: Достать id клиента из договора обслуживания */
+   var ClientID = getClientOnContr(DefCom.SfcontrID);
+   /* EVG 01.12.2010 Добавил передачу ID ДО */
+   selectAccountForSfPay( DefCom.Sum + DefCom.SumNDS, DefCom.Fiid_Sum, SrvDoc.DatePay, ClientID, SF_FEE_TYPE_PERIOD, DefCom.Id,
+                          DefCom.SfcontrID );
+   /*MEV}*/
+
+end;
+
+
+
+macro ExecuteStep( outBuff, primDoc )
+
+  var stat = 0;
+
+  setbuff( SfContr, primDoc  );
+
+  var rs, cmd;
+  record SfDefCom("sfdef.dbt");
+  record SfAccrue("sfaccrue.dbt");
+
+  var PayerAccount = "", ReceiverAccount = "";
+  var NDSPayerAccount : string, NDSReceiverAccount : string;
+
+  var prevFIID_CommSum = -1;
+  var PayerFIID = -1, ReceiverFIID = -1;
+
+  var SfConComPD : SfConComPrimDoc;
+  var IsNVPI:bool;
+
+  var AccTrnID = 0, AccTrnID_NDS = 0;
+
+  var Action = DEFCOM_ACTIONKIND_PAY;
+  var Comment = "";
+
+  // EVG
+  var SQL, rs1, ОплачиватьКомиссию = true;
+
+  /* EVG 5/12/2011 То, что раньше было в sfacrpay.mac */
+  debugbreak;
+  /* Удаляем записи об УПК за все периоды, кроме последнего - реализация 
+     требования банка о том, чтобы комиссии рассчитывались только за текущий
+     период. */
+  SQL = " DELETE FROM   dsfdeftmp_tmp t1 ";
+  SQL = SQL + "      WHERE   t1.t_action = ? ";
+  /* EVG 28/02/2012 В 2030 t_datefee одинакова для всех записей и равна дате
+     окончания периода расчёта. Поэтому сравниваем по t_dateperiodbegin.
+  SQL = SQL + "              AND t1.t_datefee < ";
+  SQL = SQL + "                    (SELECT   MAX (t2.t_datefee) ";*/
+  SQL = SQL + "              AND t1.t_dateperiodbegin < ";
+  SQL = SQL + "                    (SELECT   MAX (t2.t_dateperiodbegin) ";
+  SQL = SQL + "                             FROM dsfdeftmp_tmp t2 ";
+  SQL = SQL + "                            WHERE t2.t_feetype = t1.t_feetype ";
+  SQL = SQL + "                              AND t2.t_commnumber = t1.t_commnumber ";
+  SQL = SQL + "                              AND t2.t_conid = t1.t_conid ";
+  SQL = SQL + "                              AND t2.t_department = t1.t_department ";
+  SQL = SQL + "                              AND t2.t_action = t1.t_action) ";
+  cmd = RsdCommand( SQL );
+  cmd.addParam( "", RSDBP_IN, Action );
+  SQL_Execute( cmd );
+  /* EVG 5/12/2011 END */
+  
+
+  cmd = RsdCommand( " SELECT * FROM DSFDEFTMP_TMP WHERE t_Action = ? AND t_Skip = chr(0) " +
+                    " ORDER BY t_ConID, t_ConComID, t_FIID_CommSum "  );
+  cmd.addParam( "", RSDBP_IN, Action );
+
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )    
+
+    SfSrv_FillSfDefComRecord( rs, SfDefCom );
+    SfSrv_FillSfAccrueRecord( rs, SfAccrue );
+    
+debugbreak;
+    /* EVG 27/02/2012 Для того, чтобы понять, нужно ли оплачивать данную УПК,
+       проверим, было ли после окончания периода, за который рассчитывается комиссия,
+       изменение тарифного плана по договору обслуживания. */
+    SQL = " SELECT 1 FROM dsfconcom_dbt t1                                  ";
+    SQL = SQL + "   WHERE t1.t_FeeType    = ?                               ";
+    SQL = SQL + "     AND t1.t_CommNumber = ?                               ";
+    SQL = SQL + "     AND t1.t_Status     = 0                               ";
+    SQL = SQL + "     AND t1.t_ObjectType = 659                             ";
+    SQL = SQL + "     AND t1.t_ObjectID   = ?                               ";
+    SQL = SQL + "     AND t1.t_DateBegin <= ?                               ";
+    SQL = SQL + "     AND t1.t_DateEnd    > ?                               ";
+    /* EVG Это условие не нужно, т.к. если есть последующее изменение ТП, то t_DateEnd не может быть нулевой.
+    SQL = SQL + "        OR t1.t_DateEnd  = ? )                             ";  // TO_DATE('01-01-0001','dd-mm-rrrr')
+    */
+    SQL = SQL + "     AND EXISTS ( ";
+    SQL = SQL + "                 SELECT 1 FROM dsfconcom_dbt t2            ";
+    SQL = SQL + "                  WHERE t2.t_FeeType    = t1.t_FeeType     ";
+    //RR 17.04.2012 Исправляю ошибку при которой взымалась комиссия по старому ТП, просьба Байдуловой Г.В.
+    /*EVG 17.04.2012 Уточнение: проблема возникала в случае, если в новом ТП этой комиссии уже не было.
+          Для обхода проблемы убрали линк нового ТП именно по этой комиссии - в данном случае это не принципиально. */
+    //SQL = SQL + "                    AND t2.t_CommNumber = t1.t_CommNumber  ";
+    SQL = SQL + "                    AND t2.t_ObjectType = t1.t_ObjectType  ";
+    SQL = SQL + "                    AND t2.t_ObjectID   = t1.t_ObjectID    ";
+    SQL = SQL + "                    AND t2.t_DateBegin >= t1.t_DateEnd     ";
+    //SQL = SQL + "                    AND t2.t_SfPlanID  <> t1.t_SfPlanID    "; //RR 28.05.2012 В случае если клиента переводили на тот же ТП, эта проверка не срабатывала.
+    SQL = SQL + "                )                                          ";
+    cmd = RsdCommand( SQL );
+    cmd.addParam( "", RSDBP_IN, SfDefCom.feeType );
+    cmd.addParam( "", RSDBP_IN, SfDefCom.commNumber );
+    cmd.addParam( "", RSDBP_IN, SfDefCom.SfContrID );
+    cmd.addParam( "", RSDBP_IN, SfDefCom.datePeriodBegin );
+    cmd.addParam( "", RSDBP_IN, SfDefCom.datePeriodBegin );
+    //cmd.addParam( "", RSDBP_IN, SfDefCom.datePeriodBegin );
+       setOutPut("d:\\11qqaa.txt", false);
+       println(sql);
+       println(SfDefCom.commNumber, " - ", SfDefCom.SfContrID, " - ", SfDefCom.datePeriodBegin);
+       setOutPut(null, true);
+    rs1 = rsdRecordSet( cmd );
+    if( rs1 and rs1.moveNext() )
+       ОплачиватьКомиссию = false;
+    end;
+    
+
+    /* EVG 28/02/2012 Выявилась ещё одна проблема - комиссия оплачивается за старый период, при этом система думает,
+       что оплачивать её нужно по ТП, закончившему действовать ещё до начала этого периода. Из-за этого ПК получаются
+       разных видов, в результате чего DELETE FROM dsfdeftmp_tmp не помогает (оплата идёт на раздых шагах ДО), а проверка
+       выше также ничего не находит (реального изменения ТП не было).
+       Попробуем обойти её, просто проверив, что по ДО есть УПК с более поздним периодом. */
+    if( ОплачиватьКомиссию )
+       SQL = " SELECT 1 FROM dsfdef_dbt            ";
+       SQL = SQL + "   WHERE t_FeeType         = ? ";
+       SQL = SQL + "     AND t_CommNumber      = ? ";
+       SQL = SQL + "     AND t_SfContrID       = ? ";
+       SQL = SQL + "     AND t_DatePeriodBegin > ? ";
+       cmd = RsdCommand( SQL );
+       cmd.addParam( "", RSDBP_IN, SfDefCom.feeType );
+       cmd.addParam( "", RSDBP_IN, SfDefCom.commNumber );
+       cmd.addParam( "", RSDBP_IN, SfDefCom.SfContrID );
+       cmd.addParam( "", RSDBP_IN, SfDefCom.datePeriodBegin );
+          setOutPut("d:\\11qqaa.txt", false);
+          println(sql);
+          println(SfDefCom.commNumber, " - ", SfDefCom.SfContrID, " - ", SfDefCom.datePeriodBegin);
+          setOutPut(null, true);
+       rs1 = rsdRecordSet( cmd );
+       if( rs1 and rs1.moveNext() )
+          ОплачиватьКомиссию = false;
+       end;
+    end;
+
+
+    /* EVG 27/02/2012 Дельнейшие действия выполняются только для тех комиссий, которые нужно оплачивать. */
+    if( ОплачиватьКомиссию )
+    
+       if( prevFIID_CommSum != SfDefCom.FIID_Sum )
+         prevFIID_CommSum = SfDefCom.FIID_Sum;
+         IsNVPI = SfSrv_IsNVPICarry( SfContr.PayFIID, SfDefCom.FIID_Sum, SfContr.PayRateDateKind );
+
+         SfConComPD = SfConComPrimDoc( 83, SfConComRec, SfContr, SfDefCom.FIID_Sum);
+
+         stat = SfSrv_GetCarryParms( IsNVPI, SfConComPD, SfDefCom, SfAccrue, SfContr,  
+                                     @PayerFIID, @ReceiverFIID,
+                                     @PayerAccount, @ReceiverAccount, @NDSPayerAccount, @NDSReceiverAccount, 0, 0 );
+       end;
+/* RR 02.04.2012 Здесь это не нужно
+       if( stat == 0 )
+         if( (SfDefCom.Status == SFDEFCOM_STATUS_CALCULATED) AND (SfComissRec.ReceiverID == {HeadBankID}) )
+           if( SfAccrue.Amount > $0 )
+             stat = SfSrvCarryAccrue( PayerFIID, ReceiverFIID, SfDefCom, SfAccrue, SfContr, SfConComRec, 
+                                      PayerAccount, ReceiverAccount, NDSPayerAccount, NDSReceiverAccount,
+                                   @AccTrnID, @AccTrnID_NDS, 0, 0 );
+           end;
+         else
+           if( SfAccrue.Amount != $0 )
+             stat = SfSrvCarryAccrue( PayerFIID, ReceiverFIID, SfDefCom, SfAccrue, SfContr, SfConComRec, 
+                                      PayerAccount, ReceiverAccount, NDSPayerAccount, NDSReceiverAccount,
+                                   @AccTrnID, @AccTrnID_NDS, 0, 0 );
+           end;
+         end;
+
+         if( (stat == 0) AND ((SfAccrue.Amount != 0) OR (SfAccrue.NDSAmount != $0)) )
+        stat = SfSrv_AddSfDocs( Action, SfDefCom, AccTrnID, AccTrnID_NDS );
+         end;
+       end;
+*/
+       if( stat == 0 )
+         ChangeSfDefTmpStatus( SfDefCom, SFDEFCOM_STATUS_CALCULATED );
+       end;
+
+         SfSrv_InsertAccrueLogRec( SfDefCom, SfAccrue, PayerAccount, ReceiverAccount, 0, stat, Comment );
+           
+       /* EVG 6/12/2011 Вызов процедуры поиска счёта */
+       ExecutePayerAccountChoice( SfDefCom, SfSrvDocRec );
+       
+       if( stat == 0 )
+         stat = SfSrv_FormDocs( OutBuff, SfContr, SfComissRec, SfDefCom, SfAccrue, 
+                                SfConComPD, isNVPI, PayerAccount, ReceiverAccount, SfSrvDocRec.DatePay, false, 0, 0 );
+       end;
+
+    else
+
+       /* EVG 27/02/2012 Если оплачивать комиссию не надо, удаляем запись о ней из временной таблицы. */
+       SQL = " DELETE FROM dsfdeftmp_tmp ";
+       SQL = SQL + " WHERE t_Id = ?      ";
+       cmd = RsdCommand( SQL );
+       cmd.addParam( "", RSDBP_IN, SfDefCom.Id );
+       SQL_Execute( cmd );
+    
+    end;
+  
+  
+  end;
+
+  return stat;
+end;
+
+
+macro PostStepAction( message,     /* данный параметр может принимать следующие */
+                             /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                             /* произошла ошибка                                */
+                FirstDoc,    /* указатель на первичный документ                 */
+                ID_Oper,     /* внутренний идентификатор операции               */
+                Number_Step, /* номер шага операции          */
+                KindOper,    /* номер вида операции                             */
+                KindDoc,     /* номер вида первичного документа                 */
+                KindStep,    /* вид шага операции                               */
+                ID_Step )    /* идентификатор шага операции                     */
+
+  var strQuery = "", cmd;
+  setbuff( SfContr, FirstDoc );
+
+  /* EVG 7/12/2011 Обновление СПИ плательщика по комиссии счётом, подобранным мефёдовской процедурой
+     и ранее сохранённой в кеше (см. выше ExecutePayerAccountChoice() ). */
+  if( message == OP_EXECUTE_STEP )
+
+     var cachedAccount = GetGlobalParameter( "SFSI_" + sfContr.Id + "a_", true ),  // true - удалять после чтения
+         cachedFiid    = GetGlobalParameter( "SFSI_" + sfContr.Id + "b_", true ),
+         SQL;
+
+     debugbreak;
+     if( (valType(cachedAccount) != V_UNDEF) and (valType(cachedFiid) != V_UNDEF) )
+        SQL = " UPDATE   DSFSI_DBT si ";
+        SQL = SQL + "   SET   si.t_account = ?, si.t_fiid = ? ";
+        SQL = SQL + " WHERE   si.t_id = ";
+        SQL = SQL + "            (SELECT   si0.t_id ";
+        SQL = SQL + "               FROM   DSFSI_DBT si0, doprdocs_dbt t ";
+        SQL = SQL + "              WHERE       t.t_id_operation  = ? ";
+        SQL = SQL + "                      AND t.t_id_step       = ? ";
+        SQL = SQL + "                      AND t.t_ServDocKind   = 3001 ";             // Вид документа "Договор обслуживания"
+        SQL = SQL + "                      AND si0.t_objecttype  = 663 ";              // Вид объекта "Удерж. периодическая комиссия"
+        SQL = SQL + "                      AND si0.t_objectid    = t.t_documentid ";
+        SQL = SQL + "                      AND si0.t_debetcredit = 0) ";               // СПИ плательщика
+        cmd = RsdCommand( SQL );
+        cmd.addParam( "", RSDBP_IN, cachedAccount );
+        cmd.addParam( "", RSDBP_IN, cachedFiid );
+        cmd.addParam( "", RSDBP_IN, ID_Oper );
+        cmd.addParam( "", RSDBP_IN, ID_Step );
+        SQL_Execute( cmd );
+     end;
+
+  end;
+
+
+  /* EVG 6/12/2011 Неправильный комммент - это не откат,
+     а ошибка в процессе выполнения. */
+  /* Происходит откат */
+  if( (message==OP_EXECUTE_STEP) AND errTrn )
+    SfSrv_UpdateAccrueLogRec( SfContr, errTrn );
+    return 0;    
+  end;
+
+  return 0;
+end;
+
+private macro GetPayDocsTotalCount( Action )
+  
+  var count:integer = 0;
+  var StrQuery = " SELECT count(*) FROM dsfdeftmp_tmp tmp, dsfcomiss_dbt com WHERE " +
+                 " tmp.t_feeType = com.t_feeType AND tmp.t_CommNumber = com.t_Number " +
+                 " AND tmp.t_Action = ? AND tmp.t_Skip = chr(0) AND tmp.t_CommSum > 0 " +
+                 " AND com.t_InstantPayment = 'X' ";
+
+  var cmd = RsdCommand( StrQuery );
+  cmd.addParam( "", RSDBP_IN, Action );
+
+  var rs = RsdRecordset( cmd );  
+  
+  if( rs.moveNext() )
+    count = rs.value(0);
+  end;
+
+  return count;
+
+end;
+
+macro MassExecuteStep()
+
+  var stat = 0;
+
+  var rs, cmd;
+  record SfDefCom("sfdef.dbt");
+  record SfAccrue("sfaccrue.dbt");
+
+  file SfContrFile( sfcontr ) key 0;
+  file SfConComFile( sfconcom ) key 2;
+  file SfComissFile( sfcomiss ) key 0;
+
+  var PayerAccount = "", ReceiverAccount = "";
+  var NDSPayerAccount : string, NDSReceiverAccount : string;
+
+  var prevConID = -1, prevFIID_CommSum = -1, ConComID = 0, prevConComID = -1;
+  var PayerFIID = -1, ReceiverFIID = -1;
+
+  var SfConComPD : SfConComPrimDoc;
+  var IsNVPI:bool, bNeedNewParms:bool = false;
+
+  var AccTrnID = 0, AccTrnID_NDS = 0;
+
+  var Action = DEFCOM_ACTIONKIND_PAY;
+  var Comment = "";
+  var ID_Operation = 0, ID_Step = 0;
+
+  var payDocsTotal:integer = GetPayDocsTotalCount( Action );
+
+  var batch:BatchMode; 
+  var StrQuery = "";
+
+  stat = SfDefTmp_TransferToReal( true );
+  
+  if( stat == 0 )
+    batch = BatchMode( payDocsTotal );
+
+    StrQuery = " SELECT * FROM DSFDEFTMP_TMP WHERE t_Action = ? AND t_Skip = chr(0) " +
+               " AND t_ID NOT IN (SELECT t_SfDefComID FROM dsfrepacc_tmp WHERE t_ErrorCode = 1) " +
+               " ORDER BY t_ConID, t_ConComID, t_FIID_CommSum ";
+
+    cmd = RsdCommand( StrQuery );
+    cmd.addParam( "", RSDBP_IN, Action );
+
+    rs = RsdRecordset( cmd );
+    while( rs.moveNext() )    
+
+      SfSrv_FillSfDefComRecord( rs, SfDefCom );
+      SfSrv_FillSfAccrueRecord( rs, SfAccrue );
+
+      ConComID = rs.value("t_ConComID");
+
+      ID_Operation = rs.value("t_ID_Operation");
+      ID_Step = rs.value("t_ID_Step");
+
+      if( prevConID != SfDefCom.SfContrID )
+        prevConID = SfDefCom.SfContrID;
+        SfContrFile.ID = SfDefCom.SfContrID;
+        if( not getEQ( SfContrFile ) )
+          Comment = "Не найден ДО с ID = " + SfDefCom.SfContrID;
+          stat = 1;
+        end;
+      end;
+
+      if( stat == 0 )
+        if( prevConComID != ConComID )
+          prevConComID = ConComID;
+          prevFIID_CommSum = SfDefCom.FIID_Sum;
+          bNeedNewParms = true;
+          SfConComFile.ID = ConComID;
+          if( not getEQ( SfConComFile ) )
+            Comment = "Не найдена комиссия для ДО с ID = " + ConComID;
+            stat = 1;
+          end;
+        elif( prevFIID_CommSum != SfDefCom.FIID_Sum )
+          prevFIID_CommSum = SfDefCom.FIID_Sum;
+          bNeedNewParms = true;
+        end;
+      end;
+      
+      if( stat == 0 )
+        if( bNeedNewParms )
+          bNeedNewParms = false;
+          IsNVPI = SfSrv_IsNVPICarry( SfContrFile.PayFIID, SfDefCom.FIID_Sum, SfContrFile.PayRateDateKind );
+
+          SfConComPD = SfConComPrimDoc( 83, SfConComFile, SfContrFile, SfDefCom.FIID_Sum);
+
+          stat = SfSrv_GetCarryParms( IsNVPI, SfConComPD, SfDefCom, SfAccrue, SfContrFile,  
+                                    @PayerFIID, @ReceiverFIID,
+                                    @PayerAccount, @ReceiverAccount, @NDSPayerAccount, @NDSReceiverAccount,
+                                    ID_Operation, ID_Step );
+        end;
+      end;
+
+      if( stat == 0 )
+        SfComissFile.feeType = SfDefCom.feeType;
+        SfComissFile.number  = SfDefCom.commNumber;
+        if( not getEQ( SfComissFile ) )
+          Comment = "Не найдена комиссия";
+          stat = 1;
+        end;
+      end;
+
+      if( stat == 0 )
+        if( (SfDefCom.Status == SFDEFCOM_STATUS_CALCULATED) AND (SfComissFile.ReceiverID == {HeadBankID}) )
+          if( SfAccrue.Amount > $0 )
+            stat = SfSrvCarryAccrue( PayerFIID, ReceiverFIID, SfDefCom, SfAccrue, SfContrFile, SfConComFile, 
+                                     PayerAccount, ReceiverAccount, NDSPayerAccount, NDSReceiverAccount,
+                                     @AccTrnID, @AccTrnID_NDS, ID_Operation, ID_Step );
+          end;
+        else
+          if( SfAccrue.Amount != $0 )
+            stat = SfSrvCarryAccrue( PayerFIID, ReceiverFIID, SfDefCom, SfAccrue, SfContrFile, SfConComFile, 
+                                     PayerAccount, ReceiverAccount, NDSPayerAccount, NDSReceiverAccount,
+                                     @AccTrnID, @AccTrnID_NDS, ID_Operation, ID_Step );
+          end;
+        end;
+
+        if( (stat == 0) AND ((SfAccrue.Amount != 0) OR (SfAccrue.NDSAmount != $0)) )
+          stat = SfSrv_AddSfDocs( Action, SfDefCom, AccTrnID, AccTrnID_NDS );
+        end;
+      end;
+
+      if( SfDefCom.Status != SFDEFCOM_STATUS_CALCULATED )
+        if( not Opr_ChangeSfDefComStatus(SfDefCom.ID, SFDEFCOM_STATUS_CALCULATED, ID_Operation, ID_Step, SfDefCom.FeeType) )
+          return false;
+        end;
+      end;
+
+      SfSrv_InsertAccrueLogRec( SfDefCom, SfAccrue, PayerAccount, ReceiverAccount, 0, stat, Comment );
+      
+      /* EVG 6/12/2011 Вызов процедуры поиска счёта */
+      ExecutePayerAccountChoice( SfDefCom, SfSrvDocRec );
+
+      if( stat == 0 )
+        stat = SfSrv_FormDocs( null, SfContrFile, SfComissFile, SfDefCom, SfAccrue, SfConComPD, isNVPI, 
+                               PayerAccount, ReceiverAccount, SfSrvDocRec.DatePay, true, ID_Operation, ID_Step );
+      end;
+    end;
+
+    stat = batch.TransferToBase( false );
+  end;
+
+  return stat;
+end;

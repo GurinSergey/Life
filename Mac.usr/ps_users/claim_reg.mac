@@ -1,0 +1,437 @@
+/*  Тихомиров А.Н. Макрос Отчета по Зарегистрированным претензиям          */
+/*  14.06.2012 AAN  C-11788-6  добавил в отчёт  4 последних столбца  */
+/*  17.09.2012 Zlenko M.P.C-13868                                          */
+/*  01.02.2013 AAN  C-17415 добавил столбец Моб Инфо, проставляется 
+признак установленного пользовательского типа счёта Е и Ё
+    07.11.2013 AAN  I-00438669-2 неправильно передавался номер подразделения
+                плюс причесал малость макрос
+    11.11.2013 AAN  I-00441466-2 преобразовал пользов-й номер узла ТС в id узла
+    04.06.2015 VDN  R-588336-2 
+                                                                     */
+// 07.10.2014 C-33122 VV добавлен новый столбец ЦТО
+
+import RSD, bankinter, globals, календарь,rsbdataset,likepy;
+
+var DateRep;
+GetRegistryValue("PRBB\\USR_CLAIM\\CLAIM_DATE_REG",2,DateRep);
+DateRep = date(DateRep);
+var datebegin, dateend,VSP,sql:string = "";
+record dpdep(dp_dep);
+record account(account);
+record oper(person);
+
+
+var Fulloutputl, outl, outputl="Calim_acc.lbr";
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outl);
+Fulloutputl = FindPath(outputl, outl);
+if (not Fulloutputl)
+    msgbox("Не найдена LBR");
+    exit();
+end;
+
+var dlg = TRecHandler("arm", fulloutputl, TRUE); 
+
+const KEY_F1    = 315;
+const KEY_F2    = 316;
+const KEY_F3    = 317;
+const KEY_ESC   = 27;
+const KEY_SPACE = 32;
+const KEY_ENTER = 13;
+
+private macro to_num(number)
+    while(strlen(number) > 1)
+        if (substr(number, 1, 1) == "0")
+            number = substr(number,	2);
+        else
+            return number;
+        end;
+    end;
+    return number;
+end;
+/*Найдем имя по Partyid*/
+private MACRO GetClientName(id)
+    var  sl = " select part.t_name from dparty_dbt part where part.t_partyid="+id;
+    var  DataS = TRsbDataSet(sl);
+    if( DataS.moveNext())
+        return DataS.name;
+    else
+        if (id != 0)
+            msgbox("Субъект не найден в party.dbt");
+            return 0;
+        else
+            return {Name_Bank};
+        end;
+    end;
+END;
+
+private macro Name(id)
+    var c = rsdcommand("select t_name from dperson_dbt where t_oper = ?" );
+    c.addparam("ID",RSDBP_IN,id);
+    c.execute;
+    var r = rsdrecordset(c);
+    if (r.movenext())
+        return r.value(0);
+    end;
+    return " ";
+end;
+
+private macro TS(acc)
+    var c = rsdcommand("SELECT dep.t_name "+
+                       "  FROM daccount_dbt acc, ddp_dep_dbt dep "+
+                       " WHERE t_account = ? AND acc.t_branch = dep.t_code ");
+    c.addparam("acc", RSDBP_IN, acc);
+    c.execute;
+    var r = rsdrecordset(c);
+    if (r.movenext())
+        return r.value(0);
+    end;
+    return 1;
+end;
+
+private macro tel(client_PartyID)  // 14.06.2012 AAN  C-11788-6
+// получить телефон клиента из его анкеты РКО по его partyId
+    var str = " ";
+    var sql_phone = " SELECT NVL( (DECODE (t_phonenumber, CHR (1), '', t_phonenumber )), ' ' ) tel, "  +
+                    "                 NVL( (DECODE (t_phonenumber2, CHR (1), '', t_phonenumber2 )), ' ' ) tel2 " +
+                    "   FROM dadress_dbt adr " +
+                    "  WHERE adr.t_partyid = " + client_PartyID + ";" ;
+    var rs_phone = RsdRecordSet(sql_phone);
+    while (rs_phone.MoveNext)
+        if(rs_phone.value(0) != "") 
+            str = str + " " + rs_phone.value(0);
+        end;
+        if (rs_phone.value(1) != "")
+            if(rs_phone.value(0) != "")
+                str = str + ", " + rs_phone.value(1);
+            else
+                str = str + rs_phone.value(1);
+            end;
+        end;
+    end;
+    //Lavrenov: 11.07.2012 в рамках перехода на 11G к вызову wm_concat добавляем dbms_lob.substr
+    var sql_mphone = "    SELECT  dbms_lob.substr(NVL(wmsys.wm_concat(ADR.T_MOBILEPHONE),' ')) mphone" +
+                  "\n       FROM dadress_dbt adr" +
+                  "\n      WHERE ADR.T_MOBILEPHONE <> chr(1)" +
+                  "\n        AND adr.t_partyid = " + client_PartyID  +";";
+    var rs_mphone = RsdRecordSet(sql_mphone);
+    if (rs_mphone.MoveNext)
+        str = str + ", \n " + rs_mphone.value(0);
+    end;
+    return trim(str); 
+END;
+
+private macro date_n(d)            //14.06.2012 AAN  C-11788-6 корректно обрабатываем дату - избавляемся от Undefined
+    // написал т.к. стандартное преобразование date(rsd.value(n)); падало при дате равное 01.01.0001
+    var s;
+    if(d == " 1.01.0001 (00:00:00.00)")
+        s = "1.01.0001";
+    else
+        s = date(d);
+    end;
+    return s;
+END;
+
+private macro money_n(sum)      //14.06.2012 AAN  C-11788-6  коректно обрабатываетм сумму - избавляемся от Undefined
+    if(sum == " ")
+        sum = "0.00";
+    else
+        sum = money(sum);
+    end;
+    return sum;
+END;
+
+macro getACC(acc:String)
+    var i = 0, f, str:string = "";
+    acc = StrSubst(acc, "*", "%");
+    acc = StrSubst(acc, "?", "_");
+    f = split(trim(acc), ",");
+    str = "and ("; 
+    while(i < f.size(f))
+        str = str + " ACC.T_ACCOUNT like '" + f[i] + "' or";
+        i = i + 1;
+    end;
+    return String(substr(str, 1, strlen(str) - 2) + ")");
+end;
+
+private macro fist_pers(id_client)   // 14.06.2012 AAN  C-11788-6 ищем в базе лицо которое "первая подпись", если несколько то всех берём, если не одного то пусто
+    var FIO = "";
+    var cmd, rsd, mas_name, flag = 0;
+    cmd = rsdcommand(" SELECT o.t_personid FROM dofficer_dbt o WHERE o.t_partyid = " + id_client +" AND o.t_isfirstperson = chr (88) " );
+    cmd.execute;
+    rsd = rsdrecordset(cmd);
+    while(rsd.movenext())
+        cmd = rsdcommand( " select pr.t_name1, pr.t_name2, pr.t_name3 from dpersn_dbt pr where pr.t_personid = " + rsd.value(0) );
+        cmd.execute;
+        mas_name = rsdrecordset(cmd);
+        while(mas_name.movenext())
+            if (flag == 0)
+                FIO = string(mas_name.value(0)) + " " + string(mas_name.value(1)) + " " + string(mas_name.value(2));
+                flag = 1;
+            else
+                FIO = FIO + "\n " + string(mas_name.value(0)) + " " + string(mas_name.value(1)) + " " + string(mas_name.value(2));
+            end;
+        end;
+    end;
+    return FIO;
+END;
+
+private macro outall()
+    sql = " SELECT mas.*, "+ //, pr.t_name1 f, pr.t_name2 i, pr.t_name3 o, "+
+          "     decode ("+
+          "    (SELECT SUM (acclaimstate.t_currentamount) "+
+          "     FROM dacclaim_dbt claim, dacclaimstate_dbt acclaimstate "+
+          "     WHERE (   claim.t_finishdate = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "+
+          "             OR claim.t_finishdate > ? )"+
+          "     AND claim.t_account = mas.t_account "+
+          "     AND claim.t_claimid = acclaimstate.t_claimid "+
+          "     AND acclaimstate.t_state = 1 "+
+          "     AND acclaimstate.t_statedate = "+
+          "              (SELECT MAX (t.t_statedate) "+
+          "                 FROM dacclaimstate_dbt t"+
+          "                 WHERE t.t_claimid = claim.t_claimid "+
+          "                   AND t.t_statedate <= ? )), NULL, ' ',  "+
+          "    (SELECT SUM (acclaimstate.t_currentamount) "+
+          "     FROM dacclaim_dbt claim, dacclaimstate_dbt acclaimstate "+
+          "     WHERE (   claim.t_finishdate = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "+
+          "             OR claim.t_finishdate > ? )"+
+          "     AND claim.t_account = mas.t_account "+
+          "     AND claim.t_claimid = acclaimstate.t_claimid "+
+          "     AND acclaimstate.t_state = 1 "+
+          "     AND acclaimstate.t_statedate = "+
+          "              (SELECT MAX (t.t_statedate) "+
+          "                 FROM dacclaimstate_dbt t"+
+          "                 WHERE t.t_claimid = claim.t_claimid "+
+          "                   AND t.t_statedate <= ? ))"+
+          "              ) SUM, "+
+          //Gurin S. 11.09.2014 R-448491-2 Не все случаи учтены!
+          //"              CASE WHEN mas.T_USERTYPEACCOUNT LIKE '%Е%Ё%' THEN 'да' ELSE 'нет' END mob_info "        //  01.02.2013 AAN        C-17415
+          "              CASE "+
+          "                 WHEN regexp_like(mas.T_USERTYPEACCOUNT, 'Е[a-zA-Z0-9]{0,}Ё|Ё[a-zA-Z0-9]{0,}Е') THEN 'да' "+
+          "                 ELSE 'нет' "+
+          "              END mob_info, "+
+          "              CASE WHEN mas.T_USERTYPEACCOUNT LIKE '%B%' THEN 'да' ELSE 'нет' END CTO "+        //  07.10.2014 VV C-33122
+          "    FROM (SELECT claim.t_account, all1.*, acc.t_nameaccount, "+
+          //Gurin S. 22.05.2015 I-00567660-2
+          // acc.T_FINAL_DATE, 
+          /*VDN 04.06.2015 R-588336-2*/
+          /*"    (SELECT MAX (t_restdate) FROM drestdate_dbt WHERE t_accountid = (SELECT t_accountid FROM daccount_dbt WHERE t_account = '" + String(dlg.rec.account) + "')) T_FINAL_DATE, " +*/
+          "    (SELECT MAX (t_restdate) FROM drestdate_dbt WHERE t_accountid = acc.t_accountid) T_FINAL_DATE, " +
+          "     acc.T_CLIENT, ACC.T_OPER acc_oper, ACC.T_USERTYPEACCOUNT  "+        //  01.02.2013 AAN        C-17415
+          "     FROM dacclaim_dbt claim,  "+
+          "    daccount_dbt acc,  "+
+          "    (SELECT cl.t_changedocid, cl.t_docdate, cl.t_docnumber,  "+
+          "     cl.t_comment, lpad(usr.t_enternum,7,'0') as t_enternum, usr.t_enterdate,  "+
+          "      usr.t_oper, usr.t_initiator, cl.t_claimid,  "+
+          "      decode(val.t_note,'Арест','Приостановление', 'Изменение претензии','Изменение', 'Отмена претензии', 'Отмена', val.t_note) as t_note  "+
+          "      FROM dacclmcng_dbt cl, usr_claim usr, dllvalues_dbt val  "+
+          "      WHERE usr.t_changedoc = CHR (88)  "+
+          "      AND usr.t_flag = CHR (88)  "+
+          "      AND usr.t_claimid = cl.t_changedocid  "+
+          "      AND cl.t_sysdate BETWEEN ? AND ?  "+
+          "      AND usr.t_enternum <> '0' "+
+          "      AND cl.t_initiator = 1  "+
+          "      AND val.t_list = 2524  "+
+          "      AND val.t_element = cl.t_changekind) all1  "+
+          "     WHERE all1.t_claimid = claim.t_claimid  "+
+          "      AND acc.t_account = claim.t_account  ";
+    if (dlg.rec.account != "Все")
+        sql = sql + getACC(String(dlg.rec.account));
+    end;
+    if (dlg.rec.oper != 0)
+        sql = sql + " and ACC.T_oper ="+dlg.rec.oper ;
+    end;
+    if (dlg.rec.VSP != "000")
+        //sql = sql + " and ACC.t_branch ="+VSP ;               // 07.11.2013 AAN  I-00438669-2
+        //sql = sql + " and ACC.t_branch =" + dlg.rec.VSP ;     // 11.11.2013 AAN  I-00441466-2
+        sql = sql + " and ACC.t_branch = (SELECT t_code FROM ddp_dep_dbt uzel WHERE uzel.t_name = " + dlg.rec.VSP + ")" ;
+    end;
+    sql = sql + "  UNION ALL  "+
+          "     SELECT cl.t_account, cl.t_claimid AS t_changedocid, cl.t_docdate,  "+
+          "     cl.t_docnumber, cl.t_comment,lpad(usr.t_enternum,7,'0') as t_enternum,  "+
+          "     usr.t_enterdate, usr.t_oper, usr.t_initiator, cl.t_claimid,  "+
+          "                 decode(val.t_note,'Арест','Приостановление', 'Изменение претензии','Изменение', 'Отмена претензии','Отмена',val.t_note) as t_note, acc.t_nameaccount, " +
+          //Gurin S. 22.05.2015 I-00567660-2
+          // acc.T_FINAL_DATE, 
+          /*VDN 04.06.2015 R-588336-2*/
+          /*"    (SELECT MAX (t_restdate) FROM drestdate_dbt WHERE t_accountid = (SELECT t_accountid FROM daccount_dbt WHERE t_account = '" + String(dlg.rec.account) + "')) T_FINAL_DATE, " +*/
+          "    (SELECT MAX (t_restdate) FROM drestdate_dbt WHERE t_accountid = acc.t_accountid) T_FINAL_DATE, " +
+          "     acc.T_CLIENT, ACC.T_OPER acc_oper, ACC.T_USERTYPEACCOUNT  "+  //01.02.2013 AAN        C-17415
+          "            FROM dacclaim_dbt cl,  "+
+          "                 usr_claim usr,  "+
+          "                 daccount_dbt acc,  "+
+          "                 dllvalues_dbt val  "+
+          "           WHERE usr.t_changedoc = CHR (0)  "+
+          "             AND usr.t_flag = CHR (88)  "+
+          "             AND usr.t_claimid = cl.t_claimid  "+
+          "             AND cl.t_sysdate BETWEEN ? AND ?  "+
+          "                     AND usr.t_enternum <> '0' "+
+          "             AND cl.t_initiator = 1  "+
+          "             AND acc.t_account = cl.t_account  ";
+    if (dlg.rec.account != "Все")
+        sql = sql + getACC(String(dlg.rec.account));
+    end;
+    if (dlg.rec.oper != 0)
+        sql = sql + " and ACC.T_oper =" + dlg.rec.oper ;
+    end;
+    if (dlg.rec.VSP != "000")
+        //sql = sql + " and ACC.t_branch ="+VSP ;               // 07.11.2013 AAN  I-00438669-2
+        //sql = sql + " and ACC.t_branch =" + dlg.rec.VSP ;     // 11.11.2013 AAN  I-00441466-2
+        sql = sql + " and ACC.t_branch = (SELECT t_code FROM ddp_dep_dbt uzel WHERE uzel.t_name = " + dlg.rec.VSP + ")" ;
+    end;
+    sql = sql +
+          "             AND val.t_list = 2520  "+
+          "             AND val.t_element = cl.t_claimkind) mas "+ //, dofficer_dbt ofic, dpersn_dbt pr "+
+         /*"   WHERE ofic.t_partyid = mas.t_client " +
+          "     AND ofic.t_isfirstperson = CHR (88) " +
+          "     AND ofic.t_personid = pr.t_personid " +*/
+          " ORDER BY t_enterdate, lpad(substr(t_enternum,1,decode((instr(t_enternum,'-')-1),-1,7,0,7,(instr(t_enternum,'-')-1))),7,'0') ";
+    var cmd = rsdcommand(sql);
+    //getstring(cmd.cmdtext);
+    cmd.addparam("date0", RSDBP_IN, DateEnd);
+    cmd.addparam("date1", RSDBP_IN, DateEnd);
+    cmd.addparam("date2", RSDBP_IN, DateEnd);
+    cmd.addparam("date3", RSDBP_IN, DateEnd);
+    cmd.addparam("date4", RSDBP_IN, DateBegin); 
+    cmd.addparam("date5", RSDBP_IN, DateEnd);
+    cmd.addparam("date6", RSDBP_IN, DateBegin);
+    cmd.addparam("date7", RSDBP_IN, DateEnd); 
+    cmd.execute;
+    var rsd = rsdrecordset(cmd);
+    [       Журнал регистрации входящих документов за период с ########## по ##########
+    ┌───────────┬───────────────┬─────────────────┬────────────────────────────────────────────┬──────────┬──────────┬────────────────────┬─────────────────────────────────┬────┬───────────┬────────────────────┬──────────────────┬─────────────┬────────────────┬─────┬──────┬─────┐
+    │   Дата    │   Входящий    │  Тип документа  │           Поступил от                      │  Номер   │   Дата   │    Номер счета     │        Название клиента         │Узел│Исполнитель│   Первая подпись   │  Контакты        │   Сумма     │ Дата последней │Опер.│ Моб. │ ЦТО │
+    │регистрации│    номер      │                 │                                            │  док-та  │  док-та  │                    │                                 │ ТС │           │                    │                  │ претензии   │   проводки     │     │ инфо.│     │
+    ├───────────┼───────────────┼─────────────────┼────────────────────────────────────────────┼──────────┼──────────┼────────────────────┼─────────────────────────────────┼────┼───────────┼────────────────────┼──────────────────┼─────────────┼────────────────┼─────┼──────┼─────┤]
+    (datebegin, dateend);
+    while (rsd.movenext())
+        [│###########│###############│#################│############################################│##########│##########│####################│#################################│####│   #####   │####################│##################│#############│################│#####│######│#####│]
+        (date(rsd.value(6)), to_num(rsd.value(5)):c, rsd.value(10):c:w, rsd.value(8):w, rsd.value(3):c, date(rsd.value(2)),
+              rsd.value(0), rsd.value(11):w, TS(rsd.value(0)), rsd.value(7):r, fist_pers(rsd.value(13)):w, tel(rsd.value(13)):w,
+              money_n(rsd.value(16)):c, date_n(rsd.value(12)):c,rsd.value("acc_oper"):c, rsd.value(17):c, rsd.value(18):c );    // 14.06.2012 AAN  C-11788-6
+    end;
+    [└───────────┴───────────────┴─────────────────┴────────────────────────────────────────────┴──────────┴──────────┴────────────────────┴─────────────────────────────────┴────┴───────────┴────────────────────┴──────────────────┴─────────────┴────────────────┴─────┴──────┴─────┘
+    Исполнитель: ############################# 
+    Дата выпуска: ##########
+    Время: ##########]
+    (name({oper}), {curdate}, time());
+end;
+
+ /*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key) 
+    var const_mess = "~F2~ Продолжить ~ESC~ Выход ";
+    var const_mess2 = "~F2~ Продолжить ~SPACE~ ~ESC~ Выход ";
+    /*Первоначальная инициализация полей*/
+    if(cmd == DLG_INIT)
+        dlg.rec.DateBegin   = DateRep;
+        dlg.rec.DateEnd     = {curDate};
+        dlg.rec.Account     = "Все";
+        dlg.rec.VSP         = "000";  
+        dlg.rec.VSP_n       = {Name_Bank};  
+        dlg.rec.Oper_n      = "Все";
+        UpdateFields(dlg); 
+    end;
+    /*Установка подсказок в строке состояния*/
+    if (cmd == DLG_SETFOCUS)
+        if (FldName(dlg, id) == "DateBegin")
+            message(" ~F3~ Выбор даты из календаря " + const_mess);
+        elif (FldName(dlg, id) == "DateEnd")
+            message(" ~F3~ Выбор даты из календаря " + const_mess);
+        elif (FldName(dlg, id) == "Oper")
+            message(" ~F3~ Выбор операциониста " + const_mess);
+        elif (FldName(dlg, id) == "VSP")
+            message(" ~F3~ Выбор узла ТС " + const_mess);
+        elif (FldName(dlg, id) == "Account")
+            message(" ~F3~ Выбор счета " + const_mess);
+        end;
+        UpdateFields(dlg); 
+    end;
+    if (cmd == DLG_REMFOCUS)
+    /*Проверка корректности дат отчета*/
+        if (FldName(dlg, id) == "DateBegin")
+            if ( dlg.rec.DateBegin > {curdate} )
+                MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+                return CM_CANCEL;
+            elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата начала периода не может быть больше даты окончания периода");
+                return CM_CANCEL;
+            end;
+        end;
+        if (FldName(dlg, id) == "DateEnd")
+            if ( dlg.rec.DateEnd > {curdate} )
+                MsgBox("Дата не может быть больше даты текущего операционного дня");
+                return CM_CANCEL;
+            elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+                return CM_CANCEL;
+            end;
+        end;
+        UpdateFields(dlg); 
+    end;
+    if (cmd == DLG_KEY)
+    /*Выход из диалогового окна формирования отчета*/
+        if (KEY == KEY_ESC)
+            return exit(1);//CM_CANCEL;
+        /*Выбор данных из списка*/
+        elif ( KEY == KEY_F3)
+        /*Выбор даты из календаря*/
+            if (FldName(dlg, id) == "DateBegin")
+                dlg.rec.datebegin = GetDateByCalendar ({curDate});
+            end;
+            if (FldName(dlg, id) == "DateEnd")
+                dlg.rec.dateend = GetDateByCalendar ({curDate});
+            end;
+            if (FldName(dlg, id) == "VSP")
+                if (ListDepartment (dpdep))
+                    dlg.rec.VSP = dpdep.name;
+                    dlg.rec.VSP_n = GetClientName(dpdep.partyid);
+                    VSP = dpdep.code;
+                    UpdateFields(dlg);
+                end;
+            end;
+            if (FldName(dlg, id) == "Account")
+                if (Listaccount (account, 1, 0, dlg.rec.account))
+                    dlg.rec.account = account.account;
+                    UpdateFields(dlg);
+                end;
+            end;
+            if (FldName(dlg, id) == "Oper")
+                if (Listoper (oper))
+                    dlg.rec.oper = oper.oper;
+                    dlg.rec.oper_n = oper.name;
+                    // message(" ~F3~ Выбор операциониста "+const_mess);
+                    UpdateFields(dlg);
+                end;
+            end;
+        elif (( KEY == KEY_F2 )  or ( KEY == KEY_ENTER ))         //Проверки при вводе
+            if ( dlg.rec.DateBegin > {curdate} )
+                MsgBox("Дата начала периода не может быть больше даты текущего операционного дня");
+                return CM_IGNORE;
+            elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата начала периода не может быть больше даты окончания периода");
+                return CM_IGNORE;
+            end;
+            if ( dlg.rec.DateEnd > {curdate} )
+                MsgBox("Дата не может быть больше даты текущего операционного дня");
+                return CM_IGNORE;
+            elif ( dlg.rec.DateBegin > dlg.rec.DateEnd )
+                MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+                return CM_IGNORE;
+            end;
+            Datebegin  = dlg.rec.Datebegin;
+            Dateend = dlg.rec.DateEnd;
+            if ((Datebegin < {curDate}))    
+                Return CM_SAVE;
+            elif (gettrue(true,"Дата равна текущему опрерационному дню. Продолжить?"))
+                Return CM_SAVE;
+            end;
+        else
+            //    Return CM_IGNORE;
+        end;
+    end;
+        
+END;
+
+
+if (RunDialog(dlg, "Event"))
+    OutAll;
+end;

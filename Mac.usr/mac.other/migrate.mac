@@ -1,0 +1,2270 @@
+import Globals, RsbFormsInter, BankInter, RSD, Oralib;
+import pm_tools;
+import lib_fg;
+//Gurin S. 17.12.2012 C-15303
+//Gurin S. 05.05.2014 R-365941-2 --2031
+
+private const
+	KEY_F7 = 321;
+
+var CurrentScheme:string;
+
+class TDBLinkObject(Preference:String, Name:String, Value:String, Validate:Bool, Load:Bool)
+	var cPreference:String 	= Preference;
+	var cName:String 		= Name;
+	var cValue:String 		= Value;
+	var cValidate:Bool		= Validate;
+	var cLoad:bool		= Load;
+end;
+
+var m_CheckBox_debugquery = TRsbCheckBox;
+
+var DBLinkCurrent		 	= TDBLinkObject;
+var DBLinkObject_arr		 	= TArray;
+var DBLinkReceiver			= TArray;
+
+var BackUpCopCount 			= 10;
+var kk = 0;
+var dlink;
+
+var ShowDebugInfo			= true;
+
+var tabbed			 	= TRsbTabbedWindow;
+var DebugCnt				= 0;
+var sql_DebugQuery;
+var rsd_DebugQuery;
+
+var sql_MergeQuery;
+var rsd_MergeQuery;
+
+var panel;
+var panel2;
+var panel3;
+
+var path_date = strsubst(string(date()),".",""), path_time = strsubst(string(time()),":","");
+
+//Gurin S. 17.12.2012 C-15303
+var TxtFileDir, errCode;
+//debugbreak;
+GetRegistryValue("PRBB\\MIGRATE", V_STRING, TxtFileDir, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PRBB\\MIGRATE");
+    return false;
+  end;
+TxtFileDir = TxtFileDir +"/log";
+
+/*  =Start=============================================== Вывод сообщения в стандартный поток с пометкой о дате/Времени */
+macro TimeStampMessage(mess)
+	println(("["+date()+" "+time()+"]  " + mess));
+	return true;
+end;
+/*  =End================================================= Вывод сообщения в стандартный поток с пометкой о дате/Времени */
+/*  =Start==================================================== Генерация постфикса для бэкапа с пометкой о дате/Времени */
+macro TimeStampBackUp()
+	var dd, tt; 
+	dd = trim(string(date()));
+	while( index(dd, ".") != 0 )
+		dd = substr(dd, 1, index(dd, ".")-1) + substr(dd, index(dd, ".")+1);
+	end;
+	tt = string(time());
+	while( index(tt, ":") != 0 )
+		tt = substr(tt, 1, index(tt, ":")-1) + substr(tt, index(tt, ":")+1);
+	end;
+       tt = "00" +trim(tt);  
+       tt = substr(tt,strlen(tt)-5);
+       if (strlen(Trim(string(dd)+string(tt))) == 13)
+		return (Trim("0" + string(dd) + string(tt)));		
+	else
+		return (Trim(string(dd) + string(tt)));
+	end;
+end;
+/*  =End====================================================== Генерация постфикса для бэкапа с пометкой о дате/Времени */
+/*  =Start=============================================== Валидация DBLink'а */
+macro ValidateDBLink(DBLinkObject:TDBLinkObject)
+	var sql_ValidateDBLink = "select 1 valid from user_db_links where DB_LINK = UPPER('"+DBLinkObject.CValue+"');";
+	var rsd_ValidateDBLink = RsdRecordSet(RsdCommand(sql_ValidateDBLink));
+	if (rsd_ValidateDBLink.movenext())	
+		return True;
+	else
+		return False;
+	end;
+end;
+/*  =End================================================= Валидация DBLink'а */
+
+macro SearchOldestCopy(tname:string, dblname:string)
+	var sql_OldestCopy = "SELECT   TABLE_NAME "
++"\n				  FROM   user_tables@" + dblname + " "
++"\n				 WHERE   table_name LIKE '"+strupr(tname)+"%' "
++"\n				 AND TO_DATE (SUBSTR (TABLE_NAME, LENGTH(TABLE_NAME)-13), 'ddmmyyyyhh24miss') = (SELECT MIN (TO_DATE (SUBSTR (TABLE_NAME, LENGTH(TABLE_NAME)-13), 'ddmmyyyyhh24miss')) FROM   user_tables@" + dblname + " "
++"\n				 WHERE   table_name LIKE '"+strupr(tname)+"%'); ";
+	var rsd_OldestCopy = RsdRecordSet(RsdCommand(sql_OldestCopy));
+	if (rsd_OldestCopy.movenext())
+      		TimeStampMessage("Резервное копирование: Самая старая резервная копия: "+ rsd_OldestCopy.value(0));
+		var sql_DelOldestCopy = "BEGIN " 
+					   +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('DROP TABLE "+rsd_OldestCopy.value(0)+"'); " 
+					   +"\n END; ";
+		var rsd_DelOldestCopy = RsdCommand(sql_DelOldestCopy);
+		rsd_DelOldestCopy.execute();
+      		TimeStampMessage("Резервное копирование: Резервная копия "+ rsd_OldestCopy.value(0) + " удалена");
+	end;
+end;
+
+macro DebugReportHeader(title:String, dbt_name:String)
+       setOutput(TxtFileDir + "\\" + "DebugLog" + "_"+  path_date + "_" + path_time + ".log", true);
+	TimeStampMessage("Миграция: \t"+title+" ("+dbt_name+")");
+end;
+
+macro DebugReportBody(Cnt, DataSet)
+	var i = 0;
+	var str = "| ";
+	while (i <= Cnt-1)				
+		str = str + DataSet.value(i) + " | ";
+		i = i + 1;
+	end;
+	TimeStampMessage(str);
+end;
+
+macro DebugReportFooter(Cnt:Integer)
+	TimeStampMessage("Всего строк: " + Cnt);	
+	setOutput(TxtFileDir + "\\" + "Migrate" + "_"+  path_date + "_" + path_time + ".log", true);
+end;
+
+
+macro Initialization()
+	/* = Start = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =Читаем настройки из реестра*/
+	var error;
+	var val;
+	var access = false;
+
+	TimeStampMessage("Инициализация: Читаем настройку реестра PRBB\\МИГРЕЙТ\\OPER_ACCESS");
+	GetRegistryValue( "PRBB\\МИГРЕЙТ\\OPER_ACCESS", V_STRING, val, error );    
+	if(error == 0)
+		TimeStampMessage("Инициализация: Проверяем текущего пользователя: " + {Oper});
+		while (StrBrk(val, ";") != 0)
+			if ({Oper} == substr(val, 1, StrBrk(val, ";")-1))
+				access = true;
+			end;
+			val = StrSubst(val, substr(val, 1, StrBrk(val, ";")-1)+";", "");
+		end;
+		if (access)
+		     TimeStampMessage("Инициализация: Текущий пользователь имеет право запускать процедуру Migrate");	
+		else
+		     TimeStampMessage("Инициализация: Текущий пользователь не имеет права запускать процедуру Migrate");	
+		     TimeStampMessage("Инициализация: Завершаем процедуру");	
+		     exit();
+		end;
+		
+	else
+		TimeStampMessage("Инициализация: Не удалось прочитать настройку реестра PRBB\\МИГРЕЙТ\\OPER_ACCESS");
+		TimeStampMessage("Инициализация: Процедура завершена аварийно. Создайте настройку: PRBB\\МИГРЕЙТ\\OPER_ACCESS");
+		exit();
+	end;
+
+	TimeStampMessage("Инициализация: Читаем настройку реестра PRBB\\МИГРЕЙТ\\BACKUP");
+	GetRegistryValue( "PRBB\\МИГРЕЙТ\\BACKUP", V_INTEGER, val, error );    
+	if(error == 0)
+		BackUpCopCount = val;
+		TimeStampMessage("Инициализация: Число хранимых резервных копий равно " + BackUpCopCount);
+	else
+		TimeStampMessage("Инициализация: Не удалось прочитать настройку реестра PRBB\\МИГРЕЙТ\\BACKUP");
+		TimeStampMessage("Инициализация: Число хранимых резервных копий равно 10");
+	end;
+	/* = End = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =Читаем настройки из реестра*/
+	/* = Start = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =Загрузка и валидация DBLINK*/
+	var showreport = false;
+	var showDBLinkError = false;
+	var sql_LoadDBLink =   " SELECT   ROWNUM - 1, 									" 
+				 +"\n         parm.fld \"Настройка\",						       " 
+				 +"\n         parm.t_name, 									" 
+				 +"\n         CASE parm.t_type 								" 
+				 +"\n            WHEN 0 THEN TO_CHAR (v.t_lintvalue) 					" 
+				 +"\n            WHEN 1 THEN TO_CHAR (v.t_ldoublevalue) 				" 
+				 +"\n            WHEN 2 THEN rsb_struct.getString (v.T_FMTBLOBDATA_XXXX) 		" 
+				 +"\n            WHEN 4 THEN CHR (v.t_lintvalue) 					" 
+				 +"\n            ELSE ' ' 									" 
+				 +"\n         END 										" 
+				 +"\n            \"Значение\" 								" 
+				 +"\n  FROM   (    SELECT   t.t_keyid, 							" 
+				 +"\n                       t_type, 							" 
+				 +"\n                       SUBSTR (SYS_CONNECT_BY_PATH (t.t_name, '\\'), 2) fld, 	" 
+				 +"\n                       t.t_name 							" 
+				 +"\n                FROM   dregparm_dbt t 						" 
+				 +"\n          START WITH   t.t_parentid = 0 						" 
+				 +"\n          CONNECT BY   PRIOR t.t_keyid = t.t_parentid) parm, dregval_dbt v 	" 
+				 +"\n WHERE       v.t_keyid = parm.t_keyid 						" 
+				 +"\n         AND parm.fld LIKE 'PRBB\\МИГРЕЙТ\\DBLINK\\%' 				" 
+				 +"\n         AND parm.t_type = 2	 							";
+	var rsd_LoadDBLink = RsdRecordSet(RsdCommand(sql_LoadDBLink));
+	while (rsd_LoadDBLink.movenext())
+//		msgbox(rsd_LoadDBLink.value(0) + " -- " + rsd_LoadDBLink.value(1) + " -- " + rsd_LoadDBLink.value(2) + " -- " + rsd_LoadDBLink.value(3));
+		DBLinkObject_arr(rsd_LoadDBLink.value(0)) = TDBLinkObject(rsd_LoadDBLink.value(1), rsd_LoadDBLink.value(2), rsd_LoadDBLink.value(3));
+		DBLinkObject_arr(rsd_LoadDBLink.value(0)).cValidate = ValidateDBLink(DBLinkObject_arr(rsd_LoadDBLink.value(0)));
+		DBLinkObject_arr(rsd_LoadDBLink.value(0)).cLoad = false;
+		if (not DBLinkObject_arr(rsd_LoadDBLink.value(0)).CValidate)
+			showreport=true;
+			TimeStampMessage("Инициализация: Найден не валидный DBLink:" + DBLinkObject_arr(rsd_LoadDBLink.value(0)).CName + "("+DBLinkObject_arr(rsd_LoadDBLink.value(0)).CValue+")");
+			TimeStampMessage("Инициализация: 	Путь в реестре: " +  DBLinkObject_arr(rsd_LoadDBLink.value(0)).CPreference)
+		else
+			TimeStampMessage("Инициализация: Валидный DBLink:" + DBLinkObject_arr(rsd_LoadDBLink.value(0)).CName + "("+DBLinkObject_arr(rsd_LoadDBLink.value(0)).CValue+")");
+			TimeStampMessage("Инициализация: 	Путь в реестре: " +  DBLinkObject_arr(rsd_LoadDBLink.value(0)).CPreference)			
+		end;
+	end;
+	if (showreport)
+              TimeStampMessage("======================================================================================================================");
+              TimeStampMessage("Инициализация: Внимание! Нельзя подключиться к схемам для которых существуют НЕ ВАЛИДНЫЕ DBLink'и.");
+		TimeStampMessage("Инициализация: Для повторной валидации  и/или настройки, перейдите на закладку НАСТРОЙКИ.");
+              TimeStampMessage("Инициализация: Для продолжения закройте это окно.");
+              TimeStampMessage("======================================================================================================================");
+		SetOutput (NULL,TRUE);
+		ViewFile (TxtFileDir + "\\" + "Migrate" + "_"+  path_date + "_" + path_time + ".log");
+		SetOutput (TxtFileDir + "\\" + "Migrate" + "_"+  path_date + "_" + path_time + ".log", TRUE);
+	end;
+	/* = End = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =Загрузка и валидация DBLINK*/
+	/* = Start = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = Определяем текущую схему*/
+	var sql_CurrentScheme = "select sys.login_user from dual";
+	var rsd_CurrentScheme = RsdRecordSet(RsdCommand(sql_CurrentScheme));
+	if (rsd_CurrentScheme.movenext())
+		CurrentScheme = rsd_CurrentScheme.value(0);
+	else
+		if (MsgBoxEx ( "Не удалось определить имя текущей схемы", MB_YES+MB_NO, IND_NO, "Предупреждение" ) == IND_NO )
+			TimeStampMessage("Не удалось определить имя текущей схемы");
+			exit();
+		else
+			TimeStampMessage("Не удалось определить имя текущей схемы");
+		end;
+	end;
+	/* = End = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = Определяем текущую схему*/
+end;
+
+/*  =Start================================================= Мигрируем страны */
+macro MigrateCountry()
+	var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+	BegAction(0, "Подсчет записей в справочнике стран эталона", false);
+	TimeStampMessage("Справочник стран: Подсчет записей в справочнике стран эталона");
+	var sql_EtalonCountry = "select count(*) from dcountry_dbt;";
+	var rsd_EtalonCountry = RsdRecordSet(RsdCommand(sql_EtalonCountry));
+	if (rsd_EtalonCountry.movenext())
+		EtalonCount = int(rsd_EtalonCountry.value(0));
+		TimeStampMessage("Справочник стран: Всего записей в справочнике стран эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Справочник стран: Ошибка подсчёта записей в справочнике стран эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage("Справочник стран: " + CurrentScheme);
+		TimeStampMessage("Справочник стран: " + sql_EtalonCountry);
+	end;
+	EndAction(0);
+       kk = 0; 
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет записей в справочнике стран схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Справочник стран: Подсчет записей в справочнике стран схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentCountry = "select count(*) from dcountry_dbt@"+DBLinkObject_arr(kk).cValue+";";
+			var rsd_CurrentCountry = RsdRecordSet(RsdCommand(sql_CurrentCountry));
+			if (rsd_CurrentCountry.movenext())
+				CurrentCount = int(rsd_CurrentCountry.value(0));
+				TimeStampMessage("Справочник стран: 	Всего записей в справочнике стран: "+ CurrentCount);
+			else
+				TimeStampMessage("Справочник стран: 	Ошибка подсчёта записей в справочнике стран (Резервное восстановление не требуется): ");
+				TimeStampMessage("Справочник стран: " + DBLinkObject_arr(kk).cValue);
+				TimeStampMessage("Справочник стран: " + sql_CurrentCountry);
+			end;
+			EndAction(0);
+			BegAction(0, "Резервное копирование справочника стран схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование: Резервное копирование справочника стран схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+       		var TSBU = TimeStampBackUp();
+			var sql_BackUpCountry = "BEGIN " 
+						   +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DCOUNTRY_B"+TSBU+" AS SELECT * FROM dcountry_dbt'); " 
+						   +"\n END; ";
+			var rsd_BackUpCountry = RsdCommand(sql_BackUpCountry);		
+			rsd_BackUpCountry.execute;
+			TimeStampMessage("Резервное копирование справочника стран (DCOUNTRY_B"+TSBU+")");		
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DCOUNTRY_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Резервное копирование: Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+     			end;
+			var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("DCOUNTRY_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     EndAction(0);	
+
+			BegAction(0, "Обновление справочника стран на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+			if (m_CheckBox_DebugQuery.checked)
+                           //debugbreak;
+                            DebugCnt = 0;
+				sql_DebugQuery = " (select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID, "
+                                          +"\n         decode(T_RISKCLASS, null, chr(0), T_RISKCLASS) from dcountry_dbt@"+DBLinkObject_arr(kk).cValue+") "
+	       				+"\n	MINUS "
+						+"\n (select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID, "
+                                          +"\n         decode(T_RISKCLASS, null, chr(0), T_RISKCLASS) from dcountry_dbt)";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Справочник стран. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")","dcountry_dbt");  
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(7, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            sql_DebugQuery = " Delete from dcountry_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where (t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID) in "
+                                          +"\n            ((select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID  from dcountry_dbt@"+DBLinkObject_arr(kk).cValue+") "
+	       				+"\n	            MINUS "
+						+"\n            (select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID from dcountry_dbt))";
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+				DebugCnt = 0;
+				sql_DebugQuery = " (select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID, "
+                                          +"\n         decode(T_RISKCLASS, null, chr(0), T_RISKCLASS)  from dcountry_dbt) "
+	       				+"\n	MINUS "
+						+"\n (select t_name, t_codecyr3, t_codelat2, t_codelat3, t_fullname, T_PARENTCOUNTRYID, "
+                                          +"\n         decode(T_RISKCLASS, null, chr(0), T_RISKCLASS) from dcountry_dbt@"+DBLinkObject_arr(kk).cValue+")";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Справочник стран. Добавление записей", "dcountry_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(7, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+			end;
+
+			if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+				TimeStampMessage("Справочник стран не нуждается в обновлении");		
+			else
+		            sql_MergeQuery = "MERGE INTO   dcountry_dbt@"+DBLinkObject_arr(kk).cValue+" a " 
+			+"\n			     USING   ( (SELECT   t_name, t_codecyr3, t_codelat2, t_codelat3, t_codenum3, t_fullname, T_PARENTCOUNTRYID, T_RISKCLASS " 
+			+"\n			                       FROM   dcountry_dbt) " 
+			+"\n			                   MINUS " 
+			+"\n			                   (SELECT   t_name, t_codecyr3, t_codelat2, t_codelat3, t_codenum3, t_fullname, T_PARENTCOUNTRYID, T_RISKCLASS " 
+			+"\n			                      FROM   dcountry_dbt@"+DBLinkObject_arr(kk).cValue+")) b " 
+			+"\n			             ON   (a.t_name = b.t_name) " 
+			+"\n			     WHEN MATCHED " 
+			+"\n			     THEN " 
+			+"\n			        UPDATE SET " 
+			+"\n			           a.T_CODECYR3 = b.T_CODECYR3, a.T_CODELAT2 = b.T_CODELAT2, a.T_CODELAT3 = b.T_CODELAT3, a.T_CODENUM3 = b.T_CODENUM3, " 
+			+"\n			           a.T_FULLNAME = b.T_FULLNAME, a.T_PARENTCOUNTRYID = b.T_PARENTCOUNTRYID, a.T_RISKCLASS = b.T_RISKCLASS " 
+			+"\n			     WHEN NOT MATCHED " 
+			+"\n			     THEN " 
+			+"\n			        INSERT              (a.T_NAME, a.T_CODECYR3, a.T_CODELAT2, a.T_CODELAT3, a.T_CODENUM3, a.T_COUNTRYID, a.T_FULLNAME, a.T_PARENTCOUNTRYID, a.T_RISKCLASS) " 
+			+"\n			            VALUES   (b.T_NAME, b.T_CODECYR3, b.T_CODELAT2, b.T_CODELAT3, b.T_CODENUM3, 0, b.T_FULLNAME, b.T_PARENTCOUNTRYID, b.T_RISKCLASS) ";
+				rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+				rsd_MergeQuery.execute();
+			end;
+			EndAction(0);
+		
+			TimeStampMessage("Миграция справочника стран успешно завершена.");
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]	
+end;
+/*  =End================================================== Мигрируем страны */
+/*  =Start================================================ Мигрируем пользовательские модули */
+macro MigrateUserMod()
+	var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+	BegAction(0, "Подсчет записей в справочнике пользовательских модулей эталона", false);
+	TimeStampMessage("Пользовательские модули: Подсчет записей в справочнике пользовательских модулей");
+	var sql_EtalonUserMod = "select count(*) from ditemuser_dbt; ";
+	var rsd_EtalonUserMod = RsdRecordSet(RsdCommand(sql_EtalonUserMod));
+	if (rsd_EtalonUserMod.movenext())
+		EtalonCount = int(rsd_EtalonUserMod.value(0));
+		TimeStampMessage("Пользовательские модули: Всего записей в справочнике пользовательских модулей эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Пользовательские модули: Ошибка подсчёта записей в справочнике пользовательских модулей эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_EtalonUserMod);
+	end;
+	EndAction(0);
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+
+			BegAction(0, "Подсчет записей в справочнике пользовательских модулей схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Пользовательские модули: Подсчет записей в справочнике пользовательских модулей схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentUserMod = "select count(*) from ditemuser_dbt@"+DBLinkObject_arr(kk).cValue+"; ";
+			var rsd_CurrentUserMod = RsdRecordSet(RsdCommand(sql_CurrentUserMod));
+			if (rsd_CurrentUserMod.movenext())
+				CurrentCount = int(rsd_CurrentUserMod.value(0));
+				TimeStampMessage("Пользовательские модули: Всего записей в справочнике пользовательских модулей: "+ CurrentCount);
+			else
+				TimeStampMessage("Пользовательские модули: Ошибка подсчёта записей в справочнике пользовательских модулей (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentUserMod);
+			end;
+			EndAction(0);
+	
+			BegAction(0, "Резервное копирование справочника пользовательских модулей схемы " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование справочника пользовательских модулей схемы " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+       		var TSBU = TimeStampBackUp();
+                     /* Бэкап  ditemuser_dbt */
+ 			var sql_BackUpUserMod = "BEGIN " 
+						   +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DITEMUSER_B"+TSBU+" AS SELECT * FROM ditemuser_dbt'); " 
+						   +"\n END; ";
+			var rsd_BackUpUserMod = RsdCommand(sql_BackUpUserMod);		
+			rsd_BackUpUserMod.execute;
+                     TimeStampMessage("Резервное копирование справочника пользовательских модулей текущей схемы завершено (DITEMUSER_B"+TSBU+")");		
+                     var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DITEMUSER_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+     			end;
+ 			
+                     var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+ 				SearchOldestCopy("DITEMUSER_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     EndAction(0);	
+
+			BegAction(0, "Обновление справочника пользовательских модулей на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+		       //debugbreak;
+			if (m_CheckBox_DebugQuery.checked)
+                            DebugCnt = 0;
+				sql_DebugQuery = "(SELECT   t_cidentprogram, t_icaseitem FROM   ditemuser_dbt@"+DBLinkObject_arr(kk).cValue+" ) "
+						+"\n	MINUS "
+						+"\n (SELECT   t_cidentprogram, t_icaseitem FROM ditemuser_dbt) ";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Пользовательские модули. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "ditemuser_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(2, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+
+                            sql_DebugQuery = " delete from ditemuser_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where (t_cidentprogram, t_icaseitem, T_SZNAMEITEM) in " 
+                                          +"\n             ((SELECT   t_cidentprogram, t_icaseitem, T_SZNAMEITEM FROM ditemuser_dbt@"+DBLinkObject_arr(kk).cValue+" ) "
+                                          +"\n             MINUS "
+                                          +"\n            (SELECT   t_cidentprogram, t_icaseitem, T_SZNAMEITEM FROM ditemuser_dbt)) ";
+                            rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+ 
+                            DebugCnt = 0;
+				sql_DebugQuery = "(SELECT   t_cidentprogram, t_icaseitem FROM   ditemuser_dbt ) "
+						+"\n	MINUS "
+						+"\n (SELECT   t_cidentprogram, t_icaseitem FROM ditemuser_dbt@"+DBLinkObject_arr(kk).cValue+") ";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Пользовательские модули. Добавление записей", "ditemuser_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(2, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+			end;
+	
+			//debugbreak;
+			if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+				TimeStampMessage("Справочник пользовательских модулей не нуждается в обновлении");		
+			else
+		              sql_MergeQuery = "MERGE INTO   ditemuser_dbt@" + DBLinkObject_arr(kk).cValue + " a " 
+						+"\n	     USING   (SELECT   * " 
+						+"\n	                FROM   ditemuser_dbt"
+						+"\n	               WHERE   (t_cidentprogram, t_icaseitem) IN " 
+						+"\n	                             ( (SELECT   t_cidentprogram, t_icaseitem " 
+						+"\n	                                  FROM   ditemuser_dbt) " 
+						+"\n	                              MINUS " 
+						+"\n	                              (SELECT   t_cidentprogram, t_icaseitem " 
+						+"\n	                                 FROM   ditemuser_dbt@"+DBLinkObject_arr(kk).cValue+"))) b " 
+						+"\n	        ON   (a.t_cidentprogram = b.t_cidentprogram " 
+						+"\n	              AND a.t_icaseitem = b.t_icaseitem) " 
+						+"\n	WHEN MATCHED " 
+						+"\n	THEN " 
+						+"\n	   UPDATE SET " 
+						+"\n	      a.t_ikindmethod = b.t_ikindmethod, a.t_ikindprogram = b.t_ikindprogram, a.t_ihelp = b.t_ihelp, " 
+						+"\n	      a.t_reserve = b.t_reserve, a.t_sznameitem = b.t_sznameitem, a.t_parm = b.t_parm " 
+						+"\n	WHEN NOT MATCHED " 
+						+"\n	THEN " 
+						+"\n	   INSERT " 
+						+"\n	        (a.T_CIDENTPROGRAM, a.T_ICASEITEM, a.T_IKINDMETHOD, a.T_IKINDPROGRAM, a.T_IHELP, a.T_RESERVE, a.T_SZNAMEITEM, a.T_PARM) " 
+						+"\n	   VALUES " 
+						+"\n	        (b.T_CIDENTPROGRAM, b.T_ICASEITEM, b.T_IKINDMETHOD, b.T_IKINDPROGRAM, b.T_IHELP, b.T_RESERVE, b.T_SZNAMEITEM, b.T_PARM); ";
+				rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+				rsd_MergeQuery.execute();
+			end;
+			EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]
+	TimeStampMessage("Миграция справочника пользовательских модулей успешно завершена.");	
+end;
+/*  =End================================================== Мигрируем пользовательские модули */
+/*  =Start================================================ Мигрируем реестр */
+macro MigrateReg()
+       //debugbreak;
+	var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+	var sql_EtalonReg;
+	var rsd_EtalonReg;
+
+	BegAction(0, "Строим дерево реестра для схемы эталона", false);
+	TimeStampMessage("Реестр: Строим дерево реестра для схемы эталона");
+	var sql_genRegTree = " call get_reg_tree ('', 0, 1); ";
+	var rsd_genRegTree = RsdCommand(sql_genRegTree);	
+	rsd_genRegTree.execute;
+	TimeStampMessage("Реестр: Дерево реестра для схемы эталона успешно построено");
+	EndAction(0);
+
+	BegAction(0, "Подсчет записей в реестре эталона", false);
+	TimeStampMessage("Реестр: Подсчет записей в реестре эталона");
+	sql_EtalonReg = "select count(*) from reg_tree; ";
+	rsd_EtalonReg = RsdRecordSet(RsdCommand(sql_EtalonReg));
+	if (rsd_EtalonReg.movenext())
+		EtalonCount = int(rsd_EtalonReg.value(0));
+		TimeStampMessage("Реестр: Всего записей в реестре эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Реестр: Ошибка подсчёта записей в реестре эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_EtalonReg);
+	end;
+	EndAction(0);
+
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+
+			BegAction(0, "Строим дерево реестра для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Реестр: Строим дерево реестра для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			sql_genRegTree = " call	get_reg_tree@"+DBLinkObject_arr(kk).cValue+" ('', 0, 1); ";
+			rsd_genRegTree = RsdCommand(sql_genRegTree);	
+			rsd_genRegTree.execute;
+			TimeStampMessage("Реестр: Дерево реестра успешно построено");
+			EndAction(0);
+		
+			BegAction(0, "Подсчет записей в реестре схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Реестр: Подсчет записей в реестре схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentReg = "select count(*) from reg_tree@"+DBLinkObject_arr(kk).cValue+"; ";
+			var rsd_CurrentReg = RsdRecordSet(RsdCommand(sql_CurrentReg));
+			if (rsd_CurrentReg.movenext())
+				CurrentCount = int(rsd_CurrentReg.value(0));
+				TimeStampMessage("Реестр: Всего записей в реестре схемы: "+ CurrentCount);
+			else
+				TimeStampMessage("Реестр: Ошибка подсчёта записей в реестре (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentReg);
+			end;
+			EndAction(0);
+		
+			BegAction(0, "Резервное копирование реестра схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")" , false);
+			TimeStampMessage("Резервное копирование реестра схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+       		var TSBU = TimeStampBackUp();
+			var sql_BackUpReg = 	"BEGIN " 
+						+"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DREGPARM_B"+TSBU+" AS SELECT * FROM dregparm_dbt'); " 
+						+"\n END; ";
+
+			var rsd_BackUpReg = RsdCommand(sql_BackUpReg);		
+			rsd_BackUpReg.execute;
+			TimeStampMessage("Резервное копирование реестра завершено (DREGPARM_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DREGPARM_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+     			end;
+			
+		       var BackUpCount = int(rsd_BackUpCount.value(0));
+			if(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("DREGPARM_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     
+			EndAction(0);	
+
+			//BegAction(0, "Обновление реестра на текущей схеме: " + CurrentScheme, false);	
+		
+			if (m_CheckBox_DebugQuery.checked)
+		//		DebugBreak;	
+				DebugCnt = 0;
+				sql_DebugQuery = "(SELECT   T_PATH FROM   reg_tree) "
+						+"\n	MINUS "
+						+"\n (SELECT   T_PATH FROM reg_tree@"+DBLinkObject_arr(kk).cValue+") ";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Реестр", "dregparm_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(1, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+			end;
+			if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+				TimeStampMessage("Реестр не нуждается в обновлении");		
+			else
+				sql_MergeQuery = " SELECT   T_Path, T_Type, NVL(decode(T_Global, chr(88), chr(88), ''), chr(1)) T_Global, T_Description, NVL(decode(T_Security, chr(88), chr(88), ''), chr(1)) T_Security " 
+						+"\n  FROM   reg_tree " 
+						+"\n WHERE   T_PATH IN " 
+						+"\n               ( (SELECT   T_PATH FROM reg_tree ) " 
+						+"\n                MINUS " 
+						+"\n                (SELECT   T_PATH FROM reg_tree@"+DBLinkObject_arr(kk).cValue+" )); ";
+				rsd_MergeQuery = RsdRecordSet(RsdCommand(sql_MergeQuery));
+				var global = "";
+				var secury = "";
+				var sql_regtempq;
+				var rsd_regtempq;
+       			var cmd;
+				var stmp = "";
+				var vtmp = "";
+				var tkey = 0;
+
+                            BegAction(0, "Обновление реестра на схеме: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+				while (rsd_MergeQuery.movenext())                                                                                                            
+//					msgbox(rsd_MergeQuery.value(0));
+					stmp = substr(rsd_MergeQuery.value(0), 2);
+                                   if (strBrk(stmp, "\\") == 0)
+                                      tkey = 0;
+                                   end;
+					vtmp = "";
+					while (strBrk(stmp, "\\") != 0)
+						vtmp = vtmp + substr(stmp, 1, strBrk(stmp, "\\"));
+//						msgbox(substr(stmp, 1, strBrk(stmp, "\\")-1));
+						stmp = substr(stmp, strBrk(stmp, "\\")+1);
+//						msgbox(substr(vtmp, 1, strlen(vtmp)-1));
+						sql_regtempq = " SELECT   p.t_keyid " 
+								+"\n  FROM   (    SELECT   t_keyid, " 
+								+"\n                       UPPER (SUBSTR (SYS_CONNECT_BY_PATH (t_name, '|'), 2)) PATH " 
+								+"\n                FROM   dregparm_dbt@"+DBLinkObject_arr(kk).cValue+" " 
+								+"\n          START WITH   t_parentid = 0 " 
+								+"\n          CONNECT BY   t_parentid = PRIOR t_keyid) p " 
+								+"\n WHERE   p.PATH = UPPER(TRANSLATE ('"+substr(vtmp, 1, strlen(vtmp)-1)+"', '\\', '|' )); ";
+						rsd_regtempq = RsdRecordSet(RsdCommand(sql_regtempq));
+						if (rsd_regtempq.MoveNext())
+//							MsgBox(rsd_regtempq.value(0));
+							tkey = rsd_regtempq.value(0);
+						else
+//							MsgBox("INSERT");
+						       cmd = RsdCommand("begin ? := insregpath@"+DBLinkObject_arr(kk).cValue+"(?,?,?,?,?,?); end;");
+ 							cmd.addParam("RetValue"       , RSDBP_RETVAL, V_INTEGER,35);  
+							cmd.addParam("pkeyid_in"      , RSDBP_IN, tkey);         
+							cmd.addParam("NAME_IN"        , RSDBP_IN, substr(stmp, 1, strBrk(stmp, "\\")-1));         
+ 							cmd.addParam("type_in"        , RSDBP_IN, rsd_MergeQuery.value(1));   
+ 							cmd.addParam("global_in"      , RSDBP_IN, rsd_MergeQuery.value(2));   
+ 							cmd.addParam("description_in" , RSDBP_IN, rsd_MergeQuery.value(3));   
+ 							cmd.addParam("security_in"    , RSDBP_IN, rsd_MergeQuery.value(4));  
+
+                                                 cmd.execute();
+							tkey = cmd.Param("RetValue").value; 
+//							MsgBox(tkey);
+						end;
+					end;
+//					msgbox(stmp);
+//					msgbox(vtmp+stmp);
+					sql_regtempq = " SELECT   p.t_keyid " 
+							+"\n  FROM   (    SELECT   t_keyid, " 
+							+"\n                       UPPER (SUBSTR (SYS_CONNECT_BY_PATH (t_name, '|'), 2)) PATH " 
+							+"\n                FROM   dregparm_dbt@"+DBLinkObject_arr(kk).cValue+" " 
+							+"\n          START WITH   t_parentid = 0 " 
+							+"\n          CONNECT BY   t_parentid = PRIOR t_keyid) p " 
+							+"\n WHERE   p.PATH = UPPER(TRANSLATE ('"+(vtmp+stmp)+"', '\\', '|' )); ";
+					rsd_regtempq = RsdRecordSet(RsdCommand(sql_regtempq));
+					if (rsd_regtempq.MoveNext())
+//						MsgBox(rsd_regtempq.value(0));
+						tkey = rsd_regtempq.value(0);
+					else
+//						MsgBox("INSERT");
+//                                          debugbreak;
+						cmd = RsdCommand("begin ? := insregpath@"+DBLinkObject_arr(kk).cValue+"(?,?,?,?,?,?); end;");
+ 						cmd.addParam("RetValue", RSDBP_RETVAL, V_INTEGER,35);
+ 						cmd.addParam("pkeyid_in"      , RSDBP_IN, tkey);         
+ 						cmd.addParam("NAME_IN"        , RSDBP_IN, stmp);         
+ 						cmd.addParam("type_in"        , RSDBP_IN, rsd_MergeQuery.value(1));   
+ 						cmd.addParam("global_in"      , RSDBP_IN, rsd_MergeQuery.value(2));   
+ 						cmd.addParam("description_in" , RSDBP_IN, rsd_MergeQuery.value(3));   
+ 						cmd.addParam("security_in"    , RSDBP_IN, rsd_MergeQuery.value(4));   
+ 
+                                          cmd.execute();
+						tkey = cmd.Param("RetValue").value; 
+//						MsgBox(tkey);					
+					end;
+				end;
+                            EndAction(0);
+			end;
+			//EndAction(0);
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]
+
+	TimeStampMessage("Миграция реестра успешно завершена.");	
+end;
+/*  =End================================================== Мигрируем реестр */
+//Gurin S. 17.12.2012 C-15303   
+/*  =Start================================================ Мигрируем привилегии СУД */
+macro MigrateSUDPriv()
+       //dacsrestgroup_dbt !!!!!
+       //dacsrestrict_dbt !!!!!
+       //debugbreak;
+       var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+       BegAction(0, "Подсчет количества привилегий эталона", false);
+	TimeStampMessage("Роли: Подсчет количества привилегий эталона");
+       var sql_EtalonPrivItem = " SELECT   COUNT ( * ) FROM dacsrestgroup_dbt ";
+	var rsd_EtalonPrivItem = RsdRecordSet(RsdCommand(sql_EtalonPrivItem));
+	if (rsd_EtalonPrivItem.movenext())
+		EtalonCount = rsd_EtalonPrivItem.value(0);
+		TimeStampMessage("Привилегии: Всего ролей эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Роли: Ошибка подсчёта количества привилегий эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_EtalonPrivItem);
+	end;
+	EndAction(0);
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет количества привилегий для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+      				TimeStampMessage("Роли: Подсчет количества привилегий для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentPrivItem = " SELECT   COUNT ( * ) FROM dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue; 
+			var rsd_CurrentPrivItem = RsdRecordSet(RsdCommand(sql_CurrentPrivItem));
+			if (rsd_CurrentPrivItem.movenext())
+				CurrentCount = rsd_CurrentPrivItem.value(0);
+				TimeStampMessage("Всего привилегий текущей схемы");
+			else
+				TimeStampMessage("Ошибка подсчёта количества привилегий (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentPrivItem);
+			end;
+			EndAction(0);
+
+                     BegAction(0, "Резервное копирование привилегий схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование привилегий схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var TSBU = TimeStampBackUp();
+			/* Бэкап  dacsrestgroup */
+                     var sql_BackUpRoleItem = "BEGIN " 
+						    +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DACSRESTGROUP_B"+TSBU+" AS SELECT * FROM dacsrestgroup_dbt'); " 
+						    +"\n END; ";
+			var rsd_BackUpRoleItem = RsdCommand(sql_BackUpRoleItem);
+			rsd_BackUpRoleItem.execute;
+                     TimeStampMessage("Резервное копирование привилегий завершено (DACSRESTGROUP_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DACSRESTGROUP_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+			var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("dacsrestgroup_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+
+                     ///
+                     TimeStampMessage("Резервное копирование ограничений привилегий СУД схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			TSBU = TimeStampBackUp();
+			/* Бэкап  dacsrestrict */
+                     sql_BackUpRoleItem = "BEGIN "                                                                               
+						    +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DACSRESTRICT_B"+TSBU+" AS SELECT * FROM dacsrestrict_dbt'); " 
+						    +"\n END; ";
+			rsd_BackUpRoleItem = RsdCommand(sql_BackUpRoleItem);
+			rsd_BackUpRoleItem.execute;
+                     TimeStampMessage("Резервное копирование ограничений привилегий СУД завершено (DACSRESTRICT_B"+TSBU+")");		
+
+			sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DACSRESTRICT_B%';";
+			rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+			BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("dacsrestrict_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     ///
+			
+                     EndAction(0);
+	
+                     BegAction(0, "Обновление справочника привилегий на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+
+                     if (m_CheckBox_DebugQuery.checked)
+                            DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_RESTGROUPID, T_PRIVID, T_RESTID, T_ITEMLEVEL, T_ITEMID "    
+						+"\n	 FROM   dacsrestgroup_dbt " 
+                                          +"\n   WHERE   (T_PRIVID, T_ITEMID) IN "         
+                                          +"\n                 ( (SELECT   T_PRIVID, T_ITEMID "
+                                          +"\n                      FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+						+"\n                  MINUS " 
+						+"\n                  (SELECT   T_PRIVID, T_ITEMID "
+						+"\n                     FROM   dacsrestgroup_dbt))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Привилегии. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dacsrestgroup_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(5, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            //Gurin S. 08.07.2014 R-365941-3 Удаляем сами ограничение привилегии СУД с банка приемника
+                            sql_DebugQuery = "   BEGIN "
+                                            +"\n    FOR r "
+                                            +"\n    IN (SELECT   t_restid id "
+                                            +"\n          FROM   dacsrestgroup_dbt "
+                                            +"\n         WHERE   t_restid IN "
+                                            +"\n                       (SELECT t_restid "
+                                            +"\n                          FROM ( (SELECT t_restid, t_restkind, t_restvalue "
+                                            +"\n                                    FROM dacsrestrict_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+                                            +"\n                                MINUS "
+                                            +"\n                                (SELECT t_restid, t_restkind, t_restvalue "
+                                            +"\n                                   FROM dacsrestrict_dbt)))) "
+                                            +"\n    LOOP "
+                                            +"\n       DELETE FROM dacsrestrict_dbt@"+DBLinkObject_arr(kk).cValue+" WHERE t_restid = r.id; "
+                                            +"\n       DELETE FROM dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+" WHERE t_restid = r.id; "
+                                            +"\n       COMMIT; "
+                                            +"\n    END LOOP; "
+                                            +"\n END; ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+                            sql_DebugQuery = " delete from dacsrestrict_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where t_restid in "
+                                          +"\n         (select t_restid from dacsrestgroup_dbt where "
+                                          +"\n                 ( t_privid,  t_itemid) in "
+						+"\n	                       ( (SELECT    t_privid,  t_itemid "
+                                          +"\n                              FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+						+"\n	                         MINUS " 
+						+"\n	                         (SELECT    t_privid,  t_itemid "
+						+"\n	                            FROM   dacsrestgroup_dbt))) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+                            sql_DebugQuery = " delete from dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where ( t_privid,  t_itemid) in "
+						+"\n	                       ( (SELECT    t_privid,  t_itemid "
+                                          +"\n                              FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT    t_privid,  t_itemid "
+						+"\n	                          FROM   dacsrestgroup_dbt)) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+				DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_RESTGROUPID, T_PRIVID, T_RESTID, T_ITEMLEVEL, T_ITEMID "    
+						+"\n	 FROM   dacsrestgroup_dbt " 
+                                          +"\n   WHERE   (T_PRIVID, T_ITEMID) IN "         
+                                          +"\n                 ( (SELECT   T_PRIVID, T_ITEMID "
+                                          +"\n                      FROM   dacsrestgroup_dbt) " 
+						+"\n                  MINUS " 
+						+"\n                  (SELECT   T_PRIVID, T_ITEMID "
+						+"\n                     FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+"))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Привилегии. Добавление записей", "dacsrestgroup_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(5, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+                    end;
+
+                    if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+		          TimeStampMessage("Справочник привилегий не нуждается в обновлении");		
+		      else
+                        //TimeStampMessage("!");   
+
+                        sql_MergeQuery = " MERGE INTO   dacsrestrict_dbt@"+DBLinkObject_arr(kk).cValue+" a "
+                                       +"\n     USING   (SELECT   T_RESTID, T_RESTKIND, T_RESTVALUE "
+                                       +"\n                FROM   dacsrestrict_dbt "
+                                       +"\n               WHERE   T_RESTID IN "
+                                       +"\n                           (SELECT   t_restid "
+                                       +"\n                              FROM   dacsrestgroup_dbt "
+                                       +"\n                             WHERE   (T_PRIVID, T_ITEMID) IN " 
+                                       +"\n                                        ( (SELECT   T_PRIVID, T_ITEMID "
+                                       +"\n                                             FROM   dacsrestgroup_dbt) "
+                                       +"\n                                         MINUS "
+                                       +"\n                                         (SELECT   T_PRIVID, T_ITEMID "
+                                       +"\n                                            FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+")))) b"
+                                       +"\n        ON   (a.t_restid = b.t_restid) "
+                                       +"\n WHEN MATCHED "
+                                       +"\n THEN "
+                                       +"\n    UPDATE SET "
+                                       +"\n        a.T_RESTKIND = b.T_RESTKIND, a.T_RESTVALUE = b.T_RESTVALUE "
+                                       +"\n WHEN NOT MATCHED "
+                                       +"\n THEN "
+                                       +"\n    INSERT              (a.T_RESTID, a.T_RESTKIND, a.T_RESTVALUE) "
+                                       +"\n        VALUES   (b.T_RESTID, b.T_RESTKIND, b.T_RESTVALUE)";
+                        rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+		          rsd_MergeQuery.execute();
+
+                        sql_MergeQuery = " MERGE INTO   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+" a "
+                                       +"\n     USING   (SELECT   T_PRIVID, T_RESTID, T_ITEMLEVEL, T_ITEMID "
+                                       +"\n                FROM   dacsrestgroup_dbt "
+                                       +"\n               WHERE   (T_PRIVID, T_ITEMID) IN " 
+                                       +"\n                            ( (SELECT   T_PRIVID, T_ITEMID "
+                                       +"\n                                 FROM   dacsrestgroup_dbt) "
+                                       +"\n                             MINUS "
+                                       +"\n                            (SELECT   T_PRIVID, T_ITEMID "
+                                       +"\n                               FROM   dacsrestgroup_dbt@"+DBLinkObject_arr(kk).cValue+"))) b"
+                                       +"\n       ON   (a.T_PRIVID = b.T_PRIVID AND a.T_ITEMID = b.T_ITEMID) "
+                                       +"\n WHEN MATCHED "
+                                       +"\n THEN "
+                                       +"\n    UPDATE SET "
+                                       +"\n       a.T_RESTID = b.T_RESTID, a.T_ITEMLEVEL = b.T_ITEMLEVEL "
+                                       +"\n WHEN NOT MATCHED "
+                                       +"\n THEN " 
+                                       +"\n    INSERT              (a.T_PRIVID, a.T_RESTID, a.T_ITEMLEVEL, a.T_ITEMID) "
+                                       +"\n        VALUES   (b.T_PRIVID, b.T_RESTID, b.T_ITEMLEVEL, b.T_ITEMID) ";
+                        rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+		          rsd_MergeQuery.execute();
+		      end;
+
+		      EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]	
+       TimeStampMessage("Миграция справочника привилегий успешно завершена.");
+end;
+/*  =End================================================== привилегии СУД */
+//Gurin S. 17.12.2012 C-15303
+/*  =Start================================================ Мигрируем группы СУД */
+macro MigrateSUDGroup()
+	var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+	BegAction(0, "Подсчет количества групп СУД текущей схемы", false);
+	TimeStampMessage("Подсчет количества групп СУД текущей схемы");
+	var sql_CurrentSUDGroup = "select count(*) from dacsgroup_dbt; ";
+	var rsd_CurrentSUDGroup = RsdRecordSet(RsdCommand(sql_CurrentSUDGroup));
+	if (rsd_CurrentSUDGroup.movenext())
+		CurrentCount = int(rsd_CurrentSUDGroup.value(0));
+		TimeStampMessage("Всего групп СУД текущей схемы: "+ CurrentCount);
+	else
+		TimeStampMessage("Ошибка подсчёта количества групп СУД (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_CurrentSUDGroup);
+	end;
+	EndAction(0);
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет количества групп для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Группы: Подсчет количества групп для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentGroupItem = " SELECT   COUNT ( * ) FROM dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue; 
+			var rsd_CurrentGroupItem = RsdRecordSet(RsdCommand(sql_CurrentGroupItem));
+			if (rsd_CurrentGroupItem.movenext())
+				CurrentCount = rsd_CurrentGroupItem.value(0);
+				TimeStampMessage("Всего групп текущей схемы");
+			else
+				TimeStampMessage("Ошибка подсчёта количества групп (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentGroupItem);
+			end;
+			EndAction(0);
+
+                     BegAction(0, "Резервное копирование групп схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование групп схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var TSBU = TimeStampBackUp();
+			/* Бэкап  dacsgroup_dbt */
+                     var sql_BackUpGroupItem = 	"BEGIN " 
+						  +"\n     dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DACSGROUP_B"+TSBU+" AS SELECT * FROM dacsgroup_dbt'); " 
+						  +"\n  END; ";
+			var rsd_BackUpGroupItem = RsdCommand(sql_BackUpGroupItem);
+			rsd_BackUpGroupItem.execute;
+                     TimeStampMessage("Резервное копирование групп завершено (DREGPARM_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DACSGROUP_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+                     var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("dacsgroup_b", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     EndAction(0);
+	
+                     BegAction(0, "Обновление справочника групп на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+
+                     if (m_CheckBox_DebugQuery.checked)
+                            DebugCnt = 0;
+				sql_DebugQuery = "(SELECT   T_GROUPID, T_NAME, DECODE(T_COMMENT, null, CHR(0),T_COMMENT) T_COMMENT, "
+                                           +"\n         DECODE(T_ISNOTLOCAL, null, CHR(0), T_ISNOTLOCAL) T_ISNOTLOCAL, T_DEPARTMENT, "
+                                           +"\n         DECODE(T_ISOUTERSYSTEM, null, CHR(0), T_ISOUTERSYSTEM) T_ISOUTERSYSTEM"
+                                           +"\n  FROM   ( (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                           +"\n              FROM   dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue+") "
+                                           +"\n           MINUS "
+                                           +"\n           (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                           +"\n              FROM   dacsgroup_dbt))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Группы. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dacsgroup_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(6, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            sql_DebugQuery ="  delete from dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue
+                                           +"\n where (T_GROUPID, T_NAME, T_COMMENT) in "
+                                           +"\n     ((SELECT   T_GROUPID, T_NAME, T_COMMENT "
+                                           +"\n         FROM   ( (SELECT   T_GROUPID, T_NAME, T_COMMENT "
+                                           +"\n                     FROM   dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue+") "
+                                           +"\n                 MINUS "
+                                           +"\n                (SELECT   T_GROUPID, T_NAME, T_COMMENT " 
+                                           +"\n                   FROM   dacsgroup_dbt)))) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+                                                                                             
+				DebugCnt = 0;
+				sql_DebugQuery = "(SELECT   T_GROUPID, T_NAME, DECODE(T_COMMENT, null, CHR(0),T_COMMENT) T_COMMENT, "
+                                           +"\n         DECODE(T_ISNOTLOCAL, null, CHR(0), T_ISNOTLOCAL) T_ISNOTLOCAL, T_DEPARTMENT, "
+                                           +"\n         DECODE(T_ISOUTERSYSTEM, null, CHR(0), T_ISOUTERSYSTEM) T_ISOUTERSYSTEM"
+                                           +"\n  FROM   ( (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                           +"\n              FROM   dacsgroup_dbt) "
+                                           +"\n           MINUS "
+                                           +"\n           (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                           +"\n              FROM   dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue+"))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Группы. Добавление записей", "dacsgroup_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(6, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+                    end;
+
+                    if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+		          TimeStampMessage("Справочник групп не нуждается в обновлении");		
+		      else
+                        //TimeStampMessage("!");
+
+		          sql_MergeQuery = "  MERGE INTO   dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue+ " a "
+                                       +"\n       USING   (SELECT   * "
+                                       +"\n                  FROM   ( (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                       +"\n                              FROM   dacsgroup_dbt )"
+                                       +"\n                          MINUS "
+                                       +"\n                           (SELECT   T_GROUPID, T_NAME, T_COMMENT, T_ISNOTLOCAL, T_DEPARTMENT, T_ISOUTERSYSTEM "
+                                       +"\n                              FROM   dacsgroup_dbt@"+DBLinkObject_arr(kk).cValue+"))) b "
+                                       +"\n          ON   (A.T_groupID = B.T_groupID) "
+                                       +"\n  WHEN MATCHED "
+                                       +"\n  THEN "
+                                       +"\n     UPDATE SET "
+                                       +"\n       a.T_NAME = b.T_NAME, "
+                                       +"\n       a.T_COMMENT = b.T_COMMENT, "
+                                       +"\n       a.T_ISNOTLOCAL = b.T_ISNOTLOCAL, "
+                                       +"\n       a.T_DEPARTMENT = b.T_DEPARTMENT, "
+                                       +"\n       a.T_ISOUTERSYSTEM = b.T_ISOUTERSYSTEM "
+                                       +"\n  WHEN NOT MATCHED "
+                                       +"\n  THEN "
+                                       +"\n     INSERT (a.T_GROUPID, a.T_NAME, a.T_COMMENT, a.T_ISNOTLOCAL, a.T_DEPARTMENT, a.T_ISOUTERSYSTEM) "
+                                       +"\n     VALUES (b.T_GROUPID, b.T_NAME, b.T_COMMENT, b.T_ISNOTLOCAL, b.T_DEPARTMENT, b.T_ISOUTERSYSTEM); "; 
+		          rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+		          rsd_MergeQuery.execute();
+		      end;
+
+		      EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]
+
+	TimeStampMessage("Миграция справочника групп СУД успешно завершена.");
+       //надо и привилегии мигрейтить
+       //MigrateSUDPriv(); 
+end;
+/*  =End================================================== Мигрируем группы СУД */
+//Gurin S. 17.12.2012 C-15303   
+/*  =Start================================================ Мигрируем роли СУД */
+macro MigrateSUDRole()
+       //dacsrestgroup_dbt !!!!!
+
+       var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+       BegAction(0, "Подсчет количества ролей эталона", false);
+	TimeStampMessage("Роли: Подсчет количества ролей эталона");
+       var sql_EtalonRoleItem = " SELECT   COUNT ( * ) FROM dacsroletree_dbt ";
+	var rsd_EtalonRoleItem = RsdRecordSet(RsdCommand(sql_EtalonRoleItem));
+	if (rsd_EtalonRoleItem.movenext())
+		EtalonCount = rsd_EtalonRoleItem.value(0);
+		TimeStampMessage("Роли: Всего ролей эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Роли: Ошибка подсчёта количества ролей эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_EtalonRoleItem);
+	end;
+	EndAction(0);
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет количества ролей для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Роли: Подсчет количества ролей для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentRoleItem = " SELECT   COUNT ( * ) FROM dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue; 
+			var rsd_CurrentRoleItem = RsdRecordSet(RsdCommand(sql_CurrentRoleItem));
+			if (rsd_CurrentRoleItem.movenext())
+				CurrentCount = rsd_CurrentRoleItem.value(0);
+				TimeStampMessage("Всего ролей текущей схемы: "+ CurrentCount);
+			else
+				TimeStampMessage("Ошибка подсчёта количества ролей (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentRoleItem);
+			end;
+			EndAction(0);
+
+                     BegAction(0, "Резервное копирование ролей схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование ролей схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+                     //debugbreak;
+			var TSBU = TimeStampBackUp();
+			/* Бэкап  dacsroletree */
+                     var sql_BackUpRoleItem = "BEGIN " 
+						    +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DACSROLETREE_B"+TSBU+" AS SELECT * FROM dacsroletree_dbt'); " 
+						    +"\n END; ";
+			var rsd_BackUpRoleItem = RsdCommand(sql_BackUpRoleItem);
+			rsd_BackUpRoleItem.execute;
+                     TimeStampMessage("Резервное копирование ролей завершено (DACSROLETREE_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DACSROLETREE_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+			var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("dacsroletree_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+			
+                     EndAction(0);
+	
+                     BegAction(0, "Обновление справочника ролей на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+
+                     if (m_CheckBox_DebugQuery.checked)
+                            DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_ROLEID, T_PARENTID, T_NAME, "
+                                          +"\n          DECODE (T_COMMENT, NULL, ' ', CHR (0), ' ', T_COMMENT) T_COMMENT, "
+                                          +"\n          T_MENUID, "
+                                          +"\n          DECODE (T_ISOUTERSYSTEM, NULL, ' ', CHR (0), ' ', T_ISOUTERSYSTEM) T_ISOUTERSYSTEM "
+						+"\n	               FROM   ( (SELECT   T_ROLEID,T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+                                          +"\n                              FROM   dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_ROLEID,T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+						+"\n	                          FROM   dacsroletree_dbt))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Роли. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dacsroletree_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(6, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            sql_DebugQuery = " delete from dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where (T_ROLEID, T_PARENTID, T_NAME) in "
+                                          +"\n                 (SELECT   T_ROLEID, T_PARENTID, T_NAME "
+						+"\n	               FROM   ( (SELECT   T_ROLEID, T_PARENTID, T_NAME "
+                                          +"\n                              FROM   dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue+") " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_ROLEID, T_PARENTID, T_NAME "
+						+"\n	                          FROM   dacsroletree_dbt))) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+				DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_ROLEID, T_PARENTID, T_NAME, "
+                                          +"\n          DECODE (T_COMMENT, NULL, ' ', CHR (0), ' ', T_COMMENT) T_COMMENT, "
+                                          +"\n          T_MENUID, "
+                                          +"\n          DECODE (T_ISOUTERSYSTEM, NULL, ' ', CHR (0), ' ', T_ISOUTERSYSTEM) T_ISOUTERSYSTEM "
+						+"\n	               FROM   ( (SELECT   T_ROLEID,T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+                                          +"\n                              FROM   dacsroletree_dbt) " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_ROLEID,T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+						+"\n	                          FROM   dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue+"))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Роли. Добавление записей", "dacsroletree_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(6, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+                    end;
+
+                    if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+		          TimeStampMessage("Справочник ролей не нуждается в обновлении");		
+		      else
+                        //TimeStampMessage("!");
+
+                         sql_MergeQuery = "  MERGE INTO   dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue+ " a "
+                                       +"\n       USING   (SELECT   * "
+                                       +"\n                  FROM   ( (SELECT   T_ROLEID, T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+                                       +"\n                              FROM   dacsroletree_dbt )"
+                                       +"\n                          MINUS "
+                                       +"\n                           (SELECT   T_ROLEID, T_PARENTID, T_NAME, T_COMMENT, T_MENUID, T_ISOUTERSYSTEM "
+                                       +"\n                              FROM   dacsroletree_dbt@"+DBLinkObject_arr(kk).cValue+"))) b "
+                                       +"\n          ON   (A.T_roleID = B.T_roleID) "
+                                       +"\n  WHEN MATCHED "
+                                       +"\n  THEN "
+                                       +"\n     UPDATE SET "
+                                       +"\n       a.T_PARENTID = b.T_PARENTID, "
+                                       +"\n       a.T_NAME = b.T_NAME, "
+                                       +"\n       a.T_COMMENT = b.T_COMMENT, "
+                                       +"\n       a.T_MENUID = b.T_MENUID, "
+                                       +"\n       a.T_ISOUTERSYSTEM = b.T_ISOUTERSYSTEM "
+                                       +"\n  WHEN NOT MATCHED "
+                                       +"\n  THEN "
+                                       +"\n     INSERT (a.T_ROLEID, a.T_PARENTID, a.T_NAME, a.T_COMMENT, a.T_MENUID, a.T_ISOUTERSYSTEM) "
+                                       +"\n     VALUES (b.T_ROLEID, b.T_PARENTID, b.T_NAME, b.T_COMMENT, b.T_MENUID, b.T_ISOUTERSYSTEM); "; 
+		          rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+		          rsd_MergeQuery.execute();
+		      end;
+
+		      EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]	
+       TimeStampMessage("Миграция справочника ролей успешно завершена.");
+       //надо и привилегии мигрейтить
+       //MigrateSUDPriv(); 
+end;
+/*  =End================================================== роли СУД */
+//Gurin S. 17.12.2012 C-15303
+/*  =Start================================================ Мигрируем АРМ<->Роль */
+macro MigrateArmRole()
+	var EtalonCount:Integer = 0;
+	var CurrentCount:Integer = 0;
+	var Count:integer = 0;
+
+	BegAction(0, "Подсчет количества соответствий АРМ-Роли текущей схемы", false);
+	TimeStampMessage("Подсчет количества соответствий АРМ-Роли текущей схемы");
+	var sql_CurrentArmRole = "select count(*) from dpers_role_lnk; ";
+	var rsd_CurrentArmRole = RsdRecordSet(RsdCommand(sql_CurrentArmRole));
+	if (rsd_CurrentArmRole.movenext())
+		CurrentCount = int(rsd_CurrentArmRole.value(0));
+		TimeStampMessage("Всего соответствий АРМ-Роли текущей схемы: "+ CurrentCount);
+	else
+		TimeStampMessage("Ошибка подсчёта количества соответствий АРМ-Роли (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_CurrentArmRole);
+	end;
+	EndAction(0);
+       kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет количества соответствий АРМ-Роли для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Группы: Подсчет количества соответствий АРМ-Роли для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentArmRoleItem = " SELECT   COUNT ( * ) FROM dpers_role_lnk@"+DBLinkObject_arr(kk).cValue; 
+			var rsd_CurrentArmRoleItem = RsdRecordSet(RsdCommand(sql_CurrentArmRoleItem));
+			if (rsd_CurrentArmRoleItem.movenext())
+				CurrentCount = rsd_CurrentArmRoleItem.value(0);
+				TimeStampMessage("Всего соответствий АРМ-Роли текущей схемы");
+			else
+				TimeStampMessage("Ошибка подсчёта количества соответствий АРМ-Роли (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentArmRoleItem);
+			end;
+			EndAction(0);
+
+                     BegAction(0, "Резервное копирование соответствий АРМ-Роли схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование соответствий АРМ-Роли схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var TSBU = TimeStampBackUp();
+			/* Бэкап  dpers_role_lnk */
+                     var sql_BackUpArmRoleItem = "BEGIN " 
+						  +"\n     dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DPERS_ROLE_LNK_B"+TSBU+" AS SELECT * FROM dpers_role_lnk'); " 
+						  +"\n  END; ";
+			var rsd_BackUpArmRoleItem = RsdCommand(sql_BackUpArmRoleItem);
+			rsd_BackUpArmRoleItem.execute;
+                     TimeStampMessage("Резервное копирование соответствий АРМ-Роли завершено (DPERS_ROLE_LNK_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DPERS_ROLE_LNK_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+                     var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("dpers_role_lnk_b", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+                     EndAction(0);
+	
+                     BegAction(0, "Обновление справочника соответствий АРМ-Роли на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+
+                     if (m_CheckBox_DebugQuery.checked)
+                     //debugbreak;
+                            DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n   FROM   ( (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n               FROM dpers_role_lnk@"+DBLinkObject_arr(kk).cValue+") "
+                                           +"\n           MINUS "
+                                           +"\n           (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n              FROM   dpers_role_lnk))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("АРМ-Роли. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dpers_role_lnk");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(3, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            sql_DebugQuery = " delete from dpers_role_lnk@"+DBLinkObject_arr(kk).cValue
+                                           +"\n      where (T_MENUID, T_ROLEID, T_ACCESS_LEVEL) in "
+                                           +"\n             ((SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n                FROM   ( (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n                            FROM dpers_role_lnk@"+DBLinkObject_arr(kk).cValue+") "
+                                           +"\n                         MINUS "
+                                           +"\n                         (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "               
+                                           +"\n                            FROM   dpers_role_lnk)))) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+                                                                 
+				DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n   FROM   ( (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n               FROM dpers_role_lnk) "
+                                           +"\n           MINUS "
+                                           +"\n           (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                           +"\n              FROM   dpers_role_lnk@"+DBLinkObject_arr(kk).cValue+"))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("АРМ-Роли. Добавление записей", "dpers_role_lnk");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(3, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+                    end;
+
+                    if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+		          TimeStampMessage("Справочник соответствий АРМ-Роли не нуждается в обновлении");		
+		      else
+                        //debugbreak;
+                        //TimeStampMessage("!");
+
+                        sql_MergeQuery = "  MERGE INTO   dpers_role_lnk@"+DBLinkObject_arr(kk).cValue+ " a "
+                                       +"\n      USING   (SELECT   * "
+                                       +"\n                 FROM   ( (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                       +"\n                             FROM   dpers_role_lnk) "
+                                       +"\n                         MINUS "
+                                       +"\n                         (SELECT   T_MENUID, T_ROLEID, T_ACCESS_LEVEL "
+                                       +"\n                            FROM   dpers_role_lnk@"+DBLinkObject_arr(kk).cValue+"))) b"
+                                       +"\n         ON   (A.T_MenuID = B.T_MenuID AND A.T_RoleID = B.T_RoleID) "
+                                       +"\n WHEN MATCHED "
+                                       +"\n THEN "
+                                       +"\n    UPDATE SET "
+                                       +"\n      a.T_ACCESS_LEVEL = b.T_ACCESS_LEVEL "
+                                       +"\n WHEN NOT MATCHED "
+                                       +"\n THEN "
+                                       +"\n    INSERT              (a.T_MENUID, a.T_ROLEID, a.T_ACCESS_LEVEL) "
+                                       +"\n       VALUES   (b.T_MENUID, b.T_ROLEID, b.T_ACCESS_LEVEL); ";
+		          rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+		          rsd_MergeQuery.execute();
+		      end;
+
+		      EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]
+
+	TimeStampMessage("Миграция соответствий АРМ-Роли СУД успешно завершена.");
+end;
+/*  =End================================================== Мигрируем АРМ<->Роль */
+/*  =Start================================================ Мигрируем меню */
+macro MigrateUserMenuItem()
+	var EtalonCount:String = 0;
+	var CurrentCount:String = 0;
+	var Count:integer = 0;
+
+	BegAction(0, "Подсчет количества меню эталона", false);
+	TimeStampMessage("Меню: Подсчет количества меню эталона");
+	var sql_EtalonMenuItem = " SELECT   'tpl: ' " 
+				+"\n	         || (SELECT   COUNT ( * ) " 
+				+"\n	               FROM   (SELECT   * " 
+				+"\n	                         FROM   dmenutpl_dbt)) " 
+				+"\n	         || ' parm: ' " 
+				+"\n	         || (SELECT   COUNT ( * ) " 
+				+"\n	               FROM   (SELECT   * " 
+				+"\n	                         FROM   dmenutpl_dbt tpl, " 
+				+"\n	                                dmenuparm_dbt parm " 
+				+"\n	                        WHERE   tpl.t_menuid = parm.t_objectid " 
+				+"\n	                                AND parm.t_istemplate = 'X')) " 
+				+"\n	         || ' item: ' " 
+				+"\n	         || (SELECT   COUNT ( * ) " 
+				+"\n	               FROM   dmenutpl_dbt tpl, " 
+				+"\n	                      dmenuitem_dbt item " 
+				+"\n	              WHERE   tpl.t_menuid = item.t_objectid " 
+				+"\n	                      AND item.t_istemplate = 'X') " 
+				+"\n	  FROM   DUAL; ";
+	var rsd_EtalonMenuItem = RsdRecordSet(RsdCommand(sql_EtalonMenuItem));
+	if (rsd_EtalonMenuItem.movenext())
+		EtalonCount = rsd_EtalonMenuItem.value(0);
+		TimeStampMessage("Меню: Всего меню эталона: "+ EtalonCount);
+	else
+		TimeStampMessage("Меню: Ошибка подсчёта количества меню эталона (Резервное восстановление не требуется): ");
+		TimeStampMessage(DBLinkObject_arr(kk).cValue);
+		TimeStampMessage(sql_EtalonMenuItem);
+	end;
+	EndAction(0);
+	kk = 0;
+	while (kk != DBLinkObject_arr.Size)
+		if (DBLinkObject_arr(kk).cLoad)
+			BegAction(0, "Подсчет количества меню для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Меню: Подсчет количества меню для схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var sql_CurrentMenuItem = " SELECT   'tpl: ' " 
+						+"\n	         || (SELECT   COUNT ( * ) " 
+						+"\n	               FROM   (SELECT   * " 
+						+"\n	                         FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" )) " 
+						+"\n	         || ' parm: ' " 
+						+"\n	         || (SELECT   COUNT ( * ) " 
+						+"\n	               FROM   (SELECT   * " 
+						+"\n	                         FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+"  tpl, " 
+						+"\n	                                dmenuparm_dbt@"+DBLinkObject_arr(kk).cValue+"  parm " 
+						+"\n	                        WHERE   tpl.t_menuid = parm.t_objectid " 
+						+"\n	                                AND parm.t_istemplate = 'X')) " 
+						+"\n	         || ' item: ' " 
+						+"\n	         || (SELECT   COUNT ( * ) " 
+						+"\n	               FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+"  tpl, " 
+						+"\n	                      dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+"  item " 
+						+"\n	              WHERE   tpl.t_menuid = item.t_objectid " 
+						+"\n	                      AND item.t_istemplate = 'X') " 
+						+"\n	  FROM   DUAL; ";
+			var rsd_CurrentMenuItem = RsdRecordSet(RsdCommand(sql_CurrentMenuItem));
+			if (rsd_CurrentMenuItem.movenext())
+				CurrentCount = rsd_CurrentMenuItem.value(0);
+				TimeStampMessage("Всего меню текущей схемы");
+			else
+				TimeStampMessage("Ошибка подсчёта количества меню (Резервное восстановление не требуется): ");
+				TimeStampMessage(DBLinkObject_arr(kk).cValue);
+				TimeStampMessage(sql_CurrentMenuItem);
+			end;
+			EndAction(0);
+		       
+			BegAction(0, "Резервное копирование меню  схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")", false);
+			TimeStampMessage("Резервное копирование меню схемы: " + DBLinkObject_arr(kk).cName + " ("+DBLinkObject_arr(kk).cValue+")");
+			var TSBU = TimeStampBackUp();
+			/* Бэкап  DMENUTPL */
+                     var sql_BackUpMenuItem = "BEGIN " 
+						    +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DMENUTPL_B"+TSBU+" AS SELECT * FROM dmenutpl_dbt'); " 
+						    +"\n END; ";
+			var rsd_BackUpMenuItem = RsdCommand(sql_BackUpMenuItem);
+			rsd_BackUpMenuItem.execute;
+                     TimeStampMessage("Резервное копирование меню завершено (DMENUTPL_B"+TSBU+")");		
+
+			var sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DMENUTPL_B%';";
+			var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+
+		       var BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("DMENUTPL_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+ 
+			/* Бэкап  DMENUPARM */
+			sql_BackUpMenuItem =  "BEGIN " 
+						 +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DMENUPARM_B"+TSBU+" AS SELECT * FROM dmenuparm_dbt'); " 
+						 +"\n END; ";
+			rsd_BackUpMenuItem = RsdCommand(sql_BackUpMenuItem);
+			rsd_BackUpMenuItem.execute;
+
+
+                     sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DMENUPARM_B%';";
+			rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+
+			BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("DMENUPARM_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+
+			/* Бэкап  DMENUITEM */
+			sql_BackUpMenuItem =  "BEGIN " 
+						 +"\n dbms_utility.exec_ddl_statement@"+DBLinkObject_arr(kk).cValue+"('CREATE TABLE DMENUITEM_B"+TSBU+" AS SELECT * FROM dmenuitem_dbt'); " 
+						 +"\n END; ";
+			rsd_BackUpMenuItem = RsdCommand(sql_BackUpMenuItem);
+			rsd_BackUpMenuItem.execute;
+
+
+                     sql_BackUpCount = "select count(*) from user_tables@"+DBLinkObject_arr(kk).cValue+" where table_name like 'DMENUITEM_B%';";
+			rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+			if (rsd_BackUpCount.movenext())
+				TimeStampMessage("Всего резервных копий " +int(rsd_BackUpCount.value(0))+", максимум может существовать " + BackUpCopCount);		
+		     	end;
+			
+			BackUpCount = int(rsd_BackUpCount.value(0));
+			while(BackUpCount>BackUpCopCount)
+				TimeStampMessage("Удаляем самую старую резервную копию");		
+				SearchOldestCopy("DMENUITEM_B", DBLinkObject_arr(kk).cValue);
+                            BackUpCount = BackUpCount - 1;
+			end;
+			
+			EndAction(0);	
+                     
+			BegAction(0, "Обновление справочника пользовательских модулей на текущей схеме: " + DBLinkObject_arr(kk).cValue, false);	
+
+			if (m_CheckBox_DebugQuery.checked)
+                            DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   t_menuid, "
+						+"\n          t_name, "
+						+"\n          DECODE (t_branch, NULL, ' ', CHR (0), ' ', t_branch) t_branch, " 
+						+"\n          DECODE (t_useinchild, NULL, ' ', CHR (0), ' ', t_useinchild) t_useinchild, " 
+						+"\n          DECODE (t_isdistributed, NULL, ' ', CHR (0), ' ', t_isdistributed) t_identprogram, " 
+						+"\n          DECODE (t_identprogram, NULL, ' ', CHR (0), ' ', t_identprogram) t_identprogram, " 
+						+"\n          DECODE (t_isoutersystem, NULL, ' ', CHR (0), ' ', t_isoutersystem) t_isoutersystem " 
+						+"\n	               FROM   ( (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, " 
+						+"\n	                                  T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                           FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" ) " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, " 
+						+"\n	                                 T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                          FROM   dmenutpl_dbt))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Меню. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dmenutpl_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(7, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                           	sql_DebugQuery = " delete from dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue
+                                          +"\n       where (T_MENUID, T_NAME)in "
+						+"\n	                  ( (SELECT   T_MENUID, T_NAME " 
+						+"\n	                           FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" ) " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_MENUID, T_NAME " 
+						+"\n	                          FROM   dmenutpl_dbt)) ";
+
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+				DebugCnt = 0;
+				sql_DebugQuery = " (SELECT   t_menuid, "
+						+"\n          t_name, "
+						+"\n          DECODE (t_branch, NULL, ' ', CHR (0), ' ', t_branch) t_branch, " 
+						+"\n          DECODE (t_useinchild, NULL, ' ', CHR (0), ' ', t_useinchild) t_useinchild, " 
+						+"\n          DECODE (t_isdistributed, NULL, ' ', CHR (0), ' ', t_isdistributed) t_identprogram, " 
+						+"\n          DECODE (t_identprogram, NULL, ' ', CHR (0), ' ', t_identprogram) t_identprogram, " 
+						+"\n          DECODE (t_isoutersystem, NULL, ' ', CHR (0), ' ', t_isoutersystem) t_isoutersystem " 
+						+"\n	               FROM   ( (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, " 
+						+"\n	                                  T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                           FROM   dmenutpl_dbt ) " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, " 
+						+"\n	                                 T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                          FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+"))) ";
+
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+				DebugReportHeader("Меню. Добавление записей", "dmenutpl_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(7, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+				DebugCnt = 0;
+				sql_DebugQuery = " ( (SELECT   parm.t_objectid, parm.t_istemplate, parm.t_cidentprogram, parm.t_inumberpoint " 
+						+"\n	                           FROM   dmenutpl_dbt tpl, " 
+						+"\n	                                  dmenuparm_dbt parm " 
+						+"\n	                          WHERE   tpl.t_menuid = parm.t_objectid " 
+						+"\n	                                  AND parm.t_istemplate = 'X') " 
+						+"\n	                       MINUS " 
+						+"\n	                       (SELECT   parm.t_objectid, parm.t_istemplate, parm.t_cidentprogram, parm.t_inumberpoint " 
+						+"\n	                          FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, dmenuparm_dbt@"+DBLinkObject_arr(kk).cValue+" parm " 
+						+"\n	                         WHERE   tpl.t_menuid = parm.t_objectid " 
+						+"\n	                                 AND parm.t_istemplate = 'X')) ";
+				rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+
+				DebugReportHeader("Меню", "dmenuparm_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(4, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+                            //debugbreak;
+                            sql_DebugQuery = "   SELECT   item.T_OBJECTID, item.T_ISTEMPLATE, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT, item.T_INUMBERFATHER, item.T_INUMBERLINE, "
+                                            +"\n          item.T_ICASEITEM, DECODE (item.T_CSYSTEMITEM, NULL, CHR (0), item.T_CSYSTEMITEM), item.T_SZNAMEITEM, "
+                                            +"\n          DECODE (item.T_SZNAMEPROMPT, NULL, CHR (0), item.T_SZNAMEPROMPT), item.T_IHELP, item.T_IPROGITEM "
+                                            +"\n   FROM   dmenutpl_dbt tpl, dmenuitem_dbt item "
+                                            +"\n  WHERE   (item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT) IN "
+                                            +"\n                ( (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT "
+                                            +"\n                     FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, "
+                                            +"\n                            dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+" item "
+                                            +"\n                    WHERE   tpl.t_menuid = item.t_objectid "
+                                            +"\n                            AND item.t_istemplate = 'X') "
+                                            +"\n                  MINUS "
+                                            +"\n                  (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT "
+                                            +"\n                     FROM   dmenutpl_dbt tpl, "
+                                            +"\n                            dmenuitem_dbt item "
+                                            +"\n                    WHERE   tpl.t_menuid = item.t_objectid "
+                                            +"\n                            AND item.t_istemplate = 'X')) ";
+                            rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+
+				DebugReportHeader("Меню. Удалены записи со схемы "+DBLinkObject_arr(kk).cName+" ( "+DBLinkObject_arr(kk).cValue+")", "dmenuitem_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(12, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+
+                            sql_DebugQuery = "  delete from dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue
+                                            +"\n      where (T_OBJECTID,  T_IIDENTPROGRAM, T_INUMBERPOINT, T_INUMBERLINE ) in "
+                                            +"\n    ( (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT, item.T_INUMBERLINE  " 
+					         +"\n	                           FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, " 
+					         +"\n	                                  dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+" item " 
+					         +"\n	                          WHERE   tpl.t_menuid = item.t_objectid " 
+					         +"\n	                                  AND item.t_istemplate = 'X') " 
+					         +"\n	                       MINUS " 
+					         +"\n	                       (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT, item.T_INUMBERLINE  " 
+					         +"\n	                          FROM   dmenutpl_dbt tpl, dmenuitem_dbt item " 
+					         +"\n	                         WHERE   tpl.t_menuid = item.t_objectid " 
+						  +"\n	                                 AND item.t_istemplate = 'X')) ";
+				rsd_DebugQuery = RsdCommand(sql_DebugQuery);
+                            rsd_DebugQuery.execute();
+
+				DebugCnt = 0;
+                            //debugbreak;
+                            sql_DebugQuery = "   SELECT   item.T_OBJECTID, item.T_ISTEMPLATE, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT, item.T_INUMBERFATHER, item.T_INUMBERLINE, "
+                                            +"\n          item.T_ICASEITEM, DECODE (item.T_CSYSTEMITEM, NULL, CHR (0), item.T_CSYSTEMITEM), item.T_SZNAMEITEM, "
+                                            +"\n          DECODE (item.T_SZNAMEPROMPT, NULL, CHR (0), item.T_SZNAMEPROMPT), "
+                                            +"\n          DECODE (item.T_IHELP, NULL, CHR (0), item.T_IHELP), "
+                                            +"\n          DECODE (item.T_IPROGITEM, NULL, CHR (0),item.T_IPROGITEM) "
+                                            +"\n   FROM   dmenutpl_dbt tpl, dmenuitem_dbt item "
+                                            +"\n  WHERE   (item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT) IN "
+                                            +"\n                ( (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT "
+                                            +"\n                     FROM   dmenutpl_dbt tpl, dmenuitem_dbt item "
+                                            +"\n                    WHERE   tpl.t_menuid = item.t_objectid "
+                                            +"\n                            AND item.t_istemplate = 'X') "
+                                            +"\n                  MINUS "
+                                            +"\n                  (SELECT   item.T_OBJECTID, item.T_IIDENTPROGRAM, item.T_INUMBERPOINT "
+                                            +"\n                     FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, "
+                                            +"\n                            dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+" item "
+                                            +"\n                    WHERE   tpl.t_menuid = item.t_objectid "
+                                            +"\n                            AND item.t_istemplate = 'X')) ";
+                            rsd_DebugQuery = RsdRecordSet(RsdCommand(sql_DebugQuery));
+
+				DebugReportHeader("Меню. Добавление записей", "dmenuitem_dbt");
+				while (rsd_DebugQuery. movenext())
+					DebugReportBody(12, rsd_DebugQuery);
+					DebugCnt = DebugCnt + 1;
+				end;
+				DebugReportFooter(DebugCnt);
+			end;
+                     //Gurin S. 17.12.2012 C-15303
+                     //debugbreak;
+			if((DebugCnt == 0) and (m_CheckBox_DebugQuery.checked))
+				TimeStampMessage("Меню не нуждается в обновлении");		
+			else
+				//TimeStampMessage("!");				
+				sql_MergeQuery = " MERGE INTO   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+ " a " 
+						+"\n	     USING   (SELECT   * " 
+						+"\n	                FROM   ( (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                            FROM   dmenutpl_dbt) " 
+						+"\n	                        MINUS " 
+						+"\n	                        (SELECT   T_MENUID, T_NAME, T_BRANCH, T_USEINCHILD, T_ISDISTRIBUTED, T_IDENTPROGRAM, T_ISOUTERSYSTEM " 
+						+"\n	                           FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+"))) b " 
+						+"\n	        ON   (A.T_MENUID = B.T_MENUID) " 
+						+"\n	WHEN MATCHED " 
+						+"\n	THEN " 
+						+"\n	   UPDATE SET " 
+						+"\n	      a.T_NAME = b.T_NAME, " 
+						+"\n	      a.T_BRANCH = b.T_BRANCH, " 
+						+"\n	      a.T_USEINCHILD = b.T_USEINCHILD, " 
+						+"\n	      a.T_ISDISTRIBUTED = b.T_ISDISTRIBUTED, " 
+						+"\n	      a.T_IDENTPROGRAM = b.T_IDENTPROGRAM, " 
+						+"\n	      a.T_ISOUTERSYSTEM = b.T_ISOUTERSYSTEM " 
+						+"\n	WHEN NOT MATCHED " 
+						+"\n	THEN " 
+						+"\n	   INSERT              (a.T_MENUID, a.T_NAME, a.T_BRANCH, a.T_USEINCHILD, a.T_ISDISTRIBUTED, a.T_IDENTPROGRAM, a.T_ISOUTERSYSTEM) " 
+						+"\n	       VALUES   (b.T_MENUID, b.T_NAME, b.T_BRANCH, b.T_USEINCHILD, b.T_ISDISTRIBUTED, b.T_IDENTPROGRAM, b.T_ISOUTERSYSTEM); ";
+				rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+				rsd_MergeQuery.execute();
+
+				sql_MergeQuery = " MERGE INTO   dmenuparm_dbt@"+DBLinkObject_arr(kk).cValue+" a " 
+						+"\n	     USING   ( (SELECT   parm.* " 
+						+"\n	                  FROM   dmenutpl_dbt tpl, " 
+						+"\n	                         dmenuparm_dbt parm " 
+						+"\n	                 WHERE   tpl.t_menuid = parm.t_objectid " 
+						+"\n	                         AND parm.t_istemplate = 'X') " 
+						+"\n	              MINUS " 
+						+"\n	              (SELECT   parm.* " 
+						+"\n	                 FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, "
+                                          +"\n                           dmenuparm_dbt@"+DBLinkObject_arr(kk).cValue+" parm " 
+						+"\n	                WHERE   tpl.t_menuid = parm.t_objectid " 
+						+"\n	                        AND parm.t_istemplate = 'X')) b " 
+						+"\n	        ON   (    A.T_ISTEMPLATE = b.T_ISTEMPLATE " 
+						+"\n	              AND A.T_OBJECTID = b.T_OBJECTID " 
+						+"\n	              AND A.T_CIDENTPROGRAM = B.T_CIDENTPROGRAM " 
+						+"\n	              AND A.T_INUMBERPOINT = B.T_INUMBERPOINT) " 
+						+"\n	WHEN MATCHED " 
+						+"\n	THEN " 
+						+"\n	   UPDATE SET A.T_PARM = B.T_PARM " 
+						+"\n	WHEN NOT MATCHED " 
+						+"\n	THEN " 
+						+"\n	   INSERT              (A.T_OBJECTID, A.T_ISTEMPLATE, A.T_CIDENTPROGRAM, A.T_INUMBERPOINT, A.T_PARM) " 
+						+"\n	       VALUES   (B.T_OBJECTID, B.T_ISTEMPLATE, B.T_CIDENTPROGRAM, B.T_INUMBERPOINT, B.T_PARM); ";
+				rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+				rsd_MergeQuery.execute();				
+
+				sql_MergeQuery = " MERGE INTO   dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+" a " 
+						+"\n	     USING   ( (SELECT   item.* " 
+						+"\n	                  FROM   dmenutpl_dbt tpl, " 
+						+"\n	                         dmenuitem_dbt item " 
+						+"\n	                 WHERE   tpl.t_menuid = item.t_objectid " 
+						+"\n	                         AND item.t_istemplate = 'X') " 
+						+"\n	              MINUS " 
+						+"\n	              (SELECT   item.* " 
+						+"\n	                 FROM   dmenutpl_dbt@"+DBLinkObject_arr(kk).cValue+" tpl, "
+                                          +"\n                           dmenuitem_dbt@"+DBLinkObject_arr(kk).cValue+" item " 
+						+"\n	                WHERE   tpl.t_menuid = item.t_objectid " 
+						+"\n	                        AND item.t_istemplate = 'X')) b " 
+						+"\n	        ON   (    A.T_ISTEMPLATE = b.T_ISTEMPLATE " 
+						+"\n	              AND A.T_OBJECTID = b.T_OBJECTID " 
+						+"\n	              AND A.T_IIDENTPROGRAM = B.T_IIDENTPROGRAM " 
+						+"\n	              AND A.T_INUMBERPOINT = B.T_INUMBERPOINT) " 
+						+"\n	WHEN MATCHED " 
+						+"\n	THEN " 
+						+"\n	   UPDATE SET " 
+						+"\n	      A.T_INUMBERFATHER = B.T_INUMBERFATHER, A.T_INUMBERLINE = B.T_INUMBERLINE, " 
+						+"\n	      A.T_ICASEITEM = B.T_ICASEITEM, A.T_CSYSTEMITEM = B.T_CSYSTEMITEM, " 
+						+"\n	      A.T_SZNAMEITEM = B.T_SZNAMEITEM, A.T_SZNAMEPROMPT = B.T_SZNAMEPROMPT, " 
+						+"\n	      A.T_IHELP = B.T_IHELP, A.T_IPROGITEM = B.T_IPROGITEM " 
+						+"\n	WHEN NOT MATCHED " 
+						+"\n	THEN " 
+						+"\n	   INSERT              (A.T_OBJECTID, A.T_ISTEMPLATE, A.T_IIDENTPROGRAM, A.T_INUMBERPOINT, " 
+						+"\n	                        A.T_INUMBERFATHER, A.T_INUMBERLINE, A.T_ICASEITEM, A.T_CSYSTEMITEM, " 
+						+"\n	                        A.T_SZNAMEITEM, A.T_SZNAMEPROMPT, A.T_IHELP, A.T_IPROGITEM) " 
+						+"\n	       VALUES   (B.T_OBJECTID, B.T_ISTEMPLATE, B.T_IIDENTPROGRAM, B.T_INUMBERPOINT, " 
+						+"\n	                 B.T_INUMBERFATHER, B.T_INUMBERLINE, B.T_ICASEITEM, B.T_CSYSTEMITEM, " 
+						+"\n	                 B.T_SZNAMEITEM, B.T_SZNAMEPROMPT, B.T_IHELP, B.T_IPROGITEM); ";
+				rsd_MergeQuery = RsdCommand(sql_MergeQuery);
+				rsd_MergeQuery.execute();
+			end;
+
+			EndAction(0);
+
+		end;	// [if (DBLinkObject_arr.cLoad)]
+		kk = kk + 1;
+	end;  // [while (kk != DBLinkObject_arr.Size)]	
+	TimeStampMessage("Миграция меню успешно завершена.");
+end;
+/*  =End================================================== Мигрируем меню */
+
+
+class(TRsbPanel) MigratePanel // Основная панель с выбором объектов миграции    m_CheckBox_DebugQuery
+	var m_CheckBox_Country:		TRsbCheckBox = TRsbCheckBox;
+	var m_CheckBox_UserMod:		TRsbCheckBox = TRsbCheckBox;
+	var m_CheckBox_Reg:			TRsbCheckBox = TRsbCheckBox;
+	var m_CheckBox_UserMenuItem:	TRsbCheckBox = TRsbCheckBox;
+	var m_CheckBox_SUD:  		TRsbCheckBox = TRsbCheckBox;
+	//var m_CheckBox_SUDGroup:		TRsbCheckBox = TRsbCheckBox;
+	var m_CheckBox_ARMRole:		TRsbCheckBox = TRsbCheckBox;
+	var m_PushB:				TRsbPushButton = TRsbPushButton("Готово");
+
+	var curTab, quitTab, startTab;
+
+	macro onWndClosing( RsbEvent:object )
+		TimeStampMessage("Закрыли главное окно процедуры. Работа завершена");
+	end;
+
+	macro onKeyPressed(RsbEvent:object)
+		if( rsbEvent.KeyCode == KEY_F7 )
+			ViewFile(TxtFileDir + "\\" + "DebugLog" + "_"+  path_date + "_" + path_time + ".log");
+		end;	
+	end;
+
+	macro enabled_migrate_form(flag:bool)
+		m_CheckBox_Country.enabled = flag;
+		m_PushB.enabled = flag;
+		panel.redraw();
+	end;	
+
+	macro ReconfirmMigrate()
+		Array Msg;
+		Array Box;
+		
+              Msg(0) = "Схема эталон:";
+              Msg(1) = CurrentScheme;
+		Msg(2) = "Схемы приёмники: ";
+	       var ind = 2;
+		var k = 0;
+		while (k != DBLinkObject_arr.Size)		
+			if (DBLinkObject_arr(k).cLoad)
+				ind = ind + 1;
+				Msg(ind) = DBLinkObject_arr(k).cName + ": " + DBLinkObject_arr(k).cValue;
+			end;
+			k = k + 1;
+		end;
+		ind = ind + 1;
+              Msg(ind) = "Наборы данных: ";
+
+		if(m_checkbox_Country.checked)
+			ind = ind + 1;
+			Msg(ind) = "Справочник стран";
+		end;
+		if(m_CheckBox_UserMod.checked)
+			ind = ind + 1;
+			Msg(ind) = "Справочник пользовательских модулей";
+		end;
+		if(m_CheckBox_Reg.checked)
+			ind = ind + 1;
+			Msg(ind) = "Реестр";
+		end;
+		if(m_CheckBox_SUD.checked)
+			ind = ind + 1;
+			Msg(ind) = "Группы СУД";
+                     ind = ind + 1;
+			Msg(ind) = "Роли СУД";
+		end;
+		if(m_CheckBox_UserMenuItem.checked)
+			ind = ind + 1;
+			Msg(ind) = "Образцы пользовательских меню";
+		end;
+		if(m_CheckBox_ARMRole.checked)
+			ind = ind + 1;
+			Msg(ind) = "АРМ-роль";
+		end;
+		Box(0) = "Продолжить";
+		Box(1) = "Изменить настройки";
+		Box(2) = "Отменить и выйти";
+		var cofirm = ConfWin ( Msg, Box );
+		if (cofirm == 0) 
+			return 0;
+		elif (cofirm == 1) 
+			return 1;
+		else 
+			return 2;
+		end;
+	end;
+
+ 	macro OnClicked(RsbEvent:object)
+		var ReConfirm = ReConfirmMigrate();
+		var kk = 0;
+		if (ReConfirm == 0) 
+			enabled_migrate_form(false);
+//			debugbreak;
+			if(m_checkbox_Country.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем справочник стран");
+				MigrateCountry(DBLinkObject_arr(kk));
+                            println("___________________________________");
+             		end;
+			if(m_checkbox_UserMod.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем справочник пользовательских модулей");
+				MigrateUserMod();
+                            println("___________________________________");
+			end;
+			if(m_checkbox_Reg.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем реестр");
+				MigrateReg();
+                            println("___________________________________");
+			end;
+			if(m_checkbox_SUD.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем СУД");
+                            println("___________________________________");
+                            TimeStampMessage("Загружаем группы СУД");
+				MigrateSUDGroup();
+                            println("___________________________________");
+				TimeStampMessage("Загружаем роли СУД");
+				MigrateSUDRole();
+                            println("___________________________________");
+				TimeStampMessage("Загружаем привилегии СУД");
+				MigrateSUDPriv();
+                            println("___________________________________");
+			end;
+			if(m_checkbox_UserMenuItem.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем образцы пользовательских меню");
+				MigrateUserMenuItem();
+                            println("___________________________________");
+			end;
+			if(m_checkbox_ARMRole.checked)
+                            println("___________________________________");
+				TimeStampMessage("Загружаем справочник АРМ-роль");
+				MigrateArmRole();
+                            println("___________________________________");
+			end;
+
+			enabled_migrate_form(true);
+                     msgbox("Процедура выполнена");
+			return true;
+		elif (ReConfirm == 2)
+			TimeStampMessage("Отменено пользователем");
+			close(1);
+		else
+			TimeStampMessage("Возврат к настройкам");
+		end;
+	end;
+
+
+	InitTRsbPanel;
+	setPosition(10, 9);
+	setSize(35, 20); 
+
+	var m_Label_Country:TRsbLabel = TRsbLabel(4, 2, "Справочник стран");
+       addLabel(m_Label_Country);
+	m_CheckBox_Country.setPosition(2,2);
+	addControl(m_CheckBox_Country);
+
+	var m_Label_UserMod:TRsbLabel = TRsbLabel(4, 3, "Список пользовательских модулей");
+       addLabel(m_Label_UserMod);
+	m_CheckBox_UserMod.setPosition(2,3);
+	addControl(m_CheckBox_UserMod);
+
+	var m_Label_Reg:TRsbLabel = TRsbLabel(4, 4, "Ветки реестра");
+       addLabel(m_Label_Reg);
+	m_CheckBox_Reg.setPosition(2,4);
+	addControl(m_CheckBox_Reg);
+
+	var m_Label_SUD:TRsbLabel = TRsbLabel(4, 5, "СУД");
+       addLabel(m_Label_SUD);
+	m_CheckBox_SUD.setPosition(2,5);
+	addControl(m_CheckBox_SUD);
+
+	var m_Label_UserMenuItem:TRsbLabel = TRsbLabel(4, 6, "Образцы пользовательских меню");
+       addLabel(m_Label_UserMenuItem);
+	m_CheckBox_UserMenuItem.setPosition(2,6);
+	addControl(m_CheckBox_UserMenuItem);
+
+	var m_Label_ARMRole:TRsbLabel = TRsbLabel(4, 7, "АРМ-роль");
+       addLabel(m_Label_ARMRole);
+	m_CheckBox_ARMRole.setPosition(2,7);
+	addControl(m_CheckBox_ARMRole);
+
+	m_PushB.setPosition(19,17);
+	m_PushB.setSize(7,1);
+	m_PushB.onClicked(R2M(this, "OnClicked"));
+	addControl(m_PushB);
+
+	addEventHandler( RSB_EV_KEY_PRESSED, R2M(this, "onKeyPressed") );
+	addEventHandler( RSB_EV_WINDOW_CLOSING, R2M(this, "onWndClosing") ); 
+end;
+
+//Gurin S. 17.12.2012 C-15303 
+macro Restore(tab_name, dblink, backup_tab_name)
+if (tab_name == "DPERS_ROLE_LNK_DBT")
+    tab_name = "DPERS_ROLE_LNK"
+end;
+//debugbreak;
+var sql_restore =  "  BEGIN "
+                +"\n    BEGIN "
+                +"\n       DBMS_UTILITY.exec_ddl_statement@"+dblink+" ( "
+                +"\n         'truncate table "+tab_name+"' ); "
+                +"\n    END; "
+                +"\n    INSERT INTO "+tab_name+"@"+dblink
+                +"\n        SELECT   * FROM "+backup_tab_name+"@"+dblink+"; "
+                +"\n    COMMIT; "
+                +"\n    BEGIN "
+                +"\n      DBMS_UTILITY.exec_ddl_statement@"+dblink+" ( "
+                +"\n         'drop table "+backup_tab_name+"' ); "
+                +"\n    END; "
+                +"\n  END; ";
+    var rsd_restore = RsdCommand(sql_restore);
+        rsd_restore.execute();
+        TimeStampMessage("Восстановлена резервная копия "+backup_tab_name+" для схемы "+dblink);
+end;
+
+class(TRsbPanel) RestorePanel 
+	var m_PushRestore:				TRsbPushButton = TRsbPushButton("Восстановить");
+       var SelectRecoveryCountry:			TRsbComboBox = TRsbComboBox();
+	var SelectRecoveryUserMod:			TRsbComboBox = TRsbComboBox();
+	var SelectRecoveryReg:			TRsbComboBox = TRsbComboBox();
+	var SelectRecoverySUD:			TRsbComboBox = TRsbComboBox();
+	var SelectRecoveryUserMenuItem:		TRsbComboBox = TRsbComboBox();
+	//var SelectRecoverySUDRole:			TRsbComboBox = TRsbComboBox();
+	var SelectRecoveryARMRole:			TRsbComboBox = TRsbComboBox();
+
+       macro onWndClosing( RsbEvent:object )
+	   TimeStampMessage("Закрыли главное окно процедуры. Работа завершена");
+	end;
+
+       macro onKeyPressed(RsbEvent:object)
+	   if( rsbEvent.KeyCode == KEY_F7 )
+              ViewFile(TxtFileDir + "\\" + "DebugLog" + "_"+  path_date + "_" + path_time + ".log");
+	   end;	
+	end;
+
+       //Gurin S. 17.12.2012 C-15303
+       macro FindBackUp(table_mask:string, dblink:string)
+            var i = 0;
+            //debugbreak; //123456
+            var sql_BackUpCount = "SELECT table_name "
+                              +"\n   FROM user_tables@"+dblink 
+                              +"\n  WHERE UPPER(table_name) LIKE '"+table_mask+"%' "
+                              +"\n        AND TO_DATE (SUBSTR (TABLE_NAME, LENGTH (TABLE_NAME) - 13), "
+                              +"\n                      'ddmmyyyyhh24miss') = "
+                              +"\n              (SELECT   MAX(TO_DATE ( "
+                              +"\n                               SUBSTR (TABLE_NAME, LENGTH (TABLE_NAME) - 13), "
+                              +"\n                               'ddmmyyyyhh24miss' ))"
+                              +"\n                 FROM   user_tables@"+dblink
+                              +"\n                WHERE   UPPER(table_name) LIKE '"+table_mask+"%') ";
+            var rsd_BackUpCount = RsdRecordSet(RsdCommand(sql_BackUpCount));
+            if (rsd_BackUpCount.movenext()) 
+               TimeStampMessage("Найдена последняя резервная копия "+rsd_BackUpCount.value("table_name")+ " на схеме "+dblink);
+               return rsd_BackUpCount.value("table_name");
+            else
+               TimeStampMessage("Нет резервных копий для восстановления");
+               return "";
+            end;
+       end;
+
+       //Gurin S. 17.12.2012 C-15303
+	macro OnClickedRestore(RsbEvent:object)
+           //debugbreak;
+           //msgbox("Restore");
+           TimeStampMessage("Запущена процедура восстановления");
+
+           var restore_arr_mask =  TArray;
+           var restore_arr      =  TArray;
+
+           var i = 0, count = 0, dblink;
+           var kk = DBLinkObject_arr.Size;
+           while (i < kk)
+             if(DBLinkObject_arr(i).CLoad)
+                count = count + 1;
+                dblink = DBLinkObject_arr(i).CValue;
+             end;
+             i = i + 1;
+           end;
+           if (count == 0)
+              msgbox("Выберите схему для восстановления резервных копий");
+           elif (count >1)
+              msgbox("Выберите ОДНУ схему для восстановления резервных копий");
+           else
+              //debugbreak;
+              if (SelectRecoveryCountry.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DCOUNTRY_B";
+              end;
+              if (SelectRecoveryUserMod.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DITEMUSER_B";
+              end;
+              if (SelectRecoveryReg.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DREGPARM_B";
+              end;
+              if (SelectRecoverySUD.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DACSGROUP_B";
+                 restore_arr_mask(restore_arr_mask.size()) = "DACSROLETREE_B";
+                 restore_arr_mask(restore_arr_mask.size()) = "DACSRESTGROUP_B";
+                 restore_arr_mask(restore_arr_mask.size()) = "DACSRESTRICT_B"; 
+              end;
+              if (SelectRecoveryARMRole.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DPERS_ROLE_LNK_B";
+              end;
+              if (SelectRecoveryUserMenuItem.CurrentChoice == 1)
+                 restore_arr_mask(restore_arr_mask.size()) = "DMENUTPL_B";
+                 restore_arr_mask(restore_arr_mask.size()) = "DMENUPARM_B";
+                 restore_arr_mask(restore_arr_mask.size()) = "DMENUITEM_B";
+              end;
+          
+           //debugbreak;
+           i = 0;
+           while (i < restore_arr_mask.size())
+               //debugbreak;
+               var value = FindBackUp(restore_arr_mask(i), dblink); 
+               if (value != "")
+                    restore_arr(restore_arr.size()) = value;
+               end;
+               i = i + 1;
+           end;
+           //Восстанавливаем
+           i = 0;
+           while (i < restore_arr.size())
+               //debugbreak;
+               Restore(substr(restore_arr(i),1,index(restore_arr(i),"_B"))+"DBT", dblink, restore_arr(i));
+               i = i + 1;
+           end;
+           restore_arr_mask =  null;
+           restore_arr      =  null;
+           msgbox("Восстановление выполнено успешно");
+           //println(dblink);
+           end;
+       end;
+       
+       
+	InitTRsbPanel;
+	setPosition(10, 9);
+	setSize(45, 20); 
+
+       var m_Label_ReciveryCountry:TRsbLabel = TRsbLabel(2, 2, "Справочник стран: ");
+       addLabel(m_Label_ReciveryCountry);
+	SelectRecoveryCountry.setPosition(20,2);
+	SelectRecoveryCountry.setSize(15,1);
+       SelectRecoveryCountry.addChoice(0, "Не восстанавливать");
+       SelectRecoveryCountry.addChoice(1, "Восстановить");
+	SelectRecoveryCountry.currentChoice = 0;
+	addControl(SelectRecoveryCountry);
+
+       
+	var m_Label_ReciveryUserMod:TRsbLabel = TRsbLabel(2, 3, "Пользовательские модули: ");
+       addLabel(m_Label_ReciveryUserMod);
+	SelectRecoveryUserMod.setPosition(20,3);
+	SelectRecoveryUserMod.setSize(15,1);
+	SelectRecoveryUserMod.addChoice(0, "Не восстанавливать");
+	SelectRecoveryUserMod.addChoice(1, "Восстановить");
+	SelectRecoveryUserMod.currentChoice = 0;
+	addControl(SelectRecoveryUserMod);
+
+	var m_Label_ReciveryReg:TRsbLabel = TRsbLabel(2, 4, "Реестр: ");
+       addLabel(m_Label_ReciveryReg);
+	SelectRecoveryReg.setPosition(20,4);
+	SelectRecoveryReg.setSize(15,1);
+	SelectRecoveryReg.addChoice(0, "Не восстанавливать");
+	SelectRecoveryReg.addChoice(1, "Восстановить");
+	SelectRecoveryReg.currentChoice = 0;
+	addControl(SelectRecoveryReg);
+
+	var m_Label_ReciverySUDGroup:TRsbLabel = TRsbLabel(2, 5, "СУД: ");
+       addLabel(m_Label_ReciverySUDGroup);
+	SelectRecoverySUD.setPosition(20,5);
+	SelectRecoverySUD.setSize(15,1);
+	SelectRecoverySUD.addChoice(0, "Не восстанавливать");
+	SelectRecoverySUD.addChoice(1, "Восстановить");
+	SelectRecoverySUD.currentChoice = 0;
+	addControl(SelectRecoverySUD);
+
+	var m_Label_ReciveryUserMenuItem:TRsbLabel = TRsbLabel(2, 6, "Образцы меню: ");
+       addLabel(m_Label_ReciveryUserMenuItem);
+	SelectRecoveryUserMenuItem.setPosition(20,6);
+	SelectRecoveryUserMenuItem.setSize(15,1);
+	SelectRecoveryUserMenuItem.addChoice(0, "Не восстанавливать");
+	SelectRecoveryUserMenuItem.addChoice(1, "Восстановить");
+	SelectRecoveryUserMenuItem.currentChoice = 0;
+	addControl(SelectRecoveryUserMenuItem);
+
+	var m_Label_ReciveryARMRole:TRsbLabel = TRsbLabel(2, 7, "АРМ-роль: ");
+       addLabel(m_Label_ReciveryARMRole);
+	SelectRecoveryARMRole.setPosition(20,7);
+	SelectRecoveryARMRole.setSize(15,1);
+	SelectRecoveryARMRole.addChoice(0, "Не восстанавливать");
+	SelectRecoveryARMRole.addChoice(1, "Восстановить");
+	SelectRecoveryARMRole.currentChoice = 0;
+	addControl(SelectRecoveryARMRole);
+
+	m_PushRestore.setPosition(30,18);
+	m_PushRestore.setSize(13,1);
+	m_PushRestore.onClicked(R2M(this, "OnClickedRestore"));
+	addControl(m_PushRestore);
+
+	addEventHandler( RSB_EV_KEY_PRESSED, R2M(this, "onKeyPressed") );
+       addEventHandler( RSB_EV_WINDOW_CLOSING, R2M(this, "onWndClosing") );
+
+end;
+
+class(TRsbPanel) PreferencePanel 
+	var m_CheckBox_DBLINK 			= TArray;
+      	var m_Label_DBLINK 				= TArray;
+	var i = 0;
+	var p = 1;
+
+	macro onChecked(RsbEvent:Object)
+		var id = int(RsbEvent.SOURCE.NAME);
+		if (DBLinkObject_arr(id).cLoad)
+			DBLinkObject_arr(id).cLoad = false;
+		else
+			DBLinkObject_arr(id).cLoad = true;
+		end;
+		TimeStampMessage("Настройки: изменили схемы приёмники - " + DBLinkObject_arr(id).cName + ":" + string(DBLinkObject_arr(id).cLoad));
+	end;
+
+	macro onCheckedDebugQuery(RsbEvent:Object)
+		if (ShowDebugInfo)
+			ShowDebugInfo = false;
+		else
+			ShowDebugInfo = true;
+		end;
+		TimeStampMessage("Настройки: Отладочные отчёты - " + string(ShowDebugInfo));
+	end;
+              
+	InitTRsbPanel;
+	setPosition(10, 9);
+	setSize(45, 20); 
+
+	addLabel(TRsbLabel(2, p, "Схемы-приёмники:"));
+
+	while (i != DBLinkObject_arr.Size)
+		p = p + 1;
+		m_Label_DBLINK(i) = TRsbLabel(7, p, DBLinkObject_arr(i).cName);
+		addLabel(m_Label_DBLINK(i));
+		m_CheckBox_DBLINK(i) = TRsbCheckBox; 		
+		m_CheckBox_DBLINK(i).setPosition(4,p);
+		m_CheckBox_DBLINK(i).name = i;
+		m_CheckBox_DBLINK(i).enabled = DBLinkObject_arr(i).cValidate;
+		m_CheckBox_DBLINK(i).onChecked(R2M(this, "onChecked"));
+		addControl(m_CheckBox_DBLINK(i));
+		i = i + 1;
+	end;
+
+	p = p + 2;
+	addLabel(TRsbLabel(1, p, "+------------------------------------------+"));
+	p = p + 1;
+	addLabel(TRsbLabel(4, p, "Выполнять отладочные запросы "));
+	m_CheckBox_debugquery.setPosition(2,p);
+	m_CheckBox_debugquery.checked = true;
+	m_CheckBox_debugquery.onChecked(R2M(this, "onCheckedDebugQuery"));
+	addControl(m_CheckBox_debugquery);
+
+end;
+
+private macro Migrate()
+  panel = MigratePanel;
+  panel2 = RestorePanel;
+  panel3 = PreferencePanel;
+
+  panel.setCaption("Migrate");
+  panel.setStatus("Основные настройки Migrate F7 Отладочный отчёт");  
+  tabbed.addForm(panel);
+
+  panel2.setCaption("Экстренное восстановление данных");
+  panel2.setStatus("Восстановление из резервной копии");  
+  tabbed.addForm(panel2); 
+
+  panel3.setCaption("Настройки");
+  panel3.setStatus("Выбор сервера - приемника");
+  tabbed.addForm(panel3); 
+
+  tabbed.run;
+end;
+
+
+/*===================================================================================================*/
+/*=========================================== ТОЧКА ВХОДА ===========================================*/
+/*===================================================================================================*/
+if ((_bank.is_PRBB) or (_bank.is_VUZ))
+    setOutput(TxtFileDir + "\\" + "DebugLog" + "_"+  path_date + "_" + path_time + ".log", false);  			//Очистили файл отладочного лога
+    setOutput(TxtFileDir + "\\" + "Migrate" + "_"+  path_date + "_" + path_time + ".log", false);   			//Вернули стандартный поток вывода
+
+    TimeStampMessage("Запущена процедура Migrate (пользователь:"+{oper}+")");
+    Initialization();
+    Migrate();
+else
+    msgbox("ВНИМАНИЕ!!! Процедуру выполнять ИСКЛЮЧИТЕЛЬНО на сервере эталоне!!! | Процедура прервана");
+end;

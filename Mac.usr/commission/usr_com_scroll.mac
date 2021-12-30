@@ -1,0 +1,282 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: usr_com_scroll.mac v.2
+// @author  : 2012-04-14 zip_z. C-10090
+// @desc    : Пользовательский скроллинг для чтения/изменения примечаний вида 200 к объекту системы
+//            650 ("Комиссия"). Вместе с обновлением примечаний изменяет название категории 200 для
+//            объекта системы 3 ("Субъект экономики").
+// @changes : 2012-04-14 zip_z. + обновление привязки переписано 
+//                              + добавлены regexp для определения комиссий
+//            2012-04-23 zip_z. + добавлена возможность удалять (F8) и добавлять (F9) новые привязки
+//                                комиссий;
+//                              + пририсована панель (zResLib.lbr::usrcomm)
+// -------------------------------------------------------------------------------------------------
+import bankInter, lib_packetCommission;
+
+// @desc  : поиск библиотеки ресурсов. 
+// @return: Возвращает полный путь к найденному файлу *.lbr
+private macro getResourceLibPath (fname) 
+    const LBR_REGISTRY_PATH = "BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/LBRDIR";
+    var libraryFilePath, libraryDirPath, errCode;
+    
+    if ( getRegistryValue ( LBR_REGISTRY_PATH, V_STRING, libraryDirPath, errCode ) and not errCode )
+        libraryFilePath = findPath ( fname, libraryDirPath );   
+    else
+        libraryFilePath = fname;
+    end;
+    
+   return libraryFilePath;
+end;
+
+
+/// обработчик скроллинга периодических комиссий, действующих на текущую дату
+private class TUserPeriodCommissionScroll ()
+    private var rs        :RsdRecordSet = null;  // источник данных для построения скроллинга
+    private var isRunning :bool         = true;  // флаг "скроллинг запущен"
+    
+    var m_number = ""; // dsfcomiss_dbt.t_Number
+    var m_code   = ""; // dsfcomiss_dbt.t_Code
+    var m_name   = ""; // dsfcomiss_dbt.t_Name
+    var m_period = ""; // dsfcomiss_dbt.t_DateBegin .. dsfcomiss_dbt.t_DateEnd
+    
+    macro handleScrollEvents ( rs, cmd, id, key )
+        var retVal = CM_DEFAULT;
+        if (cmd == DLG_KEY) 
+            // Enter
+            if (key == 13) 
+                this.m_number = rs.value ("t_number");
+                this.m_code   = rs.value ("t_code");
+                this.m_name   = rs.value ("t_name");
+                this.m_period = rs.value ("m_period");
+                isRunning = false;
+                retVal = CM_SELECT;
+            
+            // Esc
+            elif (key == 27) 
+                isRunning = false;
+                retVal = CM_SELECT;
+            
+            // F8 
+            elif ((key == 322) or (key == 323))
+                retVal = CM_IGNORE;
+            end;
+        end;
+        
+        return retVal;
+    end;
+    
+    macro init ()
+        var scrollResult = false;
+        var sql = "select   t_Number, t_Code, t_Name,"
+                  "            to_char (t_DateBegin, 'dd.mm.yyyy')"
+                  "         || ' - '"
+                  "         || to_char (decode (t_DateEnd, to_date ('01.01.0001', 'dd.mm.yyyy'), to_date ('31.12.9999', 'dd.mm.yyyy' ), t_DateEnd ), 'dd.mm.yyyy') m_period"
+                  "    from dsfcomiss_dbt"
+                  "   where t_FeeType = 1 and t_ServiceKind = 3"
+                  "     and sysdate between t_DateBegin and decode (t_DateEnd, to_date ('01.01.0001', 'dd.mm.yyyy'), to_date ('31.12.9999', 'dd.mm.yyyy' ), t_DateEnd ) "
+                  "order by t_code asc";
+        
+        var col = makeArray ("t_number",        "Номер",              5,  0, -1, 0,
+                             "t_code",          "Код",               15,  0, -1, 0,
+                             "t_name",          "Название комиссии", 40,  0, -1, 0,
+                             "m_period",        "Действует с.. по",  25,  0, -1, 0 );
+        
+        while (isRunning)
+            rs = RsdRecordSet (RsdCommand (sql), RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, 4, col, null, r2m (this, "handleScrollEvents"), "Список действующих периодических комиссий", "~ENTER~ - выбор комиссии ~ESC~ - выход", 10);
+        end;
+        
+        return scrollResult;
+    end;
+
+end;
+
+
+/// обработчик скроллинга привязки комиссий
+private class (TRecHandler) TUserPacketCommissionScroll ()
+    private var rs        :RsdRecordSet = null;  // источник данных для построения скроллинга
+    private var isRunning :bool         = true;  // флаг "скроллинг запущен"
+    private var isNewLink :bool         = false; // флаг "создается новая привязка"
+    
+    initTRecHandler ("commlnk", getResourceLibPath ("zResLib.lbr"), true);
+    
+    // @desc: обработчик панели zResLib::commlnk
+    macro panelHandler ( dlg, cmd, id, key )
+        var sql, ret, params;
+        if ( cmd == DLG_INIT )
+            disableFields (dlg, fldIndex ("m_code"));
+            disableFields (dlg, fldIndex ("m_name"));
+            if (not isNewLink)
+                disableFields (dlg, fldIndex ("m_number"));
+            end;
+            
+            if (isNewLink)
+                this.("m_number")        = 0;
+                this.("m_code")          = "";
+                this.("m_name")          = "";
+                this.("m_payment_count") = 0;
+            else
+                this.("m_number")        = rs.value ("t_number");
+                this.("m_code")          = rs.value ("t_code");
+                this.("m_name")          = rs.value ("t_name");
+                this.("m_payment_count") = rs.value ("m_payment_count");
+            end;
+            
+            message ("Стрелки - перемещение; F3 - выбор; F9 - сохранить; ESC - выход");
+            updateFields (dlg);
+        
+        // F3
+        elif ((cmd == DLG_KEY) and (key == 317) and (id == fldIndex ("m_number")) )
+            var s = TUserPeriodCommissionScroll ();
+            if (s.init ())
+                this.("m_number")        = s.m_number;
+                this.("m_code")          = s.m_code;
+                this.("m_name")          = s.m_name;
+                this.("m_payment_count") = 0;
+                
+                updateFields (dlg);
+            end;
+            
+            return CM_DEFAULT;
+        
+        // F9
+        elif ((cmd == DLG_KEY) and (key == 323))
+            if ((this.("m_number") == 0) or (this.("m_payment_count") == 0))
+                msgbox ("Не заполнены параметры привязки. |Сохранение запрещено.");
+                return CM_IGNORE;
+            end;
+            if (isNewLink) // создаем новую запись привязки
+                sql = "insert into DOBJATTR_DBT"
+                      "            (t_objecttype, t_groupid, t_attrid, t_parentid, t_codelist,"
+                      "             t_numinlist, t_nameobject, t_longattr, t_intattr, t_name,"
+                      "             t_fullname,"
+                      "             t_opendate,"
+                      "             t_closedate, t_classificator, t_corractype, t_balance"
+                      "            )"
+                      "     values (3, 200, (select nvl (max (t_attrid), 0) + 1"
+                      "                        from dobjattr_dbt"
+                      "                       where t_objecttype = 3 and t_groupid = 200),"
+                      /* EVG 5/09/2012 Для работы с комиссиями по валютным пакетам реализована обработка категорий с символом 'v' в поле t_codeList (Справочник)
+                      "             0, chr (1),"*/
+                      "             0, DECODE (INSTR (?, 'v'), 0, CHR (1), 'v'),"
+                      "             to_char (?), to_char (?), 0, 0, ?,"
+                      "             ? || '<objattr:id>' || ? || '</objattr:id>',"
+                      "             to_date ('01/01/0001 00:00:00', 'MM/DD/YYYY HH24:MI:SS'),"
+                      "             to_date ('01/01/0001 00:00:00', 'MM/DD/YYYY HH24:MI:SS'), 0, chr (1), chr (1)"
+                      "            )";
+                params = makeArray (SQLParam ("", this.("m_code")),     // EVG 5/09/2012
+                                    SQLParam ("", this.("m_payment_count")),
+                                    SQLParam ("", this.("m_payment_count")),
+                                    SQLParam ("", this.("m_name")),
+                                    SQLParam ("", this.("m_name")),
+                                    SQLParam ("", this.("m_code")));
+                execSQL (sql, params);
+            end;
+            
+            // вставляем или обновляем старую запись привязки
+            debugbreak ();
+            if (not PC_UpdateCommissionLink (1, this.("m_number"), this.("m_code"), this.("m_payment_count")))
+                msgbox ("Обновление не удалось");
+            end;
+            
+            return CM_SAVE;
+        end;
+        
+    end;
+    
+    
+    macro showPanel ()
+        return RunDialog (this, R2M (this, "panelHandler"));
+    end;
+    
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( r, cmd, id, key )
+        var retVal = CM_DEFAULT;
+        var sql;
+        if (cmd == DLG_KEY) 
+            // Enter
+            if (key == 13) 
+                this.("m_payment_count") = rs.value ("m_payment_count");
+                isNewLink = false;
+                showPanel ();
+                retVal = CM_SELECT;
+            // Esc
+            elif (key == 27) 
+                isRunning = false;
+                retVal = CM_SELECT;
+            
+            // F8 
+            elif (key == 322)  
+                sql = "SELECT 1 FROM dsfconcom_dbt WHERE t_feetype = 1 AND t_objecttype = 659 AND t_status = 0 AND t_commnumber = :c AND ROWNUM = 1";
+                sql = execSQLSelect (sql, makeArray (SQLParam ("c", r.value ("t_number"))));
+                if (sql.moveNext)
+                    msgbox ("Существуют ДО с комиссией " + r.value ("t_code") + 
+                            " в состоянии \"Начисляется\" - удаление пакета невозможно");
+                else
+                    sql = "DELETE FROM dobjattr_dbt"
+                          /* EVG 5/09/2012 Для работы с комиссиями по валютным пакетам реализована обработка категорий с символом 'v' в поле t_codeList (Справочник)
+                          "      WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = CHR (1)"*/
+                          "      WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = DECODE (INSTR (t_fullName, 'v'), 0, CHR (1), 'v')"
+                          /* EVG 5/09/2012 Добавил выражение [[:alnum:]]{0,1} при анализе шаблона определения кода комиссии
+                             для того, чтобы корректно обрабатывались комиссии по валютным пакетам (с символом 'v' в конце).
+                          "        AND REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullName, '<objattr:id>\\d+.\\d+.\\d+</objattr:id>'), '\\d+.\\d+.\\d+') = :m_code";*/
+                          "        AND REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullName, '<objattr:id>\\d+.\\d+.\\d+[[:alnum:]]{0,1}</objattr:id>'), '\\d+.\\d+.\\d+[[:alnum:]]{0,1}') = :m_code";
+                    execSQL (sql, makeArray (SQLParam ("c", r.value ("t_code"))));
+                    
+                    sql = "DELETE FROM dnotetext_dbt nt"
+                          "      WHERE nt.t_objecttype = 650 AND nt.t_notekind = 200 AND nt.t_documentid = CONCAT (LPAD ('1', 5, '0'), LPAD (:m_number, 5, '0'))"
+                          "        AND nt.t_validtodate = TO_DATE ('31.12.9999', 'dd.mm.yyyy')";
+                    execSQL (sql, makeArray (SQLParam ("c", r.value ("t_number"))))
+                end;
+                
+                retVal = CM_SELECT;
+            
+            // F9
+            elif (key == 323)
+                isNewLink = true;
+                showPanel ();
+                retVal = CM_SELECT;
+            end;
+        end;
+        
+        return retVal;
+    end;
+    
+    // @desc: конструктор - вызывается при старте макроса. Вызов снизу.
+    macro init ()
+        /* Для отрисовки ищем периодические комиссии (feeType = 1), код которых (ххх) находится в тегах 
+         * <objattr:id>ххх</objattr:id> в поле dobjattr_dbt.t_fullname (ВидОбъектаСистемы = 3;  НомерПримечания = 200)
+         * и читаем эти самые примечания 200 (если есть). Если их нет - выводим "{не задано}".
+         */
+        var sql = "SELECT   com.t_number, com.t_code, com.t_name, NVL (TO_CHAR (UTL_RAW.cast_to_binary_integer (nt.t_text, 2)), '{не задано}') m_payment_count"
+                  "    FROM dsfcomiss_dbt com LEFT JOIN dnotetext_dbt nt"
+                  "         ON (nt.t_objectType = 650 AND nt.t_noteKind = 200 AND nt.t_documentID = CONCAT (LPAD (com.t_feeType, 5, '0'), LPAD (com.t_number, 5, '0')))"
+                  /* EVG 5/09/2012 Добавил выражение [[:alnum:]]{0,1} при анализе шаблона определения кода комиссии
+                     для того, чтобы корректно обрабатывались комиссии по валютным пакетам (с символом 'v' в конце).
+                  "   WHERE com.t_code IN (SELECT REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullName, '<objattr:id>\\d+.\\d+.\\d+</objattr:id>'), '\\d+.\\d+.\\d+')"*/
+                  "   WHERE com.t_code IN (SELECT REGEXP_SUBSTR (REGEXP_SUBSTR (t_fullName, '<objattr:id>\\d+.\\d+.\\d+[[:alnum:]]{0,1}</objattr:id>'), '\\d+.\\d+.\\d+[[:alnum:]]{0,1}')"
+                  "                          FROM dobjattr_dbt"
+                  /* EVG 5/09/2012 Для работы с комиссиями по валютным пакетам реализована обработка категорий с символом 'v' в поле t_codeList (Справочник)
+                  "                         WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = CHR (1))"*/
+                  "                         WHERE t_objectType = 3 AND t_groupId = 200 AND t_parentId = 0 AND t_codeList = DECODE (INSTR (t_fullName, 'v'), 0, CHR (1), 'v'))"
+                  "ORDER BY t_code";
+
+        var col = makeArray ("t_number",        "Номер",              5,  0, -1, 0,
+                             /* EVG 5/09/2012 Расширил столбец "Код"
+                             "t_code",          "Код",                5,  0, -1, 0,*/
+                             "t_code",          "Код",                6,  0, -1, 0,
+                             "t_name",          "Название комиссии", 40,  0, -1, 0,
+                             "m_payment_count", "Кол-во платежей",   15,  0, -1, 0 );
+        
+        while (isRunning)
+            rs = RsdRecordSet (RsdCommand (sql), RSDVAL_CLIENT, RSDVAL_STATIC);
+            runScroll (rs, 4, col, null, r2m (this, "handleScrollEvents"), "Справочник пакетных комиссий", "~ENTER~ - изменить ~ESC~ - выход");
+        end;
+        
+        return true;
+    end;
+
+end;
+
+// Точка сборки :)
+TUserPacketCommissionScroll.init ();
+exit (1); 

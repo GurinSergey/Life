@@ -1,0 +1,172 @@
+/* -----------------------------------------------------------------------------
+   Массовое выполнение шагов "Предобработка"
+   ----------------------------------------------------------------------------- */
+
+import CTInter, PaymInter, oralib, likepy, pm_common, pmfm;
+
+macro PutLog( msg:string )
+  /*SetOutput( "c:\\preprocess.log" );
+  println( msg );
+  SetOutput( "" );*/
+end;
+
+private macro PM_SetErrorStatus( p_PaymentID:integer, p_ErrorStatus:integer, p_ErrorMessage:string )
+
+  var query:string = "update doprtemp_tmp set t_ErrorStatus = :ErrorStatus";
+  var params:TArray = TArray;
+
+  params[0] = SQLParam( "ErrorStatus", p_ErrorStatus );
+
+  if( p_ErrorMessage )
+    query = query + " ,t_ErrorMessage = :ErrorMessage";
+    params[1] = SQLParam( "ErrorMessage", p_ErrorMessage );
+  end;
+
+  query = query + " where t_OrderID = :OrderID";
+  params[ params.size ] = SQLParam( "OrderID", p_PaymentID );
+
+  execSQL( query, params );
+
+end;
+
+/* Отвергнуть платёж и исключить из дальнейших проверок.
+   До транзакции или внутри неё. */
+
+private macro PM_MakePaymentRejected( p_PaymentID:integer, p_RejectGround:string )
+  
+  var query:string = "update dpmprepro_tmp "
+                     "set t_Reject = 'X', "
+                         "t_RejectGround = :RejectGround, "
+                         "t_SkipCheck = 'X' "
+                     "where t_PaymentID = :PaymentID";
+  var params:TArray = TArray;
+  params[0] = SQLParam( "RejectGround", p_RejectGround );
+  params[1] = SQLParam( "PaymentID"   , p_PaymentID    );
+  execSQL( query, params );
+
+end;
+
+/* Простановка примечания "Причина отказа" для отвергнутых или отправленных на ручную обработку платежей.
+   Живёт здесь, пока на PL/SQL нет функциональности для работы с примечаниями.
+   Внутри транзакции. */
+//LAO HF20
+private macro PM_MassSetNotesForRejected()
+
+  var query:string = "select t.t_OrderID "
+                           ",pre.t_RejectGround "
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                       "from V_PMMASSOP t, "
+                            "dpmprepro_tmp pre "
+                      "where t.t_SkipDocument = 0 "
+                        "and t.t_ErrorStatus  = 0 "
+                        "and pre.t_PaymentID  = t.t_OrderID "
+                        "and ( pre.t_Reject = 'X' or pre.t_Manual = 'X' )";
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          PM_NOTEKIND_DENIALGROUND, 
+                          rs.Value(1),
+                          date(),/*{curdate} - не инициализировано*/
+                          rs.Value(2),
+                          rs.Value(3) ) )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Причина отказа\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+//LAO HF20
+private macro PM_MassSetTaxNotes()
+
+  var query:string = "select t.t_OrderID " +
+                           ",tax.t_Message " +
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                       "from V_PMMASSOPFOREXE t, " +
+                           "dpmtax_tmp tax " +
+                      "where tax.t_PaymentID  = t.t_OrderID " +
+                        "and tax.t_Message != chr(1) " +
+                        "and not tax.t_Message is null ";
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          NOTEKIND_PAYM_TAXWARNING, 
+                          SubStr(StrSubst(rs.Value(1), "|", "\n"), 1, 1499),  // 1499 - ограничение на длинну примечания
+                          date(),/*{curdate} - не инициализировано*/
+                          rs.Value(2),
+                          rs.Value(3) ) )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Результат проверки налоговых реквизитов\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+/* Массовая привязка ЗДА*/
+MACRO MassLinkPreacpt():integer
+
+  var stat = 0;
+  var query:string = "select t_PreAcptID, t_PaymentID "
+                       "from dpmprepro_tmp "
+                       "where t_PreAcptID <> 0 "
+                       "order by t_PaymentID ";
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    stat = PM_MassLinkPreacpt( rs.Value(0), rs.Value(1) ); //привязка ЗДА
+  end;
+  return stat;
+
+END;
+
+/* -----------------------------------------------------------------------------
+   Общие для платежей предтранзакционные действия.
+   ----------------------------------------------------------------------------- */
+MACRO PM_MassPreproPrepare():integer
+   
+//SDA - проверку на терроризм осуществляет банк отправителя
+  return 0;  
+  
+  var stat = MassCheckTerrorPrepare(); // Проверки на терроризм
+
+  if( stat == 0 )
+    stat = MassLinkPreacpt(); // Привязка ЗДА
+  end;
+
+  return stat;
+
+END;
+
+/* -----------------------------------------------------------------------------
+   Общие для платежей транзакционные действия.
+   ----------------------------------------------------------------------------- */
+//lao hf20
+MACRO PM_MassPreproExecute(IsWlIncoming : bool):integer
+
+//SDA - проверку на терроризм осуществляет банк отправителя
+    return 0;
+
+  //Простановка примечания "Причина отказа" для отвергнутых платежей.
+  var stat = PM_MassSetNotesForRejected();
+
+  if(not IsWlIncoming and (stat == 0))
+    stat = PM_MassSetTaxNotes();
+  end;
+
+  if(stat == 0)
+    stat = MassCheckTerrorExecute(); // Проверки на терроризм
+  end;
+
+END;

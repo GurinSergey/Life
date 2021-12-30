@@ -1,0 +1,793 @@
+//-----------------------------------------------------------------------------------------
+// Отчет по документам для сверки с ЭА
+// С.Дамаров
+// @changes: 2012-02-09 zip_z. изменения в алгоритме поиска библиотеки ресурсов
+// Rogl modify (31.05.2012) Во всех вызовах ExecSql* последний параметр (если он задан) заменил на true
+//                          иначе в случае наличия оракловых ошибок пользователю об этом никак не сообщалось! 
+//-----------------------------------------------------------------------------------------
+import oralib, likepy, bankinter, Календарь, eautils;
+
+Var Parm, aDet = TArray(), aRazdel = Tarray();
+Var xml0 = ActiveX ("Microsoft.XMLDOM"), xml1 = ActiveX ("Microsoft.XMLDOM");
+Var pRazd, pCur, pnCur, pCol, pDeb, pKred, pRub, pCol2, isql, cnt=0;
+Var pel, pnum1, pshifr1, padeb1, pakred1, psdeb1, pskred1, psrub1, pnum2, pdata2,
+    pshifr2, padeb2, pakred2, psdeb2, pskred2, psrub2;
+var iRow, iCol, sql, rs, y, nRazd, nOper, nCur, bCol=0, eCol=0, bColA=0, eColA=0, bSum=$0, eSum=$0, bSumA=$0, eSumA=$0, dSum=$0, dSumA=$0, first;
+
+var TermFileName_Excel;
+var TermFileName_Txt;
+
+aDet(0) = "сводный";
+aDet(1) = "расшифровка раздела сшива";
+aDet(2) = "расшифровка по ответисполнителю";
+
+//aRazdel(0) = "Все разделы";
+aRazdel(0) = "Кассовые  документы";
+aRazdel(1) = "Внешние и транзитные платежи по Банку (РКЦ, корсеть, МФР)";
+aRazdel(2) = "Прочие внутренние бухгалтерские (клиентские, банковские, ордерные)";
+aRazdel(3) = "Внебалансовые документы";
+aRazdel(4) = "Срочные операции";
+
+// Возвращает последний закрытый опердень - day
+Private macro GetDefaultDate ( day )
+    Var sql = "select max (t_curdate) from dcurdate_dbt where t_isclosed='X' and t_branch=1";
+    sql = ExecSqlSelect (sql);
+    if ( sql.Movenext () and (ValType (sql.value (0)) != V_SPECVAL) )
+        return Date (sql.value (0)) - day;
+    else
+        Exit (0, "Не найдено ни одного закрытого дня");
+        return Date (0,0,0);
+    end;
+End;
+//-----------------------------------------------------------------------------------------
+// Возвращает имя операциониста
+Private macro GetOperName ( op )
+    Var sql = "select t_name from dperson_dbt where t_oper=:1";
+    sql = ExecSqlSelect (sql, MakeArray (SqlParam ("1", op)), true);
+    if ( sql.Movenext () and (ValType (sql.value (0)) != V_SPECVAL) )
+        return sql.value (0);
+    end;
+End;
+//-----------------------------------------------------------------------------------------
+// Возвращает доступ операциониста
+Private macro GetDostup ( op )
+    Var sql = "select t_ctypeperson from dperson_dbt where t_oper=:1";
+    sql = ExecSqlSelect (sql, MakeArray (SqlParam ("1", op)), true);
+    if ( sql.Movenext () and ((sql.value (0) == "А") or (sql.value (0) == "Б")) )
+        return true;
+    end;
+    return false;
+End;
+//-----------------------------------------------------------------------------------------
+
+// класс интерфейса для задания параметров и вызова процедур
+Private class (TRecHandler) TParm
+    // 2012-02-09 zip_z. >
+    //InitTRecHandler ("eareport", "ea.lbr", true);
+    InitTRecHandler ("eareport", getResourceLibPath (), true);
+    // < 2012-02-09 zip_z. 
+    
+    Var RazdRep = 0, DetRep = 0, Dostup = false;
+
+    // обработчик для скроллинга
+    Macro ScrollHandler ( rs, cmd, id, key )
+        if ( (cmd == DLG_KEY) and (key == kbEnter) )
+            return CM_SELECT;
+        end;
+    End;
+
+    Macro SelectOper ( )
+        Var sql = "select t_oper, t_name from dperson_dbt where t_userclosed <> 'X' order by t_oper";
+        sql = ExecSqlSelect (sql, null, false, RSDVAL_CLIENT, RSDVAL_STATIC);
+        if ( RunScroll (sql, 2, MakeArray ("t_oper", "Номер", 5, 0, 0, 0, "t_name", "Ф.И.О.", 40, 0, 40, 0),
+                        NULL, R2M (this, "ScrollHandler"), "Операционисты", "Enter Выбор  ESC Отмена", TRUE) )
+            return sql.value ("t_oper");
+        end;
+    End;
+
+    Macro Handler ( dlg, cmd, id, key )
+        if ( cmd == DLG_INIT )
+            Message ("F2 - выполнить  F3 - выбор  ESC - отмена");
+            DisableFields (dlg, FldIndex ("oRazdel"));
+            DisableFields (dlg, FldIndex ("oOper"));
+            DisableFields (dlg, FldIndex ("oOpName"));
+            UpdateFields (dlg);
+
+        elif ( cmd == DLG_REMFOCUS )
+           if (id == FldIndex ("oOper"))
+               key = dlg.(id);
+               if (key > 0)
+                   dlg.(FldIndex("oOpName")) = GetOperName(dlg.(id));
+               end;
+               UpdateFields (dlg);
+           end;
+
+        elif ( cmd == DLG_SAVE )
+        elif ( (cmd == DLG_KEY) and (key == kbF2) )
+             return CM_SAVE;
+
+        elif ( (cmd == DLG_KEY) and (key == kbF3) and (id == FldIndex ("oDate")) )
+            dlg.(id) = GetDateByCalendar (dlg.(id));
+
+        elif ( (cmd == DLG_KEY) and (key == kbF3) and (id == FldIndex ("oDetail")) )
+            DetRep = menu( aDet, null, "Выберите детализацию", 20, 10 );
+            if( DetRep >= 0 )
+                dlg.(id) = aDet(DetRep);
+                if ( DetRep == 0)
+                    DisableFields (dlg, FldIndex ("oRazdel"));
+                    DisableFields (dlg, FldIndex ("oOper"));
+                    dlg.(FldIndex("oRazdel")) = aRazdel(0);
+                    dlg.(FldIndex("oOper")) = {oper};
+                    dlg.(FldIndex("oOpName")) = GetOperName({oper});
+                elif ( DetRep == 1)
+                    EnableFields (dlg, FldIndex ("oRazdel"));
+                    DisableFields (dlg, FldIndex ("oOper"));
+                    dlg.(FldIndex("oOper")) = {oper};
+                    dlg.(FldIndex("oOpName")) = GetOperName({oper});
+                elif ( DetRep == 2)
+                    EnableFields (dlg, FldIndex ("oRazdel"));
+                    EnableFields (dlg, FldIndex ("oOper"));
+                end;
+            end;
+            UpdateFields (dlg);
+
+        elif ( (cmd == DLG_KEY) and (key == kbF3) and (id == FldIndex ("oRazdel")) )
+            RazdRep = menu( aRazdel, null, "Выберите раздел", 20, 13 );
+            if( RazdRep > 0 )
+                dlg.(id) = aRazdel(RazdRep);
+            end;
+            UpdateFields (dlg);
+
+        elif ( (cmd == DLG_KEY) and (id == FldIndex ("oOper")) /*and Dostup*/ ) //убрал проверку на выбор опера только админу и гл.бухгалтеру
+            if (key == kbF3)
+               key = SelectOper();
+               if ((key != null) and (key > 0))
+                   dlg.(id) = key;
+                   dlg.(FldIndex("oOpName")) = GetOperName(dlg.(id));
+               end;
+               UpdateFields (dlg);
+            end;
+        end;
+    End;
+    
+    Macro Init
+        this.("oDate")   = GetDefaultDate (0);
+        this.("oDetail") = aDet(0);
+        this.("oRazdel") = aRazdel(0);
+        this.("oOper")   = {oper};
+        this.("oOpName") = GetOperName({oper});
+        Dostup = GetDostup({oper});
+    End;
+
+    Macro Run
+        Init ();
+        return RunDialog (this, R2M (this, "Handler"));
+    End;
+End;
+
+
+// заполняем временную таблицу с названиями валют из Locale.ini для формирования сумм прописью
+Private macro FillCurrenciName
+    Var f = TStreamDoc (".\\locale.ini", "R");
+    Var kind, str, query = "select t_fiid from dfininstr_dbt where t_fi_kind = 1 and t_iso_number = :iso", sql;
+    Var n1, n2, n3, i;
+
+    if ( ExecSql ("truncate table user_eacurr", NULL, true) == NULL )
+        return false;
+    end;
+
+    while ( f.ReadLine (@str) )
+        str = Trim (str);
+        if ( (SubStr (str, 1, 3) == "CUR") and ((SubStr (str, 7, 1) == "A") or (SubStr (str, 7, 1) == "B")) )
+            sql = ExecSqlSelect (query, MakeArray (SqlParam ("iso", int (SubStr (str, 4, 3)))), true);
+            if ( sql.MoveNext () )
+                kind = SubStr (str, 7, 1);
+                str = Trim (Substr (str, 8));
+                i = index (str, ",");
+                if ( i )
+                    n1 = SubStr (str, 1, i-1);
+                    str = SubStr (str, i+1);
+                end;
+                i = index (str, ",");
+                if ( i )
+                    n2 = SubStr (str, 1, i-1);
+                    str = SubStr (str, i+1);
+                end;
+                i = index (str, ",");
+                if ( i )
+                    n3 = SubStr (str, 1, i-1);
+                    str = SubStr (str, i+1);
+                end;
+
+                if ( kind == "A" ) // еденицы нац. валюты
+                    if ( ExecSql ("MERGE INTO user_eacurr USING (select :n1 n1, :n2 n2, :n3 n3, :fiid fiid from dual) ON (t_fiid=fiid) "+
+                                  "WHEN NOT MATCHED THEN INSERT VALUES (fiid, n1, n2, n3, '???', '???', '???') "+
+                                  "WHEN MATCHED THEN UPDATE SET r0=n1, r1=n2, r2=n3",
+                                  MakeArray (SqlParam ("n1", n1), SqlParam ("n2", n2), SqlParam ("n3", n3), SqlParam ("fiid", sql.value (0))), true) == NULL )
+                        return false;
+                    end;
+                elif ( kind == "B" ) // копейки
+                    if ( ExecSql ("MERGE INTO user_eacurr USING (select :n1 n1, :n2 n2, :n3 n3, :fiid fiid from dual) ON (t_fiid=fiid) "+
+                                  "WHEN NOT MATCHED THEN INSERT VALUES (fiid, '???', '???', '???', n1, n2, n3) "+
+                                  "WHEN MATCHED THEN UPDATE SET k0=n1, k1=n2, k2=n3",
+                                  MakeArray (SqlParam ("n1", n1), SqlParam ("n2", n2), SqlParam ("n3", n3), SqlParam ("fiid", sql.value (0))), true) == NULL )
+                        return false;
+                    end;
+
+                end;
+            end;
+        end;
+    end;
+    return ExecSql ("insert into user_eacurr  values (-1, '???', '???', '???', '???', '???', '???')", NULL, true) != NULL;
+  OnError (err)
+    Exit (0, err.Message);
+End;
+
+//-----------------------------------------------------------------------------------------
+macro PutText(sql_, det_)
+
+    macro colstr (p_field)
+      if (ValType (p_field) == V_STRING ) 
+         return string(rs.value(p_field):0:0);
+      else            
+         return string(p_field:0:0);
+      end; 
+     end;
+
+    macro colstrsum (p_field1, p_field2)
+      if (ValType (p_field1) == V_STRING ) 
+         return string((rs.value(p_field1) + rs.value(p_field2)):0:0);
+      else            
+         return string((p_field1 + p_field2):0:0);
+      end; 
+    end;
+
+    macro sumstr (p_field)
+      if (ValType (p_field) == V_STRING ) 
+         return replace(string(rs.value(p_field):0:2),".",",");
+      else            
+         return replace(string(p_field:0:2),".",",");
+      end; 
+    end;
+
+    macro sumstrsum (p_field1, p_field2)
+      if (ValType (p_field1) == V_STRING ) 
+         return replace(string((rs.value(p_field1) + rs.value(p_field2)):0:2),".",",");
+      else            
+         return replace(string((p_field1 + p_field2):0:2),".",",");
+      end; 
+    end;
+
+    rs = ExecSqlSelect (sql_);
+
+    y=rs.movenext();
+
+    setoutput("..\\txtfile\\" + NameTxtFile);
+
+    first = true;
+    if   (Det_ == 0)
+        iRow = 6; iCol = 1;
+        if ( y )
+            nRazd = int(rs.value("nRazd"));
+        end;
+        while ( y )
+            if ( nRazd != int(rs.value("nRazd")) )
+                println("Итого " + colstr(nRazd)+". "+aRazdel(nRazd-1)   +";;"
+                        +colstr(bcol)         +";;;"+sumstr(bsum)        +";"
+                        +colstr(ecol)         +";;;"+sumstr(esum)        +";"
+                        +colstrsum(bcol,ecol) +";;;"+sumstrsum(bsum,esum)+";"
+                        +colstr(dsum));
+                println;
+
+                bCol = bSum = eCol = eSum = dsum = 0;
+                nRazd = int(rs.value("nRazd"));
+                iRow = iRow + 2;
+                first = true;
+            end;
+            if ( first )
+                first = false;
+                print(string(nRazd:0:0)+". "+aRazdel(nRazd-1));
+            end;
+            bCol = bCol + rs.value("bCol"); bColA = bColA + rs.value("bCol");
+            bSum = bSum + rs.value("bRub"); bSumA = bSumA + rs.value("bRub");
+            eCol = eCol + rs.value("eCol"); eColA = eColA + rs.value("eCol");
+            eSum = eSum + rs.value("eRub"); eSumA = eSumA + rs.value("eRub");
+            dSum = dSum + rs.value("dCol"); dSumA = dSumA + rs.value("dCol");
+
+            println(";"+rs.value("nCur")+";"
+                     +colstr("bcol")           +";"+sumstr("bdeb")           +";"+sumstr("bkred")           +";"+sumstr("brub")           +";"
+                     +colstr("ecol")           +";"+sumstr("edeb")           +";"+sumstr("ekred")           +";"+sumstr("erub")           +";"
+                     +colstrsum("bcol", "ecol")+";"+sumstrsum("bdeb", "edeb")+";"+sumstrsum("bkred","ekred")+";"+sumstrsum("brub", "erub")+";"
+                     +colstr("dcol")+";");
+
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        println("Итого " + colstr(nRazd)+". "+aRazdel(nRazd-1)+";;"
+                 +colstr(bcol)         +";;;"+sumstr(bsum)    +";"
+                 +colstr(ecol)         +";;;"+sumstr(esum)    +";"
+                 +colstrsum(bcol,ecol) +";;;"+sumstrsum(bsum,esum)+";"
+                 +colstr(dsum));
+        println;
+
+        iRow = iRow + 2;
+        println("Итого;;"
+                +colstr(bcolA)         +";;;"+sumstr(bsumA)+";"
+                +colstr(ecolA)         +";;;"+sumstr(esumA)+";"
+                +colstrsum(bcolA,ecolA)+";;;"+sumstrsum(bsumA,esumA)+";"
+                +colstr(dsumA));
+
+    elif (Det_ == 1)
+        iRow = 7; iCol = 1;
+        if ( y )
+            nRazd = rs.value("txt1");
+        end;
+        while ( y )
+            if ( nRazd != rs.value("txt1") )
+                println("Итого " + nRazd+";;"
+                        +colstr(bcol)         +";;;"+sumstr(bsum)        +";"
+                        +colstr(ecol)         +";;;"+sumstr(esum)        +";"
+                        +colstrsum(bcol,ecol) +";;;"+sumstrsum(bsum,esum)+";"
+                        +colstr(dsum));
+
+                println();
+
+                bCol = bSum = eCol = eSum = dsum = 0;
+                nRazd = rs.value("txt1");
+                iRow = iRow + 2;
+                first = true;
+            end;
+            if ( first )
+                first = false;
+
+                print(rs.value("txt1"));
+            end;
+            bCol = bCol + rs.value("bCol"); bColA = bColA + rs.value("bCol");
+            bSum = bSum + rs.value("bRub"); bSumA = bSumA + rs.value("bRub");
+            eCol = eCol + rs.value("eCol"); eColA = eColA + rs.value("eCol");
+            eSum = eSum + rs.value("eRub"); eSumA = eSumA + rs.value("eRub");
+            dSum = dSum + rs.value("dCol"); dSumA = dSumA + rs.value("dCol");
+
+            println(";"+rs.value("nCur")+";"
+                     +colstr("bcol")           +";"+sumstr("bdeb")            +";"+sumstr("bkred")           +";"+sumstr("brub")           +";"
+                     +colstr("ecol")           +";"+sumstr("edeb")            +";"+sumstr("ekred")           +";"+sumstr("erub")           +";"
+                     +colstrsum("bcol", "ecol")+";"+sumstrsum("bdeb", "edeb") +";"+sumstrsum("bkred","ekred")+";"+sumstrsum("brub", "erub")+";"
+                     +colstr("dcol")+";");
+
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        println("Итого " + nRazd+";;"
+                +colstr(bcol)         +";;;"+sumstr(bsum)        +";"
+                +colstr(ecol)         +";;;"+sumstr(esum)        +";"
+                +colstrsum(bcol,ecol) +";;;"+sumstrsum(bsum,esum)+";"
+                +colstr(dsum));
+        println;
+
+        iRow = iRow + 2;
+        println("Итого;;"
+                +colstr(bcolA)         +";;;"+sumstr(bsumA)+";"
+                +colstr(ecolA)         +";;;"+sumstr(esumA)+";"
+                +colstrsum(bcolA,ecolA)+";;;"+sumstrsum(bsumA,esumA)+";"
+                +colstr(dsumA));
+
+    elif (Det_ == 2)
+        iRow = 9; iCol = 9;
+        if ( y )
+            nCur = rs.value("ncur");
+            nRazd = rs.value("el");
+        end;
+        while ( y )
+            if ( (nRazd != rs.value("el")) or (nCur != rs.value("ncur")) )
+                println("Итого ;;;;"+sumstr(bsum)+";"+sumstr(esum)+";"+sumstr(dsum)+";;;;;;"
+                        +sumstr(bsumA)+";"+sumstr(esumA)+";"+sumstr(dsumA)+";"    );
+                println();
+
+                bSum = eSum = dSum = bSumA = eSumA = dSumA = 0;
+                iRow = iRow + 2;
+                if (nRazd != rs.value("el"))
+                    nRazd = rs.value("el");
+                    println(iif(nRazd==0,"В бумажном виде","В электронном виде"));
+                    println("Основной документ;Документ-основание");
+                    println("Номер;Шифр;Счет Дт;Счет Кт;Сумма в валюте Дт;Сумма в валюте Кт;Сумма в национальной валюте;Номер;Дата;Шифр;Счет Дт;Счет Кт;Сумма в валюте Дт;Сумма в валюте Кт;Сумма в национальной валюте");
+
+                    iRow = iRow + 3;
+                end;
+                if (nCur != rs.value("ncur"))
+                    nCur = rs.value("ncur");
+                    nRazd = rs.value("el");
+                    println(ncur);
+                    println(iif(nRazd==0,"В бумажном виде","В электронном виде"));
+                    println("Основной документ;Документ-основание");
+                    println("Номер;Шифр;Счет Дт;Счет Кт;Сумма в валюте Дт;Сумма в валюте Кт;Сумма в национальной валюте;Номер;Дата;Шифр;Счет Дт;Счет Кт;Сумма в валюте Дт;Сумма в валюте Кт;Сумма в национальной валюте");
+
+                    iRow = iRow + 4;
+                end;
+                iCol = iRow;
+            end;
+            bSum = bSum + rs.value("sdeb1"); bSumA = bSumA + rs.value("sdeb2");
+            eSum = eSum + rs.value("skred1"); eSumA = eSumA + rs.value("skred2");
+            dSum = dSum + rs.value("srub1"); dSumA = dSumA + rs.value("srub2");
+
+  /*  
+            println(rs.value("num1")+";"+rs.value("shifr1")+";`"+rs.value("adeb1")+";`"+rs.value("akred1")+";"
+                    +string(rs.value("sdeb1"):0:2)+";"+string(rs.value("skred1"):0:2)+";"+string(rs.value("srub1"):0:2)+";"
+                    +rs.value("num2")+";"+rs.value("data2")+";"+rs.value("shifr2")+";`"+rs.value("adeb2")+";`"+rs.value("akred2")+";"
+                    +string(rs.value("sdeb2"):0:2)+";"+string(rs.value("skred2"):0:2)+";"+string(rs.value("srub2"):0:2)   );
+  */
+            println(rs.value("num1")+";"+rs.value("shifr1")+";`"+rs.value("adeb1")+";`"+rs.value("akred1")+";"
+                    +sumstr("sdeb1")+";"+sumstr("skred1")+";"+sumstr("srub1")+";"
+                    +rs.value("num2")+";"+rs.value("data2")+";"+rs.value("shifr2")+";`"+rs.value("adeb2")+";`"+rs.value("akred2")+";"
+                    +sumstr("sdeb2")+";"+sumstr("skred2")+";"+sumstr("srub2")   );
+
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        println("Итого ;;;;"+sumstr(bsum)+";"+sumstr(esum)+";"+sumstr(dsum)+";;;;;;"
+                +sumstr(bsumA)+";"+sumstr(esumA)+";"+sumstr(dsumA)+";"    );
+
+    end;
+
+    setoutput(null,true);
+
+    TermFileName_Txt = Copy_text (NameTxtFile);
+
+    //msgbox (string("Это вернул Copy_text = ",TermFileName_Txt));
+    if (TermFileName_Txt == "")
+       exit(1);
+    end;
+
+end;
+//-----------------------------------------------------------------------------------------
+macro OpenTempl(det_)
+    var qt;
+
+    if   (Det_ == 0)
+        ExcelApplication.Sheets("Шаг 1").Select;
+    elif (Det_ == 1)
+        ExcelApplication.Sheets("Шаг 2").Select;
+    elif (Det_ == 2)
+        ExcelApplication.Sheets("Шаг 3").Select;
+    end;
+    ActiveSheet = ExcelApplication.ActiveSheet;
+
+    //msgbox (string("Сейчас произойдет попытка подгрузить тестовый файл с данными: ",TermFileName_Txt));
+
+    if   (Det_ == 0)
+       qt = ActiveSheet.QueryTables.Add("TEXT;"+TermFileName_Txt,ActiveSheet.Range("$A$6"));
+    elif (Det_ == 1)
+       qt = ActiveSheet.QueryTables.Add("TEXT;"+TermFileName_Txt,ActiveSheet.Range("$A$7"));
+    elif (Det_ == 2)
+       qt = ActiveSheet.QueryTables.Add("TEXT;"+TermFileName_Txt,ActiveSheet.Range("$A$9"));
+    end;
+    qt.Name = "earep";
+    qt.FieldNames = True;
+    qt.RowNumbers = False;
+    qt.FillAdjacentFormulas = False;
+    qt.PreserveFormatting = True;
+    qt.RefreshOnFileOpen = False;
+    qt.RefreshStyle = 0; //xlOverwriteCells        1;  //xlInsertDeleteCells;
+    qt.SavePassword = False;
+    qt.SaveData = True;
+    qt.AdjustColumnWidth = False;
+    qt.RefreshPeriod = 0;
+    qt.TextFilePromptOnRefresh = False;
+    qt.TextFilePlatform = 866;
+    qt.TextFileStartRow = 1;;
+    qt.TextFileParseType = 1; //xlDelimited;
+    qt.TextFileTextQualifier = 1; //xlTextQualifierDoubleQuote;
+    qt.TextFileConsecutiveDelimiter = False;
+    qt.TextFileTabDelimiter = True;
+    qt.TextFileSemicolonDelimiter = True;
+    qt.TextFileCommaDelimiter = False;
+    qt.TextFileSpaceDelimiter = False;
+//    qt.TextFileColumnDataTypes = TArray(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    qt.TextFileTrailingMinusNumbers = True;
+    qt.Refresh(False);
+
+end;
+//-----------------------------------------------------------------------------------------
+macro FormatTempl(sql_, det_, data, razd, oper)
+    rs = ExecSqlSelect (sql_);
+
+    y=rs.movenext();
+
+    first = true;
+    if   (Det_ == 0)
+        ActiveSheet.Cells(2,"A").Value = "Свод документов дня за " + Data;
+        iRow = 6; iCol = 1;
+        if ( y )
+            nRazd = int(rs.value("nRazd"));
+        end;
+        while ( y )
+            if ( nRazd != int(rs.value("nRazd")) )
+                nRazd = int(rs.value("nRazd"));
+                iRow = iRow + 2;
+                first = true;
+            end;
+            if ( first )
+                first = false;
+            end;
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        iRow = iRow + 2;
+        ActiveSheet.Range(ActiveSheet.Cells(6, 1), ActiveSheet.Cells(iRow, 15)).Select;
+        ExcelApplication.Selection.Borders.LineStyle = xlContinuous;
+
+    elif (Det_ == 1)
+        ActiveSheet.Cells(2,"A").Value = "Свод документов дня за " + Data;
+        ActiveSheet.Cells(3,"A").Value = string((Razd+1):0:0)+". "+aRazdel(Razd);
+        iRow = 7; iCol = 1;
+        if ( y )
+            nRazd = rs.value("txt1");
+        end;
+        while ( y )
+            if ( nRazd != rs.value("txt1") )
+                nRazd = rs.value("txt1");
+                iRow = iRow + 2;
+                first = true;
+            end;
+            if ( first )
+                first = false;
+            end;
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        iRow = iRow + 2;
+        ActiveSheet.Range(ActiveSheet.Cells(7, 1), ActiveSheet.Cells(iRow, 15)).Select;
+        ExcelApplication.Selection.Borders.LineStyle = xlContinuous;
+
+    elif (Det_ == 2)
+        ActiveSheet.Cells(2,"A").Value = "Свод документов дня за " + Data;
+        ActiveSheet.Cells(3,"A").Value = string((Razd+1):0:0)+". "+aRazdel(Razd);
+        ActiveSheet.Cells(4,"A").Value = GetOperName(Oper);
+        iRow = 9; iCol = 9;
+        if ( y )
+            nCur = rs.value("ncur");
+            nRazd = rs.value("el");
+            ActiveSheet.Cells(5,"A").Value = nCur;
+            ActiveSheet.Cells(6,"A").Value = iif(nRazd==0,"В бумажном виде","В электронном виде");
+        end;
+        while ( y )
+            if ( (nRazd != rs.value("el")) or (nCur != rs.value("ncur")) )
+                ActiveSheet.Range(ActiveSheet.Cells(iCol, 1), ActiveSheet.Cells(iRow, 15)).Select;
+                ExcelApplication.Selection.Borders.LineStyle = xlContinuous;
+                iRow = iRow + 2;
+                if (nRazd != rs.value("el"))
+                    nRazd = rs.value("el");
+                    ActiveSheet.Range(ActiveSheet.Cells(6, 1), ActiveSheet.Cells(8, 15)).Select;
+                    ExcelApplication.Selection.Copy;
+                    ActiveSheet.Range(ActiveSheet.Cells(iRow, 1), ActiveSheet.Cells(iRow+2, 15)).Select;
+                    ActiveSheet.Paste;
+                    ActiveSheet.Cells(iRow,"A").Value = iif(nRazd==0,"В бумажном виде","В электронном виде");
+                    iRow = iRow + 3;
+                end;
+                if (nCur != rs.value("ncur"))
+                    nCur = rs.value("ncur");
+                    nRazd = rs.value("el");
+                    ActiveSheet.Range(ActiveSheet.Cells(5, 1), ActiveSheet.Cells(8, 15)).Select;
+                    ExcelApplication.Selection.Copy;
+                    ActiveSheet.Range(ActiveSheet.Cells(iRow, 1), ActiveSheet.Cells(iRow+3, 15)).Select;
+                    ActiveSheet.Paste;
+                    ActiveSheet.Cells(iRow,"A").Value = nCur;
+                    ActiveSheet.Cells(iRow+1,"A").Value = iif(nRazd==0,"В бумажном виде","В электронном виде");
+                    iRow = iRow + 4;
+                end;
+                iCol = iRow;
+            end;
+            iRow = iRow + 1;
+            y=rs.movenext();
+        end;
+        ActiveSheet.Range(ActiveSheet.Cells(iCol, 1), ActiveSheet.Cells(iRow, 15)).Select;
+        ExcelApplication.Selection.Borders.LineStyle = xlContinuous;
+    end;
+
+end;
+//-----------------------------------------------------------------------------------------
+Macro RunReport (Data, Det, Razd, Oper) 
+    var name_oper;
+
+    if ( not FillCurrenciName () )
+        MemoryError (1, "Ошибка заполнения таблицы наименований валют");
+        return false;
+    end;
+
+    //выполнение основного запроса по документам
+//Setoutput ("..\1_ea.txt");
+
+    GetMainSql("X");
+
+/*sql = EndCapture ();
+println (sql);
+setoutput (null);
+viewfile("..\1_ea.txt");
+exit(0);
+*/
+    BegAction (0, "Идет отбор документов, ждите...", false);
+
+    sql = ExecSqlSelect (EndCapture (), MakeArray (SqlParam ("dtrub", Data), SqlParam ("dtend", Data)), true);
+
+    EndAction ();
+    InitProgress (-1, null, "Формирование отчета");
+
+
+    TermFileName_Excel = Check_templ ("eareport.xls");
+    //msgbox(string("Это вернул Check_templ = ",TermFileName));
+
+    if (TermFileName_Excel == "")
+       exit(1);
+    end;
+
+/*****************************/
+
+    //очистка временных таблиц
+    ExecSql ( "delete from user_earep1" );
+    ExecSql ( "delete from user_earep2" );
+
+    // заполнение временной таблицы
+    y = sql.MoveNext ();
+    while ( y /*and (cnt <= 1000)*/)
+      if ((Det == 0) or (Det == 1))
+        if ( xml0.LoadXml (sql.value ("MOxml")) ) //sql.value ("PMxml")
+          if ( (Det == 0) or ((Det == 1) and (int(xml0.childNodes.item (0).getAttribute ("partId")) == Razd+1)) )
+            if (Det == 0)
+              pRazd = xml0.childNodes.item (0).getAttribute ("partId");
+            else
+              pRazd = xml0.childNodes.item (0).getAttribute ("employee");
+            end;
+            if (sql.value("IsMulty") == 0)
+              pCur = sql.value("t_code_currency");
+              if (pCur != 0) pCur = 1; end;
+              pnCur = xml0.childNodes.item (0).getAttribute ("currency");
+            else
+              pCur = 2;
+              pnCur = xml0.childNodes.item (0).getAttribute ("currency1")+"/"+xml0.childNodes.item (0).getAttribute ("currency2");
+            end;
+            pDeb  = xml0.childNodes.item (0).getAttribute ("debitSum");
+            if (ValType (pDeb) == V_SPECVAL ) pDeb = 0; end;
+            pKred = xml0.childNodes.item (0).getAttribute ("creditSum");
+            if (ValType (pKred) == V_SPECVAL ) pKred = 0; end;
+            pRub  = xml0.childNodes.item (0).getAttribute ("sum");
+            if (ValType (pRub) == V_SPECVAL ) pRub = 0; end;
+            pCol  = 1;
+            if ( (ValType (sql.value ("ExtUploadDoc")) != V_SPECVAL) and (ValType (sql.value ("DevCode")) != V_SPECVAL))
+              pCol2 = 1;
+            else
+              pCol2 = 0;
+            end;
+            if (Det == 1)
+               name_oper = GetOperName(pRazd);
+            else
+               name_oper = "";
+            end;
+            if (sql.value("StoreKindMO") == 0)
+              isql="insert into user_earep1 values (:1,:2,:3,:4,:5,:6,:7,0,0,0,0,:8,:9)";
+            else
+              isql="insert into user_earep1 values (:1,:2,:3,0,0,0,0,:4,:5,:6,:7,:8,:9)";
+            end;
+            ExecSql(isql,MakeArray (SqlParam("1",pRazd),
+                                  SqlParam("2",pCur),
+                                  SqlParam("3",pnCur),
+                                  SqlParam("4",pCol),
+                                  SqlParam("5",pDeb),
+                                  SqlParam("6",pKred),
+                                  SqlParam("7",pRub),
+                                  SqlParam("8",pCol2), 
+                                  SqlParam("9",name_oper)), true);
+          end;
+        end;
+      else
+        if ( xml0.LoadXml (sql.value ("MOxml")) ) //sql.value ("PMxml")
+          if ( (int(xml0.childNodes.item (0).getAttribute ("partId")) == Razd+1) and ((int(xml0.childNodes.item (0).getAttribute ("employee")) == Oper)))
+            if (sql.value("IsMulty") == 0)
+              pCur = sql.value("t_code_currency");
+              if (pCur != 0) pCur = 1; end;
+              pnCur = xml0.childNodes.item (0).getAttribute ("currency");
+            else
+              pCur = 2;
+              pnCur = xml0.childNodes.item (0).getAttribute ("currency1")+"/"+xml0.childNodes.item (0).getAttribute ("currency2");
+            end;
+            pel = int(sql.value("StoreKindMO"));
+            pnum1   = xml0.childNodes.item (0).getAttribute ("docNumber");
+            pshifr1 = xml0.childNodes.item (0).getAttribute ("docCode");
+            if (ValType (pshifr1) == V_SPECVAL ) pshifr1 = " "; end;
+            padeb1  = xml0.childNodes.item (0).getAttribute ("accountNumber");
+            pakred1 = xml0.childNodes.item (0).getAttribute ("accountKrNumber");
+            psdeb1  = xml0.childNodes.item (0).getAttribute ("debitSum");
+            if (ValType (psdeb1) == V_SPECVAL ) psdeb1 = 0; end;
+            pskred1 = xml0.childNodes.item (0).getAttribute ("creditSum");
+            if (ValType (pskred1) == V_SPECVAL ) pskred1 = 0; end;
+            psrub1  = xml0.childNodes.item (0).getAttribute ("sum");
+            if (ValType (psrub1) == V_SPECVAL ) psrub1 = 0; end;
+
+            pnum2 = pdata2 = pshifr2 = padeb2 = pakred2 = " ";  psdeb2 = pskred2 = psrub2 = 0;
+//            if ( (ValType (sql.value ("ExtUploadDoc")) != V_SPECVAL) and (ValType (sql.value ("DevCode")) != V_SPECVAL))
+            if (ValType (sql.value ("ExtUploadDoc")) != V_SPECVAL)
+              if ( xml1.LoadXml (sql.value ("PMxml")) )
+                pnum2   = xml1.childNodes.item (0).getAttribute ("docNumber");
+                pdata2  = xml1.childNodes.item (0).getAttribute ("docStartDate");
+                pshifr2 = xml1.childNodes.item (0).getAttribute ("docCode");
+                if (ValType (pshifr2) == V_SPECVAL ) pshifr2 = " "; end;
+                padeb2  = xml1.childNodes.item (0).getAttribute ("accountNumber");
+                if (ValType (padeb2) == V_SPECVAL ) padeb2 = " "; end;        // Rogl modify (31.05.2012)
+
+                pakred2 = xml1.childNodes.item (0).getAttribute ("accountKrNumber");
+                if (ValType (pakred2) == V_SPECVAL ) pakred2 = " "; end;      // Rogl modify (31.05.2012)
+
+                psdeb2  = xml1.childNodes.item (0).getAttribute ("debitSum");
+                if (ValType (psdeb2) == V_SPECVAL ) psdeb2 = 0; end;
+                pskred2 = xml1.childNodes.item (0).getAttribute ("creditSum");
+                if (ValType (pskred2) == V_SPECVAL ) pskred2 = 0; end;
+                psrub2  = xml1.childNodes.item (0).getAttribute ("sum");
+                if (ValType (psrub2) == V_SPECVAL ) psrub2 = 0; end;
+              else
+                pnum2 = pdata2 = pshifr2 = padeb2 = pakred2 = " "; psdeb2 = pskred2 = psrub2 = 0;
+              end;
+            end;
+            isql="insert into user_earep2 values (:1,:2,:3,:4,:5,:6,:7,:8,:9,:10,:11,:12,:13,:14,:15,:16,:17,:18)";
+            ExecSql(isql,MakeArray (SqlParam("1",pCur),
+                                  SqlParam("2",pnCur),
+                                  SqlParam("3",pel),
+                                  SqlParam("4",pnum1),
+                                  SqlParam("5",pshifr1),
+                                  SqlParam("6",padeb1),
+                                  SqlParam("7",pakred1),
+                                  SqlParam("8",psdeb1),
+                                  SqlParam("9",pskred1),
+                                  SqlParam("10",psrub1),
+                                  SqlParam("11",pnum2),
+                                  SqlParam("12",pdata2),
+                                  SqlParam("13",pshifr2),
+                                  SqlParam("14",padeb2),
+                                  SqlParam("15",pakred2),
+                                  SqlParam("16",psdeb2),
+                                  SqlParam("17",pskred2),
+                                  SqlParam("18",psrub2)), true);
+
+          end;
+        end;
+      end;
+      UseProgress (cnt = cnt+1);
+      y = sql.movenext();
+    end;
+
+    // запрос из временной таблицы для соотв. детализации
+    if (Det == 0)
+        sql = "Select nrazd, cur, ncur, sum(bcol) as bcol, sum(bdeb) as bdeb, sum(bkred) as bkred, sum(brub) as brub, sum(ecol) as ecol, sum(edeb) as edeb, sum (ekred) as ekred, sum(erub) as erub, sum(dcol) as dcol "+
+              "from user_earep1 group by nrazd,cur,ncur order by nrazd,cur,ncur";
+    elif (Det == 1)
+        sql = "Select txt1, cur, ncur, sum(bcol) as bcol, sum(bdeb) as bdeb, sum(bkred) as bkred, sum(brub) as brub, sum(ecol) as ecol, sum(edeb) as edeb, sum (ekred) as ekred, sum(erub) as erub, sum(dcol) as dcol "+
+              "from user_earep1 group by txt1, cur, ncur order by txt1, cur, ncur";
+    elif (Det == 2)
+        sql = "Select cur, ncur, el, num1, shifr1, adeb1, akred1, sdeb1, skred1, srub1, "+
+              "num2, data2, shifr2, adeb2, akred2, sdeb2, skred2, srub2 from user_earep2 order by cur,ncur,el ";
+    end;
+
+    // вывод в текстовый файл
+    PutText(sql, det);
+
+    /*Откроем Excel*/
+    //msgbox(string("Отладочная информация. |Сейчас произойдет попытка открыть Excel на компьютере пользователя |и загрузить шаблон: |",TermFileName_Excel));
+
+    if(not NewExcelWorkbook2(false, TermFileName_Excel))
+      exit(0, "Не открыт файл шаблона отчета");
+    end;
+
+    // открытие шаблона и подгрузка из текстового файла
+    OpenTempl(det);
+    // постформатирование
+    FormatTempl(sql, det, data, razd, oper);
+
+    ExcelApplication.Visible = true;
+
+    RemProgress ();
+
+End;
+//-----------------------------------------------------------------------------------------
+
+Parm = TParm ();
+if ( not Parm.Run () ) Exit (1); end;
+
+RunReport( Parm.("oDate"), Parm.DetRep, Parm.RazdRep, Parm.("oOper") );
+Exit (1);

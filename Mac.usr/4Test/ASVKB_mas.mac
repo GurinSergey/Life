@@ -1,0 +1,1306 @@
+//-----------------------------------------------------------------------------
+// Назначение: Макрос выгрузки платежей для загрузки в АСВКБ 
+// Описание  : для Пробизнесбанка
+// Авторы    : Стручков А. Тихомиров А. 19.12.2008
+// Changes   :
+// TAM    04.04.2012 C-9186
+// KS     08.06.2012 I-00198430
+// vihrov 11.07.2012 C-12122 смена диапазонов кодов
+// TAM    03.10.2012 R-105826-2
+// GSP    17.09.2013 C-23081
+// TAM    19.12.2013 make-up макроса
+// TAM    22.01.2014 C-26267 - 35 параметр из примечания 118
+// DPN    29.04.2014 C-28764-6 - Шестизначная нумерация ВУЗ
+// TAM    29.07.2014 R-420514 - колличество параметров увеличено до 57
+// TAM    16.10.2014 C-32919  - для Солидарности код клиента 6 последних знаков первого кода
+// LVV    27.04.2015 C-32652  - внесены многочисленные правки для корректного заполнения полей по входящим платежам комиссий банка корреспондента (поля 9,21,22,24,29,30)
+//test 12
+//-----------------------------------------------------------------------------
+
+import "pm_note.mac",Rsbdataset;
+import PTInter, payminter, oralib, globals, "cb_sql.mac";
+Import "fg_Life_parm.mac"; //14.08.2012 vihrov смена кодов
+import lib_const, likepy, lib_fg; //DPN    29.04.2014 C-28764-6
+
+private var {CurDate};
+private var cod_in_asvkb:string = ""; //14.08.2012 vihrov смена кодов
+
+macro ASVKB(id, dir, ord_sum, ord_date, ord_flag, firstvoop, countvoop, pay_cnt)
+   ord_date= SQL_ConvTypeDate(ord_date);
+   record pmprop("pmprop");
+   record paym(pmpaym);
+
+   var PaymentObj:Rsbpayment=Rsbpayment(Id);
+   record ctg( "objattr" );
+
+   var note402prim112; //GSP 04.09.2013 C-23081
+   var i=0;
+   var sumPoCodam:money;//сумма по нескольким кодам\паспортам сделок
+   var Oldstr,NewStr,ObrStr,pos=1, posVO, sep=";",flag=0, sepVO="{",
+   da,noteV,err_mes,count,
+   cod643,AcNer,SumValContr,ObrStr1,posVO1, path;
+   var P_34, P_11, P_35, uto, IsUto = false, curvoop = 0;
+
+   getRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ПУТЬ К ФАЙЛУ OPLATA.D",V_string,path);
+   getRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ПУТЬ К ФАЙЛУ OPLATA.D",V_string,path);
+   path=path+"Oplata.d";
+   paymentobj.Categories.GetFirst( 117, {curdate}, ctg );
+
+   var zapros   :RSDRecordset;
+   var SQLQuery :string  = "";
+   var pmpaym_receiverbankID, pmpaym_payerbankID, pmpaym_payer, pmpaym_receiver,
+        pmrmprop_payerbankname, pmrmprop_receiverbankname, pmrmprop_number, pmpaym_amount, pmpaym_baseamount,
+        pmpaym_payeraccount, pmpaym_receiveraccount, pmpaym_fiid, pmpaym_basefiid, pmco_contractfiid, pmrmprop_date, pmpaym_valuedate,
+        pmco_VO_code, pmrmprop_ground, pmco_passportnumber, pmco_contractnumber, 
+        pmrmprop_payername , pmrmprop_receivername , pmpaym_cr_rec , pmpaym_cr_pay,
+        pmpaym_contractamount; // KS 19.06.2012 I-00198430 Добавлю ещё одно поле 22
+
+   // A.Gregeradsky - 01.12.2009 - Для клиентских б/нал. конверсий за сумму платежа берется всегда baseamount, 
+   // за валюту платежа и валюту контракта - basefiid 
+   SQLQuery = " SELECT pmpaym.t_receiverbankID, pmpaym.t_payerbankID, pmpaym.t_receiver, pmpaym.t_payer, "
+            + " pmrmprop.t_payerbankname, pmrmprop.t_receiverbankname, pmrmprop.t_number, "
+            + " DECODE (NVL (pmco.t_amount, 0), 0, CASE WHEN "+dir+"=1 THEN pmpaym.t_payamount WHEN "+dir+"=2 THEN pmpaym.t_amount END, pmco.t_amount )," // pmco.t_amount, " TAM 25.06.2012
+            + " pmpaym.t_payeraccount, ";
+    //TAM 27.11.2012 I-00268336-2
+   if(fgBank.is_EXV) //DPN    29.04.2014 C-28764-6
+      SQLQuery = SQLQuery + "DECODE (PMPAYM.T_RECEIVER, -1, PMPAYM.T_FUTURERECEIVERACCOUNT, PMPAYM.T_RECEIVERACCOUNT),";
+   else
+      SQLQuery = SQLQuery + "pmpaym.t_receiveraccount,";
+   end;
+   SQLQuery = SQLQuery + "pmpaym.t_fiid, "
+            + " nvl(decode (pmco.t_contractfiid, -1, (case when "+dir+"=1 then pmpaym.t_payfiid when "+dir+"=2 then pmpaym.t_fiid end), pmco.t_contractfiid),-1), "
+            + " pmrmprop.t_date, pmpaym.t_valuedate, nvl(pmco.t_VO_code,0), pmrmprop.t_ground, "
+            + " nvl(decode(pmco.t_passportnumber,chr(1),' ',pmco.t_passportnumber),' '),  nvl(pmco.t_contractnumber,' '), "
+            + " pmrmprop.T_PAYERNAME, pmrmprop.T_receiverNAME , pmpaym.T_FUTUREPAYERACCOUNT , pmpaym.T_FUTURERECEIVERACCOUNT"
+            + " , pmco.t_contractamount " // KS 19.06.2012 I-00198430 Добавлю ещё одно поле 22
+            + " , pmpaym.t_basefiid "  
+            + " , pmpaym.t_baseamount "  //LVV 23.04.15 C-38652 Еще 2 поля для проверки валютный платеж или нет.
+            + " FROM dpmpaym_dbt pmpaym, dpmrmprop_dbt pmrmprop, dpmco_dbt pmco "
+            + " WHERE pmpaym.t_paymentId = '"+id+"'"
+            + "   and pmpaym.T_PAYMENTID = pmco.T_PAYMENTID(+) " 
+            + "   and pmpaym.t_paymentId = pmrmprop.T_PAYMENTID "
+            + " order by pmco.t_pmcoid "; // KS 08.06.2012 I-00198430 Сортируем
+   zapros = RSDRecordset(SQLQuery); //результат запроса
+   var account, res_pay;
+   while ((zapros.moveNext)and(pay_cnt>0))
+      pay_cnt = pay_cnt - 1;
+      pmpaym_receiverbankID = zapros.value(0);
+      pmpaym_payerbankID = zapros.value(1);
+      pmpaym_receiver = zapros.value(2);
+      pmpaym_payer = zapros.value(3);
+      pmrmprop_payerbankname  = zapros.value(4);
+      pmrmprop_receiverbankname = zapros.value(5);
+      pmrmprop_number = zapros.value(6);
+      pmpaym_amount = money( zapros.value(7));
+      pmpaym_payeraccount = zapros.value(8);
+      pmpaym_receiveraccount = zapros.value(9);
+      pmpaym_fiid = zapros.value(10);
+      pmco_contractfiid = zapros.value(11);
+      if(pmco_contractfiid == " ")
+         if (dir == 2)
+            account = pmpaym_payeraccount;
+         elif(dir == 1)
+            account = pmpaym_receiveraccount;
+         end;
+         pmco_contractfiid = pmpaym_fiid;
+      end;
+      pmrmprop_date = SQL_ConvTypeDate(zapros.value(12));
+      pmpaym_valuedate = SQL_ConvTypeDate(zapros.value(13));
+      pmco_VO_code = zapros.value(14);
+      pmrmprop_ground = zapros.value(15);
+      pmco_passportnumber = zapros.value(16);
+      pmco_contractnumber = zapros.value(17);
+      pmrmprop_payername = zapros.value(18);
+      pmrmprop_receivername = zapros.value(19);
+      pmpaym_cr_pay = zapros.value(20);
+      pmpaym_cr_rec = zapros.value(21);
+      pmpaym_contractamount = zapros.value(22); // KS 19.06.2012 I-00198430 Добавлю ещё одно поле 22
+      pmpaym_basefiid  =  zapros.value(23);
+      pmpaym_baseamount  =  zapros.value(24);
+   end;
+
+   //TAM 14.03.2012 C-9186
+   macro GetPaymentAttribute(Payment,Category_id:integer)
+      var result = " ";
+      record pm(pmpaym);
+      pm.PaymentId = payment.paymentid;
+      GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(pm,OBJTYPE_PAYMENT), Category_id, null, null, result);
+      return result;
+   end;
+
+   //LVV 06.05.14 C-38652
+macro getAccOwner(pAccount):integer
+   
+   var sql = " SELECT a.t_client               "+
+             " FROM  daccount_dbt a            "+
+             " WHERE  A.T_ACCOUNT = :account   ";
+   sql = execSqlSelect (sql , makeArray (SqlParam ("account"     , pAccount) ));
+                           
+   if (sql.moveNext ())
+        return sql.value(0);
+   end;
+   
+   return 0;
+end;
+
+private macro getPartyShortName(partyid):string
+   record party(party); 
+   var error;  
+   
+   error = ПолучитьСубъекта(partyid,party);
+   if (error==0)
+      return party.shortname;
+   else 
+      return "";
+   end;
+end;
+   
+   //TAM 03.10.2012 R-105826-2
+   //zmp 10.10.2012 C-14675
+   macro ReadWaitDate(PaymentID:integer,codeVO:string)
+      if (inList (codeVO, "11100","21100","23100","23110")) 
+         var result = "";
+         result = trim(ReadNoteForPayment(paymentID, PM_USR_NOTEKIND_PURPOSEDATE));
+         if(strLen(result) == 9)
+            return string("0",result);
+         else
+            return result;
+         end;
+      else
+         return "";
+      end;
+   end;
+
+   //TAM 16.10.2012 R-110149-2
+   //TAM 12.12.12 I-00296424 - добавляем для проверки 31 и 41 параметры - один из них должен быть заполнен
+   //LVV 24.04.2015 C-38652 Для  документов, содержащих в назначении "Комиссия банка корреспондента"   должна возвращаться Истина
+   macro CheckFor29_30_34Params(vo_cod, par_31, par_41, par_34)
+     debugbreak; 
+      //TAM 12.12.12 I-00296424-3
+      if ((trim(par_41) == "") and (trim(par_31) == ""))
+         return false;
+      else
+         if((substr(vo_cod,1,2) == "20") or 
+            (substr(vo_cod,1,2) == "21") or 
+            (substr(vo_cod,1,2) == "22") or 
+            (substr(vo_cod,1,2) == "23") or 
+            (substr(vo_cod,1,2) == "35") or 
+            (substr(vo_cod,1,2) == "58") or 
+            (substr(vo_cod,1,2) == "70") or 
+            (substr(vo_cod,1,2) == "80") or
+            //TAM 12.11.2012 R-122996-2
+            (substr(vo_cod,1,2) == "12") or
+            (substr(vo_cod,1,2) == "13") or
+            //Gurin S. 01.04.2015 R-564038-2
+            (substr(vo_cod,1,2) == "32") or
+            Index (pmrmprop_ground,"Комиссия банка корреспондента")
+ )
+            return true;
+         else
+            return false;
+         end;
+      end;
+   end;
+
+   // TAM 24.10.2012 R-116717
+   // zip_z. {Name_Bank}
+   macro Set21Param()
+      if(fgBank.is_EXV)
+         return "ЗАО АКБ \"ЭКСПРЕСС-ВОЛГА\"";
+      elif(fgBank.is_prbb)
+         return "ОАО АКБ \"ПРОБИЗНЕСБАНК\"";
+      elif(fgBank.is_VUZ)
+         return "ОАО АКБ \"ВУЗ-БАНК\""; //29.04.2014 C-28764-6 DPN
+      end;
+   end;
+
+   macro GetServiceBankName(Payment)
+      var result = " ";
+      if(Payment.BaseFIID == 0)
+         if(Substr(Payment.ReceiverAccount,1,5) == "30111")
+            result = Payment.ReceiverName;
+         end;
+         if(Substr(Payment.PayerAccount,1,5) == "30111")
+            result = Payment.PayerName;
+         end;
+      end;
+      if(strlen(result) <= 150)
+         return result;
+      else 
+         return substr(result,1,150);
+      end;
+   end;
+
+   macro GetParentCodeAttrib(num_in_list):string
+      private var cmd, rs;
+      if(num_in_list == " ")
+         return "";
+      else
+         cmd = RSDCommand("select t_parentid from dobjattr_dbt where t_objecttype = 501 and t_groupid = 1012 and t_numinlist = ?");
+         cmd.addParam("numinlist", RSDBP_IN, num_in_list);
+         rs = RSDRecordset(cmd);
+         if(rs.MoveNext())
+            if (rs.value(0) == 0)
+               return num_in_list;
+            else 
+               return string(rs.value(0));
+            end;
+         end;
+      end;
+   end;
+
+   //FIV I-081767 Обрезаем наименование до первой запятой
+   private macro EraseNameToComa(_name)
+      var pos = Index(_name, ",");
+      if (((pmpaym_fiid != 0) or (pmpaym_basefiid != 0)) and (pos > 0))
+         return Substr(_name, 1, pos-1);
+      end;
+      return _name;
+   end;
+   
+   if (dir == 2)
+      account = pmpaym_payeraccount;
+      res_pay = EraseNameToComa(pmrmprop_receivername);
+   elif(dir == 1)
+      account = pmpaym_receiveraccount;
+      res_pay = EraseNameToComa(pmrmprop_payername);
+   end;
+   if (Index (pmrmprop_ground,"Комиссия банка корреспондента") )  //LVV C-38652 06.05.14
+      res_pay = EraseNameToComa(GetPartyShortname(getAccOwner(pmpaym_receiveraccount)));
+   end;
+
+   private  macro Get_usr_trnsf_order(pmid)
+      var sql, rs,  cmd;
+      SQL = " SELECT   * ";
+      SQL = SQL + "  FROM   usr_trnsf_order uto ";
+      SQL = SQL + " WHERE       uto.notify_num = ?  ";
+      SQL = SQL + "        AND uto.date_value = (SELECT   MAX (date_value) ";
+      SQL = SQL + "                                 FROM   usr_trnsf_order ";
+      SQL = SQL + "                                WHERE   notify_num = ? ) ";
+      SQL = SQL + "         AND uto.order_num = (SELECT   MAX (order_num) ";
+      SQL = SQL + "                                FROM   usr_trnsf_order ";
+      SQL = SQL + "                               WHERE   notify_num = ? ) ";    
+      cmd = rsdcommand(sql);
+      cmd.AddParam("", RSDBP_IN,pmid);
+      cmd.AddParam("", RSDBP_IN,pmid);
+      cmd.AddParam("", RSDBP_IN,pmid);
+      uto = rsdRecordSet(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+      if (uto and uto.movenext())
+         IsUto = true;
+      end;
+   end; 
+
+   private macro Isnerez(dir)
+      var   rs, sql;
+      if (dir == 2)
+         sql="select T_notresident from dparty_dbt where T_PartyID="+pmpaym_payer;
+         rs = execSQLselect(sql);
+         if(rs.movenext())
+            if(rs.value(0)=="X")
+               return true;
+            end;
+            return false;
+         end;
+         return false;
+      else
+         sql="select T_notresident from dparty_dbt where T_PartyID="+pmpaym_receiver;
+         rs = execSQLselect(sql);
+         if(rs.movenext())
+            if(rs.value(0)=="X")
+               return true;
+            end;
+            return false;     
+         end;
+         return false;
+      end;
+   end;
+
+   // для формы 402
+   // TAM 30.03.2012 
+   var  Num = "", cod402, code_402, par_41;
+   var ner_contr;
+   paym.PaymentID = id;
+   GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), 3, null, null, Num);
+   code_402 = Num;
+   par_41 = GetPaymentAttribute(paymentObj,1011);
+
+   if(code_402 == "")
+      if(par_41 == "")
+         cod402 = "";
+      else
+         cod402 = par_41;
+      end;
+   else
+      if(trim(par_41) != "")
+         cod402 = par_41;
+      else
+         cod402 = code_402;
+      end;
+   end;
+
+   private macro cor_fi_cod ( cod , dir)
+   
+      if(strlen(cod)>0)
+         if(dir == 2)
+            if(substr(pmpaym_cr_rec, 6, 3)=="810")
+               return("643");
+            else
+               return(substr(pmpaym_cr_rec, 6, 3));
+            end;
+         else
+            if(substr(pmpaym_cr_pay, 6, 3)=="810")
+               return("643");
+            else
+               return(substr(pmpaym_cr_pay, 6, 3));
+            end;
+         end;
+      else
+         return (" ");
+      end;
+   end;
+ //LVV 24.04.15 C-38652  переписал  macro cor_val. Для валютных платежей берем сумму в валюте
+  /*
+   private macro cor_val ( cod)
+      if(strlen(cod)>0)
+         return(pmpaym_amount);
+       else
+         return (" ");
+      end;
+   end;
+ */
+   private macro cor_val ( cod)
+      debugbreak;
+      if((strlen(cod)>0) and  (pmpaym_basefiid!=0))
+         return(pmpaym_baseamount);
+      elif (strlen(cod)>0)
+         return(pmpaym_amount);
+      else
+         return (" ");
+      end;
+   end;
+
+   // Dex -  проверка на существование данного кода ВО в справочнике
+   private macro existVO (cod)
+      var sql, rs, cod_1, ind;
+      var sepVO_="{";
+      ind = index(cod,sepVO_);
+      if (ind>0)
+         cod_1 = string(substr(cod,ind+1,5));
+         sql = " select count(*) as cnt from dllvalues_dbt where t_list=1805 and t_flag=1 and t_code='"+cod_1+"' ";
+         rs = execSQLselect(sql);
+            if(rs.moveNext())
+               if(rs.value(0)==0)
+                  return false;
+               elif(rs.value(0)==1)
+                  return true;
+               end;
+            end;
+      else
+         return false;
+      end;
+   end;
+
+   // дата справки только для валютных платежей
+   private MACRO GetDatSpr(acc,dat_spr)
+      if(substr(acc,6,3)==810)
+         return (" ");
+      else
+         return string(/**/(date(dat_spr)):f);
+      end;
+   end;
+
+   // код валюты платежа  810 на 643... для 5-го поля
+   private MACRO CodValPL(cod)
+      if (cod =="810")
+         return ("643");
+      else 
+         return cod;
+      end;
+   end;
+
+   //Возвращает 5тизначный код ВО
+   private macro GetCodVO(element:integer)
+      var query:string = "select t_code from dllvalues_dbt where t_list=1805 and t_element=" + element;
+      var rs:RsdRecordset = execSQLselect(query);
+      if( rs.moveNext() )
+         return rs.Value(0);
+      else
+         msgbox("Ошибка получения ");
+         return "";
+      end;
+   end;
+
+   //Возвращает код валюты и заменяет 810 на 643
+   private macro GetFiCod(fi:integer, paym, dir)
+      var field; 
+      var q, cmd, rs;
+      if( fi==-1)
+         // Если не задана валюта контракта, анализируется одна из валют платежа
+         if   (dir == 2)
+            field = "t_fiid";
+         elif (dir == 1)
+            field = "t_payfiid";
+         end;
+         q = "SELECT fi.t_fi_code FROM dpmpaym_dbt paym, dfininstr_dbt fi WHERE paym.t_paymentid="+paym+" AND fi.t_fiid = paym."+field;
+         cmd = RsdCommand(q);
+         cmd.execute();
+         rs = RsdRecordSet(cmd);
+         if(rs.MoveNext())
+            if(rs.Value(0) == "810")
+               return "643";
+            else
+               return trim(string(rs.Value(0)));
+            end;
+         end;
+      end;
+      
+      var query:string = "select t_fi_code from dfininstr_dbt where t_fiid=" + fi;
+      var rs1:RsdRecordset = execSQLselect(query);
+      if( rs1.moveNext() )
+         if(rs1.Value(0)==810)
+            cod643="643";
+            return Cod643;
+         else
+            return rs1.Value(0);
+         end;
+      else
+         msgbox("Ошибка получения кода валюты!");
+         return "";
+      end;
+   end;
+
+   //Возвращает числовой код(3) страны нерезидента или 643
+   private macro GetNrCC(ZS:integer)
+      debugbreak;
+      var query:string, qw, rs1;
+      var rs:RsdRecordset;
+      var BankID:integer;
+      if (ZS==2)  // Tikh Проверяем по Кт-счету для списания или по Дт-счету для зачисления, и вставляем его
+         BankID=pmpaym_receiverbankID;
+      else
+         BankID=pmpaym_payerbankID;
+      end;
+	  debugbreak;
+      //LVV C-38652 06.05.14
+      if (Index (pmrmprop_ground,"Комиссия банка корреспондента"))  //LVV C-38652 06.05.14
+         BankID=getAccOwner(pmpaym_receiveraccount);
+      end;
+      query = "select T_NRCountry from dparty_dbt where t_partyID=" + BankID;
+      rs = execSQLselect(query);
+      if( rs.moveNext() )
+         if (rs.Value(0)=="")
+            return"643";
+         end;
+         query = "select T_CODENUM3 from dcountry_dbt where T_CODELAT3 ='"+rs.Value(0)+"'";
+         rs = execSQLselect(query);
+         if (rs.moveNext())
+            return rs.Value(0);
+         else
+            return " ";
+         end;
+      else
+         var last_sy;
+         SetOutput(null,true); 
+         println("Платеж ",id," -  Ошибка получения кода СВИФТ");
+         SetOutput(path,true);
+         if (ZS==1)  
+            last_sy = strlen(pmrmprop_payerbankname);
+            qw = "select * from dcountry_dbt where T_CODENUM3 = '"+substr(pmrmprop_payerbankname,last_sy-2,3)+"'";
+            rs1 = execSQLselect(qw);
+            if (rs1.movenext)
+               return (substr(pmrmprop_payerbankname,last_sy-2,3));
+            else
+               GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), 117, null, null, ner_contr);
+               query = "select T_CODENUM3 from dcountry_dbt where T_CODECYR3 ='"+ner_contr+"'";
+               rs = execSQLselect(query);
+               if (rs.moveNext())
+                  return rs.Value(0);
+               else
+                  return " ";
+               end;
+            end;
+         else
+            last_sy = strlen(pmrmprop_receiverbankname);
+            qw = "select * from dcountry_dbt where T_CODENUM3 = '"+substr(pmrmprop_receiverbankname,last_sy-2,3)+"'";
+            rs1 = execSQLselect(qw);
+            if (rs1.movenext)
+               return (substr(pmrmprop_receiverbankname,last_sy-2,3));
+            else
+               GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), 117, null, null, ner_contr);
+               query = "select T_CODENUM3 from dcountry_dbt where T_CODECYR3 ='"+ner_contr+"'";
+               rs = execSQLselect(query);
+               if (rs.moveNext())
+                  return rs.Value(0);
+               else
+                  return " ";
+               end;
+            end;
+         end;
+         return "";
+      end;
+   end;
+
+   // Поиск страны нерезидента по категориям платежа
+   private macro GetNRCountry(ZS)
+      var attr=0, cmd, cntr = "", rs;
+      if(ZS == 1)    // Зачисление, смотрим сторону плательщика
+         attr = 118; // Номер категории "Код страны нерезидента-отправителя"
+      elif(ZS == 2)  // Списание, смотрим сторону получателя 
+         attr = 119; // Номер категории "Код страны нерезидентиа-получателя"
+      end;
+      GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), attr, null, null, cntr);
+      if(cntr == "")
+         return "643";
+      else
+         return cntr;
+      end;
+   end;
+
+   // Поиск страны банка нерезидента по категориям платежа 
+   private macro GetNRBankCountry(ZS)
+ //     debugbreak;
+      const attr=117;
+      var cmd, cntr = "", rs;
+      GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), attr, null, null, cntr); 
+      //TAM категориии настроены иначе: сразу получаем код страны I-00247979-2
+      if(cntr == "")
+         return "643";
+      else
+         return cntr;
+      end;
+   end;
+    private  macro cod_iz_c4eta(c4:string) : bool
+      private var ds = trsbdataset ("select 1 from dobjatcor_dbt where t_objecttype = 4 and t_groupid = 110 and (t_object = '010000000'||'" + c4 + "' or t_object = '01000002d'||'" + c4 + "')");
+      if (ds and ds.movenext())
+         return true;
+      else
+         return false;
+      end;
+      onerror(e)
+         msgbox("Ошибка запроса категории \n"+e.message);
+         exit(0);
+   end;
+
+   private macro day_cod_iz_c4eta(c4:string) : string
+      private macro new_client(x:string) : bool
+      //private var den_x:date = date("29.09.2012"); //DPN    29.04.2014 C-28764-6
+      private var sql = "SELECT LENGTH (LTRIM (SUBSTR (t_code, 3), '0')) " + 
+                        "  FROM dobjcode_dbt, daccount_dbt " +
+                        " WHERE t_objectid = t_client AND t_objecttype = 3 AND t_codekind = 1 AND t_state = 0 AND t_account = '" + x + "' " ;
+      private var ds = trsbdataset(sql);
+      if (ds and ds.movenext())
+         if (ds.value(0) <= 5)
+            return false;
+         elif (ds.value(0) == 6)
+            return true;
+         else
+            msgbox("Для клиента по счету " + x + " код вида 1 имеет длину больше шесть знаков. останавливаюсь. вернулся код " + ds.value(0));
+            exit(0);
+         end;
+      else
+         msgbox("Для клиента по счету " + x + " не найден код вида 1. останавливаюсь.");
+         exit(0);
+      end;
+   end;
+
+   if ((int(substr(c4, 1, 5)) >= 40107) and (int(substr(c4, 1, 5)) <= 40807)) 
+      if (new_client(c4))
+         return substr(c4, 15);
+      else
+         return substr(c4, 16);
+      end;
+   else
+      if (new_client(c4))
+         return (substr(c4, 12, 1) + substr(c4, 16));
+      else
+         return substr(c4, 16);
+      end;
+   end;
+end;
+
+
+   //Возвращаем 1й код СУБЪЕКТА
+   private   macro Get1Code_xvost(ZS:integer)
+      var query:string;
+      var rs:RsdRecordset;
+      var Subj;
+      if (ZS==1)
+         Subj=pmpaym_receiver;
+      elif(ZS==2)
+         Subj=pmpaym_payer;
+      end; 
+      query = "select substr(t_code, 7) "+  //14.08.2012 vihrov C-12122 смена диапазонов кодов
+              "from dobjcode_dbt pa  "+
+              "where pa.t_codekind=1 and pa.t_objecttype = 3 and pa.t_state = 0 and pa.T_OBJECTID ="+subj ; 
+              //14.08.2012 vihrov C-12122 смена диапазонов кодов
+      rs = execSQLselect(query);
+      if( rs.moveNext() )
+         if (rs.Value(0)=="")
+            return "0000!"; //ну нет кода((( - надо искать
+         end;
+         return string(rs.Value(0)); //14.08.2012 vihrov C-12122 смена диапазонов кодов
+      else
+       //LVV 16.03.15 I-00556383 Искать и найти!
+       //  SetOutput(null,true); 
+       //  println("клиент ",subj," -  Ошибка получения кода 1"); //не отработал запрос
+       //   SetOutput(path,true); 
+       //   return   "0000!"; //  day_cod_iz_c4eta(account);  
+         return   day_cod_iz_c4eta(account);    
+      end;
+   end;
+
+private macro Code350(pass,Cvo)  //Tikh Проставление 18 позиции, если валютная операция, то ставим
+   var PS, fl=1,code,PosCode=0;
+   var Passf=pass;
+   if (Cvo=="{35010}")                       //Tikh Для Примечаний
+      while (fl!=0)
+         PS=index(pass,"/");
+         PosCode=PosCode+PS;
+         if(Ps!=0)
+            pass=substr(pass,Ps+1);
+         else
+            Code=substr(Passf,PosCode-1,1);
+            fl=0;
+         end;
+      end;
+      return Code;
+   elIf (Cvo=="{35020}")                   
+      while (fl!=0)                         
+         PS=index(pass,"/");
+         PosCode=PosCode+PS;
+         if(Ps!=0)
+            pass=substr(pass,Ps+1);
+         else
+            Code=substr(Passf,PosCode-1,1);
+            fl=0;
+         end;
+      end;
+      return Code;
+   else
+      return " "; 
+   end;
+END;
+
+private macro Code990(Cvo)  //Tikh Проставление 18 позиции, если валютная операция, то ставим
+   if (Cvo=="{99010}") 
+      return int(ReadNoteForPayment(paymentObj.paymentID,115))//Берем 115 примечание
+   else
+      return " "; 
+   end;
+end;
+
+private macro BankID(ZS) //Tikh Название банка
+record party(party);
+
+   if (Index (pmrmprop_ground,"Комиссия банка корреспондента"))  //LVV C-38652 06.05.14
+      return EraseNameToComa(GetPartyShortname(getAccOwner(pmpaym_receiveraccount)));
+   end;
+   if (ZS==1) 
+     if  (( pmpaym_fiid !=0) or (pmpaym_basefiid !=0))
+        ПолучитьСубъекта(pmpaym_payerbankid,party);
+        return party.shortname;
+     else
+        return pmrmprop_payerbankname;
+     end;
+   else
+     if  (( pmpaym_fiid !=0) or (pmpaym_basefiid !=0))
+        ПолучитьСубъекта(pmpaym_receiverbankid,party);
+        return party.shortname;
+     else
+        return pmrmprop_receiverbankname;
+     end;
+   end;
+end;
+
+private macro BankID_23(ZS) //Gr Название банка
+debugbreak;
+ /*  if (Index (pmrmprop_ground,"Комиссия банка корреспондента") and (PaymentObj.Dockind == 15))
+        return " ";
+   end;
+   
+  */
+  
+   if((pmpaym_fiid == 0) and (pmpaym_basefiid == 0))
+      if (ZS==1)  
+         return ПолучитьКодСубъекта(pmpaym_payerbankid, PTCK_BIC);
+      else
+         return ПолучитьКодСубъекта(pmpaym_receiverbankid, PTCK_BIC);
+      end;
+   else
+      return " ";
+   end;
+end;
+
+private macro SWIFT(ZS)
+   debugbreak;
+   var SWFT;
+   //LVV C-38652 27.04.15 Для входящих ответных платежей с назначением платежа  "Комиссия банка корреспондента" всегда заполняем СВИФТ
+   if (Index (pmrmprop_ground,"Комиссия банка корреспондента"))
+       SWFT = ПолучитьКодСубъекта(getAccOwner(pmpaym_receiveraccount), 6);
+       if (SWFT != "") 
+         while (strlen(SWFT) < 11)
+            SWFT = SWFT + "X";
+         end;
+       end;
+       return SWFT;
+   // A.Gregeradsky - 11.12.2009 - Переписана функция определения S.W.I.F.T. - кода (только для платежей в валюте)
+   elif(pmpaym_fiid != 0)
+      if (ZS==1)  
+         SWFT = ПолучитьКодСубъекта(pmpaym_payerbankid, 6);
+      else
+         SWFT = ПолучитьКодСубъекта(pmpaym_receiverbankid, 6);
+      end;
+      if (SWFT != "") 
+         while (strlen(SWFT) < 11)
+            SWFT = SWFT + "X";
+         end;
+      else
+         SWFT = " ";
+      end;
+      return SWFT;
+   else
+      return " ";
+   end;
+end;
+
+private macro HPID(SWIFT,ZS) //Str! Определяем поля 25 от 24
+   var IDBankaN;
+   if (ZS==2)  // Str! определяем чей СВИФТ код берем (Списание=получателя)
+      IDBankaN=pmpaym_receiverbankID;
+   else
+      IDBankaN=pmpaym_payerbankID;
+   end;  
+   var sql="select T_notresident from dparty_dbt where T_PartyID="+IDBankaN;
+   var rs:RsdRecordset = execSQLselect(sql);
+   if((SWIFT=="") or (SWIFT == " "));
+      if( rs.moveNext() )
+         if (rs.Value(0)=="X");
+            return "НР"  //для нерезидентов без СВИФТА
+         else
+            return " ";  //для резидентов
+         end;
+      else
+         SetOutput(null,true); 
+         println("Платеж ",id," -    Ошибка определения резидентности");
+         SetOutput(path,true); 
+         return " ";   //для тех кто не может определиться с резедентностью)))
+      end;
+   else
+      return " "; //если СВИФТКод заполнен
+   end;
+end;
+
+private macro CodeW //Tikh Забираем категорию 402Ф
+   paymentobj.Categories.GetFirst(3,{curdate},ctg);
+   return " ";//ctg.nameobject;
+end;
+
+private macro SumVal(Sum,Cour)   //Tikh Макрос для расчета суммы валюты для вида валютной операции
+   if (Cour==0)
+      return Sum;
+   end;
+   Return Sum*double(Cour);  
+end;
+
+private macro SumValCon(Sum,Cour,Con_Fi,Pay_Fi)   //Dex сумма в валюте контракта
+   if(ValType(Cour) == V_UNDEF)
+      Cour = 0;
+   end;
+   Cour = double(Cour);
+   if (Con_Fi==Pay_Fi)
+      return Sum;
+   else
+      if (Cour==0)
+         return $0;
+      end;
+      Return Sum*double(Cour);  
+   end;
+end;
+
+Private Macro SwiftCode // Tikh Отбираем код Swift для платежа (референс)
+   var SW="";
+   var sl;
+   var DataS;            //Tikh Ищем последний референс Swift
+   sl = " select dwlmes_dbt.t_Trn,dpmpaym_dbt.t_PaymentID from dwlpm_dbt, dpmpaym_dbt, dwlmeslnk_dbt, dwlmes_dbt" + 
+        " where dwlpm_dbt.t_PaymentID = dpmpaym_dbt.t_PaymentID" +
+        " and dwlpm_dbt.t_WlPmNum = 0" +
+        " and dwlpm_dbt.t_Direct = CHR(0)" +
+        " and dwlmeslnk_dbt.t_ObjKind = 501" +
+        " and dwlmeslnk_dbt.t_ObjID = dwlpm_dbt.t_WlPmID" +
+        " and dwlmeslnk_dbt.t_MesID = ( select max(l2.t_MesID)" +
+                                "  from dwlmeslnk_dbt l2" +
+                                "  where l2.t_ObjKind = 501" +
+                                "  and l2.t_ObjID = dwlpm_dbt.t_WlPmID )" +
+        " and dwlmes_dbt.t_MesID = dwlmeslnk_dbt.t_MesID AND dpmpaym_dbt.t_PaymentID = " + ID;
+   DataS = TRsbDataSet(sl);
+   while (DataS.movenext())
+      SW=dataS.Trn;
+   end;
+   if (SW!="")
+      return SW;                   //Tikh Если код есть, возвращаем
+   else 
+      return pmrmprop_number;      //Tikh Если кода нет, то номер ПП
+   end;
+end;
+
+private macro Note(nota)
+   If (nota != "")
+      //Gurin S. 25.02.2015 I-00549573-2
+      return ToANSI(strsubst(nota," ","0"));
+   else
+      return " ";
+   end;
+END;
+
+// Определение типа счета в соответствии с описанием формата файла 
+private macro GetAccValType(acnt)
+   var cur, table;
+   var SQL, cmd, rs;
+   cur = substr(acnt,6,3);
+   SQL = " select nvl(knd,' ') from ( "
+       + "select "
+       + "case "
+       + "  when (instr(t_type_account,'К') != 0) "
+       + "  then '3' "
+       + "  when (instr(t_type_account,'Ч') != 0) "
+       + "  then '1' "
+       + "  when (instr(t_type_account,'X') != 0) "
+       + "  then '2' "
+       + "  when (t_balance in  "
+       + "         (select t_balance "
+       + "           from dbalance_dbt "
+       + "          where T_INUMPLAN = 0 "
+       + "            and trim(to_char(T_BALANCE)) >= '410'  "
+       + "            and trim(to_char(T_BALANCE)) < '427' "
+       + "            and t_kind_account != chr(1) "
+       + "         ) "
+       + "        ) "
+       + "  then '4' "
+       + "end "
+       + "as knd "
+       + "from daccount_dbt "
+       + "where t_account = ? "
+       + "  and t_chapter = 1 "
+       + "  ) "
+       + "where rownum = 1";
+   cmd = RsdCommand(SQL);
+   cmd.AddParam ("account",  RSDBP_IN, acnt);
+   cmd.execute();
+   rs = RsdRecordSet(cmd);
+   if(rs.MoveNext())
+      return rs.value(0);
+   end;
+   return " ";
+end;
+
+// Получаем БИК банка, обслуживающего нерезидента (с платежа) 
+private macro GetNrBankBIC(ZS, paymid, cod)
+   if(strlen(trim(cod)) == 0)
+      return " ";
+   end;
+   var bic = " ";
+   bic = BankID_23(ZS);
+   if(bic == " ")
+      return bic;
+   end;
+   var cat;
+   paym.PaymentID = paymid;
+   GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), 117, null, null, cat);
+   if(cat == "643")
+      bic = " "; /* БИК выгружаем, если страна банка-нерезидента - не РФ */
+   end;
+   return bic;
+end;
+
+macro GetDir_402(pmid, fiid, cod402, dir)
+   var cat;
+   if(trim(string(cod402)) != "")
+      if(fiid != 0)
+         return dir;
+      else
+         paym.paymentID = pmid;
+         GetMainObjAttr (null, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), 117, null, null, cat);
+         if(cat == 643) //TAM 12.09.2012 I-00251487-2 - связано со смено настройки категории
+            if(dir == 1)
+               return 3;
+            elif(dir == 2)
+               return 4;
+            end;
+         else
+            return dir;
+         end;
+      end;
+   else
+      return " ";
+   end;
+end;
+
+macro GetNote_402(str, fiid, cod402)
+   if(trim(string(cod402)) != "")
+      return str;
+   else
+      return " ";
+   end;
+end;
+
+macro GetDate_402(str, cod402)
+   if(trim(string(cod402)) != "")
+      return str;
+   else
+      return " ";
+   end;
+end;
+
+/* ---------------------------------- Основная часть макропроцедуры --------------------------------------------*/
+SetOutput(path,true);
+//debugbreak;
+// Проверка суммы платежей
+// формат строки Паспорт_сделки или 0{код_валютной операции5}сумма; код из панели не используется
+// Считать примечание 111 Платежа при обнаружении там "{"разбиваем ее на паспорт, код и сумму по ним
+sumPoCodam=0;
+Oldstr=ReadNoteForPayment(paymentObj.paymentID,111);
+//нашли разделитель делим строку
+if(index(Oldstr,sep)>0)
+   flag=1;
+end;
+
+While(Flag!=0)
+   Pos=index(Oldstr,Sep); //ищем разделитель ; в остатке строки
+   PosVO=index(Oldstr,SepVO);   //и второй там же (что бы длина паспорта нас не волновала)
+   if(Pos!=0)
+      ObrStr=substr(OldStr,1,Pos-1);
+      OldStr=substr(OldStr,Pos+1);       //остаток строки на новый круг
+      //паспорт, код и сумма
+      ObrStr1=substr(ObrStr,PosVO);
+      PosVO1=index(Obrstr1,SepVO);
+      While (PosVO1!=0)
+         PosVO1=index(Obrstr1,SepVO);
+         sumPoCodam=sumPoCodam+money(substr(ObrStr1,PosVO1+7)); //Tikh Считаем сумму//Поправил
+         ObrStr1=substr(ObrStr1,index(ObrStr1,"{")+1);
+         PosVO1=index(Obrstr1,SepVO);
+      End;
+   else
+      Flag=0;//когда в остатке строки не нашли разделителя(строка кончиться) - разбор закончен
+   end;  
+End;
+
+Oldstr=ReadNoteForPayment(paymentObj.paymentID,111);
+var last_symb;
+last_symb = strlen(Oldstr);
+if(last_symb>0)
+   if (substr(Oldstr,last_symb,1)!=";")
+      Oldstr = Oldstr + ";";
+   end;
+end;
+PosVO=index(Oldstr,SepVO);
+Get_usr_trnsf_order(id); 
+if (Isuto)
+   P_11 = "#" + string((SQL_ConvTypeDate(uto.Value("date_value"))):f);             //11
+   //TAM 22.01.2014 C-26267
+   if(ReadNoteForPayment(paymentObj.paymentID,118) != "")
+      P_35 = "#" + Note(ReadNoteForPayment(paymentObj.paymentID,118));             //35
+   else
+      P_35 = "#" + GetDatSpr(account,SQL_ConvTypeDate(uto.Value("date_value")));   //35
+   end;
+else
+   P_11 = "#" + string((date(pmpaym_valuedate)):f);      //11
+   //DAI I-00007660 дата предоставления справки для рублевых снова нужна //GetDatSpr(account,date(pmpaym_valuedate))
+   //TAM 22.01.2014 C-26267
+   if(ReadNoteForPayment(paymentObj.paymentID,118) != "")
+      P_35 = "#" + Note(ReadNoteForPayment(paymentObj.paymentID,118));             //35
+   else
+      P_35 = "#"+string(date(pmpaym_valuedate):f);          //  35  Дата предоставления справки
+   end;
+end;
+
+if((index(Oldstr,sep)>0)  and  (existVO(Oldstr)))
+   flag=1;                        //Сначала для платежей с Alt+V
+   While(Flag!=0)   
+      Pos = index(Oldstr,Sep); 
+      PosVO = index(Oldstr,SepVO);   
+      if(Pos!=0)
+         ObrStr=substr(OldStr,1,Pos-1);
+         OldStr=substr(OldStr,Pos+1);       
+         ObrStr1=substr(ObrStr,PosVO);
+         count=0;
+         PosVO1=index(Obrstr1,SepVO);
+         While (PosVO1!=0)
+            var rnd, val,ps_sd;
+            rnd=random(20);
+            SetOutput(path,true);
+            PosVO1=index(Obrstr1,SepVO);
+            curvoop = curvoop + 1;
+            if ((curvoop >= firstvoop) and (curvoop < firstvoop+countvoop))
+               if(strlen(cod402)>0)
+                  val = money(substr(ObrStr1,PosVO1+7));
+               else
+                  val = " ";
+               end;
+               
+               if (Isnerez(dir))
+                  ps_sd = " ";
+               else
+                  ps_sd = string(substr(ObrStr,1,PosVO-1));
+               end;
+               
+               if (substr(account,6,3) == "810");
+                  P_34 =  ToANSI(pmrmprop_ground, true);
+               else //TAM 08.05.2013 C-19958
+                  P_34 =  ToANSI(pmrmprop_ground, true);
+               end;
+               // нужна ли Проверка?: паспорт == 0, то паспорт=" " ?
+               if (fgBank.is_SLD) //TAM 16.10.2014 C-32919
+                  cod_in_asvkb = get1code_xvost(dir);
+               else
+                  cod_in_asvkb = substr(account,16); //14.08.2012 vihrov смена кодов
+               end;
+               // 29.04.2014 C-28764-7 DPN
+               //TAM 20.12.2013 C-24671
+               if (fgBank.is_PRBB or fgBank.is_VUZ or fgBank.is_EXV_Saratov) //14.08.2012 vihrov смена кодов
+                   if (cod_iz_c4eta(account))
+                       debugbreak;
+                      cod_in_asvkb = day_cod_iz_c4eta(account);
+                   else
+                     cod_in_asvkb = get1code_xvost(dir);
+                  end;
+               end;
+               //GSP 04.09.2013 C-23081
+               if(Note(ReadNoteForPayment(paymentObj.paymentID,112)) != " ")
+                  note402prim112 = Note(ReadNoteForPayment(paymentObj.paymentID,112));  
+                  //32 112 примечание - направление платежа для формы 402
+               else
+                  note402prim112 = GetDir_402(PaymentObj.PaymentID, PaymentObj.BaseFIID, cod402, dir); 
+                  // 32 Направление платежа для формы
+               end;
+               println(strsubst(
+                  //substr(Get1Code(dir),8)+ //только 5тизначная концовка, равная коду из 5.00,
+                  //11.07.2012 vihrov C-12122 смена диапазонов кодов
+                  cod_in_asvkb +  //14.08.2012 vihrov смена кодов                                            1
+                  "#"+dir +//Направление платежа:   //1 - зачисление/2 - списание                            2
+                  "#"+account +  //Номер счета                                                               3
+                  "#"+string(substr(ObrStr1,PosVO1+1,5)) +     //Для примечания                              4
+                  "#"+CodValPL(substr(account,6,3)) + //                                                     5
+                  "#"+string(money(substr(ObrStr1,PosVO1+7)):0:2) + //                                       6
+                  "#"+GetFICod(pmco_contractfiid, paymentObj.paymentID, dir) + //                            7
+                  // KS 19.06.2012 I-00198430 Заявка от Коншиной - пока в треккере не нашёл
+                  "#"+ifthenelse(((ReadNoteForPayment(paymentObj.paymentID,116) == "") and
+                                  (pmpaym_contractamount != 0)),
+                                 pmpaym_contractamount,
+                                 string(SumValCon(money(substr(ObrStr1,PosVO1+7)),
+                                                  ReadNoteForPayment(paymentObj.paymentID,116),
+                                                  GetFICod(pmco_contractfiid, paymentObj.paymentID, dir),
+                                                  CodValPL(substr(account,6,3))):0:2)) + //                  8
+                  "#"+GetNRCC(dir) + // код страны банка                                            9
+                  "#"+ps_sd + //                                                                             10
+                  P_11 + //                                                                                  11
+                  "#"+ToANSI(pmrmprop_number,true) + //                                                      12
+                  "#"+string((pmpaym_valuedate):f) + //                                                      13
+                  "#"+ToANSI(SwiftCode,true) +  // для РУБ 11 поле для ВАЛ нужен референс из СВИФТовки       14
+                  "#"+" " + // не используется                                                               15
+                  "#"+Note(ReadNoteForPayment(paymentObj.paymentID,119)) + //                                16
+                  "#"+" " + //                                                                               17
+                  "#"+Code350(string(substr(ObrStr,1,PosVO-1)),string(substr(ObrStr1,PosVO1,7))) + //        18
+                  "#"+Code990(string(substr(ObrStr1,PosVO1,7))) + // Примечание 105, если 99010              19
+                  "#"+" " + //   Код страны банка-нерезидента - пусто                                        20
+                  //TAM 15.10.2012 R-110149
+                  "#"+ifthenelse(((string(substr(ObrStr1,PosVO1+1,5)) == "01010") or
+                                  (string(substr(ObrStr1,PosVO1+1,5)) == "01030") or
+                                  (string(substr(ObrStr1,PosVO1+1,5)) == "01040")),
+                                 ToANSI(Set21Param(), true), ToANSI(StrUpr(res_pay), true)) + //            21 
+                  "#"+ToANSI(BankID(dir), true) + //                                                         22
+                  "#"+ToANSI(BankID_23(dir), true) + //                                                      23
+                  "#"+Swift(dir) + //                                                                        24
+                  "#"+HPID(Swift(dir),dir) + //                                                              25
+                  "#"+Id+rnd + //                                                                            26
+                  "#"+" " + //                                                                               27
+                  "#"+GetDate_402(string((pmpaym_valuedate):f), cod402) + //                                 28
+                  //TAM 15.10.2012 R-110149
+                  "#"+ifthenelse(CheckFor29_30_34Params(string(substr(ObrStr1,PosVO1+1,5)), code_402, 
+                                                     ToANSI(GetPaymentAttribute(paymentObj,1011), true),pmrmprop_ground), 
+                                                     cor_fi_cod(cod402,dir), " ") + //TAM I-00296424-3       29
+                  //TAM 15.10.2012 R-110149
+                  "#"+ifthenelse(CheckFor29_30_34Params(string(substr(ObrStr1,PosVO1+1,5)), code_402, 
+                                                     ToANSI(GetPaymentAttribute(paymentObj,1011), true),pmrmprop_ground),
+                                                     val, " ") + // TAM 12.12.12 I-00296424-3                30
+                  "#"+ToANSI(code_402, true) + //Код вида 402Ф                                               31
+                  "#"+note402prim112 + //GSP 04.09.2013 C-23081                                              32
+                  "#"+GetNote_402(ToANSI(ReadNoteForPayment(paymentObj.paymentID,113), true), 
+                                  PaymentObj.BaseFIID, cod402) +  // Примечание для формы                    33
+                  "#"+P_34 + // Примечание для нужд банка                                                    34
+                  P_35 + //                                                                                  35
+                  "#" +GetNRCountry(dir) + // Код страны иностранного к/а                                    36
+                  "#1" + // Тип счета в кодировке АСВКБ. Если не определен - ставим " " (пробел)             37
+                  "#"+CodValPL(substr(account,6,3)) + // Код валюты счета, совпадает с кодом валюты платежа  38
+                  "#"+GetNrBankBIC(dir, paymentObj.PaymentID, string(cod402))+ //                            39
+                  "# "+  //Дата открытия счета                                                               40
+                  //TAM 16.03.2012 C-9186
+                  "#" + ToANSI(GetPaymentAttribute(paymentObj,1011), true) + // Код вида операции            41
+                  "#" + ToANSI(GetPaymentAttribute(paymentObj,1013), true) + // Код страны                   42
+                  "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,152), true) + //Цель покупки\продажи  43
+                  "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,153), true) + // Примечание 1         44
+                  "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,154), true) + // Примечание 2         45
+                  "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,155), true) + // Дата перв. платежа   46
+                  "#" + ToANSI(GetParentCodeAttrib(GetPaymentAttribute(paymentObj,1012)), true) + //         47
+                  "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,156), true) + //                      48
+                  //TAM 26.09.2012 R-105826-2
+                  "#" + "1"+ // Признак идентификации платежа по 117-И (0) или по 138-И(1)                   49
+                  "#" + ToANSI(ReadWaitDate(paymentObj.paymentID,GetCodVO(pmco_VO_code)), true) + //         50
+                  "#" + PaymentObj.PayerAmount + //Сумма платежа в валюте счета                              51
+                  "#" + " " + // Дата принятия справки о валютной операции Банком третьего лица              52
+                  "#" + " " + //                                                                             53
+                  "#" + " " + //                                                                             54
+                  "#" + " " + //                                                                             55
+                  "#" + " " + //                                                                             56
+                  "#" + " " + //                                                                             57
+                  "#" + " " + //                                                                             58
+                  "#" + " " + //                                                                             59
+                  "#","##","# #")); //там где нет ничего ставим пробел
+            end; // конец проверки на firstvoop
+            ObrStr1=substr(ObrStr1,index(ObrStr1,"{")+1);
+            PosVO1=index(Obrstr1,SepVO);
+             debugbreak;
+         End; // end while
+      else
+         Flag=0;//когда в остатке строки не нашли разделителя(строка кончиться) - разбор закончен
+      end;   //end if(Pos!=0)
+   End; // end (Flag!=0)
+else //Если примечание пустой, анализируем Alt+V
+   if (pmco_VO_code==0)  //Анализируем Alt+V, если пусто уточняем
+      msgbox("Не выгружен из-за отсутствия кодов ВО");
+      return 0; 
+   end;
+   if (Isnerez(dir))
+      pmco_passportnumber == " ";
+   end;
+   if (substr(account,6,3) == "810");
+      P_34 =  ToANSI(pmrmprop_ground, true);
+   else //TAM 08.05.2013 C-19958
+      P_34 =  ToANSI(pmrmprop_ground, true);//" ";
+   end;
+   // DPN    29.04.2014 C-28764-6 - Шестизначная нумерация ВУЗ
+   if (fgBank.is_SLD)
+      cod_in_asvkb = get1code_xvost(dir); //TAM 16.10.2014 C-32919
+   else
+      cod_in_asvkb = substr(account,16);
+   end;
+   // 29.04.2014 C-28764-6 DPN
+   //TAM 20.12.2013 C-24671
+   if (fgBank.is_prbb or fgBank.is_VUZ or fgBank.is_EXV_Saratov) //14.08.2012 vihrov смена кодов
+      if (cod_iz_c4eta(account))
+         cod_in_asvkb = day_cod_iz_c4eta(account);
+      else
+         cod_in_asvkb = get1code_xvost(dir);
+      end;
+   end;
+   //GSP 04.09.2013 C-23081
+   if(Note(ReadNoteForPayment(paymentObj.paymentID,112)) != " ")
+      note402prim112 = Note(ReadNoteForPayment(paymentObj.paymentID,112));  //32 
+   else
+      note402prim112 = GetDir_402(PaymentObj.PaymentID, PaymentObj.BaseFIID, cod402, dir); // 32
+   end;
+   println(strsubst(
+      cod_in_asvkb + // 14.08.2012 vihrov смена кодов                                                        1
+      "#"+dir +  // Направление платежа: 1 - зачисление/2 -                                                  2
+      "#"+account + //Номер счета                                                                            3
+      "#"+GetCodVO(pmco_VO_code) + //                                                                        4
+      "#"+CodValPL(substr(account,6,3)) + //                                                                 5
+      "#"+string(pmpaym_amount:0:2) + //                                      6
+      "#"+GetFICod(pmco_contractfiid, paymentObj.paymentID, dir) + //                                        7
+      "#"+ifthenelse(((ReadNoteForPayment(paymentObj.paymentID,116) == "")and(pmpaym_contractamount != 0)),
+                       pmpaym_contractamount,
+                       string(SumValCon(pmpaym_amount,ReadNoteForPayment(paymentObj.paymentID,116),
+                              GetFICod(pmco_contractfiid, paymentObj.paymentID, dir),
+                              CodValPL(substr(account,6,3))):0:2)) + //                                      8
+      "#"+GetNRCC(dir) + // код страны банка                                                        9
+      "#"+pmco_passportnumber +    //                                                                        10
+      P_11  + //                                                                                             11
+      "#"+ToANSI(pmrmprop_number,true) + //                                                                  12
+      "#"+string((pmpaym_valuedate):f) + //                                                                  13
+      "#"+ToANSI(SwiftCode,true) +       // для РУБ 11 поле для ВАЛ нужен референс из СВИФТовки              14
+      "#"+" "+  // не используется                                                                           15
+      "#"+pmco_contractnumber+     //                                                                        16
+      "#"+" " +                   //                                                                         17
+      "#"+Code350(pmco_passportnumber,"{"+GetCodVO(pmco_VO_code)+"}") + //                                   18
+      "#"+Code990("{"+GetCodVO(pmco_VO_code)+"}") + // Примечание 105, если 99010 Здесь передаем для Alt+V   19
+      "#"+" "+ //  Код страны банка-нерезидента - пусто                                                      20
+      "#"+ifthenelse(((GetCodVO(pmco_VO_code) == "01010") or (GetCodVO(pmco_VO_code) == "01030") or 
+                      (GetCodVO(pmco_VO_code) == "01040")),
+                      ToANSI(Set21Param(), true), ToANSI(StrUpr(res_pay), true)) + //                        21
+      "#"+ToANSI(BankID(dir), true) + //                                                                     22
+      "#"+ToANSI(BankID_23(dir), true) +   //                                                                23
+      "#"+Swift(dir) + //                                                                                    24
+      "#"+HPID(Swift(dir),dir) + // "НР", если нет свифтового кода                                           25
+      "#"+Id +  //                                                                                           26
+      "#"+" "+  // ИНН иностранного, не надо                                                                 27
+      "#"+GetDate_402(string((pmpaym_valuedate):f), cod402) + //                                             28
+      //TAM 15.10.2012 R-110149
+      "#"+ifthenelse(CheckFor29_30_34Params(GetCodVO(pmco_VO_code), code_402, 
+                        ToANSI(GetPaymentAttribute(paymentObj,1011), true),pmrmprop_ground), cor_fi_cod(cod402,dir), " ") + //29
+      //TAM 15.10.2012 R-110149 + TAM 12.12.12 I-00296424-3
+      "#"+ifthenelse(CheckFor29_30_34Params(GetCodVO(pmco_VO_code),code_402, 
+                        ToANSI(GetPaymentAttribute(paymentObj,1011), true),pmrmprop_ground), cor_val(cod402), " ") + //       30 
+      "#"+ToANSI(code_402, true) + //Код вида 402Ф                                                            31 //TAM 30.03.2015 R-562724
+      //GSP 04.09.2013 C-23081
+      "#"+note402prim112 + //                                                                                 32
+      "#"+GetNote_402(ToANSI(ReadNoteForPayment(paymentObj.paymentID,113), true), 
+                      PaymentObj.BaseFIID, cod402) + // Примечание для формы                                  33
+      "#"+P_34 + // Примечание для нужд банка                                                                 34
+      P_35 + //                                                                                               35
+      "#"+GetNRCountry(dir) + // Код страны иностранного к/а, берем ТОЛЬКО с категории 118 или 119            36
+      "#1" + // Тип счета в кодировке АСВКБ. Если не определен - ставим " " (пробел)                          37
+      "#"+CodValPL(substr(account,6,3)) + // Код валюты счета, совпадает с кодом валюты платежа               38
+      "#"+GetNrBankBIC(dir, paymentObj.PaymentID, string(cod402)) + // БИК банка, обслуживающего нерезидента  39
+      "# "+  // Дата открытия счета                                                                           40
+      //TAM 16.03.2012 C-9186
+      "#" + ToANSI(GetPaymentAttribute(paymentObj,1011), true) + // Код вида операции                         41
+      "#" + ToANSI(GetPaymentAttribute(paymentObj,1013), true) + // Код страны                                42
+      "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,152), true) + // Цель покупки (продажи) товаров    43
+      "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,153), true) + // Примечание 1                      44
+      "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,154), true) + // Примечание 2                      45
+      "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,155), true) + // Дата первоначального платежа      46
+      "#" + ToANSI(GetParentCodeAttrib(GetPaymentAttribute(paymentObj,1012)), true) + // Направление          47
+      "#" + ToANSI(ReadNoteForPayment(paymentObj.paymentID,156), true) + // Наименование иностранного банка   48
+      //TAM 26.09.2012 R-105826-2
+      "#" + "1"+ // Признак идентификации платежа по 117-И (0) или по 138-И(1)                                49
+      "#" + ToANSI(ReadWaitDate(paymentObj.paymentID,GetCodVO(pmco_VO_code)), true) + // Ожидаемы срок        50
+      "#" + ifthenelse(((PaymentObj.Dockind == 200) and (PaymentObj.BaseFiid != 0)),
+                       PaymentObj.BaseAmount,PaymentObj.PayerAmount) + // Сумма платежа в валюте счета        51
+      "#" + " " + // Дата принятия справки о валютной операции Банком третьего лица                           52
+      "#" + " " + //                                                                                          53
+      "#" + " " + //                                                                                          54
+      "#" + " " + //                                                                                          55
+      "#" + " " + //                                                                                          56
+      "#" + " " + //                                                                                          57
+      "#" + " " + //                                                                                          58
+      "#" + " " + //                                                                                          59
+      //Gurin S. 17.02.2015 R-545312-2 
+      "#" + " " + //                                                                                          60
+      "#" + " " + //                                                                                          61
+      "#" + " " + //                                                                                          62
+      "#","##","# #"));   //там где нет ничего ставим пробел
+   debugbreak;
+   if (pmco_VO_code==0)  //Анализируем Alt+V
+      return 0; 
+   end;
+end; 
+
+OnError
+   IsUto = false;
+End;
+
+macro clear()
+   var path1;
+   getRegistryValue("PS\\REQOPENACC\\173-ФЗ СЧЕТА НЕРЕЗИДЕНТОВ\\ПУТЬ К ФАЙЛУ OPLATA.D",V_string,path1);
+   path1=path1+"Oplata.d";
+   SetOutput(path1,false);
+   SetOutput(null,true);
+   MsgBox("Файл очищен");
+   return 0
+end;
+
+//ASVKB(164887102,2,0, null,"" , 2, 0, 1); 
+//ASVKB(161379559,2,0, null,"" , 2, 0, 1);
+
+
+
+

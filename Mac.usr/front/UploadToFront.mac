@@ -1,0 +1,900 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   EVG Макрос выгрузки информации по документу во Фронт
+   Seleznev доработал под новые требования
+   zip_z переписал условия закрытия соединения, таймауты, передачу параметров. Расставил блинские отступы.
+   Gurin S. 01.04.2013 C-18865
+   Jushmanov 2014-02-20 C-19151 Логгирование массово выполненных шагов
+   Teleshova 13.03.2014 выгрузка во Фронт R-344732-2
+   Teleshova 28.08.2014 структура usr_pmdocs измениласьв 2031
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import PaymInter, FIInter, OprInter, RMInter, InsCarryDoc, SFInter, RsbDataSet, Cb_SQL, globals;
+import FrontCommon, FrontRoute, outsidecarry, op_lib;
+import "cbsttls.mac";
+import "cbctuncs.mac"; // KS 22.09.2011 Постановка на незавершённые расчеты
+// KS 18.11.2011 Шифры - виды для пойдем
+import "fg_Life_parm.mac";
+import oralib; //Jushmanov 2014-02-20 C-19151
+// KS 13.11.2011 Календарь
+//VV R-121267 11.12.12
+import календарь;
+import "Send_lotus.mac", "likepy.mac", lib_pm_check;
+
+private var oConnection_lib = ActiveX("ADODB.Connection");
+
+var PaymentObj;
+var errCode, errText;
+
+private var fgBank = fg_life_subject({OurBank});//zmp 25.09.2013 I-00428413-1 сделал private
+
+/* Очистка массива */
+MACRO SwapArray(arr)
+    var n = 0;
+    while (n < aSize(arr))
+        arr(n) = null;
+        n = n + 1;
+    end;
+    return arr;
+END;
+
+macro dump(str:object)
+    var i = 0;
+    var s="";
+    while (i < str.size)
+        if (valtype(str(i)) == 26 )
+            s = s+"пусто|";
+        else
+            s = s + str(i)+"|";
+        end;
+        i = i + 1;
+    end;
+    msgbox(s);
+end;
+
+macro getBO_ID( _ruleId )
+    var cmd = rsdCommand( " SELECT BO_ID FROM USR_ROUTE_PARM WHERE RULE_ID = :RULE_ID " );
+        cmd.addParam("RULE_ID", RSDBP_IN, _ruleId);
+
+    var rs  = rsdRecordset( cmd );
+
+    if( rs.movenext ) return rs.value( "BO_ID", NULL, V_INTEGER ) ;
+    else              return 0;
+    end;
+onerror return 0;
+end;
+
+macro getClientRsCodeByAccount( _account )
+    var _acc         = RSL_Account        ( _account );
+    var _err, rsCode = ПолучитьКодСубъекта( _acc.rec.client, 101, _err );
+
+    if( _err == 0 ) 
+        return rsCode;
+    else
+        return "";
+    end;
+onerror return ""; 
+end;
+
+macro printOurParams( adoCommand )
+    var i = 0 ;
+    while( i < adoCommand.parameters.count )
+        [################## : #]( adoCommand.Parameters(i).name, string( adoCommand.Parameters(i).value ) );
+        i = i + 1;
+    end;
+onerror end;
+
+MACRO ExecuteCaseStep( doc_buf, primDoc_buf, DocKind, OperID, qwe, asd, zxc)
+    debugbreak;
+    array aInput, aOutput;
+    var oConnection;
+    var paymtr:RsbPaymTransaction;
+    var query, rs, cmd, n = 0, lcgNumber;
+    var ruleid, tmpruleid, state, connstring, procname, waitstat, note, ask;
+    var inn,kpp;
+    var rset, retval= "";
+    var pm_docs, kind_op, shifr_op;
+    var real_fio, mess;
+    var PrimObj = GetPrimObj(PaymentObj);
+    var bo_id  = 0; // идентификатор внешней системы
+
+    private var transit_account = "",err = 0; // KS 21.09.2010 I-053538 Зачисление на банковские счета (Кредиты): Для чтения настройки
+
+    GetRegistryValue("PRBB\\FRONT\\TRANSIT_ACCOUNT_"+ПолучитьКодФинИн(PaymentObj.ReceiverFIID),V_STRING,transit_account,err);// KS 30.09.2010 I-053538: Прочитаю настройку
+
+    var errcode,errmsg,bizerrcode,bizerrmsg,konsolidaccount,clientfio,paycode,error_count,error;// KS 07.09.2011 Обработка веб-сервисов
+    var is_web = false, movenext = false;
+
+    // KS 13.11.2011 Операционное время
+    var str_time_start,
+        str_time_end,
+        time_start = time(),
+        time_end = time(),
+        NextWorkDay = date(),
+        WaitWorkDay = false,
+        IgnoreWaitWorkDay = false;
+
+    PaymentObj.origin = 9999;
+
+    if (IsForcePlaceInUnknown())
+
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_UNKNOWN, OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;    
+        return "";
+    end; // if (IsForcePlaceInUnknown())
+
+    GetFrontParm(PaymentObj, @ruleid, @state, @connstring, @procname, @waitstat, @note, @ask);
+    is_web = IsSoa(ruleid); // KS 14.09.2011 SOA
+    bo_id  = getBO_ID(ruleid);
+
+    if ((not is_web) and (ask == 1))
+        if (not(gettrue(true,"Документ подлежит обработке во Внешнюю систему, выгружать?")))        
+            return "";
+        end;
+    end;
+
+    // KS 13.11.2011 Выгрузка только в операционное время
+    if ((is_web) and (ask == 1))
+        // KS 13.11.2011 Определяем операционное время по Москве
+        GetRegistryValue("PRBB\\ОПЕРАЦИОННОЕ ВРЕМЯ\\ВРЕМЯ НАЧАЛО" ,v_string,str_time_start,err);
+        if (err==0)
+            GetRegistryValue("PRBB\\ОПЕРАЦИОННОЕ ВРЕМЯ\\ВРЕМЯ КОНЕЦ",v_string,str_time_end  ,err);
+        end;
+        if (err==0)
+            time_start = time (int(substr(str_time_start,1,2)),int(substr(str_time_start,4,2),0));
+            time_end   = time (int(substr(str_time_end  ,1,2)),int(substr(str_time_end,4,2),0));
+            
+            if ((not IsWorkDay(date())) or ((time() > time_end ) or (time() < time_start )) or ({curdate} < date()) )
+                // Если шаг "Выгрузка во внешнюю систему" уже выполнялся, то прекратить
+                cmd = RSDCommand("select * " +
+                          "  From doprstep_dbt s, doproper_dbt o " +
+                          " where s.t_id_operation = o.t_id_operation " +
+                          "   and s.t_blockid = 11000120 " +
+                          "   and s.t_isexecute='X' " +
+                          "   and o.t_documentid= lpad(?,34,'0')"); 
+                cmd.addParam("PaymentID", RSDBP_IN, PaymentObj.PaymentID);
+                rs = RSDRecordset(cmd);
+
+                if (rs.MoveNext)
+                    NextWorkDay = NextWorkDay + 1;
+                    
+                    while (not IsWorkDay(NextWorkDay))
+                        NextWorkDay = NextWorkDay + 1;
+                    end;
+                    
+                    if (not gettrue(false,"Данный платёж может быть выгружен||в ближайший рабочий день("+NextWorkDay+")||после "+time_start+" (время московское)!||Или выгрузить сейчас?"))
+                        // 11.12.12 VV - R-121267
+                        if (IsOprMultiExec())
+                              msgbox("Данный платёж может быть выгружен в ближайший рабочий день("+NextWorkDay+")||после "+time_start+" (время московское)!||");
+                              return 1;
+                        else
+                              msgbox("Данный платёж может быть выгружен в ближайший рабочий день("+NextWorkDay+")||после "+time_start+" (время московское)!||");
+                              return 1;
+                        end;
+                        //11.12.12 R-121267 
+                    else
+                        IgnoreWaitWorkDay = true;
+                    end;
+                
+                else
+                    // Иначе ждём рабочего дня
+                    WaitWorkDay = true;
+                end; // if (rs.MoveNext)
+            end;// if ((not IsWorkDay(date())) or ((time() > time_end ) or (time() < time_start )) or ({curdate} < date()) )
+        end; // if (err==0)
+    end; // if ((is_web) and (ask == 1))
+
+    if (not(WaitWorkDay)) // KS 13.11.2011 Если не ждём рабочего дня, то выгружаем сразу
+
+        /* EVG 2.12.2011 Статус "Выгрузка во Фронт" = "Не требуется" для заявлений на п/п/к не ставим, т.к. он для такого ПД не предусмотрен */
+        // !!! if( GenClassName( PrimObj ) != "RsbBuyCurrencyOrder" ); !!!
+        if( GenClassName( PrimObj ) != "RsbBuyCurrencyOrder" )
+            if( УстановитьСтатусыПлатежа( 307, 2 ) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+        end;
+
+        if (not is_web)
+            oConnection = oConnection_lib;
+            conn2front(oConnection, connstring, note);
+        end;
+
+        aInput( 0) = 1;                                 //iud                int // 1=Вставка, 3=Удаление
+        aInput( 1) = {MFO_BANK};                        //bankbic            varchar(10)           ,
+        aInput( 2) = PaymentObj.PaymentID;              //paymentid          int                   ,
+        aInput( 3) = PaymentObj.PayerAccount;           //payeraccount       varchar(25)     = NULL,
+        /*VDN C-30595 25.12.2014*/
+        var accFront;
+        if ((PaymentObj.dockind == 70) and (GetAccountFrontByPayment(PaymentObj.paymentid, accFront)))             
+          aInput( 3) = accFront;
+        end;
+        //если входящий платеж, требует ручной разноски проводок во Фронте
+        //нужно передать счет невыясненных
+        //ниже будет сделана проводка по счету невыясненных
+
+        if ((waitstat == 0) and ((PaymentObj.Dockind == 320) or (PaymentObj.Dockind == 322)) and (not fgBank.is_PRBB)) //Gurin S. 20.08.2015 исключил ПРББ 
+            // KS 21.09.2010 I-053538 Зачисление на банковские счета (Кредиты): если усть настройка, то нужно брать не 47416, а FuturePayerAccount
+            /* SDA используем технические ноли при любой маршрутизации, не только на 9 и 10 */
+            if ((err == 0) and (transit_account != ""))
+                aInput( 4) = PaymentObj.FuturePayerAccount;     //realpayer          varchar(25)     = NULL,
+            else
+                aInput( 4) = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.ReceiverFIID);
+            end;
+        else
+            aInput( 4) = PaymentObj.FuturePayerAccount;         //realpayer          varchar(25)     = NULL,
+            /*VDN C-30595 25.12.2014*/
+            if ((PaymentObj.dockind == 70) and (GetAccountFrontByPayment(PaymentObj.paymentid, accFront)))             
+              aInput( 4) = accFront;
+            end;
+        end;
+
+        aInput( 5) = PaymentObj.PayerName;              //payername          varchar(320)    = NULL,                     
+        aInput( 6) = PaymentObj.PayerBankCode;          //payerbic           varchar(35)     = NULL,
+
+        SplitFullINN (PaymentObj.PayerINN, inn, kpp);
+
+        aInput( 7) = inn;                               //payerinn           varchar(35)     = NULL,
+        aInput( 8) = kpp;                               //payerkpp           varchar(35)     = NULL,
+        aInput( 9) = PaymentObj.ReceiverAccount;        //receiveraccount    varchar(25)     = NULL,
+        // TAM 13.03.2014 выгрузка во Фронт R-344732-2
+        if(PaymentObj.FutureReceiverAccount == "")
+           aInput(10) = PaymentObj.ReceiverAccount;
+        else
+           aInput(10) = PaymentObj.FutureReceiverAccount;  //realreceiver       varchar(25)     = NULL,
+        end;
+
+        aInput(11) = PaymentObj.ReceiverName;           //receivername       varchar(320)    = NULL,
+        aInput(12) = PaymentObj.ReceiverBankCode;       //receiverbic        varchar(35)     = NULL,
+
+        SplitFullINN (PaymentObj.ReceiverINN, inn, kpp);
+
+        aInput(13) = inn;                               //receiverinn        varchar(35)     = NULL,
+        aInput(14) = kpp;                               //receiverkpp        varchar(35)     = NULL,
+        aInput(15) = PaymentObj.oper;                   //oper               int             = NULL,
+        aInput(16) = PaymentObj.NumberPack;             //pack               int             = NULL,
+        aInput(17) = 0;                                 //corschem           int             = NULL,
+        aInput(18) = 24001;                             //numoperation       int             = NULL,
+        aInput(19) = PaymentObj.Number;                 //numdoc             varchar(25)     = NULL,
+        aInput(20) = "";                                //typedoc            varchar(30)     = NULL,
+        aInput(21) = "";                                //usertypedoc        varchar(30)     = NULL,
+        aInput(22) = PaymentObj.PayerAmount;            //debetsum           decimal(18,6)   = NULL,
+        aInput(23) = PaymentObj.ReceiverAmount;         //kreditsum          decimal(18,6)   = NULL,
+
+        var frate:RsbCrossRate = PaymentObj.FactRate;
+
+        //TAM 28.01.2013 I-00317167-3
+        aInput(24) = frate.Rate/pow(10,frate.point);    //rate               decimal(18,6)   = NULL,
+        aInput(25) = PaymentObj.Ground;                 //ground             varchar(600)    = NULL,
+        aInput(26) = PaymentObj.Department;             //department         int             = NULL,
+        aInput(27) = PaymentObj.Priority;               //priority           int             = NULL,
+        aInput(28) = PaymentObj.ShifrOper;              //shifr              varchar(6)      = NULL,
+        aInput(29) = {curdate};                         //valuedate          datetime        = NULL,
+        aInput(30) = PaymentObj.PayDate;/*ClientDate; LAO 14.01.15 В 2031 клиентская дата не заполняется :(*/             //docdate            datetime        = NULL,
+        aInput(31) = PaymentObj.Dockind;                //dockind            int             = NULL,
+        aInput(32) = "";                                //cashsymbs          varchar(3)      = NULL,
+
+        aInput(33) = "";                                //fioclient          varchar(80)     = NULL,
+
+
+        if ((PaymentObj.Dockind != 320) and (PaymentObj.Dockind != 322) and (PaymentObj.Dockind != 286))
+            aInput(34) = PrimObj.userfield1;                //userfield1         varchar(120)    = NULL,
+            aInput(35) = PrimObj.userfield1;                //userfield2         varchar(40)     = NULL,
+            aInput(36) = PrimObj.userfield1;                //userfield3         varchar(80)     = NULL,
+            aInput(37) = PrimObj.userfield1;                //userfield4         varchar(80)     = NULL,
+        else
+            // Если шаг "Обработка невыясненной суммы" уже выполнялся, то прекратить
+            // Не стал отсекать именно шаг "Обработка невыясненной суммы" (от шага "Проводка платежа в невыясненные")
+            // Прости, Dима, я не стал использовать функцию, аналогичную "ПлатежИзОжидающихПоступления", т.к. нужно б былополучать номер операции и шага.
+            // Шило на мыло
+            cmd = RSDCommand("select * " +
+                             "  From doprstep_dbt s, doproper_dbt o " +
+                             " where s.t_id_operation = o.t_id_operation " +
+                             "   and s.t_blockid = 10000154 " +
+                             "   and s.t_isexecute='X' " +
+                             "   and o.t_documentid= lpad(?,34,'0')"); 
+            cmd.addParam("PaymentID", RSDBP_IN, PaymentObj.PaymentID);
+
+            rs = RSDRecordset(cmd);
+
+            if (not rs.MoveNext)
+                aInput(29) = PaymentObj.ValueDate; /*SDA для передачи во фронт ночных поступлений */     //valuedate          datetime        = NULL,
+            end;
+
+            aInput(34) = 
+            aInput(35) = 
+            aInput(36) = 
+            aInput(37) = "";
+        end;
+
+        if (iscashdoc (PaymentObj))
+            cmd = RSDCommand("select t_symbol||':'||replace(to_char(t_sum),',','.')||';' from dsymbcash_dbt where T_APPLICATIONKEY = lpad(?, 34, '0')");
+            cmd.addParam("pm_id", RSDBP_IN, PaymentObj.PaymentID);
+            rs = RSDRecordset(cmd);
+
+            while (rs.MoveNext)
+                aInput(32) = aInput(32) + rs.value(0);
+            end;
+
+            cmd = RSDCommand("select t_name from dperson_dbt where t_oper = ?");
+            cmd.addparam("oper", RSDBP_IN, {oper});
+            rs = RSDRecordset(cmd);
+            rs.movenext;
+            aInput(37) = rs.value(0); //userfield4
+
+        elif (PaymentObj.Dockind == 200) //ППК
+
+            if (PrimObj.BcOrdKind == 3)//конверсия
+                if (PrimObj.convoper == 1) //конверсия-покупка
+                    aInput(37) = 3;
+                elif (PrimObj.convoper == 2) //конверсия-продажа
+                    aInput(37) = 4;
+                end;
+            else
+                aInput(37) = PrimObj.BcOrdKind;//покупка/продажа
+            end;
+        end;
+        
+        debugbreak ();
+        aInput(38) = PaymentObj.DemandAcceptTerm;       //acceptterm         int             = NULL,
+        
+        // 2012-08-08 zip_z. >
+        if (PaymentObj.DemandAcceptDate != date (0,0,0))
+            aInput(39) = PaymentObj.DemandAcceptDate;   //acceptdate         datetime        = NULL,
+        else
+            aInput(39) = null;
+        end;
+        // < 2012-08-08 zip_z.
+        
+        aInput(40) = "";                                //paycondition       varchar(160)    = NULL,
+        aInput(41) = 0;                                 //acceptperiod       int             = NULL,
+        aInput(42) = PaymentObj.TaxAuthorState;         //creatorstatus      varchar(2)      = NULL,
+        aInput(43) = PaymentObj.BttTICode;              //kbkcode            varchar(20)     = NULL,
+        aInput(44) = PaymentObj.OKATOCode;              //okatocode          varchar(11)     = NULL,
+        aInput(45) = PaymentObj.TaxPmGround;            //groundtaxdoc       varchar(2)      = NULL,
+        aInput(46) = PaymentObj.TaxPmPeriod;            //taxperiod          varchar(10)     = NULL,
+        aInput(47) = PaymentObj.TaxPmNumber;            //numtaxdoc          varchar(15)     = NULL,
+        aInput(48) = PaymentObj.TaxPmDate;              //taxdate            varchar(10)     = NULL,
+        aInput(49) = PaymentObj.TaxPmType;              //taxtype            varchar(2)      = NULL,
+        aInput(50) = PrimObj.origin;                    //origin             int             = NULL,
+        aInput(51) = ""; // KS 02.08.2011 Патч 30 Поле удалено из объекта
+        aInput(52) = "";                                //codecomiss         varchar(30)     = NULL,
+        aInput(53) = "";                                //countrypayer       varchar(30)     = NULL,
+        aInput(54) = "";                                //countryreceiver    varchar(30)     = NULL,
+        aInput(55) = ruleid;                            //rsbroute           varchar(255)    = NULL,
+
+        if(PaymentObj.Dockind == 200)
+           // zmp 28.01.2014 С-20812      
+           var KonvBcOrder = GenObject( "RsbBuyCurrencyOrder", PaymentObj.PaymentID);     
+           if ((bo_id == 6) and (KonvBcOrder.origin == 2) and (CheckAutoExecut(PaymentObj.PaymentID))) //zmp 03.04.2014 R-357083
+              aInput[60] = 1; //@online 
+           end;
+        end;
+
+        // Golovkin 05.12.2013 C-25374 Выгрузка РСкода клиента во Фронт-Дилинг
+        // Golovkin 04.03.2015 C-36261 для всех банков
+        if( bo_id == 6 ) // Фронт-Дилинг
+            aInput(61) = getClientRsCodeByAccount( aInput(3) );
+        end;
+
+        PaymentObj.ReadNote(133,real_fio);
+
+        if ((valtype(real_fio) != V_UNDEF)and(not is_web))
+            mess = "Предыдущая выгрузка во Фронт завершилась неудачно, т.к. ФИО получателя в платеже и в договоре к счету не совпало|"+
+                   "ФИО клиента по счету "+PaymentObj.FutureReceiverAccount+" во Фронте: "+real_fio+"|выгрузить платеж с изменением ФИО?";
+            if (GetTrue(false,mess));
+                aInput(11) = real_fio;
+            end;
+        end;
+
+        //Инициализация выходных параметров
+        aOutput(0) = -1;      //0 ret             0 - все хорошо, но проводок нет, >0 идентификатор операции, <0 ошибка
+        aOutput(1) = 0;       //1 paymentid       идентификатор документа v6,
+        aOutput(2) = "";      //2 payeraccount    счет платильщика,
+        aOutput(3) = "";      //3 receiveraccount счет получателя,
+        aOutput(4) = "";      //4 receivername    получатель,
+        aOutput(5) = 0;       //5 pack            пачка,
+        aOutput(6) = "";      //6 numdoc          номер документа,
+        aOutput(7) = $0;      //7 value           сумма,
+        aOutput(8) = "";      //8 ground          основание
+        aOutput(9) = 0;       //9 originout       номер условия маршрутизации, на случай если платеж был передан другому Фронту
+
+        if (is_web)
+            if (not IgnoreWaitWorkDay)
+                RSADORecordset (ExecuteWebProcEx(procname, aInput, ruleid, @aOutput));
+            else // KS 21.11.2011 Обработка без передачи во внешнюю систему
+                aOutput(0) = 1;                 //0 ret             0 - все хорошо, но счета нет, >0 идентификатор операции, <0 ошибка
+                aOutput(1) = aInput( 2);        //1 paymentid       идентификатор документа v6,
+                aOutput(2) = aInput( 4);        //2 payeraccount    счет платильщика,
+                aOutput(3) = "";                //3 receiveraccount счет получателя,
+                aOutput(4) = "";                //4 receivername    получатель,
+                aOutput(5) = aInput(16);        //5 pack            пачка,
+                aOutput(6) = aInput(19);        //6 numdoc          номер документа,
+                aOutput(7) = aInput(22);        //7 value           сумма,
+                aOutput(8) = aInput(25);        //8 ground          основание
+                aOutput(9) = ruleid;            //9 originout       номер условия маршрутизации, на случай если платеж был передан другому Фронту
+            end;
+            movenext = true;
+        
+        else
+            rset = RSADORecordset (ExecuteFrontProcEx(procname, aInput, oConnection, ruleid, aOutput, note));
+
+            //распечатка передаваемых параметров
+            //printOurParams( rset.rs.activeCommand );
+
+            //Gurin S. 01.04.2013 C-18865
+            if (checkConnectionError (oConnection, 17002) == true) return 0; end;
+
+            if (not(rset))
+                return 1; // dex     return 1
+            end;
+            
+            movenext = rset.movenext;
+        end;
+
+        while (movenext)
+            if (is_web)// KS 07.09.2011 Обработка веб-сервисов
+                movenext = false;
+            else
+                aOutput(0) = rset.m_value[0];
+                aOutput(1) = rset.m_value[1];
+                aOutput(2) = rset.m_value[2];
+                aOutput(3) = rset.m_value[3];
+                aOutput(4) = rset.m_value[4];
+                aOutput(5) = rset.m_value[5];
+                aOutput(6) = rset.m_value[6];
+                aOutput(7) = rset.m_value[7];
+                aOutput(8) = rset.m_value[8];
+                aOutput(9) = rset.m_value[9];
+            end; // if (is_web)
+
+            n = n + 1;
+            tmpruleid =  aOutput(9);
+            pm_docs = usr_pm_docs;
+
+            /* korkin */
+            if ((IsGreenCorridor(ruleid)) and (aOutput(0) != "no_error"))
+                msgbox("Ошибка обработки платежа во Внешней системе:|("+note+")|"+aOutput(0));
+                //msgbox("Ошибка обработки платежа во Фронт:|("+note+")|"+aOutput(0));
+                return 1;
+            
+            elif (((aOutput(0) < 0)and(not is_web)) or ((aOutput(0) <-1)and(    is_web)))
+                msgbox("Ошибка обработки платежа во Внешней системе:|("+note+")|"+aOutput(8));
+                //msgbox("Ошибка обработки платежа во Фронт:|("+note+")|"+aOutput(8));
+                
+                if ((aOutput(0) == -11)/*несовпадение ФИО*/ and (valtype(real_fio)==V_UNDEF))
+                    AddNoteForPayment_txt(PaymentObj.PaymentID, 133, aOutput(4));
+                end;
+
+                return 1;
+
+            elif ((aOutput(0) == 0) and (waitstat == 0))//шаг зачисление будет выполнять внешняя система
+
+               retval = "20" ; 
+
+            elif ((aOutput(0) == 0) and (waitstat != 0))
+
+                if (is_web)// KS 07.09.2011 Обработка веб-сервисов
+                    //переход на шаг ожидания ответа из внешней системы
+                    AddNoteForPayment_txt(PaymentObj.PaymentID, 130, "Неверен счет получателя");
+                    retval = "20";
+                else
+                    msgbox("Неверный код возврата внешней системы");
+                    return 1;
+                end;
+
+            elif (waitstat == 2)  //результата от Фронта не ожидается - переход на стандартный шаг зачисления               
+
+                return "";
+            
+            elif ((aOutput(0) != -1) or (not is_web))
+                /* korkin */
+                if (IsGreenCorridor(ruleid))
+                    pm_docs.payment_id = PaymentObj.PaymentID;
+                    pm_docs.carrynum = n;
+                    pm_docs.payer_account = PaymentObj.PayerAccount;
+                    pm_docs.receiver_account = PaymentObj.ReceiverAccount;
+                    pm_docs.sum = PaymentObj.PayerAmount;
+                    //TAM 27.08.2014 I-00511122-2
+                    pm_docs.sum_payer = PaymentObj.PayerAmount;
+                    pm_docs.sum_receiver = PaymentObj.ReceiverAmount;
+                    pm_docs.date_carry = {curdate};
+                    pm_docs.oper = PaymentObj.oper;
+                        
+                    if (PaymentObj.oper == 0)
+                        pm_docs.oper = {oper};
+                    end;
+
+                    pm_docs.pack = PaymentObj.NumberPack;
+                    pm_docs.num_doc = PaymentObj.Number;
+                    pm_docs.ground = PaymentObj.Ground;
+                    pm_docs.department = PaymentObj.Department;
+                    tmpruleid = aOutput(9);
+
+                    getkindcarry(PaymentObj, @shifr_op, @kind_op);
+
+                    pm_docs.kind_oper = kind_op;
+                    pm_docs.shifr_oper = shifr_op;
+
+                else
+                    pm_docs.payment_id = PaymentObj.PaymentID;
+                    pm_docs.carrynum = n;
+                    pm_docs.payer_account = aOutput(2);
+                    pm_docs.receiver_account = aOutput(3);
+                    pm_docs.sum = aOutput(7);
+                    //TAM 27.08.2014 I-00511122-2
+                    pm_docs.sum_payer = aOutput(7);
+                    pm_docs.sum_receiver = aOutput(7);
+                    pm_docs.date_carry = {curdate};
+                    pm_docs.oper = PaymentObj.oper;
+
+                    if (PaymentObj.oper == 0)
+                        pm_docs.oper = {oper};
+                    end;
+
+                    pm_docs.pack = aOutput(5);
+                    pm_docs.num_doc = aOutput(6);
+                    pm_docs.ground = aOutput(8);
+                    pm_docs.department = PaymentObj.Department;
+                    tmpruleid = aOutput(9);
+
+                    getkindcarry(PaymentObj, @shifr_op, @kind_op);
+
+                    pm_docs.kind_oper = kind_op;
+                    pm_docs.shifr_oper = shifr_op;
+                end;
+            
+                if (not(pm_docs.insert))
+                    msgbox("Ошибка записи проводки из Внешней системы:|("+note+")|"+pm_docs.ErrorMessage);
+                    return 1
+                end;
+            end;
+
+            if (not is_web)
+                movenext = rset.movenext;
+            end;
+        end; //!!!
+
+        if ((valtype(tmpruleid) != V_UNDEF) and (ruleid != tmpruleid) and (tmpruleid != 0))
+            UpdateFrontRule (PaymentObj, tmpruleid);
+        end;
+
+        if (waitstat == 1) //проводка выполняется сразу
+            if ((retval == "20")and(is_web))
+                if( УстановитьСтатусыПлатежа( 3203, 2) ) // KS 29.09.2011 На ожидание ответа
+                    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                    return 1;
+                end;
+
+            elif (retval != "20")
+                if ((aOutput(0) != -1) or (not is_web))
+                    if (not(pm_docs.check_sum(PaymentObj)))
+                        msgbox("сумма проводок переданных из Внешней системы не совпадает с суммой платежа");
+                        return 1;
+                    end;
+                
+                else // KS 07.09.2011 Обработка веб-сервисов (aOutput(0) == -1)
+                    if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_UNKNOWN, // KS 23.04.2011 На невыясненные
+                                          OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED ) )
+                        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                        return 1;
+                    end;
+                end;
+                retval = ""; //выход из блока и переход на стандартный шаг зачисление (с автовыполнением)
+            end;// if ((retval == "20")and(is_web))
+        end; 
+    end; // KS 13.11.2011 if (not(WaitWorkDay))
+
+    if ((waitstat == 0) or ((is_web) and (err == 0) and (retval == "20")) or ((is_web) and (err == 0) and (WaitWorkDay))) 
+        //если документ входящий - ставим на невыясненные
+            
+        if (((PaymentObj.Dockind == 320) or (PaymentObj.Dockind == 322)) and (PaymentObj.FuturePayerAccount != Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.ReceiverFIID)))
+            // KS 13.11.2011 Определю делали проводку ранее
+            cmd = RSDCommand("select * " +
+                             "  From doprstep_dbt s, doproper_dbt o " +
+                             " where s.t_id_operation = o.t_id_operation " +
+                             "   and s.t_blockid = 11000120 " +
+                             "   and s.t_isexecute='X' " +
+                             "   and o.t_documentid= lpad(?,34,'0')"); 
+            cmd.addParam("PaymentID", RSDBP_IN, PaymentObj.PaymentID);
+            rs = RSDRecordset(cmd);
+
+            if (not rs.MoveNext)
+                paymtr             = PaymentObj.MakeTransaction();
+                paymtr.Chapter     = 1;
+                paymtr.FIIDPayer   = PaymentObj.PayerFIID;
+                paymtr.Sum         = PaymentObj.PayerAmount;
+                paymtr.Number_Pack = PaymentObj.NumberPack;
+
+                paymtr.ResultCarry = AVIZOCARRY;
+
+                if (fgBank.is_GO) // KS 18.11.2011 Шифры Пойдём
+                    paymtr.Kind_Oper  = " 6";
+                else
+                    paymtr.Kind_Oper  = " 1";
+                end;
+
+                paymtr.Shifr_Oper   = "09";
+                paymtr.AccountPayer = PaymentObj.FuturePayerAccount;///???????7777
+
+                // KS 21.09.2010 I-053538 Зачисление на банковские счета (Кредиты): если номер правила 9,10, то заменить номер счета
+                /* SDA используем технические ноли при любой маршрутизации, не только на 9 и 10 */
+                // KS 21.09.2010 I-053538 Зачисление на банковские счета (Кредиты): если усть настройка, то нужно заменять счет
+                var flag_sld = ((CompareStrWithMasks("47427810?0000007*", PaymentObj.ReceiverAccount) == 0) and fgBank.is_SLD);
+                if ((err == 0) and (is_web))
+                    paymtr.AccountReceiver   = InPaymentAccUnclosed( PaymentObj ).FindAndOpenAccount();
+                elif ((err == 0) and (transit_account != ""))
+                    if (not flag_sld)
+                       paymtr.AccountReceiver   = transit_account;
+                    end;
+                else
+                    if ((not fgBank.is_PRBB) and (not flag_sld)) //Gurin S. 20.08.2015 исключил ПРББ
+                          paymtr.AccountReceiver   = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.ReceiverFIID);
+                    end;
+                end;
+
+                /* EVG 29/02/2012 По сообщению Нины Савченко и Елены Тюриной: проводка должна  выполняться датой платежа.*/
+                paymtr.date_carry = PaymentObj.ValueDate;
+                paymtr.Department    = PaymentObj.Department;
+                paymtr.Ground        = PaymentObj.Ground;
+                paymtr.Numb_Document = PaymentObj.Number;     
+                paymtr.ClaimID       = PaymentObj.ClaimID;
+
+                if( not paymtr.Carry() )
+                    MsgBox("Ошибка при актуализации платежа");
+                    return 1;
+                end;
+
+                //Seleznev A49543
+                cmd = RSDCommand("select 1 from drminprop_dbt Where t_paymentid = ?");
+                cmd.addparam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+                rs=RSDRecordset(cmd);
+
+                if (not(rs.movenext))
+                    cmd = RSDCommand
+                    (
+                       "insert into drminprop_dbt (t_paymentid, " +
+                       "                           t_closed, " +
+                       "                           t_placedate, " +
+                       "                           t_account, " +
+                       "                           t_fiid, " +
+                       "                           t_sort, " +
+                       "                           t_poutdate, " +
+                       "                           t_sum, " +
+                       "                           t_outdate, " +
+                       "                           t_contrnversion, " +
+                       "                           t_reserve) " +
+                       "  values   (?, " +
+                       "            chr (0), " +
+                       "            trunc (sysdate), " +
+                       "            ?, " +
+                       "            ?, " +
+                       "            chr (1), " +
+                       "            to_date ('01010001', 'DDMMYYYY'), " +
+                       "            ?, " +
+                       "            to_date ('01010001', 'DDMMYYYY'), " +
+                       "            0, " +
+                       "            chr (1)) "
+                    );
+                    cmd.addparam("pmid", RSDBP_IN, PaymentObj.PaymentID);
+                    cmd.addparam("acc" , RSDBP_IN, paymtr.AccountReceiver);
+                    cmd.addparam("fiid", RSDBP_IN, PaymentObj.ReceiverFIID);
+                    cmd.addparam("sum" , RSDBP_IN, PaymentObj.ReceiverAmount);
+                    cmd.execute();
+                end; // if (not(rs.movenext))
+            end; // if (not rs.MoveNext) (еще один)
+        end;
+
+        if (not (WaitWorkDay))
+            if ((is_web) and (err == 0) and (retval == "20"))
+                retval = ""; // KS На ожидание
+            else
+                retval = "20" //ожидание обработки во Фронт - выполнение следующего шага делает Фронт
+            end;
+        else           
+            return "";
+        end;
+    end; 
+
+    /* Если осталось открытое соединение, закрываем */
+    // 2012-08-07 zip_z. если connection::state != adStateClosed (т.е. 0) - закрываем соединение
+    if (oConnection and (oConnection.State != 0))
+        oConnection.Close();
+    end;
+
+    if ((aOutput(0) > 0) and (is_web))
+        if( УстановитьСтатусыПлатежа( 3202, 2 ) ) // KS 23.04.2011 Для отмены повторной постановки на невыясненные 3202 = "Помещено в невыясненные", 2-Нет
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end; 
+  
+    return retval;       
+end;
+
+private MACRO GetOperName( oper:integer ):string
+    private var fperson  :TBFile = TBFile( "person.dbt",   "R", 0, "person.dbt",   "bank.def" );
+    fperson.KeyNum = 0;
+    fperson.rec.Oper = oper;
+  
+    if( fperson.GetEQ() )
+        return fperson.rec.Name;
+    else  
+        return string("Не найден операционист: ", oper);
+    end;
+END;
+
+
+MACRO CheckStepAction( mes, primDoc_buf, DocKind, OperID )
+    array aInput;
+    array aOutput;
+    var oConnection;
+
+    var ruleid, state, stat=0, connstring, procname, rset, note, waitstat, ask;
+    var frate:RsbCrossRate;
+    var is_web,movenext;// KS 07.09.2011 Обработка веб-сервисов
+
+    /* Действия при откате шага */
+    if ((mes == OP_BACKOUT_STEP) and (IsFrontPayment(PaymentObj)))
+        GetFrontParm(PaymentObj, @ruleid, @state, @connstring, @procname, @waitstat, @note, @ask);
+        is_web = IsSoa(ruleid);
+
+        /*VDN 07.10.2015 R-622595*/
+        if (     (fgBank.is_PRBB) 
+           and (CompareStrWithMasks("30102*", PaymentObj.PayerAccount) == 0)
+           and (CompareStrWithMasks("47422*60198, 47422*60154", PaymentObj.ReceiverAccount) == 0)  
+           and (inList(PaymentObj.DocKind, 320, 322) ) )
+             /*VDN 21.10.2015 R-624455*/
+             var inParams = TArray(), outParams = TArray();        
+             inParams[0] = PaymentObj.paymentid;
+             inParams[1] = {MFO_BANK};
+
+             if (ExecuteFrontFunc("prc_rsv6_payment_stat", inParams, connstring, outParams, note))
+               if (outParams(0) == -1)
+                 MsgBox("Платеж " + PaymentObj.paymentid + " не найден во Фронт: " + note);
+                 return 1;
+               end;
+
+               if (outParams(0) != 1)
+                 MsgBox("Запрещено удаление/откат документа. Документ разрешается удалить/откатить только из фронта.");
+                 return 1;
+               end;
+             end;              
+        end;
+
+        if (not(iscashdoc (PaymentObj))) //для кассовых всегда пытаемся откатить операцию
+            if ( not (getTrue(true, "Платёж был выгружен во Внешнюю систему.\nУдалить операцию во внешней системе?")))
+                return 0;
+            end;
+        end;
+
+        if (not is_web)
+            oConnection = oConnection_lib;
+            conn2front(oConnection, connstring, note);
+        end;
+
+        aInput( 0) = 3;                                 //iud                int // 1=Вставка, 3=Удаление
+        aInput( 1) = {MFO_BANK};                        //bankbic            varchar(10)           ,
+        aInput( 2) = PaymentObj.PaymentID;              //paymentid          int                   ,
+        aInput( 3) = PaymentObj.PayerAccount;           //payeraccount       varchar(25)     = NULL,
+
+        if ((waitstat == 0) and ((PaymentObj.Dockind == 320) or (PaymentObj.Dockind == 322))) 
+            aInput( 4) = Unkn_GetAccountPassive( PaymentObj.Department, PaymentObj.ReceiverFIID);
+        else
+            aInput( 4) = PaymentObj.FuturePayerAccount;     //realpayer          varchar(25)     = NULL,
+        end;
+
+        aInput( 9) = PaymentObj.ReceiverAccount;        //receiveraccount    varchar(25)     = NULL,
+        aInput(10) = PaymentObj.FutureReceiverAccount;  //realreceiver       varchar(25)     = NULL,
+        aInput(22) = PaymentObj.PayerAmount;            //debetsum           decimal(18,6)   = NULL,
+        aInput(23) = PaymentObj.ReceiverAmount;         //kreditsum          decimal(18,6)   = NULL,
+        
+        if (is_web) // KS 07.09.2011 Обработка веб-сервисов
+            aInput(25) = "Платеж был отложен пользователем "+GetOperName({oper});             //department         int             = NULL,
+        end;
+        
+        aInput(26) = PaymentObj.Department;             //department         int             = NULL,
+        aInput(29) = {curdate};//PaymentObj.ValueDate;              //valuedate          datetime        = NULL,
+        aInput(30) = PaymentObj.ClientDate;             //docdate            datetime        = NULL,
+        aInput(31) = PaymentObj.Dockind;                //dockind            int             = NULL,
+        aInput(39) = PaymentObj.DemandAcceptDate;       //acceptdate         datetime        = NULL,                      
+        aInput(55) = ruleid;                            //rsbroute           varchar(255)    = NULL,
+
+        if (is_web)
+            if (Index(ProcName,"(") == 0 )
+                ProcName = ProcName + "DelDoc";
+            else
+                ProcName = Strsubst(ProcName,"(","DelDoc(");
+            end;
+
+            RSADORecordset (ExecuteWebProcEx(procname, aInput, ruleid, @aOutput));
+            movenext = true;
+        else
+            // rset = RSADORecordset(ExecuteFrontProc(procname, aInput, oConnection));
+            rset = RSADORecordset (ExecuteFrontProcEx(procname, aInput, oConnection, ruleid));
+   
+            if (not(rset))
+                return 1; // dex     return 1
+            end;
+            movenext = rset.movenext;
+        end;
+
+        if (movenext)
+            if (is_web)// KS 07.09.2011 Обработка веб-сервисов
+                movenext = false;
+            else
+                aOutput(0) = rset.m_value[0];
+                aOutput(1) = rset.m_value[1];
+                aOutput(2) = rset.m_value[2];
+                aOutput(3) = rset.m_value[3];
+                aOutput(4) = rset.m_value[4];
+                aOutput(5) = rset.m_value[5];
+                aOutput(6) = rset.m_value[6];
+                aOutput(7) = rset.m_value[7];
+                aOutput(8) = rset.m_value[8];
+                aOutput(9) = rset.m_value[9];
+            end;
+
+            if ({oper} == 10000)
+                dump(rset.m_value);
+            end;
+
+            if (((aOutput(0) < 0) and (aOutput(0) != -3) and (not is_web))or//-3 - операции во Фронт нет
+                    ((aOutput(0) < 0) and ( is_web)))// KS 07.09.2011 Обработка веб-сервисов
+                msgbox("Ошибка " + aOutput(0) + " при удалении операции из Внешней системы:|"+aOutput(8));
+                // zip_z. 2012-08-10 Если операция не найдена во Фронте, разрешаем откат шага.
+                if (aOutput(0) == -6)
+                    stat  = 0;
+                else
+                    stat  = 1;
+                end;
+                // < zip_z.
+            
+            /*korkin*/
+            elif ((IsGreenCorridor(ruleid)) and (aOutput(0) != "no_error"))
+                msgbox("Ошибка удаления операции из Внешней системы:|"+aOutput(0));
+                stat = 1;
+            end;
+
+        else
+            msgbox("Не определен статус платежа во Внешней системе");
+            stat = 1;
+        end;
+
+        // 2012-08-07 zip_z. если connection::state != adStateClosed (т.е. 0) - закрываем соединение
+        if (oConnection and (oConnection.State != 0))
+            oConnection.Close();
+        end;
+    end;
+
+    return stat;
+END;
+
+
+//Jushmanov 2014-01-21 C-19151
+macro PostStepAction( message,  /* данный параметр может принимать следующие       */
+                                /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                      errTrn,   /* статус выполнения шага. Если параметр не равен  */
+                                /* 0, то произошла ошибка                          */
+                      FirstDoc, /* указатель на первичный документ                 */
+                      ID_Oper,  /* внутренний идентификатор операции               */
+                      Num_Step, /* Номер шага операции (из настроек)               */
+                      KindOper, /* номер вида операции                             */
+                      KindDoc,  /* номер вида первичного документа                 */
+                      KindStep, /* вид шага операции                               */
+                      ID_Step ) /* внутренний идентификатор шага операции          */
+
+private var sqlquery;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(ID_Oper) != V_INTEGER) and (valtype(ID_Oper) != V_STRING)) ID_Oper = 0; end;
+        if ((valtype(ID_Step) != V_INTEGER) and (valtype(id_Step) != V_STRING)) ID_Step = 0; end;
+
+        sqlquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                " WHERE t_id_operation = " + ID_Oper + " AND t_id_step = " + ID_Step;
+        ExecSQL(sqlquery, null, false);
+    end;
+
+    return 0;
+end;

@@ -1,0 +1,465 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Макрос скроллинга
+// Описание  : Макрос скроллинга кассовых документов ББ
+//-----------------------------------------------------------------------------
+// KS 25.11.2013 Адаптация под 31ю сборку
+
+import BankInter, globals, check117, CashInter, PaymInter, "pm_opr.mac", "pmchoper.mac", "pm_tools.mac", pm_chksave;
+/* EVG */
+import "GenNumber.mac";
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+import "ChangeReason.mac";
+import "Diver.mac"; //SDA - (ВходитВГруппу())
+
+record Pscashord( pscshdoc );
+record Pmpaym   ( pmpaym   );
+record Pmrmprop ( pmrmprop );
+record CurTr    ( pmcurtr  );
+record PmKz     ( pmkz     );
+
+record OldPscashord( pscshdoc );
+record OldPmpaym   ( pmpaym   );
+record OldPmrmprop ( pmrmprop );
+record OldCurTr    ( pmcurtr  );
+record OldPmKz     ( pmkz     );
+
+/*номера полей в панели*/
+const fld_Number    = 1,
+      fld_Date      = 2,
+      fld_DateValue = 3, 
+      fld_Ground    = 21; /*SMR 18.07.02*/
+
+// Проверка на числовой номер
+MACRO IsDigitNumber( Number )
+
+  var stat = 0, i = 1, ch, DigitString = "0123456789";
+
+      while( (not stat) and (i <= strlen(Number)) )
+        ch = SubStr( Number, i, 1 );
+        if( not Index( DigitString, ch ))
+          stat = 1;
+        end;
+        i = i + 1;
+      end;
+
+  return stat;
+
+END;
+
+// Сгенерировать номер
+MACRO СгенерироватьНомер( ):integer
+  var stat:integer = 0; 
+  var NumberDoc:string = Pmrmprop.Number;
+  
+  if( CashGenerateNumber( NumberDoc ) )
+    msgbox("Ошибка генерации номера документа");
+  else
+    Pmrmprop.Number = NumberDoc;
+  end;
+
+  return stat;
+END;
+
+MACRO Новый_Документ( )
+  /* EVG Ввод документа: автоматическое формирование номера по референсу */
+  if( StrLen( Pmrmprop.Number ) == 0 )
+     Pmrmprop.Number = GenNumberDocument();
+  end;
+  return 0;
+END;
+
+//-----------------------------------------------------------------------------
+//  Счет является маской
+//-----------------------------------------------------------------------------
+private macro AccountIsMask( Account ):bool
+  if( Index( Account, "*" ) or
+      Index( Account, "?" ) )
+    return true;
+  else
+    return false;
+  end;
+end;
+
+MACRO Проверить_Документ( Режим )
+
+  var stat = 0, 
+      saveNullNumber = false,
+      CHANG_IMPORTANT = -11,
+      CHANG_NOTIMPORTANT = -10;
+  var ErrStr:string = "";
+  var Payment:RsbPayment = RsbPayment(Pmpaym.PaymentID);
+  record debet_rec ( "pmprop.dbt" );
+  record credit_rec ( "pmprop.dbt" );
+  ClearRecord( debet_rec );
+  debet_rec.PaymentID = credit_rec.PaymentID = pmpaym.PaymentID;
+  debet_rec.Group     = credit_rec.Group     = PAYMENTS_GROUP_INTERNAL;
+  debet_rec.IsSender  = credit_rec.IsSender  = "X";
+
+   Macro IsOperInGroup(oper, group)
+
+      var SQL, cmd, rs;
+
+      SQL = "SELECT 1 FROM DACSGROUPOPER_DBT WHERE t_oper = ? and t_groupid = ?";
+      cmd = RsdCommand(SQL);
+      cmd.AddParam("", RSDBP_IN, oper);
+      cmd.AddParam("", RSDBP_IN, group);
+      cmd.Execute();
+
+      rs = RsdRecordSet(cmd);
+
+        if(rs.MoveNext())
+          return true;
+        end;
+
+      return false;
+
+   end;
+   
+  // Проверяем номер для всех документов, в том числе и отложенных
+  if( (Режим == 2 ) or (Режим == 3) or (Режим == 8) ) 
+  
+    if( Pmrmprop.Date == date(0,0,0) )
+      msgbox("Дата документа должна быть задана");
+      return fld_Date;
+    end;
+    if( Pmpaym.ValueDate < Pmrmprop.PayDate )
+      msgbox( "Дата валютирования не должна быть|меньше даты платежа" );
+      return fld_DateValue;
+    end;
+    if( Pmpaym.ValueDate > {curdate} )
+      msgbox("Дата значения платежа не должна|превышать текущую операционную дату");
+      return fld_DateValue;
+    end;
+    if( (Pmpaym.ValueDate - Pmrmprop.Date) > 10 )
+      MsgBox("Документ устарел и не может быть сохранён");
+      return fld_DateValue;
+    end;
+
+    if( StrLen( Pmrmprop.Number ) == 0 )
+
+      if( RsbGetTrue( true, false, "Не задан номер документа.|Сохранить документ?" ) == false )
+        if( not GetDialogFlag() )
+          MsgBox("Не задан номер документа");
+        end;
+        return fld_Number;
+      else
+        saveNullNumber = true;
+      end;
+    
+    end;
+
+    if( not Pscashord.IsCurrency ) // Проверки для рублевых
+      if( IsDigitNumber( Pmrmprop.Number ) )
+         MsgBox("Номер документа нечисловой");
+         return fld_Number;
+      elif( not saveNullNumber )
+         if( int( Pmrmprop.Number ) == 0 )
+            MsgBox("Номер документа не может быть нулевым");
+            return fld_Number;
+         end;
+      end;
+
+      /* Проверка убрана по запросу 155530.
+         Ждём, когда она снова кому-нибудь понадобится.
+      if( SubStr( Pmrmprop.Number, StrLen( Pmrmprop.Number )-2 ) == "000" )
+         MsgBox("Три последних разряда номера должны быть отличны от '000'");
+         return fld_Number;
+      end;
+      */
+    end;
+
+    if( StrLen( Pmrmprop.Ground ) == 0 )
+      MsgBox("Введите Назначение платежа");
+      return fld_Ground;
+    end;
+
+    //Gurin S. 19.02.2015 R-546793-2 
+    if( StrLen( Pmrmprop.Ground ) > 210 )
+      MsgBox("Длина поля 'Назначение платежа' превышает допустимые 210 символов");
+      return fld_Ground;
+    end;
+    
+    if((Pmpaym.DocKind != CASH_BOF_INCORDER) or (Payment.PIList(1).Size <= 0))
+      if(Pmpaym.ReceiverAccount == "")
+        MsgBox("Не задан счет получателя");
+        return 1;
+      elif(Index( Pmpaym.ReceiverAccount, "*" ) or Index( Pmpaym.ReceiverAccount, "?" ))
+        MsgBox("Нельзя задавать счет получателя маской");
+        return 1;
+      end;
+    end;
+   
+    ErrStr = PM_CheckPaymAccounts( Pmpaym, NULL, NULL, NULL, 1 );
+    if( strlen(ErrStr) > 0 )
+      msgbox( ErrStr );
+      return 1;
+    end;
+
+    /* Общие проверки по списку */
+    stat = CS_ScrolMacroCommonChecks( TPanelFields(), pmpaym, debet_rec, credit_rec, pmrmprop );
+    if( stat != NOTERROR )
+      return stat;
+    end;
+
+    /*проверка реквизитов валютной операции*/
+    if(PM_CheckCO(Pmpaym,Pmrmprop,0,0))
+       return 1;
+    end;
+
+    // Проверить по 117-И
+    if( CheckOnSave_117( Pmpaym, NULL, NULL, NULL ) )
+      return fld_Number;
+    end;
+
+  end;
+
+  if( Режим == 1 ) // УДАЛЕНИЕ ДОКУМЕНТА
+    if(not isDLMRuning())
+      if( Pscashord.Origin == CASH_FDOC_LOANS ) 
+        if(not Index( "Ц", StrFor(GetIdentProgram())))
+          MsgBox("Документ порoжден в п/с \"Кредитование\".| Корректировать (удалять) запрещено.");
+          return 1;
+        end;
+      elif( Pscashord.Origin == CASH_FDOC_DEPOSIT ) 
+        if(not Index( "Д", StrFor(GetIdentProgram())))
+          MsgBox("Документ порoжден в п/с \"Депозиты\".| Корректировать (удалять) запрещено.");
+          return 1;
+        end;
+      elif( Pscashord.Origin == CASH_FDOC_RETAIL )
+        if(not Index( "ВБD", StrFor(GetIdentProgram())))
+          MsgBox("Документ порoжден в п/с \"Обслуж.физ.лиц\".| Корректировать (удалять) запрещено.");
+          return 1;
+        end;
+      elif( (Pscashord.Origin != CASH_FDOC_MANUAL) and (not(ВходитВГруппу({oper},172))))
+         MsgBox("Документ порoжден в БЭК-офисе.| Корректировать (удалять) запрещено."); 
+         return 1;
+      end;
+    end;
+
+     if(CheckDeletePayment(Pmpaym.PaymentID))
+       return 1;
+     end;
+  end;
+
+  if(Режим == 3)  // РЕДАКТИРОВАНИЕ ДОКУМЕНТА
+
+    if( Pscashord.Origin == CASH_FDOC_LOANS ) 
+      if(not Index( "Ц", StrFor(GetIdentProgram())))
+        MsgBox("Документ порoжден в п/с \"Кредитование\".| Корректировать (удалять) запрещено.");
+        return 1;
+      end;
+    elif( Pscashord.Origin == CASH_FDOC_DEPOSIT ) 
+      if(not Index( "Д", StrFor(GetIdentProgram())))
+        MsgBox("Документ порoжден в п/с \"Депозиты\".| Корректировать (удалять) запрещено.");
+        return 1;
+      end;
+    elif( Pscashord.Origin == CASH_FDOC_RETAIL )
+      if(not Index( "ВБD", StrFor(GetIdentProgram())))
+        MsgBox("Документ порoжден в п/с \"Обслуж.физ.лиц\".| Корректировать (удалять) запрещено.");
+        return 1;
+      end;
+    /* EVG Проверка убрана по просьбе Е. Паньковой.
+    elif( Pscashord.Origin != CASH_FDOC_MANUAL )
+      MsgBox("Документ порoжден в БЭК-офисе.| Корректировать (удалять) запрещено."); 
+      return 1;*/
+    end;
+           
+    if( Pscashord.Status != 1 ) // документ находится в открытых или закрытых
+      stat = CHANG_NOTIMPORTANT;
+      /*При редактировании производим проверку важности внесенных изменений */
+      /* Константы важности внесенных изменений:           */
+      /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+      /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+      /* CHANG_NOTKEEP        - не сохранять изменения */
+      /* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+      /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+         и сохранение изменений можно производить без отката операции      */
+
+      if( (Pmpaym.Amount          != OldPmpaym.Amount) or                           
+          (Pmpaym.PayerAccount    != OldPmpaym.PayerAccount) or
+          (Pmpaym.NumberPack      != OldPmpaym.NumberPack) or
+          (Pmpaym.ReceiverAccount != OldPmpaym.ReceiverAccount) or
+          (Pmpaym.ValueDate       != OldPmpaym.ValueDate) or
+          (Pmpaym.Department      != OldPmpaym.Department)
+        )
+        stat = CHANG_IMPORTANT; 
+      end;
+    end;
+         
+    if( ( Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "К" ) Or 
+          Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "А" ) Or
+          Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "Е" ) Or
+          Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "е" ) ) 
+        And
+        ( /*Pspayord.CurrentState != PSPO_ST_REJECTED*/
+          Pmpaym.PaymStatus != PM_REJECTED) )
+
+       if ( 
+          /* EVG Можно править.
+           (OldPmrmprop.Number           != Pmrmprop.Number          ) or*/
+          (OldPscashord.Series          != Pscashord.Series         ) or
+          (OldPmrmprop.Date             != Pmrmprop.Date            ) or
+          (OldPmpaym.ValueDate          != Pmpaym.ValueDate         ) or
+          (OldPmpaym.ReceiverAccount    != Pmpaym.ReceiverAccount   ) or
+          (OldPmpaym.PayerAccount       != Pmpaym.PayerAccount      ) or
+          (OldPscashord.FIOClient       != Pscashord.FIOClient      ) or
+          (OldPscashord.PaperSeries     != Pscashord.PaperSeries    ) or
+          (OldPscashord.PaperNumber     != Pscashord.PaperNumber    ) or
+          (OldPscashord.PaperIssuedDate != Pscashord.PaperIssuedDate) or
+          (OldPscashord.PaperIssuer     != Pscashord.PaperIssuer    ) or
+          (OldPmpaym.Amount             != Pmpaym.Amount            ) or 
+          /* EVG Можно править.
+           (OldPmrmprop.Ground           != Pmrmprop.Ground          ) or*/
+          (OldPmpaym.NumberPack         != Pmpaym.NumberPack        ) or
+          (OldPscashord.Oper            != Pscashord.Oper           ) or
+          (OldPscashord.Kind_Operation  != Pscashord.Kind_Operation )
+          )                   
+             stat = CHANG_NOTKEEP;
+             //msgbox("Изменения не будут сохранены");
+       elif (       
+          (Not Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "U", "R") ) 
+           And
+          (Not Opr_IsStepExecuteSymb( Pmpaym.DocumentID, Pmpaym.DocKind, "З", "R", 29029) )
+           And 
+          (Pmpaym.FutureReceiverAccount != OldPmpaym.FutureReceiverAccount )
+          )
+             stat = CHANG_NOTKEEP;
+             //msgbox("Изменения не будут сохранены");
+       end;
+    
+    end;
+         
+  end;   
+
+  if( Режим == 7 ) // ПОМЕЩЕНИЕ ДОКУМЕНТА В ОТЛОЖЕННЫЕ, ОТКАТ ОПЕРАЦИИ
+  end;
+  if( Режим == 8 )  // ВВОД В ОТЛОЖЕННЫЕ
+  end;
+  
+  if(Режим == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                               // (изменения в буферах не сохраняются)
+    return IsImportantChangeForOperBbCashOrder(Pmpaym, OldPmpaym, Pmrmprop, OldPmrmprop, Pscashord, OldPscashord);
+  end;
+
+  return stat;
+END;
+
+/* Установка подсказки для скролингов из макроса */
+
+/* Хинт для списков по дате значения */
+private const Hint_ByValueDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dpscshdoc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+/* Хинт для списков по дате закрытия */
+private const Hint_ByCloseDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dpscshdoc_dbt_idx0) USE_NL(pmpaym t pmrmprop oproper oprcurst)*/";
+
+/* Хинт для списков по статусу первички */
+private const Hint_ByStatus:string = 
+"/*+FIRST_ROWS LEADING(t pmpaym pmrmprop oproper oprcurst) INDEX(t dpscshdoc_idx4) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t pmpaym pmrmprop oproper oprcurst)*/";
+
+/* Хинт для списков по символу шага */
+private const Hint_ByStep     :string = 
+"/*+FIRST_ROWS LEADING(oprstep oproper t pmpaym pmrmprop oprcurst) INDEX(oprstep doprstep_dbt_idx10) INDEX(t dpscshdoc_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(oprstep oproper t pmpaym pmrmprop oprcurst)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+
+  // Возможные значения ScrolStates:
+  //   0 Все
+  //   1 Отложенные
+  //   2 Открытые
+  //   3 Закрытые
+  //   4 Отвергнутые
+  //   5 Подготовленные
+  
+  if(  ( ScrolStates == 0 )   // Все
+    or ( ScrolStates == 3 ) ) // Закрытые
+
+    var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+    if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+      return Hint_ByCloseDate;
+    elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+      return Hint_ByValueDate;
+    else
+      return Hint_ByCloseDate;
+    end;
+
+  elif(  ( ScrolStates == 1 )   // Отложенные
+      or ( ScrolStates == 2 )   // Открытые
+      or ( ScrolStates == 4 ) ) // Отвергнутые
+
+    return Hint_ByStatus;
+
+  elif ( ScrolStates == 5 ) // Подготовленные
+
+    return Hint_ByStep;
+
+  end;
+
+  return DefaultHint;
+
+END;
+
+MACRO Проверить_Счет_В_Документе( поле ) /*0-счет кассы, 1-счет клиента*/
+  var новое_значение_счета:string = "";
+
+  if( поле ) /* счет клиента */
+     if( Pscashord.DocKind == 430 ) /*  Объявление на взнос наличными в ББ  */
+       новое_значение_счета = Pmpaym.ReceiverAccount;
+     end;
+     /* Ордер подкрепления в ББ или Чек в ББ */
+     if( (Pscashord.DocKind == 400) or (Pscashord.DocKind == 440 ) ) 
+       новое_значение_счета = Pmpaym.PayerAccount;
+     end;
+  else 
+     if( Pscashord.DocKind == 430 ) /* Объявление на взнос наличными в ББ */
+       новое_значение_счета = Pmpaym.PayerAccount;
+     end;
+     /* Ордер подкрепления в ББ или Чек в ББ */
+     if( (Pscashord.DocKind == 400) or (Pscashord.DocKind == 440) ) 
+       новое_значение_счета = Pmpaym.ReceiverAccount;
+     end;
+  end;
+
+  return новое_значение_счета;
+END;
+
+MACRO Функция_Пользователя( Режим:integer )
+
+  var PaymentObj:Rsbpayment=Rsbpayment(Pmpaym.paymentId);
+  var m;
+  array mn;
+ 
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+  mn(asize(mn)) = "Изменение платежа ФМ";
+
+  m=menu(mn,null,"Выберите действие");
+  
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+  if (m == -2) 
+     return 0; // Обработка ESC
+  elif(mn(m) == "Изменение платежа ФМ")
+     ChangeReason(PaymentObj);
+     return 0;
+  end; 
+
+/*
+ Возможные значения Режим:
+  UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+  UFN_PANEL_EDIT(2) - функция вызвана из панели корректировки объекта;
+  UFN_SCROL(3) - функция вызвана из панели скролинга, единичный вызов, любая корректировка объекта запрещена;
+  UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, вызов до начала обработки, любая корректировка объекта запрещена;
+ 
+// Пример работы: 
+ if( Режим == UFN_SCROL )
+   return UPDTPAGE;    // Обновить страницу записей и область скролинга
+   //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+ end;
+ */
+ return 0;
+END;
+
+

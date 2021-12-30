@@ -1,0 +1,935 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: bilsfgen.mac
+// @author  : 
+// @desc    : Макрос генерации сводных счетов-фактур
+// @changes : 14.05.2013 TAM HotFix76(#194059)
+//          : 17.01.2014 TAM Adaptation_2031
+// -------------------------------------------------------------------------------------------------
+import "globals.mac", sfbilf;
+import cb_sql, "diver.mac", rsexts;
+
+//Для вывода на экран протокола и файла с печатью СФ 
+var protFileName = "",
+    prnFileName  = "",
+    TxtPath = "", eCode;
+//Lavrenov вынес даты начала и конца периода в глобальные переменные чтобы не передавать их из функции в функцию.
+var dt_from, dt_to;
+// EVG ID услуги для комиссии, введённой вручную 
+const ManualComProductID = 115,
+         ManualComName      = "Комиссия, введённая вручную",
+         ManualComLiteral   = "SF";
+
+file report () txt;
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TxtPath, eCode);
+if ( eCode > 0 )
+   TxtPath = "..\\TxtFile";
+else 
+   TxtPath = substr(GetCurDir(false),1,index(StrUpr(GetCurDir(false)),"\\OBJ")) + substr(TxtPath,4);
+end;
+
+protFileName = TxtPath + "\\bilsfgenPrn." + UserNumber;
+prnFileName  = TxtPath + "\\alterBilsfPrn." + UserNumber;
+
+// EVG Для очистки файла
+SetOutPut(prnFileName, false);
+SetOutPut(null, true);
+println("──────────────────────────────── "+date()+" "+time()+" ───── "+{oper}+" ──────────────────────────────────── ");
+
+
+private macro ClearTmpTable()
+   var cmd = RsdCommand("TRUNCATE TABLE dbilsfgen_tmp");
+   cmd.execute();
+end;
+
+private macro AddSfDefComisses( FeeType, DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo )
+   //TAM 17.01.2014 Adaptation_2031
+   var ServeDateClause = 
+      "    AND (sfdef.t_FeeType,sfdef.t_ID) in                                            " +
+      "           (select pm.t_feetype,pm.t_defcomid                                      " +
+      "              from dpmpaym_dbt pm                                                  " +
+      "              where pm.t_partpaymnumber = 0                                      \n" + 
+      "                and pm.t_defcomid <> 0                                             " + 
+      "               AND (select min(TRN.T_DATE_CARRY)                                   " +
+      "                    from dacctrn_dbt trn, dpmdocs_dbt pmdoc                        " +
+      "                    where pmdoc.t_paymentid = pm.t_paymentid                       " +
+      "                      AND PMDOC.T_ACCTRNID = TRN.T_ACCTRNID                        " +
+      "                    ) between ? AND ? "                                              ;
+  
+   var cmd = RsdCommand;
+   cmd.CmdText = 
+      " INSERT INTO dbilsfgen_tmp( t_Dprt, t_DprtNode, t_PayerID, t_PayFIID, " +
+      " t_FeeType, t_CommNumber, t_ComissName, t_ProductID, t_ComID, t_ComSum, t_ComSumNDS, t_NDSRateValue, t_invoiceID ) " +
+      " SELECT sfdef.t_Department, ";
+  
+   // Узел ТС и плательщик
+   if( FeeType == SF_FEE_TYPE_ONCE )
+      cmd.CmdText = cmd.CmdText +  
+      " DECODE( sfdef.t_SfContrID, 0, 0, (SELECT contr.t_Branch FROM dsfcontr_dbt contr WHERE contr.t_ID = sfdef.t_SfContrID) ), " +
+      " (SELECT acc.t_Client FROM daccount_dbt acc " +
+        " WHERE acc.t_Account = sfdef.t_AccountPayer AND acc.t_Code_Currency = sfdef.t_FIIDPayer AND acc.t_Chapter = 1), ";    
+   else
+      cmd.CmdText = cmd.CmdText + " contr.t_Branch, contr.t_PartyID, ";
+   end;
+
+   cmd.CmdText = cmd.CmdText +  
+      " sfdef.t_FIID_Sum, " +
+      " sfdef.t_FeeType, sfdef.t_CommNumber, com.t_Name, com.t_ProductID, " +
+      " sfdef.t_ID, sfdef.t_Sum, sfdef.t_SumNDS, sfdef.t_NDSRateValue, 0 ";
+
+   if( FeeType == SF_FEE_TYPE_ONCE )
+      cmd.CmdText = cmd.CmdText +  " FROM dsfdef_dbt sfdef, dsfcomiss_dbt com " ;
+   else
+      cmd.CmdText = cmd.CmdText +  " FROM dsfdef_dbt sfdef, dsfcomiss_dbt com, dsfcontr_dbt contr " ;
+   end;
+
+   cmd.CmdText = cmd.CmdText +  " WHERE sfdef.t_FeeType = com.t_FeeType AND sfdef.t_CommNumber = com.t_Number ";
+  
+   if( FeeType != SF_FEE_TYPE_ONCE )
+      cmd.CmdText = cmd.CmdText + " AND contr.t_ID = sfdef.t_SfContrID ";
+   end;
+
+   cmd.CmdText = cmd.CmdText +
+      " AND sfdef.t_InvoiceID = 0 AND sfdef.t_FacturaID = 0 AND com.t_paynds != ? AND sfdef.t_FeeType = ? "  
+      " AND com.t_ReceiverID = ? AND (sfdef.t_Status = ? OR sfdef.t_Status = ?) AND sfdef.t_Department = ? ";
+
+   cmd.addParam( "", RSDBP_IN, SF_NOT_TAX );
+   cmd.addParam( "", RSDBP_IN, FeeType );
+   cmd.addParam( "", RSDBP_IN, {HeadBankID} );
+   cmd.addParam( "", RSDBP_IN, SFDEFCOM_STATUS_FOR_PAY );
+   cmd.addParam( "", RSDBP_IN, SFDEFCOM_STATUS_PAYED );
+   cmd.addParam( "", RSDBP_IN, DprtID );
+  
+   if( FeeType == SF_FEE_TYPE_ONCE )
+      //TAM 17.01.2014 Adaptation_2031
+      //cmd.CmdText = cmd.CmdText + " AND sfdef.t_DateFee >= ? AND sfdef.t_DateFee <= ? ";
+      cmd.CmdText = cmd.CmdText + ServeDateClause;
+   elif( FeeType == SF_FEE_TYPE_SINGLE )
+      cmd.CmdText = cmd.CmdText + ServeDateClause;
+      //TAM 17.01.2014 Adaptation_2031
+      //" AND (SELECT step.t_Fact_Date FROM doprstep_dbt step WHERE step.t_ID_Operation = sfdef.t_ID_Operation AND step.t_ID_Step = sfdef.t_ID_Step) " + 
+      //" BETWEEN ? AND ? ";
+   else
+      cmd.CmdText = cmd.CmdText + ServeDateClause;
+      //TAM 23.04.2014 I-00480528 - формируем тоже за дату проводки
+      //" AND sfdef.t_DatePeriodBegin >= ? AND sfdef.t_DatePeriodEnd <= ? "; 
+   end;
+   cmd.addParam( "", RSDBP_IN, ServDateFrom );
+   cmd.addParam( "", RSDBP_IN, ServDateTo );
+
+
+   if( DprtID != DprtNodeID )
+      if( FeeType == SF_FEE_TYPE_ONCE )
+         cmd.CmdText = cmd.CmdText + " AND ? = (SELECT contr.t_Branch FROM dsfcontr_dbt contr WHERE contr.t_ID = sfdef.t_SfContrID) ";
+      else    
+         cmd.CmdText = cmd.CmdText + " AND ? = contr.t_Branch ";
+      end;
+      cmd.addParam( "", RSDBP_IN, DprtNodeID );
+   end;
+   
+   //17.01.2014 TAM Adaptation_2031
+   //if( FeeType != SF_FEE_TYPE_PERIOD )
+   cmd.CmdText = cmd.CmdText +  "     )";
+   //end;
+   
+   if( ServKind > 0 )
+      cmd.CmdText = cmd.CmdText + " AND com.t_ServiceKind = ? ";
+      cmd.addParam( "", RSDBP_IN, ServKind );
+   end;
+
+   if( ClientID > 0 )    
+      if( FeeType == SF_FEE_TYPE_ONCE )
+      cmd.CmdText = cmd.CmdText + 
+        " AND ? = (SELECT acc.t_Client FROM daccount_dbt acc WHERE acc.t_Account = sfdef.t_AccountPayer " +
+                 " AND acc.t_Code_Currency = sfdef.t_FIIDPayer AND acc.t_Chapter = 1) ";
+      else
+         cmd.CmdText = cmd.CmdText + " AND ? = contr.t_PartyID ";
+      end;
+      cmd.addParam( "", RSDBP_IN, ClientID );
+   end;
+
+   cmd.execute();
+
+end;
+
+//Отбираем все релевантные УПК входящие в ТО
+private macro AddSfInvComisses( DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo )
+  
+   var cmd = RsdCommand;
+   cmd.CmdText = 
+      " INSERT INTO dbilsfgen_tmp( t_Dprt, t_DprtNode, t_PayerID, t_PayFIID, " +
+      " t_FeeType, t_CommNumber, t_ComissName, t_ProductID, t_ComID, t_ComSum, t_ComSumNDS, t_NDSRateValue, t_invoiceID ) " +
+      " SELECT sfdef.t_Department, "
+         " (SELECT contr.t_Branch FROM dsfcontr_dbt contr WHERE contr.t_ID = inv.t_ContractID ), " +
+         " inv.t_PayerID, sfdef.t_FIID_Sum, " +
+         " sfdef.t_FeeType, sfdef.t_CommNumber, com.t_Name, com.t_ProductID, " +
+         " sfdef.t_ID, sfdef.t_Sum, sfdef.t_SumNDS, sfdef.t_NDSRateValue, inv.t_InvoiceID "
+      " FROM dsfdef_dbt sfdef, dsfinv_dbt inv, dsfcomiss_dbt com " +
+      " WHERE sfdef.t_InvoiceID = inv.t_InvoiceID AND com.t_paynds != ? AND inv.t_FacturaID = 0 " +
+         " AND sfdef.t_FeeType = com.t_FeeType AND sfdef.t_CommNumber = com.t_Number "
+         " AND EXISTS (SELECT dep.t_Code FROM ddp_dep_dbt dep WHERE dep.t_PartyID = inv.t_BeneID AND dep.t_AccessMode <> 0 )" +       
+         " AND inv.t_Department = ?  AND inv.t_InvoiceDate >= ?  AND inv.t_InvoiceDate <= ? ";
+
+   cmd.addParam( "", RSDBP_IN, SF_NOT_TAX );
+   cmd.addParam( "", RSDBP_IN, DprtID );
+   cmd.addParam( "", RSDBP_IN, ServDateFrom );
+   cmd.addParam( "", RSDBP_IN, ServDateTo );
+
+   if( DprtID != DprtNodeID )
+      cmd.CmdText = cmd.CmdText + " AND ? = (SELECT contr.t_Branch FROM dsfcontr_dbt contr WHERE contr.t_ID = inv.t_ContractID ) ";
+      cmd.addParam( "", RSDBP_IN, DprtNodeID );
+   end;
+
+   if( ServKind > 0 )
+      cmd.CmdText = cmd.CmdText + " AND inv.t_ServiceKind = ? ";
+      cmd.addParam( "", RSDBP_IN, ServKind );
+   end;
+
+   if( ClientID > 0 )    
+      cmd.CmdText = cmd.CmdText + " AND inv.t_PayerID = ? ";
+      cmd.addParam( "", RSDBP_IN, ClientID );
+   end;
+
+   cmd.execute();
+
+end;
+
+//TAM 17.01.2014 Adaptation_2031
+private macro AddSfManualComisses(DprtID, DprtNodeID, ClientId, ServDateFrom, ServDateTo)
+   var cmd = RsdCommand;
+   // добавление во временную таблицу записей по комиссиям, взятым вручную (строка формата SFnnnSF в польз. поле 4 мемордера)
+   cmd.CmdText = "INSERT INTO dbilsfgen_tmp ( t_Dprt, t_DprtNode, t_PayerID, t_PayFIID, ";
+   cmd.CmdText = cmd.CmdText + "                      t_FeeType, t_CommNumber, t_ComissName, t_ProductID, t_ComID, ";
+   cmd.CmdText = cmd.CmdText + "                      t_ComSum, t_ComSumNDS, t_NDSRateValue, t_invoiceID ) ";
+   cmd.CmdText = cmd.CmdText + " SELECT  pm.t_department, acc.t_branch, pm.t_payer, pm.t_payfiid, ";
+   cmd.CmdText = cmd.CmdText + "         0, 0, MIN(SUBSTR(rmpr.t_Ground, 1, 80)), " + ManualComProductID + ", ordersl.dealnumber, ";
+   cmd.CmdText = cmd.CmdText + "         MAX (pm.t_payamount), MIN (pm.t_payamount), 18, 0 ";
+   cmd.CmdText = cmd.CmdText + "    FROM dpmpaym_dbt pm, dpmrmprop_dbt rmpr, daccount_dbt acc, ";
+   cmd.CmdText = cmd.CmdText + "         (SELECT TO_NUMBER (SUBSTR (mo.t_userfield4, ";
+   cmd.CmdText = cmd.CmdText + "                                    INSTR (upper(mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ") + 2, ";
+   cmd.CmdText = cmd.CmdText + "                                    (  INSTR (upper(mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ", -1) ";
+   cmd.CmdText = cmd.CmdText + "                                     - INSTR (upper(mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ") ";
+   cmd.CmdText = cmd.CmdText + "                                     - 2 ";
+   cmd.CmdText = cmd.CmdText + "                                    ) ";
+   cmd.CmdText = cmd.CmdText + "                                   ) ";
+   cmd.CmdText = cmd.CmdText + "                           ) dealnumber, ";
+   cmd.CmdText = cmd.CmdText + "                 mo.t_documentid docid, mo.t_state state ";
+   cmd.CmdText = cmd.CmdText + "            FROM dcb_doc_dbt mo ";
+   cmd.CmdText = cmd.CmdText + "           WHERE mo.t_chapter = 1 \n";
+   cmd.CmdText = cmd.CmdText + "          UNION ALL ";
+   cmd.CmdText = cmd.CmdText + "          SELECT TO_NUMBER (SUBSTR (pm.t_userfield4, ";
+   cmd.CmdText = cmd.CmdText + "                                    INSTR (upper(pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ") + 2, ";
+   cmd.CmdText = cmd.CmdText + "                                    (  INSTR (upper(pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ", -1) ";
+   cmd.CmdText = cmd.CmdText + "                                     - INSTR (upper(pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ") ";
+   cmd.CmdText = cmd.CmdText + "                                     - 2 ";
+   cmd.CmdText = cmd.CmdText + "                                    ) ";
+   cmd.CmdText = cmd.CmdText + "                                   ) ";
+   cmd.CmdText = cmd.CmdText + "                           ) dealnumber, ";
+   cmd.CmdText = cmd.CmdText + "                 pm.t_documentid docid, pm.t_paymstatus state ";
+   cmd.CmdText = cmd.CmdText + "            FROM dpmpaym_dbt pm ";
+   cmd.CmdText = cmd.CmdText + "           WHERE pm.t_dockind = 286 AND pm.t_chapter = 1) ordersl \n";
+   cmd.CmdText = cmd.CmdText + "   WHERE ordersl.dealnumber > 0 ";
+   cmd.CmdText = cmd.CmdText + "     AND ordersl.state in (50, 32000) ";         // Закрыт
+   cmd.CmdText = cmd.CmdText + "     AND pm.t_dockind  in (70, 286) ";           // Мемориальный или банковский ордер 
+   cmd.CmdText = cmd.CmdText + "     AND pm.t_documentid = ordersl.docid ";
+   cmd.CmdText = cmd.CmdText + "     AND pm.t_valuedate BETWEEN " + GetSQLDate(ServDateFrom);
+   cmd.CmdText = cmd.CmdText + "                            AND " + GetSQLDate(ServDateTo);
+   cmd.CmdText = cmd.CmdText + "     AND rmpr.t_PaymentID = pm.t_PaymentID ";
+   cmd.CmdText = cmd.CmdText + "     AND acc.t_account = pm.t_payeraccount ";
+   cmd.CmdText = cmd.CmdText + "     AND acc.t_chapter = 1     ";
+   cmd.CmdText = cmd.CmdText + "     AND acc.t_code_currency = pm.t_payfiid \n";
+   cmd.CmdText = cmd.CmdText + "     AND NOT EXISTS ( SELECT 1 FROM DBILRECONCILE_DBT ";
+   cmd.CmdText = cmd.CmdText + "                       WHERE t_dockind = pm.t_dockind ";
+   cmd.CmdText = cmd.CmdText + "                         AND t_docid   = pm.t_documentid ) ";
+
+   if( DprtID != DprtNodeID )
+      cmd.CmdText = cmd.CmdText + " AND acc.t_branch = " + DprtNodeID;
+   end;
+
+   if( ClientID > 0 )    
+      cmd.CmdText = cmd.CmdText + " AND pm.t_payer = " + ClientID;
+   end;
+
+   cmd.CmdText = cmd.CmdText + " GROUP BY ordersl.dealnumber, pm.t_department, acc.t_branch, pm.t_payer, pm.t_payfiid ";
+  
+   cmd.execute();
+end;
+
+private macro FillTmpTable( DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo )
+
+   ClearTmpTable();
+
+   AddSfDefComisses( SF_FEE_TYPE_ONCE, DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo );
+   AddSfDefComisses( SF_FEE_TYPE_SINGLE, DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo );
+   AddSfDefComisses( SF_FEE_TYPE_PERIOD, DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo );
+
+   AddSfInvComisses( DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo );
+   //TAM 17.01.2014 Adaptation_2031
+   AddSfManualComisses(DprtID, DprtNodeID, ClientID, ServDateFrom, ServDateTo);
+       
+end;
+
+private macro ResultLogBF_Success( FacturaID, BillDate )
+   file factura (bilfactura) key 0;
+   var FacturaNumber = "";
+   factura.FacturaID = FacturaID;
+   if( getEQ(factura) )
+      FacturaNumber = factura.FacturaNumber;
+   end;
+
+[     Сформирован СФ № ################################## от ########## ](FacturaNumber, BillDate);
+end;
+
+private macro ResultLogEntryBook_NotSuccess( ErrMsg )
+[            Необходимые записи книг продаж не сформированы             ];
+   println("            " + ErrMsg);
+end;
+
+private macro ResultLogBF_NotSuccess( ErrMsg )
+
+   var i = 1;
+   array StringArray;
+   StrSplit( StrSubst(ErrMsg, "|", " " ), StringArray, 67);
+
+[     СФ не сформирован. #](StringArray(0));
+
+   while ( StrLen(StringArray(i) ) > 0)
+[                        #]
+    ( StringArray(i) );
+    i = i + 1;
+   end;  
+end;
+
+private macro ResultLogClientName( ClientName )
+[                                                                       ];
+[     Клиент: #   ](ClientName);
+
+end;
+
+private macro GetFacturaLines( BillDate, Dprt, DprtNode, PayerID, PayFIID, OprCodeId )
+   var sqlString, rs, cmd, i = 0;
+   var facturaLineAr = TArray;  
+   var feeType, comissName, productID, taxSchema, comID, comSum, comSumNDS, NDSRateValue;
+
+   //TAM 22.01.2014 Adaptation_2031
+   // EVG Функция вытягивает дату / период комиссии в зависимости от типа взимания 
+   macro GetCommPeriod ( Type, Id );
+      var query, rs, res = "";
+      var SelClause, FromClause;
+      // Разовая комиссия 
+      if ( Type == SF_FEE_TYPE_ONCE )
+         SelClause = "t_CommDate";
+         FromClause = "DSFSINGDF_DBT";
+      // Периодическая комиссия 
+      elif ( Type == SF_FEE_TYPE_PERIOD )
+         SelClause = "t_DatePeriodBegin dBeg, t_DatePeriodEnd dEnd";
+         FromClause = "DSFDEFCOM_DBT";
+      // Единовременная комиссия 
+      elif ( Type == SF_FEE_TYPE_SINGLE )
+         SelClause = "t_DateFee";
+         FromClause = "DOPRSFCOM_DBT";
+      // Иначе - мемордер по комиссии, введённой вручную */
+      else
+         return "";
+      end;
+
+      query = " Select " + SelClause + "   From " + FromClause +  "  Where t_Id = " + Id;
+      rs = rsdRecordSet(query);
+      if (rs and rs.MoveNext())
+         if ( Type == SF_FEE_TYPE_PERIOD )
+            res = SQL_ConvTypeDate( rs.Value("dBeg", null, V_DATE) ) + " - " + 
+            SQL_ConvTypeDate( rs.Value("dEnd", null, V_DATE) );
+         else
+            res = SQL_ConvTypeDate( rs.Value(0, null, V_DATE) );
+         end;
+      end;
+      return trim(res);
+   end; // macro GetCommPeriod ( Type, Id );
+
+   sqlString = " SELECT bil.t_FeeType, bil.t_CommNumber, bil.t_ComissName, bil.t_ProductID, " + 
+               " (SELECT t_TaxSchema FROM dbilproduct_dbt pr WHERE pr.t_ProductID = bil.t_ProductID) TaxSchema, "
+               " bil.t_ComID, bil.t_ComSum, bil.t_ComSumNDS, bil.t_NDSRateValue " 
+               " FROM dbilsfgen_tmp bil " + 
+               " WHERE bil.t_Dprt = ? AND bil.t_DprtNode = ? AND bil.t_PayerID = ? AND bil.t_PayFIID = ? ";
+   cmd = RSDCommand( sqlString );
+   cmd.addParam( "", RSDBP_IN, Dprt );
+   cmd.addParam( "", RSDBP_IN, DprtNode );
+   cmd.addParam( "", RSDBP_IN, PayerID );
+   cmd.addParam( "", RSDBP_IN, PayFIID );
+
+   rs = RsdRecordset( cmd );
+   while( rs.moveNext() )
+    
+      feeType = rs.value("t_FeeType");
+      /*rs.value("t_CommNumber");*/
+      comissName = rs.value("t_ComissName");
+      productID  = rs.value("t_ProductID");
+      taxSchema  = rs.value("TaxSchema");
+      comID = rs.value("t_ComID");
+      comSum = rs.value("t_ComSum");
+      comSumNDS = rs.value("t_ComSumNDS");
+      NDSRateValue = rs.value("t_NDSRateValue");
+        
+      /*Заполняем спецификацию СФ*/
+      facturaLineAr[i] = TRecHandler("bilfacturaline.dbt");
+      facturaLineAr[i].Clear();    
+    
+      facturaLineAr[i].rec.LineNo = 1;    
+      facturaLineAr[i].rec.ProductID = productID;    
+      // EVG Вместо даты СФ поставим дату/период комиссии
+      facturaLineAr[i].rec.ProductName = comissName + ", " + GetCommPeriod( feeType, comID );
+      if( taxSchema != NULLVAL )
+         facturaLineAr[i].rec.TaxSchema = taxSchema;
+      end;   
+    
+      facturaLineAr[i].rec.Amount   = comSum;         
+      facturaLineAr[i].rec.AmountWithNDS = comSum + comSumNDS;    
+      facturaLineAr[i].rec.NDSAmount     = comSumNDS;
+    
+      if( NDSRateValue != 0 )
+         facturaLineAr[i].rec.NDSRate       = NDSRateValue;
+      else
+         if( (comSumNDS != $0) AND (comSum != $0) )
+            facturaLineAr[i].rec.NDSRate  = double( round(comSumNDS/comSum) ) * 100.0;
+         end;
+      end;
+        
+      facturaLineAr[i].rec.ComisID      = comID;
+      facturaLineAr[i].rec.ComisType    = feeType;
+      facturaLineAr[i].rec.OprCodeId    = OprCodeId;
+
+      i = i + 1; 
+   end;
+
+   return facturaLineAr;
+
+end;
+
+private macro UpdateDefComisses( facturaID, Dprt, DprtNode, PayerID, PayFIID )
+
+   var sqlString, cmd;
+
+   // EVG 14/03/2012 Не нужно разделять комиссии на виды, периодические комиссии у нас также формируются без ТО ("Быстрая оплата"). 
+   //Будет единый апдейт для всех видов комиссий.
+   sqlString = "UPDATE dsfdef_dbt sfdef SET sfdef.t_FacturaID = ?                         " +
+              " WHERE (sfdef.t_ID, sfdef.t_FeeType) IN (SELECT bil.t_comID, bil.t_FeeType " +
+              "                                           FROM dbilsfgen_tmp bil          " +
+              "                                        WHERE bil.t_comID > 0              " +
+              "                                          AND bil.t_Dprt = ?               " +
+              "                                          AND bil.t_DprtNode = ?           " +
+              "                                          AND bil.t_PayerID = ?            " +
+              "                                          AND bil.t_PayFIID = ?           )";
+   cmd = RSDCommand( sqlString );
+   cmd.addParam( "", RSDBP_IN, facturaID );
+   cmd.addParam( "", RSDBP_IN, Dprt );
+   cmd.addParam( "", RSDBP_IN, DprtNode );
+   cmd.addParam( "", RSDBP_IN, PayerID );
+   cmd.addParam( "", RSDBP_IN, PayFIID );
+
+   cmd.Execute();
+end;
+
+//22.01.2014 TAM Печать СФ Adaptation_2031
+private macro PrintBill ( FacID, FacLineAr )
+   var factura = TBFile ("bilfactura.dbt", "R", 0);
+   var ReceiverAccount = "";
+
+   factura.rec.FacturaID = FacID;
+   if ( factura.getEQ() )
+      SetOutPut (prnFileName, true);
+      // Вызов функции определения счёта-получателя из макроса bilsfprn.mac 
+      ReceiverAccount = ExecMacroFile ("bilsfprn_lib.mac", "FakturaReceiverAcc", factura.rec.FacturaID);
+      if (date(factura.rec.RegDate) > date("24.01.2012"))
+         ExecMacroFile ("svodsf.mac", "printSvodBilf", factura.rec, FacLineAr );
+      else
+         ExecMacroFile ("alterBilsfPrn.mac", "AlternativeBillPrinting", factura.rec.FacturaNumber,
+                                                                        factura.rec.RegDate,
+                                                                        factura.rec.SupplierName,
+                                                                        factura.rec.SupplierAddress,
+                                                                        factura.rec.SupplierINN,
+                                                                        factura.rec.ReceiverName,
+                                                                        factura.rec.ReceiverAddress,
+                                                                        factura.rec.ReceiverINN,
+                                                                        ReceiverAccount,
+                                                                        factura.rec.Shipper,
+                                                                        factura.rec.Consignee,
+                                                                        factura.rec.PaymentNumber,
+                                                                        factura.rec.PaymantDate,
+                                                                        FacLineAr );
+      end;                                                                                                                                            
+   SetOutPut (null, false);
+   end;
+end;
+
+private macro ToFullDocID( ID:string )
+   const DocIdSize = 34;  
+   var DocID = mkstr( "0", DocIdSize - strlen(ID) ) + ID;
+   return DocID;
+end;
+
+
+// EVG Функция возвращает номер и дату документа оплаты.
+//   Если документа оплаты нет, то ничего не возвращает; если их много - возвращает только дату. 
+macro GetBilfDocNumberDate (DocsAr, DocsQount, DocNumber:@String, DocDate:@Date)
+   var i = 0, query, rs;
+   var onlyDate = false;
+
+   if ( DocsQount == 0 )
+      return;
+   elif ( DocsQount > 1 )
+      onlyDate = true;
+   end;
+
+   query = " Select prop.t_Number, paym.t_ValueDate " +
+           "   From DPmpaym_dbt paym, DPmRmProp_dbt prop " +
+           "  Where paym.t_DocKind    = " + DocsAr[0].rec.DocKind +
+           "    and paym.t_DocumentID = " + DocsAr[0].rec.DocID +
+           "    and prop.t_PaymentID  = paym.t_PaymentID ";
+   rs = rsdRecordSet(query);
+
+   if (rs and rs.MoveNext())
+      if (not onlyDate)
+         DocNumber  = rs.Value(0, null, V_STRING);
+      end;
+      DocDate       = rs.Value(1, null, V_DATE);
+   end;
+
+end;
+
+
+// EVG 26/01/2012 Новое название в 2030 - SF_CreateBilBookEntryCommon()
+private macro SF_CreateBilBookEntryCommon( facturaID, Dprt, DprtNode, PayerID, PayFIID, BillDate )
+var bilfDocArray = TArray;
+   var retVal = 0, retValTmp = 0, bilbeID = 0;
+   var RegDate = BillDate;
+   const PM_FINISHED = 32000;
+   var sqlString, rs, cmd;  
+   var docKind, paymentID, pmAmount, pmFIID;
+
+   var BilfDocsForGEB = false,
+       lifeBank,
+       DocsCount = 0;
+
+  //разовые и единовременные комиссии
+   if ( BillDate < date(1,1,2011) )
+      lifeBank = fg_life_subject( {OurBank} );
+      if ( lifeBank.is_GEB )
+         BilfDocsForGEB = true;
+      end;
+   end;
+  
+   // EVG Банк ГЭБ: для документов с датой до 01.01.2011 счёт-фактура сразу полностью отражается в книге продаж, независимо
+   //  от того, оплачивается ли документ сразу и полностью или нет (ставится на картотеку 2). Поэтому разделения на полностью
+   //  оплаченные документы и частичные оплаты К2, как делается в ПРББ, не нужно. 
+   if ( BilfDocsForGEB )
+      // EVG 14/03/2012 Здесь же отбираются и документы по период комиссиям с признаком "Быстрая оплата" 
+      /* EVG 26/02/2015 В случае, если БО оплаты комиссии валютный, сумму нужно брать рублёвую.
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, pm.t_Amount pmAmount, pm.t_FIID pmFIID " +*/
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, DECODE(pm.t_FIID, 0, pm.t_Amount, pm.t_PayAmount) pmAmount, DECODE(pm.t_FIID, 0, pm.t_FIID, pm.t_BaseFIID) pmFIID " +
+                 " FROM dpmpaym_dbt pm, dbilsfgen_tmp bil " + 
+                 " WHERE bil.t_Dprt          = " + Dprt +
+                 "   AND bil.t_DprtNode      = " + DprtNode +
+                 "   AND bil.t_PayerID       = " + PayerID +
+                 "   AND bil.t_PayFIID       = " + PayFIID +
+                 " AND pm.t_feeType        = bil.t_feeType " +
+                 " AND pm.t_DefComID       = bil.t_comID " +
+                 " AND pm.t_partpaymnumber = 0 ";
+      cmd = RSDCommand( sqlString );
+      rs = RsdRecordset( cmd );
+      while( rs.moveNext() )
+         bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+         bilfDocArray[0].Clear();
+         bilfDocArray[0].rec.DocKind = rs.value("docKind");    
+         bilfDocArray[0].rec.DocID  = rs.value("pmID");
+         bilfDocArray[0].rec.Amount = rs.value("pmAmount");
+         bilfDocArray[0].rec.FIID   = rs.value("pmFIID");
+         Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind,     ToFullDocID(bilfDocArray[0].rec.DocID), 
+                             bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+         if( PM_GetPaymentExecutionDate(Int(bilfDocArray[0].rec.DocID), RegDate) != 0 )
+            RegDate = BillDate;
+         end;
+         if( not BFCreateBilBookEntry(facturaID, bilfDocArray, RegDate, bilbeID) )
+            retVal = retVal + 1;      
+         end;
+         UpdateRefOnMem( rs.value("docKind"), rs.value("pmID") );
+         DocsCount = DocsCount + 1;
+      end;
+   else
+      // EVG Сначала отбираются документы, кроме картотечных 
+      // EVG 14/03/2012 Здесь же отбираются и документы по период комиссиям с признаком "Быстрая оплата" 
+      /* EVG 26/02/2015 В случае, если БО оплаты комиссии валютный, сумму нужно брать рублёвую.
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, pm.t_Amount pmAmount, pm.t_FIID pmFIID " +*/
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, DECODE(pm.t_FIID, 0, pm.t_Amount, pm.t_PayAmount) pmAmount, DECODE(pm.t_FIID, 0, pm.t_FIID, pm.t_BaseFIID) pmFIID " +
+                  " FROM dpmpaym_dbt pm,dbilsfgen_tmp bil " + 
+                   // Статус "Закрыт" => документы на картотеке не попадают
+                  " WHERE pm.t_PaymStatus    >= " + PM_FINISHED +
+                  " AND pm.t_partpaymnumber = 0 " +
+                  // Нет документов частичных оплат
+                  " AND NOT EXISTS (SELECT 1 " +
+                  "                   FROM dpmpaym_dbt " +
+                  "                  WHERE t_feeType  = pm.t_feeType  " +
+                  "                    AND t_DefComID = pm.t_DefComID " +
+                  "                    AND t_partpaymnumber > 0) "+
+                  " AND pm.t_feeType = bil.t_feeType "+
+                  " AND pm.t_DefComID = bil.t_comID" +
+                  " AND bil.t_Dprt          = " + Dprt +
+                        "   AND bil.t_DprtNode      = " + DprtNode +
+                        "   AND bil.t_PayerID       = " + PayerID +
+                        "   AND bil.t_PayFIID       = " + PayFIID;
+      cmd = RSDCommand( sqlString );
+      rs = RsdRecordset( cmd );
+      while( rs.moveNext() )
+         bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+         bilfDocArray[0].Clear();
+         bilfDocArray[0].rec.DocKind = rs.value("docKind");    
+         bilfDocArray[0].rec.DocID  = rs.value("pmID");
+         bilfDocArray[0].rec.Amount = rs.value("pmAmount");
+         bilfDocArray[0].rec.FIID   = rs.value("pmFIID");
+
+         Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind, ToFullDocID(bilfDocArray[0].rec.DocID), 
+                              bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+
+         if( PM_GetPaymentExecutionDate(Int(bilfDocArray[0].rec.DocID), RegDate) != 0 )
+            RegDate = BillDate;
+         end;
+
+         if( not BFCreateBilBookEntry(facturaID, bilfDocArray, RegDate, bilbeID) )
+            retVal = retVal + 1;      
+         end;
+         UpdateRefOnMem( rs.value("docKind"), rs.value("pmID") );
+         DocsCount = DocsCount + 1;
+      end;
+     
+      // EVG Затем отдельно частичные оплаты К2 
+      // EVG 14/03/2012 Здесь же отбираются и документы по период комиссиям с признаком "Быстрая оплата" 
+      /* EVG 26/02/2015 В случае, если БО оплаты комиссии валютный, сумму нужно брать рублёвую.
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, pm.t_Amount pmAmount, pm.t_FIID pmFIID " +*/
+      sqlString = " SELECT pm.t_DocKind docKind, to_char(pm.t_PaymentID) pmID, DECODE(pm.t_FIID, 0, pm.t_Amount, pm.t_PayAmount) pmAmount, DECODE(pm.t_FIID, 0, pm.t_FIID, pm.t_BaseFIID) pmFIID " +
+                  " FROM dpmpaym_dbt pm, dbilsfgen_tmp bil " + 
+                  " WHERE bil.t_Dprt          = " + Dprt +
+                  "   AND bil.t_DprtNode      = " + DprtNode +
+                  "   AND bil.t_PayerID       = " + PayerID +
+                  "   AND bil.t_PayFIID       = " + PayFIID +
+                  "   AND pm.t_feeType        = bil.t_feeType " +
+                  "   AND pm.t_DefComID       = bil.t_comID " +
+                  //   Статус "Закрыт" => документы на картотеке не попадают
+                  "   AND pm.t_PaymStatus    >= " + PM_FINISHED +
+                  //   № частичной оплаты > 0 - это документ частичной оплаты
+                  "   AND pm.t_partpaymnumber > 0 ";
+      cmd = RSDCommand( sqlString );
+      rs = RsdRecordset( cmd );
+      while( rs.moveNext() )
+         bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+         bilfDocArray[0].Clear();
+
+         bilfDocArray[0].rec.DocKind = rs.value("docKind");    
+         bilfDocArray[0].rec.DocID  = rs.value("pmID");
+         bilfDocArray[0].rec.Amount = rs.value("pmAmount");
+         bilfDocArray[0].rec.FIID   = rs.value("pmFIID");
+         Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind, ToFullDocID(bilfDocArray[0].rec.DocID), 
+                              bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+
+         if( PM_GetPaymentExecutionDate(Int(bilfDocArray[0].rec.DocID), RegDate) != 0 )
+            RegDate = BillDate;
+         end;
+         if( not BFCreateBilBookEntry(facturaID, bilfDocArray, RegDate, bilbeID) )
+            retVal = retVal + 1;      
+         end;
+         UpdateRefOnMem( rs.value("docKind"), rs.value("pmID") );
+         DocsCount = DocsCount + 1;
+      end;
+   end; // if ( BilfDocsForGEB )
+  
+   //ТО
+   var invoiceID = 0, isIncluded = "", contractID = 0, pmLinks = 0;
+   sqlString = "SELECT DISTINCT inv.t_InvoiceID invID, inv.t_IsIncluded isInc, inv.t_ContractID conID, " +
+               " (SELECT count (*) FROM dsfinvlnk_dbt lnk WHERE lnk.t_InvoiceID = inv.t_InvoiceID) pmLnk " +
+               " FROM dsfinv_dbt inv, dbilsfgen_tmp bil WHERE inv.t_InvoiceID = bil.t_invoiceID " + 
+               " AND (inv.t_InvoiceStatus = ? OR inv.t_InvoiceStatus = ?) " +
+               " AND bil.t_Dprt = ? AND bil.t_DprtNode = ? AND bil.t_PayerID = ? AND bil.t_PayFIID = ? " ;
+   cmd = RSDCommand( sqlString );
+   cmd.addParam( "", RSDBP_IN, SFINV_STATUS_PARTPAYED );
+   cmd.addParam( "", RSDBP_IN, SFINV_STATUS_PAYED );
+   cmd.addParam( "", RSDBP_IN, Dprt );
+   cmd.addParam( "", RSDBP_IN, DprtNode );
+   cmd.addParam( "", RSDBP_IN, PayerID );
+   cmd.addParam( "", RSDBP_IN, PayFIID );
+
+   rs = RsdRecordset( cmd );
+   while( rs.moveNext() )
+      invoiceID  = rs.value("invID");
+      isIncluded = rs.value("isInc");
+      contractID = rs.value("conID");
+      pmLinks = rs.value("pmLnk");
+      retValTmp = SF_CreateBilBookEntryForSfInv( facturaID, invoiceID, isIncluded, contractID, pmLinks );
+      retVal = retVal + retValTmp;
+      UpdateRefOnMem( rs.value("docKind"), rs.value("pmID") );
+      DocsCount = DocsCount + 1;
+   end;  
+
+   // EVG 01.12.2009 Реализовано добавление в массив платежей по комиссиям, взятым вручную (строка формата SFnnnSF в польз. поле 4 мемордера).
+   // Здесь разделение на обычные документы и частичные оплаты не требуется, т.к. картотеки тут не бывает (только введённые вручную МО полной оплаты). 
+   var SQL;
+   SQL = " SELECT pm.t_dockind dockind, TO_CHAR (pm.t_paymentid) pmid, ";
+   SQL = SQL + "       pm.t_amount pmamount, pm.t_fiid pmfiid ";
+   SQL = SQL + "  FROM dbilsfgen_tmp bil, dpmpaym_dbt pm, dcb_doc_dbt mo ";
+   SQL = SQL + " WHERE bil.t_dprt     = " + Dprt;
+   SQL = SQL + "   AND bil.t_dprtnode = " + DprtNode;
+   SQL = SQL + "   AND bil.t_payerid  = " + PayerID;
+   SQL = SQL + "   AND bil.t_payfiid  = " + PayFIID;
+   SQL = SQL + "   AND bil.t_feetype  = 0 ";
+   SQL = SQL + "   AND TO_NUMBER (SUBSTR (mo.t_userfield4, ";
+   SQL = SQL + "                          INSTR (UPPER (mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ") + 2, ";
+   SQL = SQL + "                          (  INSTR (UPPER (mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ", -1) ";
+   SQL = SQL + "                           - INSTR (UPPER (mo.t_userfield4), " + GetSQLString(ManualComLiteral) + ") ";
+   SQL = SQL + "                           - 2 ";
+   SQL = SQL + "                          ) ";
+   SQL = SQL + "                         ) ";
+   SQL = SQL + "                 )      = bil.t_comid ";
+   SQL = SQL + "   AND pm.t_dockind     = 70 ";
+   SQL = SQL + "   AND (pm.t_amount     = bil.t_comsum or pm.t_amount = bil.t_comsumnds) ";
+   SQL = SQL + "   AND pm.t_paymentid   = mo.t_documentid ";
+   SQL = SQL + "   and PM.T_PAYER       = bil.t_payerid ";
+   SQL = SQL + "   and PM.T_valuedate between to_date('"+Dt_From+"','dd.mm.yyyy') and to_date('"+Dt_To+"','dd.mm.yyyy') ";
+   SQL = SQL + "   AND pm.t_paymstatus >= " + PM_FINISHED;
+   // EVG 11/12/2011 Добавлена обработка банковских ордеров 
+   SQL = SQL + " UNION ALL ";
+   SQL = SQL + " SELECT pm.t_dockind dockind, TO_CHAR (pm.t_paymentid) pmid, ";
+   SQL = SQL + "       pm.t_amount pmamount, pm.t_fiid pmfiid ";
+   SQL = SQL + "  FROM dbilsfgen_tmp bil, dpmpaym_dbt pm ";
+   SQL = SQL + " WHERE bil.t_dprt     = " + Dprt;
+   SQL = SQL + "   AND bil.t_dprtnode = " + DprtNode;
+   SQL = SQL + "   AND bil.t_payerid  = " + PayerID;
+   SQL = SQL + "   AND bil.t_payfiid  = " + PayFIID;
+   SQL = SQL + "   AND bil.t_feetype  = 0 ";
+   SQL = SQL + "   AND TO_NUMBER (SUBSTR (pm.t_userfield4, ";
+   SQL = SQL + "                          INSTR (UPPER (pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ") + 2, ";
+   SQL = SQL + "                          (  INSTR (UPPER (pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ", -1) ";
+   SQL = SQL + "                           - INSTR (UPPER (pm.t_userfield4), " + GetSQLString(ManualComLiteral) + ") ";
+   SQL = SQL + "                           - 2 ";
+   SQL = SQL + "                          ) ";
+   SQL = SQL + "                         ) ";
+   SQL = SQL + "                 )      = bil.t_comid ";
+   SQL = SQL + "   AND pm.t_dockind     = 286 ";
+   SQL = SQL + "   AND (pm.t_amount     = bil.t_comsum or pm.t_amount = bil.t_comsumnds) ";
+   SQL = SQL + "   and PM.T_PAYER       = bil.t_payerid ";
+   SQL = SQL + "   and PM.T_valuedate between to_date('"+Dt_From+"','dd.mm.yyyy') and to_date('"+Dt_To+"','dd.mm.yyyy') ";
+   SQL = SQL + "   AND pm.t_paymstatus >= " + PM_FINISHED;
+
+   rs = RsdRecordset( SQL );
+   while( rs.moveNext() )
+      bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+      bilfDocArray[0].Clear();
+
+      bilfDocArray[0].rec.DocKind = rs.value("docKind");    
+      bilfDocArray[0].rec.DocID  = rs.value("pmID");
+      bilfDocArray[0].rec.Amount = rs.value("pmAmount");
+      bilfDocArray[0].rec.FIID   = rs.value("pmFIID");
+     
+      Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind, ToFullDocID(bilfDocArray[0].rec.DocID), 
+                           bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+
+      if( PM_GetPaymentExecutionDate(Int(bilfDocArray[0].rec.DocID), RegDate) != 0 )
+         RegDate = BillDate;
+      end;
+
+      if( not BFCreateBilBookEntry(facturaID, bilfDocArray, RegDate, bilbeID) )
+         retVal = retVal + 1;      
+      end;
+
+      UpdateRefOnMem( rs.value("docKind"), rs.value("pmID") );
+      DocsCount = DocsCount + 1;
+   end;
+  
+  // EVG 27/01/2012 Процедура добавления в счёт-фактуру номера и даты РДД 
+   var DocNumber, DocDate;
+   GetBilfDocNumberDate( bilfDocArray, DocsCount, @DocNumber, @DocDate );
+   if( (valType(DocNumber) != V_UNDEF) OR (valType(DocDate)   != V_UNDEF) )
+      if( valType(DocNumber) == V_UNDEF )
+         DocNumber = "";
+      end;
+      if( valType(DocDate)   == V_UNDEF )
+         DocDate = date(0,0,0);
+      end;
+     
+      SQL =       " Update DBILFACTURA_DBT      ";
+      SQL = SQL + "    Set t_PaymentNumber = ?, ";
+      SQL = SQL + "        t_PaymantDate   = ?  ";
+      SQL = SQL + "  Where t_FacturaID     = ?  ";  
+      rs = RsdCommand( SQL );
+      rs.addParam( "", RSDBP_IN, DocNumber );
+      rs.addParam( "", RSDBP_IN, DocDate );
+      rs.addParam( "", RSDBP_IN, facturaID );
+      rs.Execute();
+   end;
+   return retVal;
+end;
+
+private macro getDefaultOprCodeId()
+   var oprCodeId = 0;
+
+   var sqlString = "SELECT t_id FROM DBILOPRCODE_DBT WHERE t_code = ?";
+   var cmd = RSDCommand(sqlString);
+   cmd.addParam("", RSDBP_IN, "01");
+        
+   var rs = RsdRecordset(cmd);
+  
+   if(rs.moveNext())
+      oprCodeId = rs.value(0);
+   end;
+        
+   return oprCodeId;
+end;
+
+private macro CreateBilFacturaForClient( ClientName, BillDate, Dprt, DprtNode, PayerID, PayFIID, OprCodeId, 
+                                         facturaID:@integer, bilfDocArray:@TArray, 
+                                         // EVG Возврат массива строк спецификации и количества не включенных в книгу 
+                                         facturaLines:@TArray, NoBook_Count:@integer )
+  
+  var retVal = false;
+   var i = 0;
+  const BILTYPE_BILFAC = 1;
+  const SFTYPE_DISTRIBUTED = 1;
+
+  record factura("bilfactura.dbt");
+  ClearRecord(factura);
+
+  SF_FillBilFactura( SF_FEE_TYPE_COMMON, NULL, BillDate, Dprt, DprtNode, PayerID, payFIID, factura, true );
+
+  var facturaLineAr = GetFacturaLines( BillDate, Dprt, DprtNode, PayerID, PayFIID, OprCodeId);
+  // Поиск документа оплаты 
+  var bilbeID = 0;
+  if( BFCreateBilFactura(factura, facturaLineAr, facturaID) )   
+    UpdateDefComisses( facturaID, Dprt, DprtNode, PayerID, PayFIID );
+    ResultLogBF_Success( facturaID, BillDate );
+    retVal = true;
+    // TAM 22.01.2014 Adaptation_2031
+      if( SF_CreateBilBookEntryCommon(facturaID, Dprt, DprtNode, PayerID, PayFIID, BillDate) > 0 )
+         NoBook_Count = NoBook_Count + 1;
+         ResultLogEntryBook_NotSuccess( GetErrMsg() );
+      end;  
+   end;  
+   //ОЮФ по заявкам I-049836, I-059899 После вставки перед печатью проверяем КАЖДУЮ фактуру на наличие номера
+   ИсправитьРеференс(facturaID);
+   PrintBill ( facturaID, facturaLineAr );
+  return retVal;
+end;
+
+private macro GenerateCompositeBills( BillDate, BF_Count:@integer, NoBF_Count:@integer, NoBook_Count:@integer )
+   var sqlString, rs, cmd;  
+   var Dprt, DprtNode, PayerID, PayFIID, ClientName, OprCodeId;
+   var facturaLineAr = TArray, count = 0, i = 0;
+   var facturaID = 0, bilbeID = 0, bilfDocArray = TArray;
+   OprCodeId = getDefaultOprCodeId();
+   // EVG 27/01/2012 Подсчёт строк 
+   sqlString = " SELECT  bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID, " +
+               " (SELECT t_ShortName FROM dparty_dbt p WHERE p.t_PartyID = bil.t_PayerID) ClientName " +
+               " FROM dbilsfgen_tmp bil GROUP BY bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID ";  
+   rs = RsdRecordset( sqlString );
+   while( rs.moveNext() )
+      count = count + 1;
+   end;
+   initProgress( count, null, "Формирование счетов-фактур" );
+
+   sqlString = " SELECT  bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID, " +
+               " (SELECT t_ShortName FROM dparty_dbt p WHERE p.t_PartyID = bil.t_PayerID) ClientName " +
+               " FROM dbilsfgen_tmp bil GROUP BY bil.t_Dprt, bil.t_DprtNode, bil.t_PayerID, bil.t_PayFIID ";  
+   cmd = RSDCommand( sqlString );
+   rs = RsdRecordset( cmd );
+   while( rs.moveNext() )
+    
+      Dprt = rs.value("t_Dprt");    
+
+      if( rs.value("t_DprtNode") == NULLVAL )
+         DprtNode = 0;
+      else
+         DprtNode = rs.value("t_DprtNode");
+      end;
+
+      PayerID  = rs.value("t_PayerID");
+      PayFIID  = rs.value("t_PayFIID");
+      ClientName = rs.value("ClientName");
+      Message("Клиент: " + ClientName);
+      SetOutPut (protFileName, true);
+      ResultLogClientName( ClientName + "(Код:"+string(ПолучитьКодСубъекта(PayerID,1))+")"); // VEA из-за трудности поиска клиента
+      if( CreateBilFacturaForClient(ClientName, BillDate, Dprt, DprtNode, PayerID, PayFIID, OprCodeId, @facturaID, @bilfDocArray, @facturaLineAr, @NoBook_Count) )
+         BF_Count = BF_Count + 1;
+         /* TAM 22.01.2014 if( SF_CreateBilBookEntryCommon(facturaID, Dprt, DprtNode, PayerID, PayFIID, BillDate) > 0 )
+            NoBook_Count = NoBook_Count + 1;
+            ResultLogEntryBook_NotSuccess( GetErrMsg() );
+         end; */
+      else
+         NoBF_Count = NoBF_Count + 1;
+         ResultLogBF_NotSuccess( GetErrMsg() );
+      end;  
+      i = i + 1;
+      useProgress(i);
+   end;
+   remProgress();
+end;
+
+private macro PrintLogFooter(BF_Count, NoBF_Count, NoBook_Count)
+[                                                                       ];
+[     Итоговый результат:                                               ];
+[     Сформировано СФ:    #######                                       ](BF_Count); 
+[     Не сформировано СФ: #######                                       ](NoBF_Count);
+[     СФ, по которым не удалось сформировать записи книги продаж: ######](NoBook_Count);
+end;
+
+private macro PrintLogHeader( DprtName, DprtNodeName, ServKindName, ClientName, ServDateFrom, ServDateTo, BillDate )
+  
+
+[            Протокол формирования сводных СФ по услугам банка         
+                                                                        ];
+[     Дата формирования:   ##########                                   ](date());
+[     Время формирования:  ########                                     ](time());
+[     Операционист:        ##### ###################################### ]({oper}, {Name_Oper});
+[     Подразделение банка: ############################################ ]({Name_Bank});
+[          
+      Параметры запуска:                                                ];
+[     Филиал:             ############################################  ](DprtName);
+[     Подразделение ТС:   ############################################  ](DprtNodeName);
+[     Вид обслуживания:   ############################################  ](ServKindName);
+[     Клиент:             ############################################  ](ClientName);
+[     Дата оказания услуги: с ########## по ##########                  ](ServDateFrom, ServDateTo);
+[     Дата счета-фактуры: ##########                                    ](BillDate);
+[                                                                       ];
+[     Результаты выполнения:                                            ];
+  
+
+end;
+
+
+macro CompositeBillGenerationProc( DprtID, DprtName, DprtNodeID, DprtNodeName, ServKind, ServKindName,  
+                                   ClientID, ClientName, ServDateFrom, ServDateTo, BillDate )
+   var BF_Count = 0, NoBF_Count = 0, NoBook_Count = 0;
+   //TAM 17.01.2014 Adaptation_2031
+   var NameFile_monValueForRef = TxtPath + "\\monValueForRef." + UserNumber;
+   FILE monValueForRef() txt write;
+   open(monValueForRef,NameFile_monValueForRef);
+   insert(monValueForRef,string(BillDate)); 
+   close(monValueForRef);
+
+   dt_from = ServDateFrom;
+   dt_to   = ServDateTo;
+
+   SetOutPut(protFileName, false);
+   println("     ─── "+date()+" "+time()+" ───── "+{oper}+" ───");     
+   PrintLogHeader( DprtName, DprtNodeName, ServKindName, ClientName, ServDateFrom, ServDateTo, BillDate );
+
+   FillTmpTable( DprtID, DprtNodeID, ServKind, ClientID, ServDateFrom, ServDateTo );
+
+   GenerateCompositeBills( BillDate, @BF_Count, @NoBF_Count, @NoBook_Count  );
+
+   SetOutPut(protFileName, true);
+   PrintLogFooter( BF_Count, NoBF_Count, NoBook_Count );
+   //TAM 17.01.2014 Adaptation_2031
+   SetOutPut(null, false);
+   ViewFile (protFileName);
+   // EVG Вывод печати счетов-фактур
+   if ( (BF_Count > 0) and getTrue(true, "Вывести на экран сформированные счета-фактуры?") )
+      Open(report, prnFileName);
+      ViewFile (report);
+   end;
+   Exit(1);
+end;

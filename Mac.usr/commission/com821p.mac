@@ -1,0 +1,200 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Макрос пользовательского алгоритма расчёта базовых сумм комиссии 8.2.1
+       "Аб. плата за пересчет выручки,проинкассированной в пределах МКАД".
+
+       Тип комиссии - периодическая.
+
+       Комментарий.
+       Сумма комиссии рассчитывается как разность между тарифом, установленным по
+       комиссии 8.2.1 и суммой разовых комиссий 8.2.2-8.2.6, взысканных с клиента
+       за отчётный период.
+
+       Значение тарифа по комиссии 8.2.1 задаётся в поле "Максимальная сумма" та-
+       рифа с базовой суммой > 0.00. Кроме этого, обязательным является наличие 
+       второго тарифа с базовой суммой > 0.01 и значением 100%, который будет 
+       использоваться для получения суммы комиссии.
+       
+       Таким образом для расчёта комиссии, необходимо 2 тарифа:
+          - первый тариф (база > 0.00) используется для указания значения тарифа 
+            в графе "Макс. сумма";
+          - второй тариф (база > 0.01) - реально использующийся при расчёте 
+            комиссии, в котором указано значение 100% и не указано максимальной 
+            суммы.
+        
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+/*Changes:
+15.11.2013 joy C-2431 Жаворонкова Н. Адаптирование макроса для ГЭБа, добавление чтения реестра 
+                      настроек банка, параметризация запросов, отбор тарифа по ДО\ТП
+                      + поиск разовых комиссий по всем счетам клиента
+   //RR 19.02.2014 Адаптирую под 2031(darhdoc_dbt -> dacctrn_dbt)
+   //joy 14.11.2014 I-00532241 в 2031 обязательно надо проверять, что t_state в проводках = 1
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, cb_sql;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+
+CONST ComCodePrefix = "8.2",    // Группа комиссий
+      PerComSuffix  = ".1";     // Суффикс комиссии группы, которая является периодической (!!!)
+
+// Вид примечаний "Количество точек в пределах МКАД (для тарифа 8.2.1)"
+CONST NOTEKIND_POINTCOUNT = 151;
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sAddr /* EVG Какой-то ещё адрес */, sfcontrStruc /*Cтруктура sfcontr*/ )
+
+    record sfcontr( sfcontr );
+    record acc( account );
+
+    var query, rs, stat, sql, cmd;
+    var CommSum = $0;
+    var TarifValue, SingComSum, PointsCount;
+    var IncomeAccount = "";
+
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+    else
+       Copy ( sfcontr, sfcontrStruc );
+    end;
+
+
+    /* Определяем количество точек (из примечания к счёту) и в случае, если примечание
+       определено, умножаем полученную сумму комиссии на количество точек. */
+    ClearRecord(acc);
+    acc.Account       = sfcontr.Object;
+    acc.Chapter       = 1;
+    acc.Code_currency = sfcontr.FIID;
+
+    PointsCount = 0;
+    PointsCount = readNoteForObject(OBJTYPE_ACCOUNT, UniID(acc, OBJTYPE_ACCOUNT), NOTEKIND_POINTCOUNT);
+    GetRegistryValue ("PRBB\\ЕРЦ\\ДОХОДНЫЙ СЧЁТ 8.2.2-8.2.6", V_STRING, IncomeAccount);
+    
+    /* Получим значение тарифа */
+    TarifValue = $0;
+    SingComSum = $0;
+    debugbreak;
+    
+    if (IncomeAccount != "")
+        /* FIV Была ошибка в отборе тарифной сетки, исправил */
+        SQL =       " with t as (                                                                                                               ";
+        SQL = SQL + " select   nvl (trf.t_maxvalue / 10000, 0)                                                                                  ";
+        SQL = SQL + "   from   dsftarif_dbt trf, dsftarscl_dbt scl, dsfcomiss_dbt com                                                           ";
+        SQL = SQL + "  where       com.t_feetype = 1                                                                                            ";
+        SQL = SQL + "          and com.t_code = :code                                                                                           ";
+        SQL = SQL + "          and scl.t_feetype = com.t_feetype                                                                                "; 
+        SQL = SQL + "          and scl.t_commnumber = com.t_number                                                                              ";
+        SQL = SQL + "          and scl.t_feetype = com.t_feetype                                                                                ";
+        SQL = SQL + "          and scl.t_commnumber = com.t_number                                                                              ";
+        SQL = SQL + "          and (scl.t_begindate between :begindate and :enddate or scl.t_begindate = to_date ('01-01-0001', 'DD-MM-YYYY'))  ";
+        SQL = SQL + "          and  ((scl.t_objecttype = 57                                                                                     ";
+        SQL = SQL + "                 and scl.t_objectid = (select   cp.t_sfplanid                                                              ";
+        SQL = SQL + "                                         from   dsfcontrplan_dbt cp                                                        ";
+        SQL = SQL + "                                        where   cp.t_sfcontrid = :contrid                                                  ";
+        SQL = SQL + "                                         and cp.t_begin = (select   max (cp1.t_begin)                                      ";
+        SQL = SQL + "                                                             from   dsfcontrplan_dbt cp1                                   ";
+        SQL = SQL + "                                                            where   cp1.t_sfcontrid = :contrid1 and cp.t_begin <= :begindate1))) ";
+        SQL = SQL + "                 or  ( scl.t_objecttype = 659 and scl.t_objectid = :contrid2 )      )                                      ";
+        SQL = SQL + "          and trf.t_tarsclid = scl.t_id                                                                                    ";
+        SQL = SQL + "          and trf.t_basesum = 0                                                                                            ";
+        SQL = SQL + "         ORDER BY scl.t_ObjectType DESC)                                                                                   ";
+        SQL = SQL + "         select * from t where rownum = 1";
+
+        cmd = rsdcommand(sql);
+        cmd.AddParam("code",      RSDBP_IN,ComCodePrefix + PerComSuffix);
+        cmd.AddParam("BeginDate", RSDBP_IN,BeginDate);
+        cmd.AddParam("EndDate",   RSDBP_IN,EndDate);
+        cmd.AddParam("contrid",   RSDBP_IN,sfcontr.id);
+        cmd.AddParam("contrid1",  RSDBP_IN,sfcontr.id);
+        cmd.AddParam("BeginDate1",RSDBP_IN,BeginDate);
+        cmd.AddParam("contrid2",  RSDBP_IN,sfcontr.id);
+        
+        rs = rsdRecordSet(cmd);
+
+    
+        if (rs and rs.moveNext())
+            TarifValue = rs.value(0, null, V_DOUBLE);
+            TarifValue = TarifValue * PointsCount;
+        end;
+
+        if ( TarifValue > 0 )
+            var mm, yy, begdate;
+            dateSplit( endDate, null, mm, yy );
+            BegDate = date(1, mm, yy); /*Анализ разовых комиссий с 1 числа месяца списания комиссии*/
+
+       /* Посчитаем сумму взысканных разовых комиссий группы */
+
+            SQL = " SELECT NVL (SUM (pm.t_amount), 0) sum ";
+            SQL = SQL + "  FROM dpmpaym_dbt pm, dpmdocs_dbt pmd, dacctrn_dbt arh ";
+            SQL = SQL + " WHERE pm.t_payer = :payer" ;
+            SQL = SQL + "   AND pm.t_receiveraccount = :receiveraccount" ;
+            SQL = SQL + "   AND pm.t_paymentid = pmd.t_paymentid ";
+            SQL = SQL + "   AND ARH.T_ACCTRNID = PMD.T_ACCTRNID";
+            SQL = SQL + "   AND ARH.t_state = 1 ";
+            SQL = SQL + "   AND arh.t_date_carry BETWEEN :BeginDate AND :EndDate" ;
+           
+            cmd = rsdcommand(sql);
+            cmd.AddParam("payer",    RSDBP_IN,sfcontr.partyID);
+            cmd.AddParam("receiveraccount", RSDBP_IN,IncomeAccount);
+            cmd.AddParam("BeginDate",       RSDBP_IN,BegDate);
+            cmd.AddParam("EndDate",         RSDBP_IN,EndDate);
+
+            rs = rsdRecordSet(cmd);
+
+            if (rs and rs.moveNext())
+                SingComSum = rs.value(0, null, V_MONEY);
+                CommSum = TarifValue - SingComSum;
+            end;
+        end;
+
+        if (CommSum < $0)
+            CommSum = $0;
+        end;
+    else
+        CommSum = $0;
+    end;
+
+
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+        if (CommSum > 0)
+            return true;
+        end;
+        return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType = SF_BASETYPE_SUM;
+    sfbassum.baseSum  = CommSum;
+
+    sfbassum.baseType2 = SF_BASETYPE_SUM;
+    sfbassum.baseSum2  = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/

@@ -1,0 +1,253 @@
+  /***************************************************************************************************************
+   Имя файла..:       ReportDocInARM.mac
+   Назначение.:       Выгрузка закрытых входящих документов за день из АРМ-позиционер по счетам
+   Заявка.....:       R-622590
+   Дата.......:       06.10.2015
+   Автор......:       Ващенко Дмитрий                        
+****************************************************************************************************************/
+import RSD, "ldmklbr.mac", "fg_Life_parm.mac", "KeyCodes.mac", globals, activeX, lib_sqltools, RCW, Rsexts;
+var StatusBar = "F2 Выполнить ESC Выход"; 
+ 
+private class WorkFile ( cntRecord )
+
+    private var countRecord = cntRecord;
+    private var myWorkBook;
+    private var myWorkExcel;
+    private var myWorkSheet;                   
+
+    /*Определение рабочей директории временных файлов*/
+    private macro getWorkDirName() : string
+      var DirName:string = "", 
+          StrErr :string = "";
+
+      GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, DirName, StrErr );        
+      if( DirName )     
+        if( SubStr(DirName, 1, 1) == "." ) DirName = "$" + GetCurDir(TRUE) + replace (DirName, "..",""); end;     
+        if (existFile(DirName))  return DirName;  end;
+      end;
+
+      DirName = "$" + GetEnv("TEMP");
+
+      if( NOT DirName ) DirName = "$" + GetEnv("TMP"); end;
+      if (existFile(DirName)) return DirName; end;
+
+      msgbox("Ошибка поиска папки для временных файлов на терминале");
+
+      return "";
+    end;
+
+    /*Копирование файла на терминал*/
+    private macro copyFileToTerminal (Name_file)
+      var Templs_Dir_Term = GetWorkDirName();
+
+      var TermFileName = toAnsi(Name_file);
+      var SPFileName;
+
+      if ( Templs_Dir_Term == "" )  return "";  end;
+      SPFileName = "..\\txtfile\\" + Name_file;
+
+      if (not existFile(SPFileName)) MsgBox(string("Транспортный временный файл не найден: |", SPFileName)); return ""; end;
+      if( not CopyFile(SPFileName, Templs_Dir_Term + "\\" + TermFileName) ) RunError("Ошибка при передаче файла на терминал\n" + Templs_Dir_Term + "\\" + TermFileName); end;
+
+      return subStr(Templs_Dir_Term + "\\" + TermFileName, 2);      
+    end;
+
+    /*Определение формата загружаемых данных*/
+    private macro setTypeColumns();
+      var result_arr = TArray(true), i;
+ 
+      for(i, 1, 16)
+        var templs_arr = TArray(true);         
+        templs_arr(0) = i;
+        templs_arr(1) = 2;
+
+        result_arr(i - 1) = templs_arr;
+      end; 
+
+      return result_arr;
+    end;          
+
+    /*Формирование и открытие файла Excel*/
+    private macro openExcel()
+      private var objectXls, WorkExcel;
+
+      objectXls = CreateObject ("rsax", "TRsAxServer", string("RsAxServer", UserNumber()), IsStandAlone());
+      WorkExcel = objectXls.CreateComObject ("Excel.Application"); 
+
+      myWorkExcel = WorkExcel;
+
+      return true;
+
+    OnError(er) 
+      return false;
+    end;
+
+    /*Заполнение заголовков столбцов, формирование сетки таблицы*/
+    private macro setHeaderExcelTable()
+      var i; 
+      myWorkBook.Sheets(1);
+      myWorkSheet = myWorkBook.ActiveSheet();
+
+      myWorkSheet.Cells(1, 1).Value  = "ИД документа";
+      myWorkSheet.Cells(1, 2).Value  = "Номер документа";
+      myWorkSheet.Cells(1, 3).Value  = "Сумма платежа";
+      myWorkSheet.Cells(1, 4).Value  = "Привязка";       
+      myWorkSheet.Cells(1, 5).Value  = "Счет";       
+     
+      for (i, 1, 5)
+        myWorkSheet.Cells(1, i).HorizontalAlignment = 3;
+        myWorkSheet.Cells(1, i).Font.Bold = true; 
+        myWorkSheet.Columns(i).EntireColumn.AutoFit;
+      end; 
+
+      myWorkSheet.Range("A1:E" + (countRecord + 1)).Borders.Weight = 2;  
+      myWorkSheet.Range("A1:E1").Interior.Color = #B5B5B5;
+                                                                                                 	
+      return true;
+
+     OnError
+       return false;
+     end;     
+
+     macro createExcelReport( fileNameReport )
+       var fileNameRep = copyFileToTerminal( fileNameReport );
+
+       if ( fileNameRep == "" or (not openExcel()) )
+         RunError("Ошибка формирования файла");
+       end;
+
+       myWorkExcel.Workbooks.OpenText (fileNameRep, 866, 1, 1, 2, false, false, false, false, false, true, ";", setTypeColumns(), 1, "."," ", true, false);
+       myWorkBook = myWorkExcel.Workbooks.Application;
+
+       setHeaderExcelTable();
+         
+       msgBox("Файл успешно записан");
+
+       myWorkExcel.Visible = true;
+     end;
+end;
+
+private class Report( dateRep )
+    private var dateReport = dateRep;
+    private var recordTable;
+    private var fileNameReport = "reportDocInARM" + date();
+    private var countRecord = 0;
+    private var separator = ";";     
+
+    private macro printExeption( error )
+      msgBox(error.Message);
+    end;     
+
+    private macro getRsb()
+      startQueryCapture ();
+      [
+        SELECT d.t_paymentid,
+               p.t_number,
+               REPLACE(d.t_amount, '.', ','),
+               CASE WHEN (SELECT COUNT ( * ) FROM dacctrn_dbt c, dpmdocs_dbt b
+                          WHERE c.t_acctrnid = b.t_acctrnid
+                            AND b.t_paymentid = d.t_paymentid
+                            AND SUBSTR (t_account_payer, 1, 5) = '47422') > 0
+                    THEN 'Да'
+                    ELSE 'Нет'
+               END,
+               t_receiveraccount
+        FROM dpmpaym_dbt d, dpmrmprop_dbt p
+        WHERE d.t_paymentid = p.t_paymentid
+          AND t_receiveraccount IN ('47422810100000060154', '47422810600000160198')
+          AND t_valuedate = :dateRep
+      ];
+
+      var cmd = RsdCommand (endQueryCapture ());
+      cmd.addParam ("dateRep", RSDBP_IN, dateReport);
+
+      recordTable = RsdRecordSet(cmd);
+
+      return true;
+
+    onError( e )
+       printExeption ( e );
+       return false;
+    end;    
+
+    private macro setToFile()      
+       setoutput("..\\txtfile\\" + fileNameReport); 
+
+       println(separator);
+        
+       while ( recordTable.moveNext() )
+         var text = "", i;
+
+         for (i, 1, 5) text = text + recordTable.value(i - 1) + separator; end;
+         println(text);
+
+         countRecord = countRecord + 1;
+         useprogress(countRecord);
+       end;
+
+       setoutput(null, true);       
+
+    end;
+
+    macro createReport()
+      initProgress(-1, "", "Ожидайте, формируется выборка");
+      getRsb();                                             
+      remProgress;
+
+      initProgress(-1, "", "Ожидайте, формируется отчет");
+      setToFile();      
+
+      var excelFile = WorkFile( countRecord );  
+      excelFile.createExcelReport( fileNameReport );    
+
+      remProgress;     
+    end; 
+end;
+
+class (TRecHandler) TParm(LbrName)    
+  InitTRecHandler ("statCB", (LbrName), true);    
+  macro Handler (dlg, cmd, id, key)            
+    if ((cmd == DLG_KEY) and ((KEY == KEY_F2) or (KEY == KEY_ENTER)))	        
+      var myReport = Report( dlg.("BeginDate") );               
+          myReport.createReport();  
+    elif ((cmd == DLG_KEY) and (KEY == KEY_ESC)) return CM_CANCEL; end;        
+  end;
+     
+  macro Run return RunDialog (this, R2M (this, "Handler")); end;
+end; 
+
+macro MyPanel( lbr )    
+  var rc = lbr.AddPanel( "statCB", 10, 10, 30, 1, lbr.EColour.SHLP, lbr.EFRame.UNARY ), elem;
+      rc.Title = "Настройка отчета";
+      rc.StatusLine = StatusBar;
+    
+      elem = rc.AddFrame(0, 0, 30, 3, 2);
+      elem = rc.AddLabel( 1, 1, "Дата отчета:");
+      elem = rc.AddField( 19, 1,lbr.EFieldType.EDIT, lbr.EFocus.YES, lbr.EDataType.V_DATE, "BeginDate", 10, 1);   
+end;
+
+macro MyLbr
+  var Fulloutputlbr, outputlbr = "statReportDocInARM.lbr", outlbr, lbr;
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, outlbr);
+  Fulloutputlbr = outlbr + "\\" + outputlbr;
+  lbr = TLbrFile( Fulloutputlbr, "C" );
+  MyPanel( lbr );
+
+  lbr.Save(); 
+  lbr = NULL;
+  return Fulloutputlbr;
+end;
+
+  /********************Точка входа***********************/
+private var LbrName, Parm;
+LbrName = MyLbr();
+
+Parm = TParm(LbrName);
+
+Parm.rec.BeginDate  = Date(); 
+
+if( not Parm.Run() )
+  Parm = null;
+  DelFile(LbrName);
+  Exit (1);
+end; 

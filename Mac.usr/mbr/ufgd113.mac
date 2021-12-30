@@ -1,0 +1,137 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация платежей по сообщениям УФЭБС ED113                             */
+/*                                                                          */
+/* Имя файла: ufgd113.mac                                                   */
+/* Создан:    13.07.12                                       Chukina T.     */
+/* Изменен:   Gurin S. N. 30.08.2012 C-13708                                */
+/* Изменен:   Gurin S. N. 15.10.2012 C-14244                                */
+/* Изменен:   Gurin S. N. 01.03.2013 I-00333677-2                           */
+/* Изменен:   Gurin S. N. 02.04.2013 R-174305-2                             */
+/* Изменен:   Gurin S. N. 01.07.2013 I-00393021-2                           */
+/* Изменен:   TAM         20.03.2014 R-344690                               */
+/****************************************************************************/
+//SDA 06.12.2013 в Bankinter не определено значение PSPO_OR_PAYEEBANK, адаптация для 31-й 
+
+import BankInter, PaymInter, OprInter, wluftool;
+
+//Gurin S. N. 30.08.2012 C-13708
+private var NumPack, errCode; 
+GetRegistryValue("PRBB\\MCI\\ПАЧКА_ED113", V_INTEGER, NumPack, errCode);
+  if (errCode > 0)
+      NumPack = 0;
+  end;
+
+macro GenDoc (addrMes) 
+  debugbreak;
+  record wlmes(wlmes);
+  SetBuff( wlmes, addrMes );
+
+  PrintLog( 2, "Генерация платежа по сообщению ED113" );
+
+  var xml:object = ActiveX( "MSXML.DOMDocument" );
+  var tmpstr = "";
+
+  var field_name, field_value;
+  if( not СчитатьПоле( field_name, field_value ) )
+    return FALSE;
+  end;
+
+  if ( not xml.loadXML(field_value) )
+    println( string( "Неверный формат сообщения по форме ED113" ) );
+    return FALSE;
+  end; 
+  
+  //Gurin S. N. C-14244
+  debugbreak;
+  if (not Check_113_114(xml, @wlmes))
+    UpdState(wlmes.mesid);
+    
+    if (IsOprMultiExec())
+       std.msg("Сгенерировано ED274");
+       return FALSE;
+    else
+       msgboxEx("Сгенерировано ED274",0);
+    end;
+  else
+  
+    var PsOrder:object = GenObject( "RsbPsPayOrder", 0 );
+    PsOrder.DocKind = PSPOKIND_DEMAND;
+    PsOrder.Origin = 19 /*PSPO_OR_PAYEEBANK*/; //SDA 06.12.2013 в Bankinter не определено значение PSPO_OR_PAYEEBANK  
+
+    var Payment:RsbPayment = PsOrder.Payment();
+    Payment.DocKind = Payment.PrimDocKind = PS_PAYORDER;
+
+    //TAM 26.03.13 HF_71    
+    PsOrder.ReqSum = Payment.BaseAmount; 
+
+    Payment.ShifrOper = "02";
+
+    FillPayment_113_114(xml, wlmes, Payment);
+    var PaytKind : integer = int(ReadOptinalAttribute(xml,"PaytKind"));
+      if( PaytKind == 1 )
+        Payment.PaymentKind = "Э";
+      elif( PaytKind == 2 )
+        Payment.PaymentKind = "П";
+      elif( PaytKind == 3 )
+        Payment.PaymentKind = "Т";
+      elif( PaytKind == 4 )
+        Payment.PaymentKind = "С";
+      end;
+
+    //Gurin S. N. 30.08.2012 C-13708
+    Payment.NumberPack = NumPack;
+    //TAM 05.09.2012 C-13782
+    Payment.Origin = 19 /*PSPO_OR_PAYEEBANK*/; //SDA 06.12.2013 в Bankinter не определено значение PSPO_OR_PAYEEBANK 
+
+    tmpstr = ReadOptinalAttribute(xml, "PaytCondition");
+    if(tmpstr)
+       PsOrder.AcceptTerm = GetAcceptTermByPaytCond(tmpstr);
+    end;
+    tmpstr = ReadOptinalAttribute(xml, "AcptTerm");
+    if(tmpstr)
+      PsOrder.AcceptPeriod = int(tmpstr);
+    else
+      PsOrder.AcceptPeriod = 5;
+    end;
+    tmpstr = ReadOptinalAttribute(xml, "MaturityDate");
+    if(tmpstr)  
+      PsOrder.AcceptDate = ToDate_(tmpstr); //TAM
+    else
+      PsOrder.AcceptDate = GetDateAfterWorkDays(Payment.ValueDate, PsOrder.AcceptPeriod); //Gurin S. 02.04.2013 R-174305-2
+    end;
+
+    tmpstr = ReadOptinalAttribute(xml, "DocDispatchDate");
+    if(tmpstr)
+       Payment.DocDispatchDate = ToDate_(tmpstr);//TAM
+    end;
+    
+  
+     if( PsOrder.Update() != 0 )
+       std.msg("Ошибка при вводе платежного требования");
+      return FALSE;
+    end;
+
+    /*Связь рублевого платежа РКО с входящим сообщением */
+    //TAM 20.03.2014
+    var meslnk = TRecHandler("wlmeslnk.dbt");
+    meslnk.rec.MesID   = wlmes.MesID;
+    meslnk.rec.Direct  = "X";/*WLD_MES_IN*/
+    meslnk.rec.ObjID   = Payment.PaymentID;
+    meslnk.rec.ObjKind = OBJTYPE_PSPAYORD;
+    var MesLnkObj = RsbWlMesLnk( meslnk.rec.ObjKind, meslnk.rec.ObjID, meslnk.rec.Direct );            
+    if( (MesLnkObj.Insert( meslnk ) != 0) or (MesLnkObj.Save() != 0) )
+      std.msg("Ошибка при создании связи платежного требования с входящим сообщением");
+      return FALSE;
+    end;
+  end; // (not Check_113_114(xml, @wlmes))
+
+  return TRUE;
+
+  OnError(er) /* обработка ошибок времени выполнения */
+    ExeptionMessage(er);
+    return FALSE;  
+
+end;

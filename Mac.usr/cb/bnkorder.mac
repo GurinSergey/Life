@@ -1,0 +1,353 @@
+/*********************************************************************************************************************************************
+          Автоматизированная банковская система RS-Bank v6.0           
+                  Copyright (c) R-Style Software Lab                   
+   Имя файла        : bnkorder.mac
+   Описание         : Макрос скроллинга банковских ордеров
+   Создан           : 11.02.2010                                       
+   Изменения: RR  27.09.2012 добавил возможность поиска комиссии, которой был порожден документ R-106923-2
+              joy 07.02.2013 Жаворонкова Н. рефакторинг кода
+              joy 15.02.2013 Жаворонкова Н. C-17206-6 Изменение вида хранения в ЭА по ctrl+z
+              TAM 16.05.2013 удалено про группу ВК, так как это был мой бред. Сделаем проверку на группу 106, так как она правит в закрытых
+              SDA 26.11.2013  адаптация пользовательской функциональности для 31-й сборки.
+              EVG 24.01.2014 Изменены все ссылки на структуры. pm_paym, old_pm_paym и т.п. больше не используются. Вместо них структуры из 
+                             \Mac\Cb\pmbuff.mac - r_pmpaym, r_pmpaym_old и др.
+              Gurin S.16.01.2013 R-314518-2 "Исправить очередность и дату" по CTRL+Z
+**********************************************************************************************************************************************/
+
+import bbbodoc;
+import "cb_FillFactura.mac";
+/* Gurin S. N. I-00140354-2 Автоматическое формирование номера по референсу*/
+import "GenNumber.mac";
+//SDA - удаление документа операции операционистом группы
+import "Diver.mac";
+// KS 04.03.2012 Удаление проводки, выгруженной из внешней системы
+import "outsidecarry.mac";
+
+import "lib_const.mac";
+
+
+/* EVG 24/1/2014 Закомментил, эти структуры больше не нужны.
+   Если будут вылезать ошибки из-за ссылок на них, используйте структуры из pmbuff.mac.
+record  pm_paym ( pmpaym );
+record  debet ( pmprop );
+record  credit ( pmprop );
+record  rm( pmrmprop );
+record  curtr( pmcurtr );
+record  pmkz( pmkz );
+
+record  old_pm_paym ( pmpaym );
+record  old_debet ( pmprop );
+record  old_credit ( pmprop );
+record  old_rm( pmrmprop );
+record  old_curtr( pmcurtr );
+record  old_pmkz( pmkz );
+
+/* EVG 30/03/2012 Вся эта шляпа из ps_po.mac нужна для того,
+   чтобы не было "отсутствия глоб. перем." при выполнении част.
+   оплаты картотеки 2. */
+record  pmpaym ( pmpaym );
+record  pmprop ( pmprop );
+record  pmrmprop( pmrmprop );
+record  pspayord ( pspayord );
+record  pspaydem ( pspaydem );
+record  pmakkr ( pmakkr );
+record  oldpmpaym ( pmpaym );
+record  oldpmprop ( pmprop );
+record  oldpmrmprop( pmrmprop );
+record  oldpspayord ( pspayord );
+record  oldpspaydem ( pspaydem );
+record  oldpmakkr ( pmakkr );
+record  OldCurtr( pmcurtr );
+*/
+
+//Gurin S. 19.03.2014 R-348390-2
+private file rmprop_f ("pmrmprop.dbt");
+private file rmprop_old ("pmrmprop.dbt");
+private file rmprop_new ("pmrmprop.dbt");
+private var Trn_Mode;
+
+/* Установка подсказки оптимизатору ORACLE */
+
+private const Hint_ByPaymStatus:string = 
+"/*+FIRST_ROWS(200) LEADING(t pmrmprop oproper) INDEX(t dpmpaym_dbt_idx16) USE_NL(t pmrmprop oproper)*/";
+
+private const Hint_ByValueDate :string = 
+"/*+FIRST_ROWS(200) LEADING(t pmrmprop oproper) INDEX(t dpmpaym_dbt_idx11) USE_NL(t pmrmprop oproper)*/";
+
+private const Hint_ByCloseDate :string = 
+"/*+FIRST_ROWS(200) LEADING(t pmrmprop oproper) INDEX(t dpmpaym_dbt_idx15) USE_NL(t pmrmprop oproper)*/";
+
+private const Hint_ByStep      :string = 
+"/*+FIRST_ROWS(200) LEADING(t oproper pmpaym pmrmprop) INDEX(t doprstep_dbt_idx10) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t oproper pmpaym pmrmprop)*/";
+
+macro УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+  
+  // Возможные значения ScrolStates:
+  //   0 Все
+  //   1 Отложенные
+  //   2 Открытые
+  //   3 Закрытые
+  //   4 Отвергнутые
+  //   5 Для контроля, Для визирования, Ожидающие поступлений, В К2, В КОР, В картотеке невыясненных сумм
+
+  if(  ( ScrolStates == 0 )   // Все
+    or ( ScrolStates == 3 ) ) // Закрытые
+
+    var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+    if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+      return Hint_ByCloseDate;
+    elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+      return Hint_ByValueDate;
+    else
+      return Hint_ByCloseDate;
+    end;
+
+  elif(  ( ScrolStates == 1 )   // Отложенные
+      or ( ScrolStates == 2 )   // Открытые
+      or ( ScrolStates == 4 ) ) // Отвергнутые
+
+    return Hint_ByPaymStatus;
+
+  elif ( ScrolStates == 5 ) // Всякие подготовленные
+
+    return Hint_ByStep;
+
+  end;
+
+  return DefaultHint;
+
+END;
+
+macro Новый_Документ()
+
+  /* Gurin S. N. I-00140354-2 Ввод документа: автоматическое формирование номера по референсу*/ 
+  if( StrLen( r_pmrmprop.Number ) == 0 )
+      /* EVG 14/12/2013 Переход на 2031
+      rm.Number = GenNumberDocument();*/
+      r_pmrmprop.Number = GenNumberDocument();
+  end;
+
+/* Дистрибутивный блок */
+  if( r_pmpaym.DocKind == DLDOC_BANKORDER )
+    return BB_BankOrderNewDoc();
+  end;
+
+  msgbox("Неизвестный вид документа");
+  return 1;
+/************************/
+end;
+
+/*
+                      Пользовательская функция
+     Режимы функции
+        UFN_PANEL_INPUT = 1 - панель ввода
+        UFN_PANEL_EDIT  = 2 - панель редактирования
+        UFN_SCROL       = 3 - вызов из скроллинга
+     (константы доступны при подключенном BankInter)
+*/
+macro Функция_Пользователя( режим )
+  // режим == 4 (UFN_SCROL_FMASS) Вызов пользоветельской макро функции до группового выполнения
+  // режим == 6 (UFN_SCROL_LMASS) Вызов пользоветельской макро функции после группового выполнения
+  // Для данных режимов буфера не заполняются
+  if ( (режим == 4) OR (режим == 6))
+    return 0;
+  end;
+
+  private array USR_Menu;
+  private var Number;
+  private var PaymentObj:Rsbpayment=Rsbpayment(r_pmpaym.paymentid);
+  private var Rcmd0, Rrs0, sqwyrt0, Rcmd, Rrs, sqwyrt, priority, date_document,pr,dt;
+  private var rs2;
+  //RR Тут описываем пункты меню
+  USR_Menu[0] = "Происхождение документа комиссии"; debugbreak;
+  /*15-02-2012 Жаворонкова Н. (joy) C-17206 */
+  USR_Menu[1] = "Изменить вид хранения";                
+  //RR Тут в зависимости от выбора Number принимает нужное значение
+  //Gurin S. 19.03.2014 R-348390-2
+  //if (r_pmpaym.PaymStatus == PM_FINISHED) // Только для закрытых
+      USR_Menu[2] = "Исправить очередность и дату";
+  //end;
+  //Gurin S. 28.08.2015 I-00581174-2
+  if (ВходитВГруппу({oper}, ACS_GRP_CLOSE_DOC))
+    USR_Menu[3] = "Закрыть документ без проводок";
+  end;
+  Number = Menu (USR_Menu, null, "Выберете желаемое действие");
+  //RR А уже вот тут мы эти значения и обрабатываем
+    if (Number == 0)
+        execMacroFile ("lib_menu_common.mac", "GetParentDocInfo", r_pmpaym); 
+        /*15-02-2012 Жаворонкова Н. (joy) C-17206 */
+    elif (Number == 1)
+        if (r_pmpaym.PaymStatus == PM_FINISHED) // Только для закрытых, если открыт\отложен - меняем
+            execMacroFile ("ea_checks.mac", "CheckEAGroup", r_pmpaym); 
+        else
+            execMacroFile ("ea_checks.mac","SetEAStoreKind", r_pmpaym);
+        end;
+        /*---end joy*/
+    elif (Number == 2)
+        if (ВходитВГруппу({oper}, ACS_GRP_PM_PRIORITY_DATE)) //184 - "Право исправлять очередность и дату в документах"
+            rmprop_old.PaymentId = PaymentObj.PaymentId;
+            if (GetEq (rmprop_old))
+                Trn_Mode = OLupdate;
+            else
+                Trn_Mode = OLInsert;
+            end;
+            copy (rmprop_new, rmprop_old);
+            priority = paymentObj.priority;
+            date_document = paymentObj.date;
+            pr = getint(priority, "Очередность");
+            dt = getdate(date_document, "Дата документа");
+            if((pr and (pr != 6)) or dt)//если хотябы один параметр изменили, обновляем базу + TAM 12.12.13 C-25730
+                rs2 = rsdcommand("begin update dpmrmprop_dbt set t_priority = "+priority+", t_date = to_date('"+date_document+"','dd.mm.yyyy') where t_paymentid = "+paymentObj.paymentid+"; commit; end; ");
+                rs2.execute;
+                if ((priority != paymentObj.priority) or (date_document != paymentObj.date))
+                    rmprop_new.priority = priority;
+                    rmprop_new.date = date_document;
+                    WriteFiscLog (Trn_Mode, rmprop_f, rmprop_old, rmprop_new);
+                end;
+            end;
+        else
+            msgbox("Вы не включены в группу \"184 - Право исправлять очередность и дату в документах\" ");
+        end;
+    //Gurin S. 28.08.2015 I-00581174-2
+    elif (Number == 3)
+       execMacroFile ("lib_menu_common.mac","UsrCloseDoc", PaymentObj);
+       return UPDTPAGE;
+    end;
+/**** Дистрибутивный блок ****/
+  if( r_pmpaym.DocKind == DLDOC_BANKORDER )
+    return BB_BankOrderUserFunc( режим );
+  end;
+
+  msgbox("Неизвестный вид документа");
+  return 1;
+/****************************/
+end;
+
+macro Проверить_Документ( mode )
+  debugbreak;
+  var PaymentObj:RsbPayment = RsbPayment(r_pmpaym.PaymentID);
+  var fld:TBankOrderPanelFields = TBankOrderPanelFields();
+  var retval:integer = 0;
+  var Status:integer = -1, IndexStatus:integer = -1;
+  var errors:TArray = TArray();
+
+  private var cmd,rs;
+
+  private var obj; // KS 04.03.2012 Удаление проводки, выгруженной из внешней системы
+  /*zmp 11.12.2012 C-16200-5 >>> */
+    if( (mode == OBJ_INSERT) or (mode == OBJ_UPDATE) )      
+        if( (substr(r_pmpaym.payeraccount,1,5) == "40911") and(not CompareStrWithMasks("47423*,70601*",r_pmpaym.receiveraccount)) )
+            MsgBox("Операция запрещена по бух/учету");
+            return 1;
+        end;   
+    end;  
+
+  /*<<< zmp 11.12.2012 C-16200-5 */
+    if( (mode == OBJ_INSERT) or (mode == OBJ_UPDATE) or (mode == OBJ_INSNOTOPR) )
+        if(not InList(r_pmpaym.PaymStatus, PM_PREPARING, PM_REJECTED))
+            if(not PM_GetOprStatus( PaymentObj.DocKind, PaymentObj.DocumentID, OPR_PAYM_CONTROL, @Status ))
+                return 1;
+            end;
+            if(not PM_GetOprStatus( PaymentObj.DocKind, PaymentObj.DocumentID, OPR_PAYM_INDEX, @IndexStatus ))
+                return 1;
+            end;
+
+      // можно менять только документы, еще не прошедшие контроль, или документы К2, КОР 
+            if( ( Status == OPR_PAYM_ST_CTRL_CONTROL ) and 
+                ( IndexStatus != OPR_PAYM_ST_INDEX_I2MEET ) and 
+                ( IndexStatus != OPR_PAYM_ST_INDEX_WP_MEET ) and 
+                //TAM 16.05.2013 - удалено про группу ВК, так как это был мой бред. Сделаем проверку на группу 106, так как она правит в закрытых
+                (not ВходитВГруппу({oper},ACS_GRP_CHANGE_PAYERNAME ))) 
+                return CHANG_NOTKEEP;
+            elif(IsImportantChangeBankOrder(r_pmpaym, r_pmpaym_old) == CHANGE_IMPORTANT)
+                return CHANG_NOTKEEP;
+            end;
+        end;
+
+    elif(mode == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                               // (изменения в буферах не сохраняются)
+    end;
+  
+    if( ( mode == OBJ_DELETE ) or ( mode == OBJ_UPDATE ) )
+
+    end;
+  
+    if( mode == OBJ_UPDATE )
+
+    // KS 04.03.2012 Удаление проводки, выгруженной из внешней системы
+        obj = GenObject("RsbPayment", r_pmpaym.paymentid);
+
+        if (IsExternalCarry(obj))
+            if (gettrue(false,"Вы редактируете документ выгруженный из внешнией системы|информация об альтернативной схеме проводок может быть утеряна|продолжить?"))
+                cmd = RSDCommand("delete usr_pmdocs where paymentid = ?");
+                cmd.addparam("pmid", RSDBP_IN, r_pmpaym.paymentid);
+                cmd.execute;
+            else
+                return CHANG_NOTKEEP;
+            end;
+        end;
+    end;
+
+    if ( mode == OBJ_DELETE )
+debugbreak;
+
+        if(CheckDeletePayment(r_pmpaym.PaymentID))
+            return 1;
+        else
+            if (ВходитВГруппу({oper}, ACS_GRP_DUMMY))
+                cmd = RsdCommand("select count(1) from doprdocs_dbt oprdocs"+
+                                 " where oprdocs.t_DocKind=?"+
+                                 "   and oprdocs.t_DocumentID=LPAD(?,34,'0')"+
+                                 "   and rownum=1");
+                cmd.AddParam("", RSDBP_IN, r_pmpaym.DocKind);
+                cmd.AddParam("", RSDBP_IN, r_pmpaym.PaymentID);
+                rs=RSDRecordset(cmd);
+
+                if (rs.movenext)
+                    if (rs.value(0)==1)
+                        if ( gettrue(true,"Документ порожден шагом операции.|Удалить привязку к данной операции?"))
+                            // KS 22.02.2011 I-00008100 Отвязываем документ
+                            cmd = RsdCommand("delete from doprdocs_dbt oprdocs"+
+                                             " where oprdocs.t_DocKind=?"+
+                                             "   and oprdocs.t_DocumentID=LPAD(?,34,'0')");
+                            cmd.AddParam("", RSDBP_IN, r_pmpaym.DocKind);
+                            cmd.AddParam("", RSDBP_IN, r_pmpaym.PaymentID);
+                            cmd.execute();
+                        end;
+                    end;
+                end;
+            end;
+        end;
+    end;
+
+/**** Дистрибутивный блок ****/
+  if( r_pmpaym.DocKind == DLDOC_BANKORDER )
+    return BB_BankOrderCheckDoc( mode );
+  end;
+
+  msgbox("Неизвестный вид документа");
+  return 1;
+/****************************/
+END;
+
+macro ProcessPanel(mode, key, field, panel)
+var stat, val;
+/* SDA - закоментарено до выяснкния необходимости
+    if( key == 317 )   
+   // KS 19.10.2011 Исправительные обороты
+        if (field == 14)
+            if ((Index(r_pmpaym.UserTypeDocument   , "И")>0) and
+                (Index(old_r_pmpaym.UserTypeDocument, "И")==0))
+                stat = GenerateReference( 61, val );
+                if (stat == 0)
+                    old_r_pmpaym.UserTypeDocument = r_pmpaym.UserTypeDocument;
+                    panel.Fields.Item( 0 ).value = val;
+                    panel.Refresh();
+                end;
+            end; 
+        end;
+    end; 
+*****************************************************/
+return key;
+END;

@@ -1,0 +1,159 @@
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : Межбанковские расчеты
+//
+// Описание     : Генерация сообщения SBC2 по транспорту ФНС в формате XML
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 27.05.2014
+//
+//-----------------------------------------------------------------------------
+import "mnssbcal.mac", FIInter;
+
+private const vers : integer = 510; // версия формата 5.10
+
+// Записать сведения о договоре: НомерДог, КодСостДог, ДатаРастДог
+private macro WriteContractInfo(GenAcc, reqclosa)
+
+  if( GetKindActionFNS() == KIND_ACTION_FNS_NULL )
+    var OldfnsMessageID : integer = GetOldfnsMessageID();
+    ЗаписатьПолеДляАннул("НомерДог", OldfnsMessageID);
+    ЗаписатьПолеДляАннул("КодСостДог", OldfnsMessageID);
+    ЗаписатьПолеДляАннул("ДатаРастДог", OldfnsMessageID);
+  else
+    var IsSfContr : bool = false;
+    var SfCntr : TRecHandler = TRecHandler("sfcontr.dbt"); // договор обслуживания для счета
+    if( ПолучитьДоговорОбслуживания(GenAcc.Code_Currency, GenAcc.Account, SfCntr) == 0 )
+      IsSfContr = true;
+    end;
+
+    var IsSfUnionContr : bool = false, SfUnionContrCloseDate : date = date(0, 0, 0);
+    if(IsSfContr and SfCntr.rec.UnionContrID)
+      IsSfUnionContr = GetSfUnionContrCloseDate( SfCntr.rec.UnionContrID, 
+                                                @SfUnionContrCloseDate );
+    end;
+
+    // НомерДог
+    if(IsSfContr and SfCntr.rec.Number)
+      ЗаписатьПолеЛог( "НомерДог", SfCntr.rec.Number );
+    end;
+
+    // КодСостДог
+    var КодСостДог : integer;
+    if( IsSfUnionContr and (SfUnionContrCloseDate == date(0, 0, 0)) )
+      КодСостДог = 0;
+    else
+      //TAM 12.09.2014 HF_124 исправление
+      if(reqclosa.SubKind == 4)
+        КодСостДог = 2;
+      else
+         КодСостДог = reqclosa.SubKind;
+       end;
+    end;
+    ЗаписатьПолеЛог( "КодСостДог", string(КодСостДог) );
+
+    // ДатаРастДог
+    ЗаписатьПоле_ДатаРастДог( reqclosa, IfThenElse(IsSfContr, SfCntr, null), vers, 
+                             IsSfUnionContr, SfUnionContrCloseDate );
+  end;
+
+end;
+
+private macro WriteAccInfoClose(GenAcc, reqclosa)
+  StartBlockLogXML("Закрыт");
+
+  WriteFieldWithCheckAnnul( "КодСостСч", "0" );
+  ЗаписатьПоле_ДатаЗакрСч(GenAcc.Close_Date);
+  WriteContractInfo(GenAcc, reqclosa);
+
+  FinishBlockLogXML("Закрыт");
+end;
+
+// СвСчет
+private macro WriteAccInfo(Счет : string, Валюта : integer, GenAcc, reqclosa)
+  StartBlockLogXML("СвСчет");
+
+  // атрибуты элемента СвСчет
+  WriteAccInfoAttrs(Счет, Валюта, GenAcc);
+
+  // Файл\Документ\СвСчет\Закрыт
+  WriteAccInfoClose(GenAcc, reqclosa);
+
+  FinishBlockLogXML("СвСчет");
+end;
+
+macro GenMes( addrMes, addrReq, addrOldMes )
+  record wlmes(wlmes);
+  SetBuff( wlmes, addrMes );
+
+  record reqclosa(reqclosa);
+  SetBuff(reqclosa, addrReq);
+
+  record OldMes(wlmes);
+  SetBuff( OldMes, addrOldMes );
+
+  PrintLog(2, "Генерация сообщения по SBC2");
+
+  record GenAcc(account);
+  var Счет : string, Валюта : integer, ErrMsg : string = "";
+
+  ПолучитьСчетСВалютой(reqclosa, 0 /*Закрытие*/, Счет, Валюта);
+  ПолучитьСчет(Валюта, Счет, GenAcc);
+
+  var CommonSBC : TCommonDataGenSBC = TCommonDataGenSBC( GenAcc.Department, 
+                                                         ACCMSG_KIND_CLOSE, 
+                                                         vers );
+
+  var CorrectMesObj : TCorrectMesFNS = TCorrectMesFNS();
+
+  // Файл
+  StartBlockLogXML("Файл");
+
+  // атрибуты элемента "Файл"
+  WriteFileAttrs(CommonSBC);
+
+  // Файл \ Документ
+  StartBlockLogXML("Документ");
+
+  // атрибуты элемента "Документ"
+  WriteDocumentAttrs(CommonSBC, Счет, "", Валюта, GenAcc.Client, OldMes.MesID, CorrectMesObj);
+
+  // Файл \ Документ \ СвБанк
+  if( not WriteBankInfo(CommonSBC.MesSender, "СвБанк", @ErrMsg, CorrectMesObj) )
+    if(not ErrMsg)
+      ErrMsg = "Ошибка при записи сведений о банке (филиале банка)";
+    end;
+    RunError(ErrMsg);
+  end;
+
+  // Файл \ Документ \ СвНП
+  WriteTaxPayerInfo(GenAcc.Client, ACCMSG_KIND_CLOSE, GenAcc.Open_Date);
+
+  // Файл \ Документ \ СвСчет
+  WriteAccInfo(Счет, Валюта, GenAcc, reqclosa);
+
+  FinishBlockLogXML("Документ");
+
+  FinishBlockLogXML("Файл");
+
+  if(CommonSBC._ВидРегОргана)
+    ЗаписатьПолеЛог("_ВидРегОргана", CommonSBC._ВидРегОргана);
+  end;
+
+  if(CommonSBC._СпОбм)
+    ЗаписатьПолеЛог("_СпОбм", CommonSBC._СпОбм);
+  end;
+
+  if( not CorrectMesObj.Check() )
+    return FALSE;
+  end;
+
+  return TRUE;
+
+OnError(er)
+  ExeptionMessage(er);
+  return FALSE;
+end;

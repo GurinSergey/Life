@@ -1,0 +1,363 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*  Импорт сообщений из филиала и Экономбанка (Экспресс-Волга г. Саратов)   */
+/*  Имя файла: wlmfrin.mac                                                  */
+/*  Создан:  18.01.11                                             Зубко С.  */
+/*  19.04.11 Зубко С. Универсально: явное указание "mg" на Get_ff_ext()     */
+/****************************************************************************/
+import "wlimport.mac", "wlmfr_lib.mac";
+import rsexts;
+
+/* Общие глобализмы */
+private var СчитаннаяСтрока:string = "";    /* считанная и необработанная строка */
+private var ДатаОбработки;
+
+private var impTpShemID:integer;
+private var impRespID:integer;
+private var impFormName:string;
+private var impKindMes:integer;
+private var impRslFormID:integer;
+
+private const ДлинаСтроки = 1024;  /* Максимальная длина строки (полноформатный документ) */
+
+private const ФормаСообщЭкономбанк = "ЭБнк_Pamnt";
+private const FormFldDoc = "Doc";
+
+
+private const impMCI_OK     =  0, /* все ОК                                         */
+              impMCI_EOF    =  1, /* найден конец файла                             */
+              impMCI_MesErr = -1; /* ошибка при обработке сообщения (ругается сама) */
+
+file Prot2 () txt write;                         // текстовый файл квитанции Экономбанка
+
+var ИмяФайлаРНП = "";                            // Имя принятого файла
+var fkvt_name = "";                              // имя файла квитанции для принятого файла Экономбанка 
+var vremstr = "";                                // символьная переменная для формирования строки квитанции Экономбанка
+var LoroNostro = "";
+
+
+/* Определяет дату обработки сообщений */
+macro ОпределитьДатуОбработки( строка )
+
+   ДатаОбработки = date( int(substr(строка, 7,2)), int(substr(строка, 9,2)), int(substr(строка, 11,4)) ) ;
+   return true;
+
+   OnError(er) /* обработка ошибок */
+      std.out( 1, string("Неверный идентификатор реестра") );
+      return false; 
+end;
+
+/* Пропустить сообщение с неизвестной формой */
+macro ReadUnknownMsg()
+  std.out( 2, СчитаннаяСтрока );
+  return impMCI_OK;
+end;
+
+/* Считать идентификаторы сообщения */
+macro СчитатьИдентификатор( Форма, НомерДокумента, ДатаСоздания)
+  var НДокумента, Дата, FormID, НомерФормыСообщения, error;
+  var Payer_Code = "";
+
+  НомерФормыСообщения = ФормаСообщЭкономбанк;
+
+  НДокумента = substr( СчитаннаяСтрока, 1, 6 ); /* Электронный номер документа */
+  Дата = ДатаОбработки;
+
+  SetParm( 0, НомерФормыСообщения );
+  SetParm( 1, НДокумента );
+  SetParm( 2, Дата );
+
+  if( (impFormName != НомерФормыСообщения) OR (impTpShemID == -1) OR (impKindMes == 0) OR (impRslFormID == -1) )
+
+   /* Определим отправителя */
+   Payer_Code = substr( СчитаннаяСтрока, 25, 9 );
+   impRespID = ПолучитьКодСубъекта( Payer_Code, PTCK_BIC, error );
+   if( error )
+     ErrImport("Не определен субъект для БИК = " + Payer_Code );
+     return FALSE;
+   end;
+
+    /* Определяем ID формы сообщения */
+    FormID = ОпределитьФорму( Транспорт, НомерФормыСообщения, impKindMes );
+
+    if( FormID == -1 )
+      ErrImport( string( "Не определен номер формы - ", НомерФормыСообщения,", сообщение игнорируется" ) );
+      impFormName = "";
+      ReadUnknownMsg();
+      return impMCI_MesErr;
+    end;
+    /* Определяем транспортную схему */
+    impTpShemID = ОпределитьТранспортнуюСхему( impRespID, -1, -1, Транспорт, FormID, impRslFormID, NULL, NULL, wlsess.TpFrmtID );
+    if( impTpShemID == -1 )
+      ErrImport( string( "Не определена транспортная схема для респондента: ", Payer_Code, "форма сообщения: ", НомерФормыСообщения ) );
+      impFormName = "";
+      return impMCI_MesErr;
+    end;
+
+    impFormName = НомерФормыСообщения;
+  end;
+
+  return impMCI_OK;
+end;
+
+/* Прочитать текстовый блок неизвестной формы */
+macro СчитатьБлокЦелевойИнформации( Форма, НомерДокумента, ДатаСоздания )
+  var error, Строка, continue0, длина, result, stat;
+  var Сумма = $0;
+  var rs:object;
+  var select:string;
+  var params:TArray;
+
+  std.out( 1, "Прочитано сообщение: макет " + Форма + " эл. номер " + НомерДокумента );
+  std.out( 2, "Строка сообщения: " + СчитаннаяСтрока );
+
+  /* Заполняем буфер импортируемого сообщения */
+  ClearRecord( wlmes );
+  wlmes.TpSchemID          = impTpShemID;
+  wlmes.RlsFormID          = impRslFormID;
+  wlmes.Kind               = impKindMes;
+  wlmes.OutsideAbonentID   = impRespID;
+  wlmes.AgentID            = impRespID;
+  wlmes.TRN                = НомерДокумента;
+  wlmes.OutsideAbonentDate = ДатаСоздания;
+  FillMesCode( TRANSP_MCI, wlmes );
+
+  if( not СоздатьЗапись( wlmes ) )
+    ErrImport( "Невозможно создать запись по форме: " + Форма );
+    return impMCI_MesErr;
+  end;
+
+  if( impKindMes == MESKIND_PAYMENT )
+    Сумма = substr( СчитаннаяСтрока, 136, 18 );
+    Сумма = moneyL(Сумма)/100;
+  end;
+
+  AddRepElem(wlmes.Kind, Форма, "RUR", Сумма);
+
+  /*Зубко Для файлов из Экономбанка устанавливается признак ЛОРО/НОСТРО. У платежей из филиалов - не заполнено, поэтому прокатит*/
+  if (LoroNostro == "")
+    LoroNostro = trim(substr( СчитаннаяСтрока, 864, 26 ));            // в присланном Эканомбанком образце файла символы L21032008 заканчиваются в 889 позиции, а не в 887 по Приложению №1 к Допсоглашению №8, то есть длина резервного поля 26 а не 24
+  end;
+  if (LoroNostro == trim(substr( СчитаннаяСтрока, 864, 26 )))         // все документы принимаемого файла должны иметь одинаковые реквизиты Лоро/Ностро
+
+  else
+    msgbox("реквизиты Лоро/Ностро в документах одного файла (Экономбанк, файл ", ИмяФайлаРНП, " ) различаются: ", LoroNostro, " и ", trim(substr( СчитаннаяСтрока, 864, 26 )));
+    return impMCI_MesErr;
+  end;
+
+
+  if( not ЗаписатьПоле( FormFldDoc, СчитаннаяСтрока ) )
+    ErrImport( "Ошибка записи поля: " + FormFldDoc );
+    return impMCI_MesErr;
+  end;
+
+  return impMCI_OK;
+end;
+
+/***************************************************************************/
+/*  Функция считывания сообщения                                           */
+/*  Возвращает:                                                            */
+/*  impMCI_OK     =  0, все ОК                                             */
+/*  impMCI_EOF    =  1, найден конец файла                                 */
+/*  impMCI_MesErr = -1; ошибка при обработке сообщения (ругается сама)     */
+/***************************************************************************/
+macro ОбработатьСообщение()
+
+  /* Вспомогательные переменные */
+  var Строка, длина, result, Форма, ДатаСоздания, НомерДокумента;
+
+  /* Считываем загловок */
+  длина = ДлинаСтроки;
+  Строка = СчитатьСтроку( длина );
+
+  if( (длина == КонецФайла) OR (Trim(Строка) == "") )
+    return impMCI_EOF; /* Достигнут конец файла */
+  else
+    СчитаннаяСтрока = Строка;
+    /*println( string( "Строка: " + СчитаннаяСтрока) );*/
+  end;
+
+  /* Считали идентификатор реестра */
+  if ( not ОпределитьДатуОбработки(Строка) )
+      return impMCI_MesErr;
+  end;
+
+  result = СчитатьИдентификатор( Форма, НомерДокумента, ДатаСоздания);
+  if ( result != impMCI_OK )
+    return result;
+  end;
+  return СчитатьБлокЦелевойИнформации( Форма, НомерДокумента, ДатаСоздания );
+
+
+end;
+
+macro ФормированиеКвитанции (p_ImportFileName)
+
+ /*полный путь к файлу квитанции Экономбанка в каталоге TXTFILE для формирования*/
+ var ProtF_Name =  "";       
+ /*путь к каталогу куда нужно выкладывать квитанцию. Выкладываем в директорию импорта*/
+ var EK_Path = PathWithOutFile(p_ImportFileName);   
+
+ var Value_err; 
+ var i = 0; 
+ var ОбработаноСтрок = 0;
+ var KvtSum = $0;
+
+  /*Получим значение настройки TXTDIR*/
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, ProtF_Name, Value_err);
+ 
+  if ( Value_err  != 0)
+    println(" Ошибка получения значения настройки BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR");
+    println(" Код ошибки = ", Value_err);
+    return false;
+  end;
+
+
+  /*Так как массив уже заполнен, то возьмем информацию из него*/
+  while( i < ImpReport.size )
+    if( ImpReport(i).MesKind == MESKIND_PAYMENT )
+      KvtSum = KvtSum + ImpReport(i).Amount;
+    end;
+    ОбработаноСтрок = ОбработаноСтрок + ImpReport(i).Number;
+    i = i + 1;    
+  end;
+
+  /*Формируем имя отправляемого файла квитанции*/
+  fkvt_name = "k2o"+substr(ИмяФайлаРНП, 4, 7)+"mg";
+  ProtF_Name =  ProtF_Name+"\\"+fkvt_name;       // полный путь к файлу квитанции Экономбанка
+  if( not open(Prot2, ProtF_Name) )
+     println(" ! Файл квитанции Экономбанка не сформирован. Не открыт файл:, ", ProtF_Name);
+     return false;
+  end;
+  insert (Prot2, "КВИТАНЦИЯ ПРИЁМА ФАЙЛА ЭКОНОМБАНКА");
+  insert (Prot2, "________________________________________________________");
+  vremstr = ("Рейс "+substr(ИмяФайлаРНП, 4, 2)+"      Дата квитанции "+string({curdate})+" Время "+string(time()) );
+  insert (Prot2, vremstr);
+  if (substr(LoroNostro, 1, 1) == "L" )
+    vremstr = ("Принят файл Экономбанка "+ИмяФайлаРНП+"   НОСТРО "+substr(LoroNostro, 2, 10) );  //ностро -  меняется местами L и N в квитанции
+  elif (substr(LoroNostro, 1, 1) == "N")
+    vremstr = ("Принят файл Экономбанка "+ИмяФайлаРНП+"   ЛОРО "+substr(LoroNostro, 2, 10) );    //лоро - меняется местами N и L в квитанции
+  else
+    vremstr = ("Принят файл Экономбанка "+ИмяФайлаРНП+"   "+LoroNostro);
+  end;
+  insert (Prot2, vremstr);
+  vremstr = ("Принято в обработку документов         "+string(ОбработаноСтрок) );
+  insert (Prot2, vremstr);
+  vremstr = ("Сумма документов, принятых в обработку "+ string(KvtSum) );
+  insert (Prot2, vremstr);
+  insert (Prot2, "----------------------------------------------------------");
+  Close(Prot2) ;
+
+  CopyFile(ProtF_Name, EK_Path+fkvt_name, true);     // полный путь к файлу квитанции Экономбанка
+  /*println("Принято в обработку документов Экономбанка ", ОбработаноСтрок," на сумму ", KvtSum, " руб.");*/
+  println(" Квитанция сгенерирована: ", EK_Path, fkvt_name) ;
+
+  return true;
+  
+end;
+
+/* Процедура импорта сообщенийот Экономбанка и филиалов */
+macro MFRInProc( TpID, ImportFileName, addrSess )
+
+  var error, stat, continue0, NDoc = 0;
+  var impFileName = "";
+  var payer_BIC = "";
+  var kvit_stat:bool = true;
+
+  SetBuff( wlsess, addrSess );
+
+  Транспорт = TpID;
+  ВидКодаТранспорта = PTCK_BIC;
+
+  impTpShemID  = -1;
+  impRespID    = -1;
+  impFormName  = "";
+  impKindMes   = 0;
+  impRslFormID = 0;
+
+  ПерейтиВНачалоФайла();
+
+
+  var RaceNumber = GetLastNumberRace({curdate},wlsess.TPFRMTID)+1; 
+  println("НОМЕР РЕЙСА: ", RaceNumber);
+  println("НОМЕР СЕАНСА: ", wlsess.number);
+  SetNumberRace(RaceNumber,wlsess.SESSIONID); 
+
+  /*Выделяем наименование файла из общего пути*/
+  impFileName = FileFromPath(ImportFileName);
+
+  /*Если наименование файла некорректно определилось*/
+  if(strlen(impFileName)<2)
+     println( string( "Имя файла импорта определилось некорректно. Имя файла: " + impFileName) );
+     return FALSE;
+  end;
+
+  /*Если наименование файл предназначается не нам - первые 2 символа наименования файла (кому отправляется файл) 
+    отличаются от кода, который присваивается этому файлу */
+  if(substr(impFileName,1,2) != Get_ff_ext())
+     println( string( "!!! ФАЙЛ НЕ ДЛЯ НАС! Имя файла: " + impFileName) );
+     println( string( "!!! Первые два символа \"" + substr(impFileName,1,2) + "\" отличаются от ожидаемых \"" + Get_ff_ext()+ "\" !!!") );
+     return FALSE;
+  end;
+/*  if(substr(impFileName,1,2) != "mg")
+     println( string( "Файл не предназначается АКБ Экспресс-Волга. Имя файла: " + impFileName) );
+     return FALSE;
+  end;
+*/
+  /*Запоминаем имя файла для квитанции*/
+  ИмяФайлаРНП = impFileName;
+
+/* Формирование информационного сообщения не заработало
+  GenDocExec();
+  return false;
+*/
+
+/*
+  Энгельс    - 046375825;        РКЦ	         - mg
+  Волгоград  - 041806835;        Сбербанк       - i1
+  Воронеж    - 042007755;        Э-В Энгельс    - mx
+  Ульяновск  - 047308902.        Э-В Волгоград  - n7
+  Экономбанк - 046311722         Э-В Воронеж    - nw
+                                 Э-В Ульяновск  - nu
+                                 Экономбанк     - k2
+*/
+
+
+  /* Считываем сообщения */
+  continue0 = TRUE;
+  while( continue0 )
+     stat = ОбработатьСообщение();
+
+     Message("Обработано строк - "+string(NDoc));
+
+     NDoc = NDoc + 1;    
+
+     if( stat == impMCI_EOF ) /* найден конец файла */
+       continue0 = FALSE;
+     elif( stat == impMCI_MesErr )
+       return FALSE;
+     elif( stat == 0 )
+     end;
+  end;
+
+  PrintImportReport();
+
+  /*Если файл пришел из Экономбанка, то формируем квитанцию*/
+  if(StrUpr(substr(impFileName,11,2)) == "K2")
+
+    println(" Начинаем формирование квитанции по файлу ", ImportFileName);
+    kvit_stat = ФормированиеКвитанции (ImportFileName);
+
+    if (not kvit_stat)
+      println( " !!! Ошибка формирования квитанции");
+    end;
+  else 
+    println(" Квитанция не формируется, так как 11-12 символ: ", substr(impFileName,11,2), ", а не K2");
+  end;
+
+  return true;
+end;
+
+

@@ -1,0 +1,386 @@
+// -------------------------------------------------------------------------------------------------
+// @desc   : Загрузка курсов драг. металлов
+// @changes: 2012-05-09 Gurin S. N. создание объектной модели (TFILoader, TDBFRecord), распаковка, чтение формата
+// -------------------------------------------------------------------------------------------------
+import FIInter;                                                                                                                                            
+import oralib, likepy, globals, rsexts, treport;
+import BankInter, rcw, rsd;
+
+private var temppath; // полный путь к архиву (*.FGN)
+private var fname; // полный путь к разархивированному файлу (*.DBF)
+
+// @desc: Выбрасывает сообщение об ошибке и выходит из макроса
+private macro raiseApplicationError (str)
+    msgbox (str);
+    exit (1);
+end;
+
+// @desc  : получение строкового значения настройки реестра
+// @return: возвращается значение или пустая строка, если при чтении случилась ошибка
+private macro getStringRegVal (path)
+    var retVal = "", errCode = 0;
+    getRegistryValue(path, V_STRING, retVal, errCode);
+    if (errCode)
+        raiseApplicationError ("Не удалось прочитать значение настройки " + path);
+    end;
+    return retVal;
+end; 
+
+// @desc  : получение сводобного индефикатора фин. инструмента
+// @return: возвращает номер max(t_fiid)+1
+private macro getNumFiid ()
+    var sql, cmd, rs;
+    // debugbreak;
+    sql = " SELECT distinct(1) "
+          " FROM dfininstr_dbt "
+          " WHERE EXISTS (SELECT (NVL ((SELECT MAX (f2.t_fiid) "
+              "                         FROM dfininstr_dbt f2 "
+              "                         WHERE f2.t_fiid < f1.t_fiid), 0) + 1) t_fiid "
+              "           FROM dfininstr_dbt f1 "
+              "           WHERE f1.t_fiid - NVL ((SELECT MAX (f2.t_fiid) "
+              "                                   FROM dfininstr_dbt f2 "
+              "                                   WHERE f2.t_fiid < f1.t_fiid), 0) > 1 "
+              "           AND f1.t_fiid > 45 ) ";
+    cmd = RSDCommand(sql);
+    rs = RSDRecordset(cmd);
+    if (rs and rs.movenext())
+        sql = " SELECT (NVL ((SELECT MAX (f2.t_fiid) "
+              "               FROM dfininstr_dbt f2 "
+              "               WHERE f2.t_fiid < f1.t_fiid), 0) + 1) t_fiid "
+              " FROM dfininstr_dbt f1 "
+              " WHERE f1.t_fiid - NVL ((SELECT MAX (f2.t_fiid) "
+              "                         FROM dfininstr_dbt f2 "
+              "                         WHERE f2.t_fiid < f1.t_fiid), 0) > 1 "
+              " AND f1.t_fiid > 45 ";
+    else 
+        sql = " SELECT MAX (t_fiid) + 1 t_fiid"
+              " FROM dfininstr_dbt ";
+    end;
+    cmd = RSDCommand(sql);
+    rs = RSDRecordset(cmd);
+
+    while (rs and rs.movenext())
+        return int(rs.value("t_fiid"))
+    end;
+end;
+
+// @desc  : вставляем драг. металы в справочник, если их нет
+private macro InsertFI (fiid, fi_code, name)         // InsertFI (getNumFiid(), trim (m_kod), m_name_rus)
+var sql, cmd, rs;
+       //debugbreak;
+        sql = " Select 1 "
+              " from dfininstr_dbt "
+              " where t_fi_code = :fi_code ";
+        cmd = RSDCommand(sql);
+        cmd.AddParam ("fi_code", RSDBP_IN, fi_code);
+        cmd.Execute;
+        rs = RSDRecordset (cmd);
+        if (rs and not rs.movenext())
+            sql = " INSERT INTO darticle_dbt "                                                            +
+                  " (t_fiid, t_measurecode, t_qty, t_reserve ) "                                          +
+                  " VALUES (:fiid, 163, 1, CHR (1)) ";                                                    
+            cmd = RSDCommand(sql);
+            cmd.AddParam ("fiid", RSDBP_IN, fiid);
+            cmd.Execute; 
+            
+           sql = " INSERT INTO dfininstr_dbt  "                                                           +
+                  "            (t_fiid, t_fi_code, t_fi_kind, t_avoirkind, t_name, t_definition, "        +
+                  "             t_codeinaccount, t_iso_number, t_ccy, t_issuer, t_issued, "               +
+                  "             t_settlement_code, t_facevaluefi, t_facevalue, t_parentfi,"               +
+                  "             t_drawingdate, t_expirydate, t_isclosed, t_userfield1, "                  +
+                  "             t_userfield2, t_userfield3, t_userfield4, t_isinverse, t_scale, "         +
+                  "             t_point, t_issys, t_isadditional, t_mainfiid, t_sumprecision, "           +
+                  "             t_isgeneralized, t_generalizedfiid, t_reserve, t_duration, "              +
+                  "             t_typeduration ) "                                                        +
+                  " VALUES (:fiid, :fi_code1, 6, 0, :name, CHR (1), "                                      +
+                  "         :fi_code2, 0, CHR (0), -1, '01.01.0001', "                                     +
+                  "         0, 0, 0, 0, "                                                                 +
+                  "         '01.01.0001', '01.01.0001', CHR (0), CHR (1), "                               +
+                  "         CHR (1), CHR (1), CHR (1), CHR (0), 0, "                                      +
+                  "         0, CHR (0), CHR (0), -1, 2, "                                                 +
+                  "         CHR (0), -1, CHR (0), 0, "                                                    +
+                  "         0 ) ";                                                                        
+
+            cmd = RSDCommand(sql);
+            cmd.AddParam ("fiid", RSDBP_IN, fiid);
+            cmd.AddParam ("fi_code1", RSDBP_IN, fi_code);
+            cmd.AddParam ("name", RSDBP_IN, name);
+            cmd.AddParam ("fi_code2", RSDBP_IN, fi_code); 
+            cmd.Execute;
+        end;
+end;
+
+
+/*** Описатель импортируемого курса ***/
+private class TDBFRecord (_kod, _dat, _quote_buy, _quote_sell, _name_rus)
+    var m_kod           = _kod;        // ISO-код финансового инструмента
+// Алешин В.В. 22.06.2012 в файле курсов, передаваемом в банк указана дата принятия курса, а не дата начала действия
+// Сверял с курсами с сайта www.cbr.ru.
+    var m_dat           = _dat+1;      // дата начала действия курса
+    var m_quote_buy     = _quote_buy;  // курс покупки
+    var m_quote_sell    = _quote_sell; // курс продажи 
+    var m_name_rus      = _name_rus;   // наименование на русском языке
+    
+    var m_no_error_flag     = false;   // флаг "нет ошибки импорта". По умолчанию - ошибка импорта есть (false).
+    var m_import_error_desc = "";      // описание ошибки
+    
+    // @desc  : Вставка записи о курсе драгметалла
+    // @return: true - если все хорошо; 
+    macro insertRateInfo ()
+        record  rt_parm (rateparm); 
+        
+        private const RT_TYPE_CB       = 7;       // вид курса = "курс ЦБ"
+        private const FI_NATCUR        = "810";   // dfininstr_dbt.t_fi_type для RUR
+        
+        private const SET_CHAR   = "X";
+        private const UNSET_CHAR = "\0";
+
+        private var sql, cmd, rs;
+        
+        if (m_quote_buy)
+            rt_parm.FI_Code    = FI_NATCUR;
+            rt_parm.OtherFI    = trim (m_kod);
+            rt_parm.Rate       = money (m_quote_buy) * 10000;
+        else 
+            rt_parm.FI_Code    = trim (m_kod);
+            rt_parm.OtherFI    = FI_NATCUR;
+            rt_parm.Rate       = money (m_quote_sell) * 10000;
+        end;
+
+        rt_parm.IsInverse  = UNSET_CHAR;
+        rt_parm.IsDominant = SET_CHAR;
+        rt_parm.Type       = RT_TYPE_CB;
+        rt_parm.Scale      = 1;
+        rt_parm.Point      = 4;
+        rt_parm.SinceDate  = m_dat;
+
+        InsertFI (getNumFiid(), string(trim (m_kod)), string(trim(m_name_rus)));
+
+        var err = УстановитьКурс (rt_parm);
+        m_no_error_flag = (err == 0); // true, если УстановитьКурс = 0
+        
+        // ошибки импорта
+        var errCode = makeArray ("",                                           // 0
+                                 "Не найдена котируемая валюта",               // 1
+                                 "Не найдена базовая валюта",                  // 2
+                                 "Не найден вид курса для текущей валюты" );   // 3 
+        m_import_error_desc = errCode (err);
+        return m_no_error_flag;
+    end;
+
+   end;
+
+/*** Класс для выполнения операций с файлом курсов драг. металлов ***/
+private class TFILoader ()
+
+    private var m_fullPath;       // полный путь к файлу курсов
+
+    const m_DbfFileName   = "METCOURS.DBF"; // файл-справочник курсов (*.DBF)
+    const m_extensionMask = "*.FGN";        // маска архива (default *.FGN) 
+
+    var m_directory;       // имя папки
+    var m_fileName;        // имя файла (без расширения) 
+    var m_fileExtension;   // расширение (всегда *.fgn)
+    
+    var rec_err     = TArray (); // отбракованные записи
+    var rec_success = TArray (); // вставленные записи  
+    
+    // @desc  : Выбор имени файла из диалогового окна
+    // @return: true - если выбрали; false - если отказались от выбора
+    macro getFileName ()
+        var retVal = false;
+
+        var ob = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+        var ex = ob.CreateComObject ("Excel.Application");
+        // if (retVal = selectFile (m_fullPath, m_extensionMask))
+        if (m_fullPath = ex.application.GetOpenFileName ("Файлы (*.FGN),*.FGN", null, "Выберите файл для загрузки"));
+            m_directory = splitFile (m_fullPath, m_fileName, m_fileExtension);
+            retVal = True;
+        end;
+       
+       return retVal;
+
+    onError
+        raiseApplicationError ("Невозможно открыть файл. Необходимо завершить | все процессы Microsoft Office в диспетчере задач | и повторить загрузку");
+    end;
+
+    // @desc  : Определение расположения архива-справочника
+    // @return: true - файл на СП ,false - файл на терминале
+    macro StrPath (str)
+        if (substr(trim(str),1,1) == "\\")
+            return true;
+        else 
+            return false;
+        end;
+    end;
+
+    // @desc  : Копирование архива файла справочника (*.FGN) на СП если он находится на терминале
+    // @return: true - если скопировалось уcпешно, false - если файл-справочник уже на СП
+    macro FileCopy () 
+    var retVal=  True; 
+    var copy;
+    //msgbox(temppath);
+    temppath = temppath + "\\" + m_fileName + m_fileExtension;
+       if (not StrPath(m_fullPath))
+           m_fullPath ="$" + m_fullPath;                                   
+           if ( not CopyFile( m_fullPath, temppath))
+               retVal = False;
+           end;
+       else
+          debugbreak;
+           if (substr(m_fullPath,1,8) == substr(temppath,1,8))
+               copy = run (GetEnv("COMSPEC"),"/c copy "+ m_fullPath  +","+ temppath);
+               if (copy == 0)
+                   retVal = True;    
+               end;
+           else
+               m_fullPath ="$" + m_fullPath;
+               if ( not CopyFile( m_fullPath, temppath))
+                   retVal = False;
+               end;
+           end;
+
+       end;
+       m_directory = splitFile (temppath, m_fileName, m_fileExtension);
+       return retVal;
+    end;
+    
+    // @desc  : Распаковка файла (файл поставляется запакованным архиватором arj)
+    // @return: true - если распаковщик вывалился с кодом возврата 0 (EXIT_SUCCESS)
+    macro extractFile ()
+    var retVal = run ("arj32.exe", string ("e -y ", temppath, " ", m_directory));
+        return (retVal == 0);
+    end;
+    
+    // @desc  : Чтение записи курса драг. металла
+    // @return: true - если все хорошо, false - при ошибке
+    macro readFiRate ()
+        file    m_dbf () dbf;
+
+        var fi:TDBFRecord;
+        fname = string (m_directory, m_DbfFileName);
+        
+        if (not open(m_dbf, fname))
+            return false;
+        end;
+        
+        rewind (m_dbf);
+        while (next (m_dbf))
+            fi   = TDBFRecord (m_dbf.KOD, m_dbf.DAT, m_dbf.QUOTE_BUY, m_dbf.QUOTE_SELL, m_dbf.NAME_RUS);
+            
+            // если при вставке произошли ошибки - заполняем массив ошибок
+            // если ошибок нет - заполняем массив успешно вставленных записей
+            if (fi.insertRateInfo () != true)
+                rec_err (rec_err.size ()) = fi;
+            else
+                rec_success (rec_success.size ()) = fi;
+            end;
+        end;
+        
+        close (m_dbf);
+        return true;
+    end;
+
+    // @desc  : Формирование протокола
+    // @return: void
+    macro viewProtocol ()
+        var table = CTableReport ();
+        var i = 0;
+        
+        [##########################################################################################] ("Протокол загрузки курсов драгоценных металлов":c:40);
+        [                                                                       Пользователь: #####] ({oper});
+        [                                                       Дата: ########### Время: ##########] (date (), time ());
+        [                                                                                          ];
+        // печать ошибок
+        if (rec_err.size ())
+            table.addColumn ("Код",           5, AL_CENTER); 
+            table.addColumn ("Дата",         10, AL_CENTER);
+            table.addColumn ("Курс продажи",  8, AL_CENTER);
+            table.addColumn ("Курс покупки",  8, AL_CENTER);
+            table.addColumn ("Наименование", 20, AL_CENTER);
+            table.addColumn ("Ошибка",       20, AL_CENTER);
+            table.printHead (string ("Ошибки загрузки":c:40));
+    
+            i = 0;
+            while (i < rec_err.size ())
+                table.printStringTransferByWord (rec_err[i].m_kod, 
+                                                 rec_err[i].m_dat, 
+                                                 rec_err[i].m_quote_buy, 
+                                                 rec_err[i].m_quote_sell, 
+                                                 rec_err[i].m_name_rus, 
+                                                 rec_err[i].m_import_error_desc);
+                i = i + 1;
+            end;
+            
+            table.printBottom ();
+        else
+            println ("Ошибок нет")
+        end;
+        
+        if (rec_success.size ())
+            table.addColumn ("Код",           5, AL_CENTER); 
+            table.addColumn ("Дата",         10, AL_CENTER);
+            table.addColumn ("Курс продажи",  8, AL_CENTER);
+            table.addColumn ("Курс покупки",  8, AL_CENTER);
+            table.addColumn ("Наименование", 20, AL_CENTER);
+            table.printHead (string ("Успешно загружены следующие курсы":c:40));
+            
+            i = 0;
+            while (i < rec_success.size ())
+                table.printStringTransferByWord (rec_success [i].m_kod, 
+                                                 rec_success [i].m_dat, 
+                                                 rec_success [i].m_quote_buy, 
+                                                 rec_success [i].m_quote_sell, 
+                                                 rec_success [i].m_name_rus);
+                i = i + 1;
+            end;
+            
+            table.printBottom ();
+        else
+            println ("Ни один курс не был успешно загружен");
+        end;
+        
+    end;
+    
+    /*** конструктор ***/
+    macro init ()
+          temppath = getStringRegVal("BANK_INI/ОБЩИЕ ПАРАМЕТРЫ/ДИРЕКТОРИИ/TEXTDIR");
+    end;
+
+    init ();
+end;
+
+private macro main ()
+    var f = TFILoader ();
+    
+    /* 1. Выбираем файл */
+    if (not f.getFileName ())
+        raiseApplicationError ("Файл не выбран. Процедура импорта прервана");
+    end;
+
+    /* 2. Копируем файл на СП */
+    if (not f.FileCopy ())
+        raiseApplicationError ("Файл на СП не скопирован.");
+    end; 
+
+    /* 3. Извлекаем из файла *.DBF */
+    if (not f.extractFile ()) 
+        raiseApplicationError ("Ошибка при распаковке файла");
+    end;
+    
+    /* 4. Читаем DBF */
+    if (not f.readFiRate ()) 
+        raiseApplicationError ("Ошибка открытия файла *.DBF");
+    end;
+
+    /* 5. Формируем протокол операции */
+    f.viewProtocol ();
+
+    /* 6. Удаляем "ненужные" файлы (*.DBF, *.FGN)*/
+    RemoveFile(fname);
+    RemoveFile(temppath);
+end;
+
+// Вход здесь.
+main ();
+

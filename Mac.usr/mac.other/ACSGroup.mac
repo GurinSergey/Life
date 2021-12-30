@@ -1,0 +1,542 @@
+/*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG 02.09.2010   Функционал  для работы с пользователями и  группами (добавление,
+                    удаление пользователей в/из групп, просмотр списка пользователей
+                    в группе.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+import cb_sql, globals;
+
+  var stat, regGroups, errCode, DialogueRezult;
+  var ind = 0, Repline = 0;
+
+  const ACTION_INSERT_USER  = 0,
+        ACTION_DELETE_USER  = 1,
+        ACTION_INSERT_GROUP = 2,
+        ACTION_DELETE_GROUP = 3,
+        WORK_USERS    = 0,
+        WORK_GROUPS   = 1,
+        WORK_EXIT     = 2;
+
+  /* ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ */
+  
+  macro AddColumn( col, fld, head, width )
+     Col.value( ind * 6 + 0 ) = fld;  // fieldName
+     Col.value( ind * 6 + 1 ) = head; // header 
+     Col.value( ind * 6 + 2 ) = width; // width
+     Col.value( ind * 6 + 3 ) = 2;    // fldType (2 = FBT)
+     Col.value( ind * 6 + 4 ) = null; // decPoint
+     Col.value( ind * 6 + 5 ) = 0;    // reserv
+     ind = ind + 1;
+  end;
+
+
+  macro GetNames( UserID, GroupID, UsName:@String, GrName:@String )
+    var rs, Command;
+
+    Command = " Select t_Name From DAcsGroup_dbt " +
+              "  Where t_GroupID = " + GroupID;
+    rs = rsdRecordSet( Command );
+    if ( rs and rs.MoveNext )
+       GrName = rs.Value(0, null, V_STRING);
+    end;
+
+    Command = " Select t_Name From DPerson_dbt " +
+              "  Where t_Oper = " + UserID;
+    rs = rsdRecordSet( Command );
+    if ( rs and rs.MoveNext )
+       UsName = rs.Value(0, null, V_STRING);
+    end;
+
+  end;
+
+  /* END ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ */
+
+
+
+  /* ФУНКЦИИ ПЕЧАТИ ОТЧЁТА */
+  
+  MACRO PrintReportHeader()
+
+     [
+             Отчёт о редактировании групп пользователей
+
+         Дата:         #
+         Операционист: #
+
+
+         Выполненные действия:
+
+     ]( {CurDate}, {oper} + " " + {Name_Oper} )
+
+  END;
+
+
+  MACRO PrintReportLine( Action, UserID, GroupID )
+    var UserName, GroupName;
+
+    GetNames( UserID, GroupID, @UserName, @GroupName );
+
+    Repline = Repline + 1;
+
+    if ( Action == ACTION_INSERT_GROUP )
+       println ("\t", Repline, "\t Для пользователя № " + UserID + " " + UserName + " добавлена группа № " + GroupID + " \"" + GroupName + "\".");
+    elif ( Action == ACTION_DELETE_GROUP )
+       println ("\t", Repline, "\t У пользователя № " + UserID + " " + UserName + " удалена группа № " + GroupID + " \"" + GroupName + "\".");
+    elif ( Action == ACTION_INSERT_USER )
+       println ("\t", Repline, "\t В группу № " + GroupID + " \"" + GroupName + "\" добавлен пользователь № " + UserID + " " + UserName + ".");
+    elif ( Action == ACTION_DELETE_USER )
+       println ("\t", Repline, "\t Из группы № " + GroupID + " \"" + GroupName + "\" удален пользователь № " + UserID + " " + UserName + ".");
+    end;
+
+  END;
+
+
+  MACRO PrintReportFooter()
+
+     printLn("\n\n\n");
+     printLn("Операционист"," ___________________ ", {Name_Oper});
+     printLn({Name_Book}," ___________________ ", {FIO_Book});
+     printLn({Name_Boss}," ___________________ ", {FIO_Boss});
+     printLn("\n\n\n");
+  END;
+
+  /* END ФУНКЦИИ ПЕЧАТИ ОТЧЁТА */
+
+
+  /* ФУНКЦИИ ВСТАВКИ / УДАЛЕНИЯ ГРУППЫ / ПОЛЬЗОВАТЕЛЯ */
+
+  MACRO UpdatePrivilStatus( UserID )
+    var Command;
+
+    /* Для того, чтобы произошло заимствование привилегий из группы (или удаление привилегий при удалении п-ля из группы), 
+       необходимо очистить поле t_IsValid значений всех привилегий этого пользователя. Тогда при первом обращении к привилегиям 
+       пользователя система сама обновит все значения. */
+    Command = RSDCommand( " Update DAcsOperRest_dbt Set t_IsValid = CHR (0) Where t_Oper = " + UserID );
+    Command.Execute();
+    
+  END;
+  
+  
+  MACRO GroupAdd( UserID, GroupID, Action )
+    var Command;
+
+    /* Сначала удалим у клиента те группы, назначенные ему ранее, которые являются родительскими для назначаемой сейчас дочерней группы
+       (они добавятся следующим Inser-ом, но уже с признаком IsInherited) */
+    Command = RSDCommand( " Delete From DAcsGroupOper_dbt Where t_GroupID in " +
+                          "        ( Select t_ParentID From DAcsGroupLink_dbt Where t_GroupID = " + GroupID + 
+                          "                                                     and t_Oper    = " + UserID  + ") ");
+    Command.Execute();
+
+    
+    /* Добавление выбранной группы, а также родительской группы, если включение пользователя происходит в подгруппу */
+    Command = RSDCommand( " Insert Into DAcsGroupOper_dbt " +
+                          "        ( Select t_GroupID,  " + UserID + ", CHR (0)  From DAcsGroup_dbt     Where t_GroupID = " + GroupID +
+                          "          Union all " +
+                          "          Select t_ParentID, " + UserID + ", CHR (88) From DAcsGroupLink_dbt Where t_GroupID = " + GroupID + ") ");
+    Command.Execute();
+  
+    UpdatePrivilStatus( UserID );
+
+    PrintReportLine( Action, UserID, GroupID );
+  END;
+
+
+  MACRO GroupDelete( UserID, GroupID, Action )
+
+    var rs, Command;
+    var GrName = "", UsName = "";
+
+    /* Проверим, не включен ли пользователь в удаляемую группу неявно (т.е. включался он не в саму эту группу,
+       а в дочернюю для неё, и эта группа добавилась автоматически) - IsInherited = "X" */
+    Command = " Select t_IsInherited From DAcsGroupOper_dbt " +
+              "  Where t_GroupID = " + GroupID +
+              "    and t_Oper    = " + UserID;
+    rs = rsdRecordSet( Command );
+    if ( rs and rs.MoveNext )
+       if ( rs.Value(0, null, V_STRING) == StrFor(88)/*X*/ )
+          Command = " Select t_Contents From DBank_msg Where t_Number = 21753 "; /* Пользователь включен в группу неявно */
+          rs = rsdRecordSet( Command );
+          if ( rs and rs.MoveNext )
+             msgbox ("Сообщение № " + 21753 + " \"" + rs.Value(0, null, V_STRING) + "\"");
+          else
+             msgbox ("Пользователь включен в группу неявно");
+          end;
+
+          return false;
+       end;
+    end;
+       
+    
+    /* Задаём сакраментальный вопрос */
+
+    /* Сначала данные для него */
+    GetNames( UserID, GroupID, @UsName, @GrName );
+
+    if ( getTrue( true, "Вы действительно хотите удалить пользователя " + UsName +
+                        " из группы \"" + GrName + "\"?") )
+
+       /* Удаляется запись о самой удаляемой группе */
+       Command = RSDCommand( " Delete From DAcsGroupOper_dbt Where t_GroupID = " + GroupID +
+                             "                                 and t_Oper    = " + UserID );
+       Command.Execute();
+
+
+       /* Если удаляемая группа имеет родительские группы, удаляются и они */
+       Command = RSDCommand( " Delete From DAcsGroupOper_dbt Where t_GroupID in " +
+                             "        ( Select t_ParentID From DAcsGroupLink_dbt Where t_GroupID = " + GroupID + 
+                             "                                                     and t_Oper    = " + UserID  + ") ");
+       Command.Execute();
+
+       UpdatePrivilStatus( UserID );
+
+       PrintReportLine( Action, UserID, GroupID );
+       return true;
+    end;
+
+    return false;
+  END;
+
+  /* END ФУНКЦИИ ВСТАВКИ / УДАЛЕНИЯ ГРУППЫ / ПОЛЬЗОВАТЕЛЯ */
+
+
+  /* ФУНКЦИИ СО СКРОЛЛИНГАМИ */
+
+  MACRO AddGroupForUser( UserID )
+     var rs, query, cols = TArray;
+     var GroupAdded = false;
+
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 13 /*Enter*/))
+
+           if ( GetTrue( true, "Добавить группу № " + rs.value("gId") + "?" ) );
+              GroupAdd( UserID, rs.value("gId"), ACTION_INSERT_GROUP );
+              GroupAdded = true;
+              return CM_CANCEL;
+           end;
+
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка групп:|"+rsldefenv.error(0).descr);
+
+     end;
+
+
+     GetRegistryValue( "PRBB\\СЕРВИС ГКБО\\РАЗРЕШЕННЫЕ ГРУППЫ", V_STRING, regGroups, errCode );
+     if ( (errCode > 0) or (strLen(regGroups) == 0) )
+        msgbox ("К сожалению, вам запрещено включать пользователей в группы.\n" +
+                "Значение параметра \"PRBB\\СЕРВИС ГКБО\\РАЗРЕШЕННЫЕ ГРУППЫ\" = " + "\"" + regGroups+ "\".");
+        return CM_IGNORE;
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "gId",      "Группа",       10); 
+     AddColumn(cols, "gName",    "Наименование", 50);
+     AddColumn(cols, "gComment", "Описание",     50);
+
+
+     query = " Select gr.t_GroupID gId, gr.t_Name gName, gr.t_Comment gComment " +
+             "   From DAcsGroup_dbt gr " +
+             "  Where Instr( " + GetSQLString( regGroups ) + ", gr.t_GroupID ) > 0 " +
+             "    and not exists ( Select 1 From DAcsGroupOper_dbt " +
+             "                      Where t_GroupID = gr.t_GroupID " +
+             "                        and t_Oper    = " + UserID + ") " +
+             "  Order By gId ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        RunScroll( rs, ind, cols, "acsAddGroup", @EvProc, "Добавление группы ", "ENTER Выбор ", true, /*X*/12, /*Y*/10, null, null );
+
+     end;
+
+     return GroupAdded;
+  END;
+
+
+  MACRO AddUserToGroup( GroupID )
+     var rs, query, cols = TArray;
+     var UserAdded = false;
+
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 13 /*Enter*/))
+
+           if ( GetTrue( true, "Добавить пользователя № " + rs.value("Oper") + " в группу № " + GroupID + "?" ) );
+              GroupAdd( rs.value("Oper"), GroupID, ACTION_INSERT_USER );
+              UserAdded = true;
+              return CM_CANCEL;
+           end;
+
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка групп:|"+rsldefenv.error(0).descr);
+
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "Oper", "Номер", 5); 
+     AddColumn(cols, "Name", "Фио",   35);
+
+     query = " Select t_Oper Oper, t_Name Name From DPerson_dbt pers " +
+             "  Where pers.t_UserClosed <> CHR(88) " +
+             "    and pers.t_UserBlocked <> CHR(88) " +
+             "    and not exists ( Select 1 From DAcsGroupOper_dbt " +
+             "                      Where t_GroupID = " + GroupID +
+             "                        and t_Oper    = pers.t_Oper) " +
+             "  Order By Oper ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        RunScroll( rs, ind, cols, "acsAddUser", @EvProc, "Добавление пользователя ", "ENTER Выбор ", true, /*X*/null, /*Y*/10, null, null );
+
+     end;
+
+     return UserAdded;
+  END;
+  
+  
+  MACRO ShowUserGroups( UserID )
+     var rs, query, cols = TArray;
+
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 338 /*Insert*/))
+
+           if ( AddGroupForUser( UserID ) )
+              return CM_CANCEL;
+           else
+              return CM_IGNORE;
+           end;
+           
+        elif ((cmd == DLG_KEY) and (key == 339 /*Delete*/))
+
+           if ( GroupDelete( UserID, rs.Value("Id", null, V_INTEGER), ACTION_DELETE_GROUP ) )
+              return CM_CANCEL;
+           else
+              return CM_IGNORE;
+           end;
+           
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка групп:|"+rsldefenv.error(0).descr);
+
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "Id" ,  "Группа",       10); 
+     AddColumn(cols, "Name", "Наименование", 63);
+
+     query = " Select gr.t_GroupID Id, gr.t_Name Name " +
+             "   From DAcsGroup_dbt gr, DAcsGroupOper_dbt opgr " +
+             "  Where opgr.t_Oper = " + UserID +
+             "    and gr.t_GroupID = opgr.t_GroupID " +
+             "  Order by Id ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        RunScroll( rs, ind, cols, "acsUsGroups", @EvProc, "Группы пользователя " + UserID, "Insert Добавить  Delete Удалить", true, /*X*/null, /*Y*/null, null, null );
+
+     end;
+
+  END;
+
+
+  MACRO ShowGroupUsers( GroupID )
+     var rs, query, cols = TArray;
+
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 338 /*Insert*/))
+
+           if ( AddUserToGroup( GroupID ) )
+              return CM_CANCEL;
+           else
+              return CM_IGNORE;
+           end;
+           
+        elif ((cmd == DLG_KEY) and (key == 339 /*Delete*/))
+
+           if ( GroupDelete( rs.Value("Oper", null, V_INTEGER), GroupID, ACTION_DELETE_USER ) )
+              return CM_CANCEL;
+           else
+              return CM_IGNORE;
+           end;
+           
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка групп:|"+rsldefenv.error(0).descr);
+
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "Oper", "Номер", 10); 
+     AddColumn(cols, "Name", "ФИО",   63);
+
+     query = " Select pers.t_Oper Oper, pers.t_Name Name " +
+             "   From DAcsGroupOper_dbt opgr, DPerson_dbt pers " +
+             "  Where opgr.t_GroupID = " + GroupID +
+             "    and pers.t_Oper = opgr.t_Oper " +
+             "  Order by Oper ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        RunScroll( rs, ind, cols, "acsGroupUsers", @EvProc, "Пользователи группы " + GroupID, "Insert Добавить  Delete Удалить", true, /*X*/null, /*Y*/null, null, null );
+
+     end;
+
+  END;
+
+  
+  MACRO ShowUsersList()
+     var rs, query, cols = TArray;
+  
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 13 /*Enter*/))
+
+           ShowUserGroups( rs.value("Oper") );
+
+           
+           return CM_IGNORE;
+
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка пользователей:|"+rsldefenv.error(0).descr);
+
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "Oper", "Номер", 5); 
+     AddColumn(cols, "Name", "Фио",   35);
+
+
+     query = " Select t_Oper Oper, t_Name Name From DPerson_dbt " +
+             "  Where t_UserClosed <> CHR(88) " +
+             "    and t_UserBlocked <> CHR(88) " +
+             "  Order By Oper ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        //RunScroll( rs, ind, cols, "acsUsers", @EvProc, "Список пользователей: ", "ENTER Группы пользователя", true, /*X*/null, /*Y*/null, null, null );
+        RunScroll( rs, ind, cols, "acsUsers", @EvProc, "Пожалуйста, выберите пользователя: ", "ENTER Группы пользователя", true, /*X*/null, /*Y*/null, null, null );
+
+     end
+
+  END;
+
+
+  MACRO ShowGroupsList()
+     var rs, query, cols = TArray;
+  
+     macro EvProc (rs, cmd, id, key)
+
+        if ((cmd == DLG_KEY) and (key == 13 /*Enter*/))
+
+           ShowGroupUsers( rs.value("Id") );
+           
+           return CM_IGNORE;
+
+        end;
+
+        onerror(er)
+           msgbox("Ошибка построения и обработки списка пользователей:|"+rsldefenv.error(0).descr);
+
+     end;
+
+     GetRegistryValue( "PRBB\\СЕРВИС ГКБО\\РАЗРЕШЕННЫЕ ГРУППЫ", V_STRING, regGroups, errCode );
+     if ( (errCode > 0) or (strLen(regGroups) == 0) )
+        msgbox ("К сожалению, вам запрещено работать с группами пользователей.\n" +
+                "Значение параметра \"PRBB\\СЕРВИС ГКБО\\РАЗРЕШЕННЫЕ ГРУППЫ\" = " + "\"" + regGroups+ "\".");
+        return CM_IGNORE;
+     end;
+
+
+     ind  = 0;
+     cols = null;
+     cols = TArray();
+
+     AddColumn(cols, "Id" ,  "Группа",       6); 
+     AddColumn(cols, "Name", "Наименование", 50);
+
+     query = " Select gr.t_GroupID Id, gr.t_Name Name " +
+             "   From DAcsGroup_dbt gr " +
+             "  Where Instr( " + GetSQLString( regGroups ) + ", gr.t_GroupID ) > 0 " +
+             "  Order by Id ";
+
+     rs = rsdRecordSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     if ( rs )
+
+        //RunScroll( rs, ind, cols, "acsGroups", @EvProc, "Управление группами", "ENTER Пользователи группы", true, /*X*/null, /*Y*/null, null, null );
+        RunScroll( rs, ind, cols, "acsGroups", @EvProc, "Пожалуйста, выберите группу:", "ENTER Пользователи группы", true, /*X*/null, /*Y*/null, null, null );
+
+     end
+
+  END;
+  
+  /* END ФУНКЦИИ СО СКРОЛЛИНГАМИ */
+
+
+  MACRO ShowMainDialogue()
+
+     var msg = TArray(),
+         buttons = TArray();
+
+     msg(0) = "Пожалуйста, ввыберите режим администрирования:";
+     buttons(0) = "Работа с группами пользователя";
+     buttons(1) = "Работа с пользователями группы";
+     buttons(2) = "Выход";
+
+     return ConfWin( msg, buttons );
+  
+  END;
+
+
+  /* ТОЧКА ВХОДА */
+  
+  PrintReportHeader();
+
+  DialogueRezult = ShowMainDialogue();
+  while( DialogueRezult != WORK_EXIT )
+     if (DialogueRezult == WORK_USERS)
+        ShowUsersList();
+     elif (DialogueRezult == WORK_GROUPS)
+        ShowGroupsList();
+     end;
+     DialogueRezult = ShowMainDialogue();
+  end;
+
+  PrintReportFooter();
+
+     
+  //exit (1);

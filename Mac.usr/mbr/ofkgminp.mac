@@ -1,0 +1,2074 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация сообщения по INFP                                              */
+/*                                                                          */
+/*  Имя файла: ofkgminp.mac                                                 */
+/*   Создан:  17.12.12                                    Лазаренко М.      */
+/*  Изменен:  TAM 08.10.2013  C-24082                                       */
+/*            Chesnokov D.S. 30.06.2015 Адаптация под ГИС ГМП 1.16          */
+/****************************************************************************/
+
+import "wlgenmes.mac", FIInter, OprInter, WldInter, PaymInter, "xmlmestools.mac",
+       "bnk_ptlib.mac", "pmlib.mac", "fm_util.mac";
+
+FILE pspaydem( "pspaydem.dbt" ) key 0;
+
+// получить системную дату
+macro GetSysDate():string
+  var day, mon, year, str;
+
+  DateSplit( date(), day, mon, year );
+  if( day < 10 )
+    day = "0"+string( day );
+  else
+    day = string( day );
+  end;
+
+  if ( mon < 10 )
+    mon = "0"+string( mon );
+  else
+    mon = string( mon );
+  end;
+  str = SubStr( string(year), 3 ) + mon + day ;
+  return str;
+end;
+
+// сформировать ID платежа
+private macro FormPaymentID( BIC:string, OperNode:string, ObjKind:integer, ObjID:integer ):string
+
+  var PaymentID:string = "",
+      refer:string = "";
+  
+  PaymentID = "1" + BIC;
+  if( StrLen(OperNode) > 6 )
+    PaymentID = PaymentID + substr( OperNode, StrLen(OperNode) - 5 );
+  else
+    PaymentID = PaymentID + strLpad( OperNode, 6, "0" );
+  end;
+  GetGGPaymentRefer( 232, refer, ObjKind, ObjID );
+  PaymentID = PaymentID + refer;
+  
+  return PaymentID;
+end;
+
+// формат даты ДДММГГГГ
+private macro ДатаДДММГГГГ( Дата )
+  if( Дата == date(0,0,0) )
+    return "";
+  end;
+  var День, Месяц, Год;
+  
+  datesplit( Дата, День, Месяц, Год );
+  if( День  < 10 )   День  = String( "0", день  );  end;
+  if( Месяц < 10 )   Месяц = String( "0", месяц );  end;
+
+  return String( Год, "-", Месяц, "-", День  );
+end;
+
+private macro GetFieldFromText( text:string, field:string ):string
+
+  var temp:string = "";
+  var symbnum:integer = 0;
+  var textlen:integer = 0;
+
+  symbnum = Index(text, field + ":");  
+  temp = subStr( text, symbnum );
+  textlen = Index( temp, "\n") - Index(temp, field + ":") - StrLen(field) - 1; 
+  temp = substr( temp, Index(temp, field + ":") + StrLen(field) + 1, textlen );
+  
+  return  Trim( temp );
+
+end;
+
+// найти код субъекта по ID и виду кода
+private macro FindPartCode( PartyID:integer, CodeKind:integer ):string
+
+  var query = "select part.t_Code part" +
+              "  from dpartcode_dbt part " +
+              " where part.t_PartyID = " + PartyID +
+              "   and part.t_CodeKind = " + CodeKind;
+  var rs:RsdRecordset = execSQLselect(query);
+  if (rs and rs.moveNext() )
+    return rs.value(0);
+  else
+    return "";
+  end;
+end;
+
+// найти наименование субъекта по ID
+private macro FindPartName( PartyID:integer ):string
+
+  var query = "select part.t_Name part" +
+              "  from dparty_dbt part " +
+              " where part.t_PartyID = " + PartyID;
+  var rs:RsdRecordset = execSQLselect(query);
+  if (rs and rs.moveNext() )
+    return rs.value(0);
+  end;
+end;
+
+private macro GetPaperType( PaperKind:integer ):string
+
+  if( PaperKind == 0 )
+    return "01";
+  elif( PaperKind == 4 )
+    return "02";
+  elif( PaperKind == 15 )
+    return "03";
+  elif( ( PaperKind == 1 ) or ( PaperKind == 1 ) )
+    return "04";
+  elif( ( PaperKind == 2 ) or ( PaperKind == 16 ) )
+    return "05";
+  elif( PaperKind == 14 )
+    return "06";
+  elif( PaperKind == 9 )
+    return "07";
+  elif( PaperKind == 11 )
+    return "08";
+  elif( PaperKind == 5 )
+    return "09";
+  elif( PaperKind == 20 )
+    return "10";
+  elif( PaperKind == 13 )
+    return "11";
+  elif( PaperKind == 23 )
+    return "12";
+  elif( PaperKind == 7 )
+    return "13";
+  end;
+  return "00";
+end;
+
+private macro GetPaperSerNumb( Series:string, Number:string ):string
+
+  if( IsDigitalNumber( Series ) )
+    Series = StrUpr(Series);
+  end;
+  var tmpstr = Series + Number;
+  var pos = 0;
+  while( pos = index(tmpstr, "_") )
+    tmpstr = SubStr(tmpstr,1,pos-1) + SubStr(tmpstr,pos+1);
+  end;
+  if( StrLen(tmpstr) < 20 )
+    strLpad( tmpstr, 20, "0" );
+  elif( StrLen(tmpstr) > 20 )
+    tmpstr = Number;
+    if( StrLen(tmpstr) < 20 )
+      strLpad( tmpstr, 20, "0" ); 
+    end;
+  end;
+  return tmpstr;
+end;
+
+private macro GetEmployer( ID ) : string
+  var query_persn = "select persn.t_IsEmployer " +
+                    "  from dparty_dbt part, dpersn_dbt persn " +
+                    " where part.t_PartyID = " + ID +
+                    "   and part.t_PartyID = persn.t_PersonID ";
+  var rs_persn:RsdRecordset = execSQLselect(query_persn);
+  if( rs_persn and rs_persn.moveNext() )
+    return rs_persn.value(0);
+  end;
+  return "";
+end;
+
+// сформировать ID плательщика
+private macro PayerIDForm( PayerID:integer ):string
+
+  var PayerIdentifier:string = "";
+  var INN:string = "", KPP:string = "";
+  var Code:string = "";
+
+  Code = FindPartCode( PayerID, 16 );
+  if( Code == "" )
+    return "";
+  end;
+  
+  var query_party = "select part.t_LegalForm, part.t_NotResident, part.t_NRCountry part" +
+                    "  from dparty_dbt part " +
+                    " where part.t_PartyID = " + PayerID;
+  var rs_party:RsdRecordset = execSQLselect(query_party);
+  if( rs_party and rs_party.moveNext() )
+    if( rs_party.Value(0) == 1 ) // ЮрЛицо
+      if( rs_party.Value(1) == "X" )
+        PayerIdentifier = "3";
+      else
+        PayerIdentifier = "2";
+      end;
+      INN = RemoveKPP( GetPartyINN( PayerID, 1 ) );
+      PayerIdentifier = PayerIdentifier + INN;
+      KPP = RemoveINN( GetPartyINN( PayerID, 1 ) );
+      PayerIdentifier = PayerIdentifier + KPP;
+    end;
+    if( rs_party.Value(0) == 2 ) // ФизЛицо
+      if( GetEmployer( PayerID ) == "X" )
+        PayerIdentifier = "4" + SubStr( RemoveKPP(GetPartyINN(PayerID, 1)), 1 );
+      else
+        if( StrLen( GetPartyINN( PayerID, 1 ) ) > 0 ) 
+          PayerIdentifier = "21";
+          INN = RemoveKPP( GetPartyINN( PayerID, 1 ) );
+          PayerIdentifier = PayerIdentifier + strLpad( INN, 20, "0" );
+          if( rs_party.Value(1) == "X" )
+            if( rs_party.Value(2) == "" )
+              PayerIdentifier = PayerIdentifier + "999";
+            else
+              PayerIdentifier = PayerIdentifier + rs_party.Value(2);
+            end;
+          else
+            PayerIdentifier = PayerIdentifier + "643";
+          end;
+        else
+          var query_persnidc = "select persn.t_PaperKind, persn.t_PaperSeries, persn.t_PaperNumber, " +
+                               " part.t_NRCountry, part.t_NotResident " +
+                               "  from dparty_dbt part, dpersnidc_dbt persn " +
+                               " where part.t_PartyID = " + PayerID +
+                               "   and persn.t_PersonID = " + PayerID +
+                               "   and persn.t_IsMain = 'X' ";
+          var rs_persnidc:RsdRecordset = execSQLselect(query_persnidc);
+          if( rs_persnidc and rs_persnidc.moveNext() )
+            PayerIdentifier = GetPaperType( rs_persnidc.Value(0) );
+            PayerIdentifier = PayerIdentifier + strLpad( GetPaperSerNumb( rs_persnidc.Value(1), rs_persnidc.Value(2) ), 20, "0" );
+            if( rs_persnidc.Value(4) == "X" )
+              if( rs_persnidc.Value(3) == "" )
+                PayerIdentifier = PayerIdentifier + "999";
+              else
+                PayerIdentifier = PayerIdentifier + rs_persnidc.Value(3);
+              end;
+            else
+              PayerIdentifier = PayerIdentifier + "643";
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  return PayerIdentifier;
+end;
+
+private macro GetFieldValue( MesID:integer, FieldName:string, Master:string ):string
+
+  var query = " select wlmesval.t_Value "
+              "  from dwlmes_dbt wlmes, dwlmesrls_dbt wlmesrls, dwlmesfrm_dbt wlmesfrm, " +
+              "    dwltpfld_dbt wltpfld, dwlmesfld_dbt wlmesfld, dwlmesval_dbt wlmesval ";
+  if( StrLen(Master) != 0 )
+    query = query + ", dwlmesfld_dbt masterfld ";
+  end;
+
+  query = query + "   where wlmes.t_MesID = " + MesID +
+              "    AND wlmesrls.t_RlsFormID = wlmes.t_RlsFormID " +
+              "    AND wlmesfrm.t_FormID = wlmesrls.t_FormID " +
+              "    AND wltpfld.t_TpID = wlmesfrm.t_TpID " +
+              "    AND wltpfld.t_Name = '" + FieldName + "' " +
+              "    AND wlmesfld.t_RlsFormID = wlmesrls.t_RlsFormID " +
+              "    AND wlmesfld.t_TpFieldID = wltpfld.t_TpFieldID " +
+              "    AND wlmesval.t_MesID = " + MesID +
+              "    AND wlmesval.t_FieldID = wlmesfld.t_FieldID ";
+  if( strlen(Master) != 0 )
+    query = query + " AND wlmesfld.t_Master = masterfld.t_FieldID "
+                    " AND masterfld.t_BlockName = '" + Master + "' " ;
+  end;
+  var rs:RsdRecordset = execSQLselect(query);
+  if( rs and rs.moveNext() )
+    return rs.Value(0);
+  end;    
+  return 0;
+end;
+
+macro GenMes( addrMes, addrPaym, addrOldMes )
+  record OldMes(wlmes);
+  record Pmpaym(pmpaym);
+  record bdtransf("bdtransf.dbt");
+
+  SetBuff( wlmes, addrMes );
+  SetBuff( OldMes, addrOldMes );
+  SetBuff( pmpaym, addrPaym );
+  SetBuff( bdtransf, addrPaym );
+  var BIK:string = "";
+  var isPayment = false;
+  var IsRecreate:bool = GetKindActionGG()==4; //Перегенерация?
+  var note = "";
+
+  if( pmpaym.PaymentID > 0 )
+    isPayment = true;
+  elif( bdtransf.BdTransfID > 0 )
+    isPayment = false;
+  end;
+
+  PrintLog(2,"Генерация сообщения по INFP");
+
+  var text:string = "",
+      tmpstr:string = "";  
+
+  var pmprop_debet = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_debet.rec );
+  pmprop_debet.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_debet.rec.DebetCredit = 0;
+  pmprop_debet.getEQ ();
+  
+  var pmprop_credit = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_credit.rec );
+  pmprop_credit.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_credit.rec.DebetCredit = 1;
+  pmprop_credit.getEQ ();
+  
+  var pmrmprop = Tbfile ("pmrmprop.dbt");
+  ClearRecord( pmrmprop.rec );
+  pmrmprop.rec.PaymentID = pmpaym.PaymentID;
+  pmrmprop.getEQ ();
+
+  var wlmes_xml:object = ActiveX( "MSXML.DOMDocument" );
+
+  // UnifoTransferMsg -------------------------------------------
+  УстановитьКонтекстБлокаЛог( "UnifoTransferMsg" );
+  ЗаписатьПолеЛог( beginField, "n1:UnifoTransferMsg" );
+  
+   // Message -------------------------------------------
+   УстановитьКонтекстБлокаЛог( "Message" );
+   ЗаписатьПолеЛог( beginField, "smev:Message" );  
+
+    // Sender -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "Sender" );
+    ЗаписатьПолеЛог( beginField, "smev:Sender" );  
+
+     if( wlmes.InsideAbonentCode != "" )
+       ЗаписатьПолеЛог( "Code", wlmes.InsideAbonentCode );
+     else 
+       WlGGSetRepError( "Для отправителя сообщения БИК" + FindPartCode( pmpaym.PayerBankID, 3 ) + 
+                        " не указан код информационной системы в СМЭВ. Задайте код вида ""Код ИС в СМЭВ"" в справочнике субъектов и повторите выгрузку сообщений" );
+       return false;
+     end;
+     ЗаписатьПолеЛог( "Name", GetPartyName( wlmes.InsideAbonentID ) );
+  
+    ЗаписатьПолеЛог( endField, "smev:Sender" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // Sender -------------------------------------------
+
+    // Recipient -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "Recipient" );
+    ЗаписатьПолеЛог( beginField, "smev:Recipient" );  
+
+     if( wlmes.OutsideAbonentCode != "" )
+       ЗаписатьПолеЛог( "Code", wlmes.OutsideAbonentCode );
+     else
+       WlGGSetRepError( "Для получателя сообщения не указан код информационной системы в СМЭВ. Задайте код получателя и повторите выгрузку сообщений" );
+       return false;
+     end;
+     
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Name", "Recipient" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Name", "Recipient" );
+    else
+      tmpstr = GetRecipientName( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "Name", tmpstr );
+
+    ЗаписатьПолеЛог( endField, "smev:Recipient" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // Recipient -------------------------------------------
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "TypeCode" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "TypeCode" );
+    else
+    tmpstr = GetTypeCode( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "TypeCode", tmpstr );
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Status" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Status" );
+    else
+    tmpstr = GetStatus( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "Status", tmpstr );
+    ЗаписатьПолеЛог( "Date", " " );
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "ExchangeType" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "ExchangeType" );
+    else
+    tmpstr = GetExchangeType( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "ExchangeType", tmpstr );
+
+   ЗаписатьПолеЛог( endField, "smev:Message" ) ;
+   УстановитьКонтекстБлокаЛог( ".." );
+   // Message -------------------------------------------
+
+   // MessageData -------------------------------------------
+   УстановитьКонтекстБлокаЛог( "MessageData" );
+   ЗаписатьПолеЛог( beginField, "smev:MessageData" );
+   
+    // AppData -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "AppData" );
+    ЗаписатьПолеЛог( beginField, "smev:AppData" );
+
+     // ImportData -------------------------------------------
+     УстановитьКонтекстБлокаЛог( "ImportData" );
+     ЗаписатьПолеЛог( beginField, "unifo:ImportData" );
+
+      // ImportRequest -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "ImportRequest" );
+      ЗаписатьПолеЛог( beginField, "pirq:ImportRequest" );  
+
+       // PostBlock -------------------------------------------
+       УстановитьКонтекстБлокаЛог( "PostBlock" );
+       ЗаписатьПолеЛог( beginField, "PostBlock" );
+  
+        if( IsRecreate ) // перегенерация
+          tmpstr = GetFieldValue( GetOldGGMessageID(), "ID" );
+        elif( GetKindActionGG() != 0 ) // перегенерация
+         tmpstr = GetFieldValue( GetOldGGMessageID(), "ID" );
+        else
+          tmpstr = execStoredFunc( "sys_guid", V_STRING );  
+        end;
+        ЗаписатьПолеЛог( "ID", tmpstr ); 
+        ЗаписатьПолеЛог( "TimeStamp", " " );
+
+        if( IsRecreate ) // перегенерация
+          tmpstr = GetFieldValue( OldMes.MesID, "SenderIdentifier" );
+        elif( GetKindActionGG() != 0 ) // перегенерация
+         tmpstr = GetFieldValue( GetOldGGMessageID(), "SenderIdentifier" ); 
+        else
+          tmpstr = GetSenderIdentifier( wlmes.Department );
+        end;
+        ЗаписатьПолеЛог( "SenderIdentifier", tmpstr );
+
+       ЗаписатьПолеЛог( endField, "PostBlock" ) ;
+       УстановитьКонтекстБлокаЛог( ".." );
+       // PostBlock -------------------------------------------
+
+        // FinalPayment -------------------------------------------
+        УстановитьКонтекстБлокаЛог( "FinalPayment" );
+        ЗаписатьПолеЛог( beginField, "FinalPayment" );
+       
+         if( isPayment )  
+           if( pmrmprop.rec.UIN != "" )
+             ЗаписатьПолеЛог( "SupplierBillID", pmrmprop.rec.UIN );  
+           else
+             ЗаписатьПолеЛог( "SupplierBillID", "0" );
+           end;
+         else
+           if( bdtransf.UIN )
+             ЗаписатьПолеЛог( "SupplierBillID", bdtransf.UIN );
+           else    
+             ЗаписатьПолеЛог( "SupplierBillID", "0" );
+           end;
+         end;
+
+         if( isPayment )
+           if( StrLen( pmrmprop.rec.Ground ) == 0 )
+             ЗаписатьПолеЛог( "Narrative", "0" );
+           elif( StrLen( pmrmprop.rec.Ground ) <= 255 )
+             ЗаписатьПолеЛог( "Narrative", pmrmprop.rec.Ground );
+           else
+             ЗаписатьПолеЛог( "Narrative", SubStr(pmrmprop.rec.Ground, 1, 255 ) );
+           end;
+         else
+           if( StrLen( bdtransf.Ground ) == 0 )
+             ЗаписатьПолеЛог( "Narrative", "0" );
+           else
+             ЗаписатьПолеЛог( "Narrative", bdtransf.Ground );
+           end;
+         end;
+
+         if( GetKindActionGG() == 2 )
+           ЗаписатьПолеЛог( "Amount", "0" );
+         elif( isPayment ) 
+           ЗаписатьПолеЛог( "Amount", string((pmpaym.Amount * 100):0:0) );    
+         else
+           ЗаписатьПолеЛог( "Amount", string((bdtransf.Amount * 100):0:0) );    
+         end;
+
+         if( isPayment )
+           note = readNoteForObject(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 50 );
+           if( note != "" )
+             ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( note ) );  
+           else
+             ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( pmpaym.ValueDate ) );
+           end;
+         else
+           ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( bdtransf.Date ) );
+         end;
+
+         // BudgetIndex -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "BudgetIndex" );
+         ЗаписатьПолеЛог( beginField, "BudgetIndex" );
+
+          if( isPayment )
+            tmpstr = pmrmprop.rec.TaxAuthorState;
+          else 
+            tmpstr = bdtransf.TaxAuthorState; 
+          end;
+          if( StrLen( tmpstr ) > 0 ) 
+            ЗаписатьПолеЛог( "Status", tmpstr ); 
+          else
+            ЗаписатьПолеЛог( "Status", "0" );
+          end;
+          
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmType != "" )
+              ЗаписатьПолеЛог( "PaymentType", pmrmprop.rec.TaxPmType );
+            else
+              ЗаписатьПолеЛог( "PaymentType", "0" );
+            end;
+          else
+            if( bdtransf.TaxPmType != "" )
+              ЗаписатьПолеЛог( "PaymentType", bdtransf.TaxPmType );
+            else
+              ЗаписатьПолеЛог( "PaymentType", "0" );
+            end;
+          end;
+
+          if( isPayment )
+            tmpstr = pmrmprop.rec.TaxPmGround; 
+          else
+            tmpstr = bdtransf.TaxPmGround; 
+          end;
+          if( StrLen( tmpstr ) > 0 ) 
+            ЗаписатьПолеЛог( "Purpose", tmpstr ); 
+          else
+            ЗаписатьПолеЛог( "Purpose", "0" );
+          end;
+         
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmPeriod != "" )
+              ЗаписатьПолеЛог( "TaxPeriod", pmrmprop.rec.TaxPmPeriod );
+             else 
+               ЗаписатьПолеЛог( "TaxPeriod", "0" );
+             end;
+          else 
+            if( bdtransf.TaxPmPeriod != "" )
+              ЗаписатьПолеЛог( "TaxPeriod", bdtransf.TaxPmPeriod );
+            else 
+              ЗаписатьПолеЛог( "TaxPeriod", "0" );
+            end;
+          end;
+
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmNumber != "" ) 
+              ЗаписатьПолеЛог( "TaxDocNumber", pmrmprop.rec.TaxPmNumber );
+            else 
+              ЗаписатьПолеЛог( "TaxDocNumber", "0" );
+            end;
+          else
+            if( bdtransf.TaxPmNumber != "" ) 
+              ЗаписатьПолеЛог( "TaxDocNumber", bdtransf.TaxPmNumber );
+            else 
+              ЗаписатьПолеЛог( "TaxDocNumber", "0" );
+            end;
+          end;
+          
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmDate != date( 0, 0, 0 ) ) 
+              ЗаписатьПолеЛог( "TaxDocDate", pmrmprop.rec.TaxPmDate );
+            else
+             ЗаписатьПолеЛог( "TaxDocDate", "0" ); 
+            end;
+          else
+            if( bdtransf.TaxPmDate != date( 0, 0, 0 ) ) 
+              ЗаписатьПолеЛог( "TaxDocDate", bdtransf.TaxPmDate );
+            else
+             ЗаписатьПолеЛог( "TaxDocDate", "0" ); 
+            end;
+          end;
+
+         ЗаписатьПолеЛог( endField, "BudgetIndex" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // BudgetIndex ------------------------------------------- 
+
+         // PaymentIdentificatio -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "PaymentIdentificatio" );
+         ЗаписатьПолеЛог( beginField, "PaymentIdentificationData" );
+
+          // Bank -------------------------------------------
+          УстановитьКонтекстБлокаЛог( "Bank" );
+          ЗаписатьПолеЛог( beginField, "Bank" );
+
+           if( isPayment )
+             ЗаписатьПолеЛог( "Name", pmrmprop.rec.PayerBankName );
+             ЗаписатьПолеЛог( "CorrespondentBankAcc", pmrmprop.rec.PayerCorrAccNostro );
+      
+             if( pmprop_debet.rec.CodeKind == 3 )
+               BIK = pmprop_debet.rec.Bankcode;
+             else
+               BIK = FindPartCode( pmpaym.PayerBankID, 3 );
+             end;
+
+             ЗаписатьПолеЛог( "BIK", BIK  );
+           else
+             var query1 = "select party.t_Name, bnkdprt.t_CorAcc, party.t_PartyID "   +
+                 "  from dparty_dbt party, ddp_dep_dbt  dep, dbankdprt_dbt bnkdprt " +
+                 " where party.t_PartyID = dep.t_PartyID "   +
+                 "   and bnkdprt.t_PartyID = dep.t_PartyID " +
+                 "   and dep.t_Code = " + bdtransf.Department;
+
+             var rs_bank:RsdRecordset = execSQLselect(query1);
+             if( rs_bank.moveNext() )
+
+               ЗаписатьПолеЛог( "Name", rs_bank.Value(0) );
+               ЗаписатьПолеЛог( "CorrespondentBankAcc", rs_bank.Value(1) );
+                  
+               BIK = FindPartCode( rs_bank.Value(2), 3 );
+               ЗаписатьПолеЛог( "BIK", BIK  );
+             end;
+           end;
+
+           var query = "select * " +
+                 "  from dadress_dbt adr "        +
+                 " where adr.t_PartyID = "    + pmpaym.PayerBankID +
+                 "   and adr.t_Adress <> CHR(1) "  +                          
+                 " order by adr.t_Type ";
+           var rs_adress:RsdRecordset = execSQLselect(query);
+           if( rs_adress.moveNext() )
+    
+             // Adress -------------------------------------------
+             УстановитьКонтекстБлокаЛог( "Address" );
+             ЗаписатьПолеЛог( beginField, "Address" );
+
+             ЗаписатьПолеЛог( "kind", string(rs_adress.value( "t_Type" )) );
+              ЗаписатьПолеЛог( "View", rs_adress.value( "t_Adress" ) );
+        
+             ЗаписатьПолеЛог( endField, "Address" ) ;
+             УстановитьКонтекстБлокаЛог( ".." );
+             // Adress -------------------------------------------
+ /*
+            if( ( rs_adress.value( "t_PhoneNumber" ) != "" ) or
+                ( rs_adress.value( "t_PhoneNumber2" ) != "" ) or
+                ( rs_adress.value( "t_Fax" ) != "" ) or
+                ( rs_adress.value( "t_E_mail" ) != "" ) or
+                ( rs_adress.value( "t_MobilePhone" ) != "" ) )
+
+               // Contacts -------------------------------------------    
+               УстановитьКонтекстБлокаЛог( "Contacts" );
+               ЗаписатьПолеЛог( beginField, "Contacts" );
+
+                if( ( rs_adress.value( "t_PhoneNumber" ) != "" ) )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Work phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_PhoneNumber" ) ) );
+               
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( ( rs_adress.value( "t_PhoneNumber2" ) != "" )  and ( rs_adress.value( "t_PhoneNumber2" ) == "" ) )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+        
+                   ЗаписатьПолеЛог( "Kind", "Work phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_PhoneNumber2" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( rs_adress.value( "t_Fax" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Fax" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_Fax" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+         
+                if( rs_adress.value( "t_E_mail" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+        
+                   ЗаписатьПолеЛог( "Kind", "Mail" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_E_mail" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( rs_adress.value( "t_MobilePhone" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Mobile phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_MobilePhone" ) ) );
+               
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+               ЗаписатьПолеЛог( endField, "Contacts" ) ;
+               УстановитьКонтекстБлокаЛог( ".." );
+               // Contacts -------------------------------------------
+             end;  // if Contacts
+*/
+           end; // if Adress
+          ЗаписатьПолеЛог( endField, "Bank" ) ;
+          УстановитьКонтекстБлокаЛог( ".." );
+          // Bank -------------------------------------------
+
+         if( IsRecreate ) // перегенерация
+          tmpstr = GetFieldValue( GetOldGGMessageID(), "SystemIdentifier" );
+         elif( GetKindActionGG() != 0 ) // перегенерация
+           tmpstr = GetFieldValue( GetOldGGMessageID(), "SystemIdentifier" ); 
+         else
+           var dep = Tbfile ("dp_dep.dbt");
+           ClearRecord( dep.rec );
+           if( isPayment )
+             dep.rec.Code = pmpaym.OperNode;
+           else
+             dep.rec.Code = bdtransf.Department; 
+           end;
+           dep.getEQ ();
+
+           if( isPayment )
+             tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_PAYMENT, pmpaym.PaymentID );
+           else
+             tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_BDTRANSF, bdtransf.BdTransfID );
+           end;
+         end;
+         ЗаписатьПолеЛог( "SystemIdentifier", tmpstr );
+
+         ЗаписатьПолеЛог( endField, "PaymentIdentificationData" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // PaymentIdentificatio -------------------------------------------
+  
+         if( isPayment )
+           tmpstr = PayerIDForm( pmpaym.Payer );
+         else
+           tmpstr = bdtransf.TaxPersonRef;
+         end;
+         if( tmpstr != "" )
+           ЗаписатьПолеЛог( "PayerIdentifier", tmpstr );
+         else
+           ЗаписатьПолеЛог( "PayerIdentifier", "0" );
+         end;
+         
+         if( isPayment )
+           if( StrLen( pmpaym.PayerAccount ) > 0 )
+             ЗаписатьПолеЛог( "PayerPA", pmpaym.PayerAccount );
+           end;
+         else
+           if( StrLen( bdtransf.PayerAccount ) > 0 )
+             ЗаписатьПолеЛог( "PayerPA", bdtransf.PayerAccount );
+           end;
+         end;
+         // PayeeBankAcc -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "PayeeBankAcc" );
+         ЗаписатьПолеЛог( beginField, "PayeeBankAcc" );
+
+          if( isPayment )
+            if( pmprop_credit.rec.CodeKind == 3 )
+              ЗаписатьПолеЛог( "BIK", pmprop_credit.rec.BankCode );
+            else
+              tmpstr = FindPartCode( pmpaym.ReceiverBankID, 3 );
+              ЗаписатьПолеЛог( "BIK", tmpstr );
+            end;
+          else
+            ЗаписатьПолеЛог( "BIK", bdtransf.ReceiverBankCode );
+          end;
+
+          if( isPayment ) 
+            ЗаписатьПолеЛог( "AccountNumber", pmpaym.ReceiverAccount );
+          else
+            ЗаписатьПолеЛог( "AccountNumber", bdtransf.ReceiverAccount );
+          end;
+
+         ЗаписатьПолеЛог( endField, "PayeeBankAcc" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // PayeeBankAcc -------------------------------------------
+
+         ЗаписатьПолеЛог( "Version", "1.15" );
+
+         if( IsRecreate ) // перегенерация
+           tmpstr = GetFieldValue( GetOldGGMessageID(), "ChangeStatus" );
+           ЗаписатьПолеЛог( "ChangeStatus", tmpstr );
+         elif( GetKindActionGG() != 0 ) // перегенерация
+           ЗаписатьПолеЛог( "ChangeStatus", "2" );
+         else
+           ЗаписатьПолеЛог( "ChangeStatus", "1" );
+         end;
+
+         if( pmrmprop.rec.ReceiverINN != "" )
+           if( isPayment )
+             tmpstr = RemoveKPP( pmrmprop.rec.ReceiverINN );
+           else
+             tmpstr = RemoveKPP( bdtransf.ReceiverINN );
+           end;
+           if( tmpstr != "" )
+             ЗаписатьПолеЛог( "payeeINN", tmpstr );
+           else
+             ЗаписатьПолеЛог( "payeeINN", "0000000000" );
+           end;
+           if( isPayment )
+             tmpstr = RemoveINN( pmrmprop.rec.ReceiverINN );
+           else
+             tmpstr = RemoveINN( bdtransf.ReceiverINN );
+           end;
+           if( tmpstr != "" )
+             ЗаписатьПолеЛог( "payeeKPP", tmpstr );
+           else 
+             ЗаписатьПолеЛог( "payeeKPP", "000000000" );
+           end;
+         else 
+           ЗаписатьПолеЛог( "payeeINN", "0000000000" );
+           ЗаписатьПолеЛог( "payeeKPP", "000000000" );
+         end;
+        
+         if( isPayment )
+           if( StrLen( pmrmprop.rec.BTTTICode ) > 0 )
+             ЗаписатьПолеЛог( "KBK", pmrmprop.rec.BTTTICode );
+           else
+             ЗаписатьПолеЛог( "KBK", " " );
+           end;
+           if( StrLen( pmrmprop.rec.OKATOCode ) > 0 )
+             ЗаписатьПолеЛог( "OKATO", strRpad( pmrmprop.rec.OKATOCode, 11, "-" ) );
+           else
+             ЗаписатьПолеЛог( "OKATO", " " );
+           end;
+         else
+           if( StrLen( bdtransf.BTTTICode ) > 0 )
+             ЗаписатьПолеЛог( "KBK", bdtransf.BTTTICode );
+           else
+             ЗаписатьПолеЛог( "KBK", " " );
+           end;
+           if( StrLen( bdtransf.OKATOCode ) > 0 )
+             ЗаписатьПолеЛог( "OKATO", strRpad( bdtransf.OKATOCode, 11, "-" ) );
+           else
+             ЗаписатьПолеЛог( "OKATO", " " );
+           end;
+         end;
+        ЗаписатьПолеЛог( endField, "FinalPayment" ) ;
+        УстановитьКонтекстБлокаЛог( ".." );
+        // FinalPayment -------------------------------------------
+
+      ЗаписатьПолеЛог( endField, "pirq:ImportRequest" ) ;
+      УстановитьКонтекстБлокаЛог( ".." );
+      // ImportRequest -------------------------------------------
+
+     ЗаписатьПолеЛог( endField, "unifo:ImportData" ) ;
+     УстановитьКонтекстБлокаЛог( ".." );
+     // ImportData -------------------------------------------
+
+    ЗаписатьПолеЛог( endField, "smev:AppData" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // AppData -------------------------------------------
+
+   ЗаписатьПолеЛог( endField, "smev:MessageData" ) ;
+   УстановитьКонтекстБлокаЛог( ".." );
+   // MessageData -------------------------------------------
+
+  ЗаписатьПолеЛог( endField, "n1:UnifoTransferMsg" ) ;
+  УстановитьКонтекстБлокаЛог( ".." );
+  // UnifoTransferMsg -------------------------------------------
+
+  return TRUE; /* Успешное завершение */
+end;
+
+// INFP 1.15.1              
+
+private macro GetAccountType( ReceiverAccount:string ):string
+  
+  var query = "select acc.t_Type_Account " +
+              "  from daccount_dbt acc " +
+              " where acc.t_Account = '" + ReceiverAccount + "'";
+  var rs:RsdRecordset = execSQLselect( query );
+  if( rs and rs.moveNext() )
+    if( ( Index(rs.value(0),"Ч") ) or ( Index(rs.value(0),"Х") ) )
+      return "1";
+    elif( ( Index(rs.value(0),"W") )  and ( (not Index(rs.value(0),"Ч")) 
+                                        and (not Index(rs.value(0),"Х")) 
+                                        and (not Index(rs.value(0),"К")) ) )
+      return "2";
+    elif( ( Index(rs.value(0),"К") )  and ( (not Index(rs.value(0),"Ч")) 
+                                        and (not Index(rs.value(0),"Х")) ) )
+      return "3";
+    end;
+  end;
+  return "";
+end;
+
+macro GenMes1_15_1( addrMes, addrPaym )
+  record OldMes(wlmes);
+  ClearRecord(OldMes);
+  record Pmpaym(pmpaym);
+  record bdtransf("bdtransf.dbt");
+
+  SetBuff( wlmes, addrMes );
+  SetBuff( pmpaym, addrPaym );
+  SetBuff( bdtransf, addrPaym );
+  var BIK:string = "";
+  var isPayment = false;
+  var note = "";
+  var IsRecreate:bool = GetKindActionGG()==4; //Перегенерация?
+
+  if( pmpaym.PaymentID > 0 )
+    isPayment = true;
+  elif( bdtransf.BdTransfID > 0 )
+    isPayment = false;
+  end;
+
+  PrintLog(2,"Генерация сообщения по INFP");
+  PrintLog(2,"Генерация сообщения по INFP1.15.1");
+  PrintLog(2,"Генерация сообщения по INFP1.15");
+
+  var text:string = "",
+      tmpstr:string = "";  
+
+  var pmprop_debet = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_debet.rec );
+  pmprop_debet.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_debet.rec.DebetCredit = 0;
+  pmprop_debet.getEQ ();
+  
+  var pmprop_credit = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_credit.rec );
+  pmprop_credit.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_credit.rec.DebetCredit = 1;
+  pmprop_credit.getEQ ();
+  
+  var pmrmprop = Tbfile ("pmrmprop.dbt");
+  ClearRecord( pmrmprop.rec );
+  pmrmprop.rec.PaymentID = pmpaym.PaymentID;
+  pmrmprop.getEQ ();
+
+  var wlmes_xml:object = ActiveX( "MSXML.DOMDocument" );
+
+  // UnifoTransferMsg -------------------------------------------
+  УстановитьКонтекстБлокаЛог( "UnifoTransferMsg" );
+  ЗаписатьПолеЛог( beginField, "n1:UnifoTransferMsg" );
+  
+   // Message -------------------------------------------
+   УстановитьКонтекстБлокаЛог( "Message" );
+   ЗаписатьПолеЛог( beginField, "smev:Message" );  
+
+    // Sender -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "Sender" );
+    ЗаписатьПолеЛог( beginField, "smev:Sender" );  
+
+     if( wlmes.InsideAbonentCode != "" )
+       ЗаписатьПолеЛог( "Code", wlmes.InsideAbonentCode );
+     else 
+       ЗаписатьПолеЛог( "Code", " " );
+     end;
+     ЗаписатьПолеЛог( "Name", GetPartyName( wlmes.InsideAbonentID ) );
+  
+    ЗаписатьПолеЛог( endField, "smev:Sender" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // Sender -------------------------------------------
+
+    // Recipient -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "Recipient" );
+    ЗаписатьПолеЛог( beginField, "smev:Recipient" );  
+
+     if( wlmes.OutsideAbonentCode != "" )
+       ЗаписатьПолеЛог( "Code", wlmes.OutsideAbonentCode );
+     else
+       WlGGSetRepError( "Для получателя сообщения не указан код информационной системы в СМЭВ. Задайте код получателя и повторите выгрузку сообщений" );
+       return false;
+     end;
+     
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Name", "Recipient" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Name", "Recipient" );
+    else
+      tmpstr = GetRecipientName( wlmes.Department );
+    end;
+      ЗаписатьПолеЛог( "Name", tmpstr );
+
+    ЗаписатьПолеЛог( endField, "smev:Recipient" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // Recipient -------------------------------------------
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "TypeCode" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "TypeCode" );
+    else
+      tmpstr = GetTypeCode( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "TypeCode", tmpstr );
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Status" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "Status" );
+    else
+      tmpstr = GetStatus( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "Status", tmpstr );
+    ЗаписатьПолеЛог( "Date", " " );
+
+    if( IsRecreate ) // перегенерация
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "ExchangeType" );
+    elif( GetKindActionGG() != 0 )
+      tmpstr = GetFieldValue( GetOldGGMessageID(), "ExchangeType" );
+    else
+      tmpstr = GetExchangeType( wlmes.Department );
+    end;
+    ЗаписатьПолеЛог( "ExchangeType", tmpstr );
+
+   ЗаписатьПолеЛог( endField, "smev:Message" ) ;
+   УстановитьКонтекстБлокаЛог( ".." );
+   // Message -------------------------------------------
+
+   // MessageData -------------------------------------------
+   УстановитьКонтекстБлокаЛог( "MessageData" );
+   ЗаписатьПолеЛог( beginField, "smev:MessageData" );
+   
+    // AppData -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "AppData" );
+    ЗаписатьПолеЛог( beginField, "smev:AppData" );
+
+     // ImportData -------------------------------------------
+     УстановитьКонтекстБлокаЛог( "ImportData" );
+     ЗаписатьПолеЛог( beginField, "unifo:ImportData" );
+
+      // ImportRequest -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "ImportRequest" );
+      ЗаписатьПолеЛог( beginField, "pirq:ImportRequest" );  
+
+       // PostBlock -------------------------------------------
+       УстановитьКонтекстБлокаЛог( "PostBlock" );
+       ЗаписатьПолеЛог( beginField, "PostBlock" );
+  
+       if( IsRecreate ) // перегенерация
+         tmpstr = GetFieldValue( GetOldGGMessageID(), "ID" );
+       elif( GetKindActionGG() != 0 ) // перегенерация
+         tmpstr = GetFieldValue( GetOldGGMessageID(), "ID" );
+       else
+         tmpstr = execStoredFunc( "sys_guid", V_STRING ); 
+       end;
+       ЗаписатьПолеЛог( "ID", tmpstr );
+       ЗаписатьПолеЛог( "TimeStamp", " " );
+
+       if( IsRecreate ) // перегенерация
+         tmpstr = GetFieldValue( OldMes.MesID, "SenderIdentifier" );
+       elif( GetKindActionGG() != 0 ) // перегенерация
+         tmpstr = GetFieldValue( GetOldGGMessageID(), "SenderIdentifier" ); 
+       else
+         tmpstr = GetSenderIdentifier( wlmes.Department );
+       end;
+       ЗаписатьПолеЛог( "SenderIdentifier", tmpstr );
+
+       ЗаписатьПолеЛог( endField, "PostBlock" ) ;
+       УстановитьКонтекстБлокаЛог( ".." );
+       // PostBlock -------------------------------------------
+
+        // FinalPayment -------------------------------------------
+        УстановитьКонтекстБлокаЛог( "FinalPayment" );
+        ЗаписатьПолеЛог( beginField, "FinalPayment" );
+       
+         if( isPayment )
+           if( pmrmprop.rec.UIN != "" )
+             ЗаписатьПолеЛог( "SupplierBillID", pmrmprop.rec.UIN );  
+           else
+             ЗаписатьПолеЛог( "SupplierBillID", "0" );
+           end;
+         else
+           if( bdtransf.UIN )
+             ЗаписатьПолеЛог( "SupplierBillID", bdtransf.UIN );
+           else    
+             ЗаписатьПолеЛог( "SupplierBillID", "0" );
+           end;
+         end;
+
+         if( isPayment )
+           if( StrLen( pmrmprop.rec.Ground ) == 0 )
+             ЗаписатьПолеЛог( "Narrative", "0" );
+           elif( StrLen( pmrmprop.rec.Ground ) <= 255 )
+             ЗаписатьПолеЛог( "Narrative", pmrmprop.rec.Ground );
+           else
+             ЗаписатьПолеЛог( "Narrative", SubStr(pmrmprop.rec.Ground, 1, 255 ) );
+           end;
+         else
+           if( StrLen( bdtransf.Ground ) == 0 )
+             ЗаписатьПолеЛог( "Narrative", "0" );
+           else
+             ЗаписатьПолеЛог( "Narrative", bdtransf.Ground );
+           end;
+         end;
+
+         if( GetKindActionGG() == 2 )
+           ЗаписатьПолеЛог( "Amount", "0" );
+         elif( isPayment ) 
+           ЗаписатьПолеЛог( "Amount", string((pmpaym.Amount * 100):0:0));    
+         else
+           ЗаписатьПолеЛог( "Amount", string((bdtransf.Amount * 100):0:0));    
+         end;
+
+         if( isPayment )
+           note = readNoteForObject(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 50 );
+           if( note != "" )
+             ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( note ) );  
+           else
+             ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( pmpaym.ValueDate ) );
+           end;
+         else
+           ЗаписатьПолеЛог( "PaymentDate", ДатаДДММГГГГ( bdtransf.Date ) );
+         end;
+
+         // BudgetIndex -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "BudgetIndex" );
+         ЗаписатьПолеЛог( beginField, "BudgetIndex" );
+
+          if( isPayment )
+            tmpstr = pmrmprop.rec.TaxAuthorState;
+          else 
+            tmpstr = bdtransf.TaxAuthorState; 
+          end;
+          if( StrLen( tmpstr ) > 0 ) 
+            ЗаписатьПолеЛог( "Status", tmpstr ); 
+          else
+            ЗаписатьПолеЛог( "Status", "0" );
+          end;
+          
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmType != "" )
+              ЗаписатьПолеЛог( "PaymentType", pmrmprop.rec.TaxPmType );
+            else
+              ЗаписатьПолеЛог( "PaymentType", "0" );
+            end;
+          else
+            if( bdtransf.TaxPmType != "" )
+              ЗаписатьПолеЛог( "PaymentType", bdtransf.TaxPmType );
+            else
+              ЗаписатьПолеЛог( "PaymentType", "0" );
+            end;
+          end;
+
+          if( isPayment )
+            tmpstr = pmrmprop.rec.TaxPmGround; 
+          else
+            tmpstr = bdtransf.TaxPmGround; 
+          end;
+          if( StrLen( tmpstr ) > 0 ) 
+            ЗаписатьПолеЛог( "Purpose", tmpstr ); 
+          else
+            ЗаписатьПолеЛог( "Purpose", "0" );
+          end;
+         
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmPeriod != "" )
+              ЗаписатьПолеЛог( "TaxPeriod", pmrmprop.rec.TaxPmPeriod );
+             else 
+               ЗаписатьПолеЛог( "TaxPeriod", "0" );
+             end;
+          else 
+            if( bdtransf.TaxPmPeriod != "" )
+              ЗаписатьПолеЛог( "TaxPeriod", bdtransf.TaxPmPeriod );
+            else 
+              ЗаписатьПолеЛог( "TaxPeriod", "0" );
+            end;
+          end;
+
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmNumber != "" ) 
+              ЗаписатьПолеЛог( "TaxDocNumber", pmrmprop.rec.TaxPmNumber );
+            else 
+              ЗаписатьПолеЛог( "TaxDocNumber", "0" );
+            end;
+          else
+            if( bdtransf.TaxPmNumber != "" ) 
+              ЗаписатьПолеЛог( "TaxDocNumber", bdtransf.TaxPmNumber );
+            else 
+              ЗаписатьПолеЛог( "TaxDocNumber", "0" );
+            end;
+          end;
+          
+          if( isPayment )
+            if( pmrmprop.rec.TaxPmDate != date( 0, 0, 0 ) ) 
+              ЗаписатьПолеЛог( "TaxDocDate", pmrmprop.rec.TaxPmDate );
+            else
+             ЗаписатьПолеЛог( "TaxDocDate", "0" ); 
+            end;
+          else
+            if( bdtransf.TaxPmDate != date( 0, 0, 0 ) ) 
+              ЗаписатьПолеЛог( "TaxDocDate", bdtransf.TaxPmDate );
+            else
+             ЗаписатьПолеЛог( "TaxDocDate", "0" ); 
+            end;
+          end;
+
+         ЗаписатьПолеЛог( endField, "BudgetIndex" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // BudgetIndex ------------------------------------------- 
+
+         // PaymentIdentificatio -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "PaymentIdentificatio" );
+         ЗаписатьПолеЛог( beginField, "PaymentIdentificationData" );
+
+          // Bank -------------------------------------------
+          УстановитьКонтекстБлокаЛог( "Bank" );
+          ЗаписатьПолеЛог( beginField, "Bank" );
+
+           if( isPayment )
+             ЗаписатьПолеЛог( "Name", pmrmprop.rec.PayerBankName );
+             ЗаписатьПолеЛог( "CorrespondentBankAcc", pmrmprop.rec.PayerCorrAccNostro );
+      
+             if( pmprop_debet.rec.CodeKind == 3 )
+               BIK = pmprop_debet.rec.Bankcode;
+             else
+               BIK = FindPartCode( pmpaym.PayerBankID, 3 );
+             end;
+
+             ЗаписатьПолеЛог( "BIK", BIK  );
+           else
+             var query1 = "select party.t_Name, bnkdprt.t_CorAcc, party.t_PartyID "   +
+                 "  from dparty_dbt party, ddp_dep_dbt  dep, dbankdprt_dbt bnkdprt " +
+                 " where party.t_PartyID = dep.t_PartyID "   +
+                 "   and bnkdprt.t_PartyID = dep.t_PartyID " +
+                 "   and dep.t_Code = " + bdtransf.Department;
+
+             var rs_bank:RsdRecordset = execSQLselect(query1);
+             if( rs_bank.moveNext() )
+
+               ЗаписатьПолеЛог( "Name", rs_bank.Value(0) );
+               ЗаписатьПолеЛог( "CorrespondentBankAcc", rs_bank.Value(1) );
+                  
+               BIK = FindPartCode( rs_bank.Value(3), 3 );
+               ЗаписатьПолеЛог( "BIK", BIK  );
+             end;
+           end;
+
+           var query = "select * " +
+                 "  from dadress_dbt adr "        +
+                 " where adr.t_PartyID = "    + pmpaym.PayerBankID +
+                 "   and adr.t_Adress <> CHR(1) "  +                          
+                 " order by adr.t_Type ";
+           var rs_adress:RsdRecordset = execSQLselect(query);
+           if( rs_adress.moveNext() )
+    
+             // Adress -------------------------------------------
+             УстановитьКонтекстБлокаЛог( "Address" );
+             ЗаписатьПолеЛог( beginField, "Address" );
+
+             ЗаписатьПолеЛог( "kind", string(rs_adress.value( "t_Type" )) );
+              ЗаписатьПолеЛог( "View", rs_adress.value( "t_Adress" ) );
+        
+             ЗаписатьПолеЛог( endField, "Address" ) ;
+             УстановитьКонтекстБлокаЛог( ".." );
+             // Adress -------------------------------------------
+/*
+            if( ( rs_adress.value( "t_PhoneNumber" ) != "" ) or
+                ( rs_adress.value( "t_PhoneNumber2" ) != "" ) or
+                ( rs_adress.value( "t_Fax" ) != "" ) or
+                ( rs_adress.value( "t_E_mail" ) != "" ) or
+                ( rs_adress.value( "t_MobilePhone" ) != "" ) )
+
+               // Contacts -------------------------------------------    
+               УстановитьКонтекстБлокаЛог( "Contacts" );
+               ЗаписатьПолеЛог( beginField, "Contacts" );
+
+                if( ( rs_adress.value( "t_PhoneNumber" ) != "" ) )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Work phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_PhoneNumber" ) ) );
+               
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( ( rs_adress.value( "t_PhoneNumber2" ) != "" )  and ( rs_adress.value( "t_PhoneNumber2" ) == "" ) )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+        
+                   ЗаписатьПолеЛог( "Kind", "Work phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_PhoneNumber2" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( rs_adress.value( "t_Fax" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Fax" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_Fax" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+         
+                if( rs_adress.value( "t_E_mail" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+        
+                   ЗаписатьПолеЛог( "Kind", "Mail" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_E_mail" ) ) );
+              
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+                if( rs_adress.value( "t_MobilePhone" ) != "" )
+
+                  // Contact -------------------------------------------
+                  УстановитьКонтекстБлокаЛог( "Contact" );
+                  ЗаписатьПолеЛог( beginField, "Contact" );    
+    
+                   ЗаписатьПолеЛог( "Kind", "Mobile phone" );
+                   ЗаписатьПолеЛог( "Value", ( rs_adress.value( "t_MobilePhone" ) ) );
+               
+                  ЗаписатьПолеЛог( endField, "Contact" ) ;
+                  УстановитьКонтекстБлокаЛог( ".." );
+                  // Contact -------------------------------------------
+                end;
+
+               ЗаписатьПолеЛог( endField, "Contacts" ) ;
+               УстановитьКонтекстБлокаЛог( ".." );
+               // Contacts -------------------------------------------
+             end;  // if Contacts
+*/ 
+           end; // if Adress
+          ЗаписатьПолеЛог( endField, "Bank" ) ;
+          УстановитьКонтекстБлокаЛог( ".." );
+          // Bank -------------------------------------------
+
+         if( GetKindActionGG() != 0 ) // перегенерация
+           tmpstr = GetFieldValue( GetOldGGMessageID(), "SystemIdentifier" ); 
+           ЗаписатьПолеЛог( "SystemIdentifier", tmpstr );
+         else
+           var dep = Tbfile ("dp_dep.dbt");
+           ClearRecord( dep.rec );
+           if( isPayment )
+             dep.rec.Code = pmpaym.OperNode;
+           else
+             dep.rec.Code = bdtransf.Department; 
+           end;
+           dep.getEQ ();
+
+           if( isPayment )
+             tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_PAYMENT, pmpaym.PaymentID );
+           else
+             tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_BDTRANSF, bdtransf.BdTransfID );
+           end;
+           ЗаписатьПолеЛог( "SystemIdentifier", tmpstr );
+         end;
+
+         ЗаписатьПолеЛог( endField, "PaymentIdentificationData" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // PaymentIdentificatio -------------------------------------------
+  
+         if( isPayment )
+           tmpstr = PayerIDForm( pmpaym.Payer );
+         else
+           tmpstr = bdtransf.TaxPersonRef;
+         end;
+         if( tmpstr != "" )
+           ЗаписатьПолеЛог( "PayerIdentifier", tmpstr );
+         else
+           ЗаписатьПолеЛог( "PayerIdentifier", "0" );
+         end;
+         
+         if( isPayment )
+           if( StrLen( pmpaym.PayerAccount ) > 0 )
+             ЗаписатьПолеЛог( "PayerPA", pmpaym.PayerAccount );
+           end;
+         else
+           if( StrLen( bdtransf.PayerAccount ) > 0 )
+             ЗаписатьПолеЛог( "PayerPA", bdtransf.PayerAccount );
+           end;
+         end;
+         // PayeeBankAcc -------------------------------------------
+         УстановитьКонтекстБлокаЛог( "PayeeBankAcc" );
+         ЗаписатьПолеЛог( beginField, "PayeeBankAcc" );
+
+          if( isPayment and ( pmprop_credit.rec.Group != PAYMENTS_GROUP_EXTERNAL ) )  
+            tmpstr = GetAccountType( pmpaym.ReceiverAccount );
+            if( tmpstr != "" )
+              ЗаписатьПолеЛог( "kind", tmpstr );
+            end;
+          end;
+
+          if( isPayment )
+            tmpstr = pmpaym.ReceiverAccount;
+          else
+            tmpstr = bdtransf.ReceiverAccount;
+          end;          
+          if( tmpstr != "" )
+            ЗаписатьПолеЛог( "Account", tmpstr );
+          else
+            ЗаписатьПолеЛог( "Account", "00000000000000000000" );
+          end;
+
+          // Bank ------------------------------------------------------
+          УстановитьКонтекстБлокаЛог( "Bank" );
+          ЗаписатьПолеЛог( beginField, "Bank" ); 
+
+           if( isPayment )
+             ЗаписатьПолеЛог( "Name", pmrmprop.rec.ReceiverBankName );
+             ЗаписатьПолеЛог( "CorrespondentBankAcc", pmrmprop.rec.ReceiverCorrAccNostro );
+           else
+             var query_recbank = "select party.t_Name, bnkdprt.t_CorAcc "   +
+                                 "  from dparty_dbt party, dbankdprt_dbt bnkdprt, dpartcode_dbt code " +
+                                 " where code.t_PartyID = party.t_PartyID "  +
+                                 "   and code.t_CodeKind = 3 " +
+                                 "   and code.t_Code = " + bdtransf.ReceiverBankCode +
+                                 "   and bnkdprt.t_PartyID = code.t_PartyID ";
+
+             var rs_recbank:RsdRecordset = execSQLselect(query1);
+             if( rs_recbank.moveNext() )
+               ЗаписатьПолеЛог( "Name", rs_recbank.Value(0) );
+               ЗаписатьПолеЛог( "CorrespondentBankAcc", rs_recbank.Value(1) );
+             end;
+           end;
+
+           if( isPayment )
+            if( pmprop_credit.rec.CodeKind == 3 )
+              ЗаписатьПолеЛог( "BIK", pmprop_credit.rec.BankCode );
+            else
+              tmpstr = FindPartCode( pmpaym.ReceiverBankID, 3 );
+              ЗаписатьПолеЛог( "BIK", tmpstr );
+            end;
+          else
+            ЗаписатьПолеЛог( "BIK", bdtransf.ReceiverBankCode );
+          end;
+
+          ЗаписатьПолеЛог( endField, "Bank" );
+          УстановитьКонтекстБлокаЛог( ".." );
+          // PayeeBankAcc -------------------------------------------
+
+         ЗаписатьПолеЛог( endField, "PayeeBankAcc" ) ;
+         УстановитьКонтекстБлокаЛог( ".." );
+         // PayeeBankAcc -------------------------------------------
+
+         ЗаписатьПолеЛог( "Version", "1.15" );
+
+         if( IsRecreate ) // перегенерация
+           tmpstr = GetFieldValue( GetOldGGMessageID(), "ChangeStatus" );
+           ЗаписатьПолеЛог( "ChangeStatus", tmpstr );
+         elif( GetKindActionGG() != 0 ) // перегенерация
+           ЗаписатьПолеЛог( "ChangeStatus", "2" );
+         else
+           ЗаписатьПолеЛог( "ChangeStatus", "1" );
+         end;
+
+         if( pmrmprop.rec.ReceiverINN != "" )
+           if( isPayment )
+             tmpstr = RemoveKPP( pmrmprop.rec.ReceiverINN );
+           else
+             tmpstr = RemoveKPP( bdtransf.ReceiverINN );
+           end;
+           if( tmpstr != "" )
+             ЗаписатьПолеЛог( "payeeINN", tmpstr );
+           else
+             ЗаписатьПолеЛог( "payeeINN", "0000000000" );
+           end;
+           if( isPayment )
+             tmpstr = RemoveINN( pmrmprop.rec.ReceiverINN );
+           else
+             tmpstr = RemoveINN( bdtransf.ReceiverINN );
+           end;
+           if( tmpstr != "" )
+             ЗаписатьПолеЛог( "payeeKPP", tmpstr );
+           else 
+             ЗаписатьПолеЛог( "payeeKPP", "000000000" );
+           end;
+         else 
+           ЗаписатьПолеЛог( "payeeINN", "0000000000" );
+           ЗаписатьПолеЛог( "payeeKPP", "000000000" );
+         end;
+        
+         if( isPayment )
+           if( StrLen( pmrmprop.rec.BTTTICode ) > 0 )
+             ЗаписатьПолеЛог( "KBK", pmrmprop.rec.BTTTICode );
+           else
+             ЗаписатьПолеЛог( "KBK", " " );
+           end;
+           if( StrLen( pmrmprop.rec.OKATOCode ) > 0 )
+             ЗаписатьПолеЛог( "OKATO", strRpad( pmrmprop.rec.OKATOCode, 11, "-" ) );
+           else
+             ЗаписатьПолеЛог( "OKATO", " " );
+           end;
+         else
+           if( StrLen( bdtransf.BTTTICode ) > 0 )
+             ЗаписатьПолеЛог( "KBK", bdtransf.BTTTICode );
+           else
+             ЗаписатьПолеЛог( "KBK", " " );
+           end;
+           if( StrLen( bdtransf.OKATOCode ) > 0 )
+             ЗаписатьПолеЛог( "OKATO", strRpad( bdtransf.OKATOCode, 11, "-" ) );
+           else
+             ЗаписатьПолеЛог( "OKATO", " " );
+           end;
+         end;
+        ЗаписатьПолеЛог( endField, "FinalPayment" ) ;
+        УстановитьКонтекстБлокаЛог( ".." );
+        // FinalPayment -------------------------------------------
+
+      ЗаписатьПолеЛог( endField, "pirq:ImportRequest" ) ;
+      УстановитьКонтекстБлокаЛог( ".." );
+      // ImportRequest -------------------------------------------
+
+     ЗаписатьПолеЛог( endField, "unifo:ImportData" ) ;
+     УстановитьКонтекстБлокаЛог( ".." );
+     // ImportData -------------------------------------------
+
+    ЗаписатьПолеЛог( endField, "smev:AppData" ) ;
+    УстановитьКонтекстБлокаЛог( ".." );
+    // AppData -------------------------------------------
+
+   ЗаписатьПолеЛог( endField, "smev:MessageData" ) ;
+   УстановитьКонтекстБлокаЛог( ".." );
+   // MessageData -------------------------------------------
+
+  ЗаписатьПолеЛог( endField, "n1:UnifoTransferMsg" ) ;
+  УстановитьКонтекстБлокаЛог( ".." );
+  // UnifoTransferMsg -------------------------------------------
+
+  return TRUE; /* Успешное завершение */
+end;
+
+private macro FillID()
+  var mean:string="", stat=0;
+
+  if( GetKindActionGG() != 0 ) // перегенерация
+    mean = GetFieldValue( GetOldGGMessageID(), "ID" ); 
+  else
+    GetRegistryValue( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ГИС ГМП\\SymbolPaymentID", V_STRING, mean, stat );
+    var ID = execStoredFunc( "sys_guid", V_STRING );
+    if( (stat == 0) AND mean )
+      mean = SubStr( mean, 1, 1 ) + "_" + SubStr( ID, 1,  8 ) + "-" +
+                                          SubStr( ID, 9,  4 ) + "-" +
+                                          SubStr( ID, 13, 4 ) + "-" +
+                                          SubStr( ID, 17, 4 ) + "-" +
+                                          SubStr( ID, 21 ); // symbol + GUID
+    else
+      mean = ID;
+    end;
+  end;
+
+  ЗаписатьПолеЛог( "ID", mean );
+end;
+
+private macro GetStrDateAndHistSysTime( ID, ValDate ):string
+  var query = " select to_char(t_SysTime, 'hh24:mi:ss') as t_SysTime from dpmhist_dbt " +
+              "  where t_PaymentID =  " + ID +
+              "  order by t_AutoKey desc ";
+  var rs:RsdRecordset = execSQLselect(query);
+  var sdate:string = "", Time_:string = "";
+  var query_zone = "select to_char(DBTIMEZONE) from dual";
+  var rs_zone:RsdRecordset = execSQLselect(query_zone);
+  if (rs_zone and rs_zone.moveNext() )
+    Time_ = trim( string( rs_zone.value(0) ) );
+  end;
+
+  if( rs.moveNext() )
+    sdate = "T" + trim( string( rs.value("t_SysTime") ) ) + Time_;
+  else
+    var query_time = "select to_char(systimestamp, 'HH24:MI:SS.FF3') FROM dual ";
+    var rs_time:RsdRecordset = execSQLselect(query_time);
+    if (rs_time and rs_time.moveNext() )
+      Time_ = "T" + trim( string( rs_time.value(0) ) ) + Time_;
+    end;  
+    sdate = Time_;
+  end;
+  sdate = ДатаДДММГГГГ(ValDate) + sdate;
+  return sdate;
+end;
+
+private macro GetPaydem(PaymentID : integer)
+  pspaydem.OrderId = PaymentID;
+  getEQ(pspaydem);
+end;
+
+private macro GetDocKind(PaymentID : integer) : integer
+  var q = "select t_DocKind " +
+          "  from dpspayord_dbt " +
+          " where t_OrderID = :PaymentID ";
+  var rs = execSQLselect(q, makeArray( SQLParam("PaymentID", PaymentID) ) );
+  if(rs and rs.moveNext())
+    return rs.value("t_DocKind");
+  end;
+
+  return 0;
+end;
+
+private macro CheckUIN( UIN ):bool
+  var len = strlen(UIN);
+  if( not InList(len, 20, 25) and (SubStr(UIN,1,1) != "0") )
+    return false;
+  end;
+  return true;
+end;
+
+private macro GetUIN(UIN_prop, Ground, ret_UIN)
+  
+  var len;
+  len = StrLen(UIN_prop);
+  
+  if ((len == 20) or (len == 25))
+    SetParm(2, UIN_prop);
+  else
+    SetParm(2, "0");
+    //if (UIN_prop == "")
+    //  SetParm(2, "0");
+    //elif(UIN_prop == "0")
+    //  SetParm(2, UIN_prop);
+    //end;
+  end;
+end;
+
+private macro CheckStatus( status ):bool
+  var stat = true;
+  //Gurin S. 20.10.2015 R-623896-2
+  if (trim(status) == "") return stat; end;
+  if( status )
+    GetllValueElement( 1800, int(status), stat );
+  end;
+  return stat = not stat;
+end;
+
+private macro CheckINNKPP( INNKPP, err:@string ):bool
+  var stat = false;
+  if( INNKPP and (SubStr(INNKPP,1,1) != "/") )
+    if( (index(INNKPP,"/")==0) or ((strlen(INNKPP) - index(INNKPP,"/")) == 0) )
+      err = "В платеже не задан обязательный реквизит - КПП получателя средств";
+      return false;
+    end;
+  else
+    err = "В платеже не задан обязательный реквизит - ИНН получателя средств";
+    return false;
+  end;
+  return true;
+end;
+
+private macro GetTransKind( TransKind ):string
+  if( not InList( TransKind, "01", "06", "02", "ПД"  ) )
+    return "";
+  end;
+  return TransKind;
+end;
+
+private macro GetCorrAcc( val, IsPayment ):string
+  file bank("bankdprt") key 0;
+  file dp_dep("dp_dep") key 0;
+  if( val != null )
+    var PartyID = val;
+    if( not IsPayment )
+      dp_dep.Code = val;
+      GetEQ(dp_dep);
+      PartyID = dp_dep.PartyID;
+    end;
+    bank.PartyID = PartyID;
+    GetEQ(bank);
+    return bank.CorAcc;
+  end;
+  return 0;
+end;
+
+//Макрос высчитавыет разницу между длинной строки в rsl
+//и длинной строки подготовленной для отправки в xml
+private macro GetLenXmlStr(str)
+  var params:TArray = TArray();
+  var delta:integer = 0;
+  params[0] = SQLParam( "p_str", str);
+
+  delta = execStoredFunc("USR_GIS_GMP_UTIL.GETTRANSFIELDLEN", V_INTEGER, params);
+  if (delta)
+    return delta; 
+  end;
+  return 0;
+end;
+
+macro GenMes1_16( addrMes, addrPaym )
+  debugbreak;
+  
+  record wlmes(wlmes);
+  ClearRecord(wlmes);
+  file pmpaym(pmpaym);
+  record bdtransf("bdtransf.dbt");
+
+  SetBuff( wlmes, addrMes );
+  SetBuff( wlInfo, addrPaym );
+  //SetBuff( pmpaym, addrPaym );
+
+  var isPayment = true;
+  var PaymentID:string = "", BIK:string = "";
+  var note = "";
+  var IsRecreate:bool = GetKindActionGG()==4; //Перегенерация?
+  var KindActionGG = GetKindActionGG();
+  var UIN:string = "";
+
+  PrintLog(2,"Генерация сообщения по INFP1.16.1");
+
+  var text:string = "",
+      tmpstr:string = "";  
+
+  text = ПрочитатьТекстИнфСообщения( wlInfo );
+  PaymentID = GetFieldFromText( text, "ID платежа" );
+
+  ClearRecord( pmpaym);
+  pmpaym.PaymentID = int(PaymentID);
+  getEQ(pmpaym);
+
+  var pmprop_debet = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_debet.rec );
+  pmprop_debet.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_debet.rec.DebetCredit = 0;
+  pmprop_debet.getEQ ();
+  
+  var pmprop_credit = Tbfile ("pmprop.dbt");
+  ClearRecord( pmprop_credit.rec );
+  pmprop_credit.rec.PaymentID = pmpaym.PaymentID;
+  pmprop_credit.rec.DebetCredit = 1;
+  pmprop_credit.getEQ ();
+  
+  var pmrmprop = Tbfile ("pmrmprop.dbt");
+  ClearRecord( pmrmprop.rec );
+  pmrmprop.rec.PaymentID = pmpaym.PaymentID;
+  pmrmprop.getEQ ();
+
+  var wlmes_xml:object = ActiveX( "MSXML.DOMDocument" );
+
+  // Document -------------------------------------------
+  УстановитьКонтекстБлокаЛог( "Document" );
+    ЗаписатьПолеЛог( beginField, "Document" );
+    if( isPayment )
+      ЗаписатьПолеЛог( "originatorID", IfThenElse( pmpaym.StartDepartment != wlmes.Department, 
+                                         GetCodeParty( GetDprtPartyID(pmpaym.StartDepartment), 61/*УРН (ГИС ГМП)*/ ),
+                                         "") );
+    else
+      ЗаписатьПолеЛог( "originatorID", "" );
+    end;
+
+    // FinalPayment -------------------------------------------
+    УстановитьКонтекстБлокаЛог( "FinalPayment" );
+      ЗаписатьПолеЛог( beginField, "FinalPayment" );
+      FillID();
+      //if( not CheckUIN( IfThenElse(isPayment, pmrmprop.rec.UIN, bdtransf.UIN) ) )
+      //  msgbox("В платеже задано некорректное значение УИН (УИП). "
+      //         "Допускаются значения, состоящие из 20 или 25 символов, а также значение \"0\"");
+      //  return false;
+      //end;
+      
+      GetUIN(pmrmprop.rec.UIN, pmrmprop.rec.Ground, UIN);
+      
+      if( isPayment )
+        //ЗаписатьПолеЛог( "SupplierBillID", pyOR( pmrmprop.rec.UIN, "0" ) );
+        ЗаписатьПолеЛог( "SupplierBillID", UIN);
+        ЗаписатьПолеЛог( "Narrative"     , pyOR( SubStr( pmrmprop.rec.Ground, 1, 210 - GetLenXmlStr(pmrmprop.rec.Ground) ), "0" ) );
+        ЗаписатьПолеЛог( "Amount"        , string( (pmpaym.BaseAmount * 100):0:0 ) );
+      else
+        ЗаписатьПолеЛог( "SupplierBillID", pyOR( bdtransf.UIN, "0" ) );
+        ЗаписатьПолеЛог( "Narrative"     , pyOR( SubStr( bdtransf.Ground, 1, 210 ), "0" ) );
+        ЗаписатьПолеЛог( "Amount"        , string( (bdtransf.Amount * 100):0:0 ) );
+      end;
+
+      if( isPayment )
+        note = readNoteForObject(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 50 );
+        if( note != "" )
+          ЗаписатьПолеЛог( "PaymentDate", note );
+        else
+          ЗаписатьПолеЛог( "PaymentDate", GetStrDateAndHistSysTime( pmpaym.PaymentID, pmpaym.ValueDate ) );
+        end;
+        ЗаписатьПолеЛог( "ReceiptDate"   , pyOR( ДатаДДММГГГГ(pmpaym.PayerBankEnterDate), "" ) );
+      else
+        ЗаписатьПолеЛог( "PaymentDate", /*ДатаДДММГГГГ(bdtransf.Date) + "T" + string(bdtransf.Time) );*/ GetStrDateAndHistSysTime( bdtransf.bdtransfID, bdtransf.Date ) );
+        ЗаписатьПолеЛог( "ReceiptDate"   , pyOR( ДатаДДММГГГГ(bdtransf.Date), "" ) );
+      end;
+
+      // BudgetIndex -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "BudgetIndex" );
+        ЗаписатьПолеЛог( beginField, "BudgetIndex" );
+        if( not CheckStatus( IfThenElse(isPayment, pmrmprop.rec.TaxAuthorState, bdtransf.TaxAuthorState) ) )
+          msgbox("В платеже не задан или задан неверно статус составителя. Отправка данных по платежу невозможна.");
+          return false;
+        end;
+
+        if( isPayment )
+          ЗаписатьПолеЛог( "Status"       , IfThenElse( pmrmprop.rec.TaxAuthorState and (pmrmprop.rec.TaxAuthorState != "0"), strLpad(pmrmprop.rec.TaxAuthorState,2,"0"), "0" ) ); // "0" - invalid mean, valid: enumeration 01-26
+          ЗаписатьПолеЛог( "Purpose"      , pyOR( pmrmprop.rec.TaxPmGround,    "0" ) );
+          ЗаписатьПолеЛог( "TaxPeriod"    , IfThenElse( pmrmprop.rec.TaxPmPeriod and (pmrmprop.rec.TaxPmPeriod != "0"), strLpad(pmrmprop.rec.TaxPmPeriod,2,"0"), "0" ) );
+          ЗаписатьПолеЛог( "TaxDocNumber" , pyOR( pmrmprop.rec.TaxPmNumber,    "0" ) );
+/*строка*/ЗаписатьПолеЛог( "TaxDocDate"   , pyOR( pmrmprop.rec.TaxPmDate,      "0" ) );
+          if ((pmrmprop.rec.TaxPmType != "ШТ") and (pmrmprop.rec.TaxPmType != "ЗД") and
+              (pmrmprop.rec.TaxPmType != "ПЦ") and (pmrmprop.rec.TaxPmType != "ПЕ") and
+              (pmrmprop.rec.TaxPmType != "0"))
+            ЗаписатьПолеЛог( "PaymentType"  , "0");
+          else
+            ЗаписатьПолеЛог( "PaymentType"  , pyOR( pmrmprop.rec.TaxPmType,      "0" ) );
+          end;
+        else
+          ЗаписатьПолеЛог( "Status"       , IfThenElse( bdtransf.TaxAuthorState and (bdtransf.TaxAuthorState != "0"), strLpad(bdtransf.TaxAuthorState,2,"0"), "0" ) ); // "0" - invalid mean, valid: enumeration 01-26
+          ЗаписатьПолеЛог( "Purpose"      , pyOR( bdtransf.TaxPmGround,    "0" ) );
+          ЗаписатьПолеЛог( "TaxPeriod"    , IfThenElse( bdtransf.TaxPmPeriod and (bdtransf.TaxPmPeriod != "0"), strLpad(bdtransf.TaxPmPeriod,2,"0"), "0" ) );
+          ЗаписатьПолеЛог( "TaxDocNumber" , pyOR( bdtransf.TaxPmNumber,    "0" ) );
+/*дата*/  ЗаписатьПолеЛог( "TaxDocDate"   , pyOR( ДатаДДММГГГГ(bdtransf.TaxPmDate),      "0" ) );
+          ЗаписатьПолеЛог( "PaymentType"  , pyOR( bdtransf.TaxPmType,      "" ) );
+        end;
+      ЗаписатьПолеЛог( endField, "BudgetIndex" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      // PaymentIdentificatio -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "PaymentIdentificatio" );
+        ЗаписатьПолеЛог( beginField, "PaymentIdentificatio" );
+
+        // Bank -------------------------------------------
+        УстановитьКонтекстБлокаЛог( "Bank" );
+          ЗаписатьПолеЛог( beginField, "Bank" );
+          if( isPayment )
+            ЗаписатьПолеЛог( "Name", pmrmprop.rec.PayerBankName );
+            var d_Code = " ";
+            GetPartyCodeEx( pmpaym.PayerBankID, PTCK_BIC, @d_Code );
+            ЗаписатьПолеЛог( "BIK",  IfThenElse( pmprop_debet.rec.CodeKind == PTCK_BIC, pmprop_debet.rec.Bankcode, d_Code ) );
+            ЗаписатьПолеЛог( "CorrespondentBankAcc",  GetCorrAcc(pmpaym.PayerBankID,true/*payment*/) );
+          else
+            var PartyID = 0, PartyName = " ";
+            var select = "select party.t_Name, party.t_PartyID from dparty_dbt party, ddp_dep_dbt dp_dep "
+                         " where party.t_PartyID = dp_dep.t_PartyID "
+                         "   and dp_dep.t_Code = :Department ";
+            
+            var params = makeArray( SQLParam( "Department", bdtransf.Department ) );
+            var rs:RSDRecordSet = execSQLselect( select, params, FALSE );
+
+            if( rs.moveNext() )
+              PartyName = rs.value(0);
+              PartyID = rs.value(1);
+            end;
+            ЗаписатьПолеЛог( "Name", PartyName );
+            d_Code = " ";
+            GetPartyCodeEx( PartyID, PTCK_BIC, @d_Code );
+            ЗаписатьПолеЛог( "BIK", d_Code );
+            ЗаписатьПолеЛог( "CorrespondentBankAcc",  GetCorrAcc(bdtransf.Department,false/*transfer*/) );
+          end;
+        ЗаписатьПолеЛог( endField, "Bank" );
+        УстановитьКонтекстБлокаЛог( ".." );
+
+        if( KindActionGG != 0 ) // перегенерация
+          tmpstr = GetFieldValue( GetOldGGMessageID(), "SystemIdentifier" ); 
+          ЗаписатьПолеЛог( "SystemIdentifier", strLpad(tmpstr, 32, "0") );
+        else
+          var dep = Tbfile ("dp_dep.dbt");
+          ClearRecord( dep.rec );
+          if( isPayment )
+            dep.rec.Code = pmpaym.OperNode;
+          else
+            dep.rec.Code = bdtransf.Department; 
+          end;
+          dep.getEQ ();
+
+          GetPartyCodeEx( pmpaym.PayerBankID, PTCK_BIC, @BIK );
+          if( isPayment )
+            tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_PAYMENT, pmpaym.PaymentID );
+          else
+            tmpstr = FormPaymentID( BIK, dep.rec.Name, OBJTYPE_BDTRANSF, bdtransf.BdTransfID );
+          end;
+          ЗаписатьПолеЛог( "SystemIdentifier", strLpad(tmpstr, 32, "0") );
+        end;
+      ЗаписатьПолеЛог( endField, "PaymentIdentificatio" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      // AccDoc -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "AccDoc" );
+        ЗаписатьПолеЛог( beginField, "AccDoc" );
+        if( isPayment )
+          //ЗаписатьПолеЛог( "AccDocNo",   string( pmrmprop.rec.Number ) ); // ???? СЕРВИС ГЛЮЧИТ / изменили на 3 цифры
+          ЗаписатьПолеЛог( "AccDocNo",   Substr(string( pmrmprop.rec.Number ), 1, 6) ); // Глючит не сервис, глючит реализация, по формату 6 символов max
+          ЗаписатьПолеЛог( "AccDocDate", ДатаДДММГГГГ(pmrmprop.rec.Date) );
+        else
+          ЗаписатьПолеЛог( "AccDocNo",   string( bdtransf.Number ) ); // 31.12.2014 ГИС не пропускает этот элемент
+          ЗаписатьПолеЛог( "AccDocDate", ДатаДДММГГГГ(bdtransf.Date) );
+        end;
+      ЗаписатьПолеЛог( endField, "AccDoc" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      // Payer -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "Payer" );
+        ЗаписатьПолеЛог( beginField, "Payer" );
+        if( isPayment )
+          //tmpstr = IfThenElse( isPayment, PayerIDForm( pmpaym.Payer ), bdtransf.TaxPersonRef );
+          // Для физиков PayerIdentifier передается в 158 примечание
+          tmpstr = readNoteForObject(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), 158 );
+          if (tmpstr == "")
+            tmpstr = IfThenElse( isPayment, PayerIDForm( pmpaym.Payer ), bdtransf.TaxPersonRef );
+          end;
+          ЗаписатьПолеЛог( "PayerIdentifier", pyOR( tmpstr, "0" ) );
+          if( IsPartyInst( pmpaym.Payer ) )
+            //ЗаписатьПолеЛог( "PayerName",       pyOR( pmrmprop.rec.PayerName, "" ) );
+            ЗаписатьПолеЛог( "PayerName",       pyOR( Substr(pmrmprop.rec.PayerName, 1, 160 - GetLenXmlStr(pmrmprop.rec.PayerName)), "" ) );
+                      end;
+          ЗаписатьПолеЛог( "PayerAccount",    pyOR( pmpaym.PayerAccount, "" ) );
+        else
+          ЗаписатьПолеЛог( "PayerIdentifier", pyOR( bdtransf.TaxPersonRef, "0" ) );
+          if( IsPartyInst( bdtransf.BdTransfID ) )
+            ЗаписатьПолеЛог( "PayerName",       pyOR( bdtransf.PayerName, "" ) );
+          end;
+          ЗаписатьПолеЛог( "PayerAccount",    pyOR( bdtransf.PayerAccount, "" ) );
+        end;
+      ЗаписатьПолеЛог( endField, "Payer" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      // Payee -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "Payee" );
+        ЗаписатьПолеЛог( beginField, "Payee" );
+        //var err = "";
+        //if( not CheckUIN( IfThenElse(isPayment, pmrmprop.rec.ReceiverINN, bdtransf.ReceiverINN), @err ) )
+        //  msgbox( err );
+        //  return false;
+        //end;
+
+        if( isPayment )
+          ЗаписатьПолеЛог( "PayeeName", pmrmprop.rec.ReceiverName );
+          ЗаписатьПолеЛог( "payeeINN",  RemoveKPP(pmrmprop.rec.ReceiverINN) );
+          ЗаписатьПолеЛог( "payeeKPP",  RemoveINN(pmrmprop.rec.ReceiverINN) );
+        else
+          ЗаписатьПолеЛог( "PayeeName", bdtransf.ReceiverName );
+          ЗаписатьПолеЛог( "payeeINN",  RemoveKPP(pmrmprop.rec.ReceiverINN) );
+          ЗаписатьПолеЛог( "payeeKPP",  RemoveINN(pmrmprop.rec.ReceiverINN) );
+        end;
+        // PayeeBankAcc -------------------------------------------
+        УстановитьКонтекстБлокаЛог( "PayeeBankAcc" );
+          ЗаписатьПолеЛог( beginField, "PayeeBankAcc" );
+          if( isPayment )
+            ЗаписатьПолеЛог( "Account", pyOR( pmpaym.ReceiverAccount,   "00000000000000000000" ) );
+          else
+            ЗаписатьПолеЛог( "Account", pyOR( bdtransf.ReceiverAccount, "00000000000000000000" ) );
+          end;
+          // Bank -------------------------------------------
+          УстановитьКонтекстБлокаЛог( "Bank" );
+            ЗаписатьПолеЛог( beginField, "Bank" );
+            if( isPayment )
+              ЗаписатьПолеЛог( "Name", pyOR( pmrmprop.rec.ReceiverBankName, "" ) );
+              var c_Code = "";
+              GetPartyCodeEx( pmpaym.ReceiverBankID, PTCK_BIC, @c_Code );
+              ЗаписатьПолеЛог( "BIK",  IfThenElse( pmprop_credit.rec.CodeKind == PTCK_BIC, pmprop_credit.rec.Bankcode, c_Code ) );
+              ЗаписатьПолеЛог( "CorrespondentBankAcc",  GetCorrAcc(pmpaym.ReceiverBankID,true/*payment*/) );
+            else
+              ЗаписатьПолеЛог( "Name", pyOR( bdtransf.ReceiverName, "" ) );
+              ЗаписатьПолеЛог( "BIK",  bdtransf.ReceiverBankcode );
+
+              var makeParams = makeArray( SQLParam( "ReceiverBankCode", bdtransf.ReceiverBankcode ) );
+              var execQuery = execSQLselect( "select t_PartyID from dpartcode_dbt where t_Code = :ReceiverBankCode and t_CodeKind = 3", makeParams, FALSE );
+              var _PartyID = 0;
+              if ( execQuery and execQuery.moveNext() )
+                _PartyID = execQuery.value(0);
+              end;
+              ЗаписатьПолеЛог( "CorrespondentBankAcc", GetCorrAcc(_PartyID,true/*transfer*/) );
+            end;
+          ЗаписатьПолеЛог( endField, "Bank" );
+          УстановитьКонтекстБлокаЛог( ".." );
+
+        ЗаписатьПолеЛог( endField, "PayeeBankAcc" );
+        УстановитьКонтекстБлокаЛог( ".." );
+
+      ЗаписатьПолеЛог( endField, "Payee" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      // ChangeStatus -------------------------------------------
+      УстановитьКонтекстБлокаЛог( "ChangeStatus" );
+        ЗаписатьПолеЛог( beginField, "ChangeStatus" );
+        var reason = GetCachedVar( WLD_CONTEXTANNULREASON );
+        if( isPayment )
+          if( IsRecreate ) // перегенерация
+            tmpstr = GetFieldValue( GetOldGGMessageID(), "meaning" ); 
+            ЗаписатьПолеЛог( "meaning", tmpstr );
+            tmpstr = GetFieldValue( GetOldGGMessageID(), "Reason" ); 
+            ЗаписатьПолеЛог( "Reason", pyOR( tmpstr, "" ) );
+          else
+            ЗаписатьПолеЛог( "meaning", IfThenElse( KindActionGG == 1, "2", IfThenElse( KindActionGG == 2, "3", "1" ) ) );
+            ЗаписатьПолеЛог( "Reason",  string( pyOR( reason, "" ) ) ); // Заполняем при выполнении процедуры аннулирования информации о платеже.
+          end;
+        else
+          ЗаписатьПолеЛог( "meaning", IfThenElse( KindActionGG != 0, "3", "1" ) );
+          ЗаписатьПолеЛог( "Reason",  string( pyOR( reason, "" ) ) ); // Заполняем при выполнении процедуры аннулирования информации о платеже.
+        end;
+      ЗаписатьПолеЛог( endField, "ChangeStatus" );
+      УстановитьКонтекстБлокаЛог( ".." );
+
+      if( isPayment )
+         // pmpaym.PaymentID, not DocumentID ?
+        var isClientRequirement:bool = GetDocKind( pmpaym.PaymentID ) == 2/*$(Клиентское требование)???*/;
+        GetPaydem( pmpaym.PaymentID );
+        ЗаписатьПолеЛог( "KBK", pyOR( pmrmprop.rec.BTTTICode, "0" ) );
+        ЗаписатьПолеЛог( "TransKind",       GetTransKind( IfThenElse( pmpaym.PrimDocOrigin == PD_OR_RETAIL, "ПД" , string(pmrmprop.rec.ShifrOper) ) ) );
+        ЗаписатьПолеЛог( "TransContent",    IfThenElse( pmpaym.PartPaymNumber, GetContentOperationString( pmpaym.ContentOperation, pmpaym, false ), "" ) );
+        ЗаписатьПолеЛог( "PaytCondition",   IfThenElse( isClientRequirement, IfThenElse( pspaydem.AcceptTerm!=0, "1", "2" ), "" ) );
+        ЗаписатьПолеЛог( "AcptTerm",        IfThenElse( isClientRequirement, string(pspaydem.AcceptPeriod),                  "" ) );
+        ЗаписатьПолеЛог( "MaturityDate",    IfThenElse( isClientRequirement, ДатаДДММГГГГ(pspaydem.AcceptDate),              "" ) );
+        ЗаписатьПолеЛог( "DocDispatchDate", ДатаДДММГГГГ( pmrmprop.rec.DocDispatchDate ) );
+      else
+        ЗаписатьПолеЛог( "KBK", pyOR( bdtransf.BTTTICode, "" ) );
+        ЗаписатьПолеЛог( "TransKind",       "ПД" );
+        ЗаписатьПолеЛог( "TransContent",    ""  );
+        ЗаписатьПолеЛог( "PaytCondition",   ""  );
+        ЗаписатьПолеЛог( "AcptTerm",        ""  );
+        ЗаписатьПолеЛог( "MaturityDate",    ""  );
+        ЗаписатьПолеЛог( "DocDispatchDate", ""  );
+      end;
+
+      // PartialPayt -------------------------------------------
+      if( isPayment and (pmpaym.PartPaymNumber > 0) )
+        УстановитьКонтекстБлокаЛог( "PartialPayt" );
+          ЗаписатьПолеЛог( beginField, "PartialPayt" );
+          ЗаписатьПолеЛог( "PaytNo",          string(pmpaym.PartPaymNumber) );
+          ЗаписатьПолеЛог( "TransKind",       string(pmpaym.PartPaymShifrMain) );
+          ЗаписатьПолеЛог( "SumResidualPayt", pyOR( string( (pmpaym.PartPaymRestAmountMain * 100):0:0 ), "" ) );
+
+          // AccDoc -------------------------------------------
+          УстановитьКонтекстБлокаЛог( "AccDoc" );
+            ЗаписатьПолеЛог( beginField, "AccDoc" );
+            ЗаписатьПолеЛог( "AccDocNo",   Substr(string( pmpaym.PartPaymNumMain), 1, 6) );
+            //ЗаписатьПолеЛог( "AccDocNo",   string( pmpaym.PartPaymNumMain ) );
+            ЗаписатьПолеЛог( "AccDocDate", ДатаДДММГГГГ(pmpaym.PartPaymDateMain) );
+          ЗаписатьПолеЛог( endField, "AccDoc" );
+          УстановитьКонтекстБлокаЛог( ".." );
+        ЗаписатьПолеЛог( endField, "PartialPayt" );
+        УстановитьКонтекстБлокаЛог( ".." );
+      end;
+
+      if( isPayment )
+        ЗаписатьПолеЛог( "Priority",  pyOR( string(pmrmprop.rec.Priority), "" ) );
+        ЗаписатьПолеЛог( "OKTMO"    , pyOR( pmrmprop.rec.OKATOCode, "0" ) );
+      else
+        ЗаписатьПолеЛог( "Priority",  pyOR( string(bdtransf.Priority), "" ) );
+        ЗаписатьПолеЛог( "OKTMO"    , pyOR( bdtransf.OKATOCode, "0" ) );
+      end;
+      ЗаписатьПолеЛог( "Signature", "" );
+
+    ЗаписатьПолеЛог( endField, "FinalPayment" );
+    УстановитьКонтекстБлокаЛог( ".." );
+
+  ЗаписатьПолеЛог( endField, "Document" );
+
+  return true;
+end;

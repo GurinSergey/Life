@@ -1,0 +1,326 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29019 - "Картотека 1"
+// Шаг      : 10    - "Изъятие из картотеки 1"
+// Описание : Макрос шага
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov 2014-02-21 C-19151 Логгирование массово выполненных шагов
+// Gurin S. 26.03.2015 HF2031_19_25_148
+//-----------------------------------------------------------------------------
+import pm_common, pm_setst, payconst, payinter, "catfdoc.mac", cbsttls, rsd, "pm_answerret.mac", "mpckvit.mac"; //TAM 21.02.13 HF_64
+import OprInter, oralib; //Jushmanov 2014-02-21 C-19151
+var PaymentObj:RsbPayment;
+
+var OpenBalansAccountK2 = 0;
+var numb1, date1, cmdk1, rsdk1, strground;
+
+private macro GetOperK1(paymentid)
+    var rs, str;
+    str = "SELECT s.t_oper  " +
+          "  FROM doproper_dbt o, doprstep_dbt s  " +
+          " WHERE s.t_id_operation = o.t_id_operation  " +
+          "   AND s.T_BLOCKID = 10000133 " +
+          "   and S.T_NUMBER_STEP = 10  " +
+          "   AND o.t_dockind in (201,286)  " +
+          "   AND o.t_documentid = LPAD ("+paymentid+", 34, 0) ";
+    rs = trsbdataset(str);
+
+    if(rs and rs.movenext)
+        return rs.t_oper;
+    end;
+
+    return 0;
+end;
+
+private macro ValueDateForExtractFromInd1(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+    end;
+
+    return ValueDate;
+end;
+
+MACRO ExecuteStep( doc, paymDoc )
+
+    // Объекты для КУ
+    var FD_Index1 :PaymIndex1_FirstDoc    = PaymIndex1_FirstDoc( PaymentObj.PaymentID );
+    var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+    var K1Oper;
+
+    // Счета КУ
+    var СистемныйСчетДляКартотек:string = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+    var ВнебалСчетКартотеки1    :string = FD_Index1.FindAndOpenAccount( "Картотека 1", 0, PaymentObj.PayerBankEnterDate );
+
+    var obj:RsbPsPayOrder = RsbPsPayOrder( PaymentObj.DocumentID );
+    var DenialAmount = PaymentObj.DenialAmount;
+    var AcceptAmount = PaymentObj.PayerAmount - PaymentObj.DenialAmount;
+    var СостояниеАкцепта: integer;
+
+    if( AcceptAmount == PaymentObj.PayerAmount )
+        СостояниеАкцепта = 0; //акцепт
+        PaymentObj.PayerAmount    = PaymentObj.FuturePayerAmount;
+        PaymentObj.ReceiverAmount = PaymentObj.PayerAmount;
+    elif( (AcceptAmount > 0) and (DenialAmount > 0) )
+        СостояниеАкцепта = 1; //частичный акцепт
+        PaymentObj.PayerAmount    = AcceptAmount;
+        PaymentObj.ReceiverAmount = AcceptAmount;
+    else
+        СостояниеАкцепта = 2; //отказ
+        PaymentObj.PayerAmount = 0;
+    end;
+
+    //Lavrenov: Определяем кто ставил документ на К1
+    K1Oper = GetOperK1(PaymentObj.paymentid);
+  
+    //Лавренов: для конвертированныхдокументов К1 даем воззможность задать правильный внеалансовый счет, если бдруг выбрвнный системой не удовлетворяет  
+    if (PaymentObj.PayerBankEnterDate <= date("16.10.2009"))
+        if(msgboxex("Выбран след внебалансовый счет К1: "+ВнебалСчетКартотеки1+". ||Желаете изменить?",MB_YES+MB_NO,
+                        IND_NO,"Выбор внебалансового счета") == IND_YES)
+            getstring(ВнебалСчетКартотеки1,"Задайте счет К1",20);
+        end;
+    end;
+
+    PaymentObj.ValueDate = ValueDateForExtractFromInd1(PaymentObj);
+    //Gurin S. 29.07.2015 I-00578096-2
+    //PaymentObj.PayDate = PaymentObj.ValueDate;
+    PaymentObj.OutTransferDate = PmGetDefaultOutTransferDate( PaymentObj );
+
+    if( DenialAmount != 0 )// Заполнить примечание причиной отказа
+        if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, PaymentObj.DenialGround) != 0 )
+            MsgBox("Ошибка при вставке примечания платежа");
+        end;
+    end;
+
+    if( СостояниеАкцепта == 1 )
+        obj.Accept = PSPAYDEM_ST_ACCEPT;
+        var PartPayments: TArray = PaymentObj.PartPayments(true);
+        var err_mes : string = "";
+        for(var i, 0, PartPayments.size() - 1, 1)
+            err_mes = "";
+            if( ReDefinePartPaymShifrOper(PartPayments[i], @err_mes) != 0 )
+                msgbox(err_mes);
+                return 1;
+            end;
+            // Если основной платеж из модуля "Проценты" - свяжем с ним планируемую оплату
+            if( IsPrcPayment( PaymentObj ) )
+                if( PrcKvitLinkPayments( PaymentObj.PaymentID, PartPayments[i].PaymentID ) )
+                    return 1;
+                end;
+            end;
+    
+            if(PaymentObj.CheckTerror != CHT_NOTNEED)
+                PartPayments[i].CheckTerror = CHT_NOTCHECK;
+            end;
+        end;
+    end;
+
+    // Выполнить проводку по внебалансу для акцепта
+    if( СостояниеАкцепта < 2 )
+        var paymtr_acc = PaymentObj.MakeTransaction( NULL, NULL, AcceptAmount, PaymentObj.PayerFIID );
+
+        if( paymtr_acc == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+
+        paymtr_acc.Chapter         = 3;                                            
+        paymtr_acc.Date_Carry      = {curdate};;
+        paymtr_acc.Number_Pack     = PaymentObj.NumberPack;
+        paymtr_acc.Numb_Document   = PaymentObj.Number;
+        paymtr_acc.ResultCarry     = 48;
+        paymtr_acc.Kind_Oper       = " 1";
+        paymtr_acc.Shifr_Oper      = "09";
+        paymtr_acc.Department      = PaymentObj.Department;
+        paymtr_acc.AccountPayer    = СистемныйСчетДляКартотек;
+        paymtr_acc.AccountReceiver = ВнебалСчетКартотеки1;
+        paymtr_acc.FIID            = PaymentObj.PayerFIID;
+        paymtr_acc.Sum             = AcceptAmount;
+
+        if(k1oper != 0)
+            paymtr_acc.Oper = k1oper;
+        end;
+
+        if (СостояниеАкцепта == 0 )
+            paymtr_acc.Ground = "Списание с картотеки акцептованной суммы " + string(paymtr_acc.Sum) + 
+                                " по документу № " + string(PaymentObj.Number) + 
+                                " от "             + string(FD_Index1.GetDate()) + 
+                                " к счету "        + string(PaymentObj.PayerAccount);
+        else
+            paymtr_acc.Ground = "Списание с картотеки акцептованной суммы " + string(paymtr_acc.Sum) + " из " + string(obj.ReqSum) + 
+                                " по документу № " + string(PaymentObj.Number) + 
+                                " от "             + string(FD_Index1.GetDate()) + 
+                                " к счету "        + string(PaymentObj.PayerAccount);
+        end;
+
+        if( not paymtr_acc.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;  
+
+    end;
+
+    if( СостояниеАкцепта == 0 )
+        // СП - открыт, ДО - предобработка, КАРТ - нет
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_OPEN, OPR_PAYM_DO, OPR_PM_ST_PREP, OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+
+        if( PM_WasChanged( PaymentObj.PaymentID ) )
+            if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL ) )
+                msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                return 1;
+            end;
+        end;
+
+        PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_WORKING );
+        PaymentObj.PaymStatus = PM_READIED; 
+    
+        if(PaymentObj.CheckTerror != CHT_NOTNEED)
+            PaymentObj.CheckTerror = CHT_NOTCHECK;
+        end;
+    else
+        //Общая часть для частичного акцепта и отказа
+        //Установить статус первичного документа родительского документа = $(закрыт)
+        PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_CLOSED );
+        //Установить статус платежа = PM_FINISHED
+        PaymentObj.PaymStatus = PM_FINISHED;
+        //Установить сегмент <Состояние платежа> = $(Закрыт)
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+
+    // Выполнить проводку по внебалансу для отказа
+    var paymtr_den:object = NULL;
+
+    if( DenialAmount != 0 )
+        paymtr_den = PaymentObj.MakeTransaction( NULL, NULL, DenialAmount, PaymentObj.PayerFIID );
+        if( paymtr_den == NULL )
+            MsgBox("Ошибка при создании проводки по платежу");
+            return 1;
+        end;
+
+        paymtr_den.Chapter         = 3;                                            
+        paymtr_den.Date_Carry      = {curdate};;
+        paymtr_den.Number_Pack     = PaymentObj.NumberPack;
+        paymtr_den.Numb_Document   = PaymentObj.Number;
+        paymtr_den.ResultCarry     = 49;
+        paymtr_den.Kind_Oper       = " 1";
+        paymtr_den.Shifr_Oper      = "09";
+        paymtr_den.Department      = PaymentObj.Department;
+        paymtr_den.AccountPayer    = СистемныйСчетДляКартотек;
+        paymtr_den.AccountReceiver = ВнебалСчетКартотеки1;
+        paymtr_den.FIID            = PaymentObj.PayerFIID;
+        paymtr_den.Sum             = DenialAmount;
+
+    if( AcceptAmount != 0 )
+        paymtr_den.Ground = "Списание с картотеки неакцептованной суммы " + string(DenialAmount) + 
+                            " из "                          + string(obj.ReqSum) + 
+                            " по документу № "              + string(PaymentObj.Number) + 
+                            " от "                          + string(FD_Index1.GetDate())  + 
+                            " к счету "                     + string(PaymentObj.PayerAccount);
+    else
+      paymtr_den.Ground = "Отказ от акцепта документа № " + string(PaymentObj.Number) + 
+                          " от "                          + string(FD_Index1.GetDate())  + 
+                          " к счету "                     + string(PaymentObj.PayerAccount);
+    end;
+
+        if( not paymtr_den.Carry )
+            MsgBox("Ошибка при актуализации платежа");
+            return 1;
+        end;
+
+    end;
+
+    if( obj.PreacptID != 0 )
+        PM_ActuateState( PaymentObj.PaymentID, DenialAmount );
+    end;
+
+    // Установить дату начала операции равной дате операционного дня пользователя
+    SetOprDate(29000000, PaymentObj.ValueDate);
+
+    //Здесь можно вставлять дополнительные проводки для шага
+
+    return 0;
+END;
+
+
+private macro GetDenialAmountGround( PaymentID : integer, IndexNum : integer,
+                                     Amount : @money, Ground : @string )
+    var select = "Select t_Amount, t_Ground " +
+                 "  from dpmdenial_dbt " +
+                 " where t_PaymentID = :PaymentID " +
+                 "   and t_IndexNum = :IndexNum ";
+    var params = makeArray( SQLParam("PaymentID", PaymentID),
+                            SQLParam("IndexNum",  IndexNum) );
+    var rs : RsdRecordset = execSQLselect(select, params);
+    if(rs and rs.moveNext)
+        Amount = rs.value("t_Amount");
+        Ground = rs.value("t_Ground");
+    else
+        Amount = $0;
+        Ground = "";
+    end;
+
+end;
+
+
+macro PostStep( message,     /* 1 - выполнение шага; 2 - откат шага;   */
+                errTrn,      /* статус выполнения шага. Если параметр  */
+                             /* не равен 0, произошла ошибка           */
+                FirstDoc,    /* указатель на первичный документ        */
+                ID_Oper,     /* внутренний идентификатор операции      */
+                Num_Step,    /* Номер шага операции (из настроек)      */
+                KindOper,    /* номер вида операции                    */
+                KindDoc,     /* номер вида первичного документа        */
+                KindStep,    /* вид шага операции                      */
+                ID_Step )    /* внутренний идентификатор шага операции */
+
+    var stat = 0;
+
+    //Jushmanov 2014-02-21 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        var logquery, idOper = ID_Oper, idStep = ID_Step;
+        if ((valtype(IDOper) != V_INTEGER) and (valtype(IDOper) != V_STRING)) IDOper = 0; end;
+        if ((valtype(IDStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) IDStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + IDOper + " AND t_id_step = " + IDStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    if( ( errTrn == 0 ) and ( message == 1 ) )// на выполнении шага
+        var DenialAmount = $0, DenialGround = "";
+
+        GetDenialAmountGround(PaymentObj.PaymentID, PAYMENTS_INDEX_1, @DenialAmount, @DenialGround);
+
+        if(DenialAmount > $0)
+            var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+            //TAM 26.03.13 HF_71
+            var Narrative : string = "", Queries : string = "";
+
+            if(DenialAmount == PsOrder.ReqSum) // отказ полный
+                Queries = "InfoCode:3";
+                //Narrative = DenialGround;
+                Narrative = 
+                  "Отказ от акцепта плательщиком, уведомляем об отказе от акцепта плательщика, " +
+                  "и об аннулировании платежного требования. Основание отказа " + DenialGround;
+            else // частичный акцепт
+                Queries = "InfoCode:4";
+                //Narrative = "Сумма отказа от акцепта " + DenialAmount + ". " + DenialGround;                    
+                Narrative = 
+                  "Частичный отказ от акцепта платежного требования плательщиком, " +
+                  "уведомляем о получении частичного акцепта плательщика. " +
+                  "Сумма отказа от акцепта " + DenialAmount + ". Основание отказа: " + DenialGround;                    
+            end;
+
+            CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step);
+        end; // Если сумма отказа > 0
+    end;
+
+    return stat;
+end;

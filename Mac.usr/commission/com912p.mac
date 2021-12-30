@@ -1,0 +1,182 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Макрос пользовательского алгоритма расчёта базовых сумм комиссии 9.1.2
+       "Выполнение функций агента валютного контроля-от суммы платежа или векселя".
+
+       Тип комиссии - периодическая.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, cb_sql;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+record paym(pmpaym);
+
+
+/* ID Категории "Вид тарифа комиссии 9.1/9.3 за выполнение функций валютного контроля" */
+const GroupID = 27;
+
+/* Выполнение функций валютного контроля - процент от суммы платежа или векселя */
+const TarifCatNumber = "9.1.2";
+
+
+
+/*
+    Расчет для периодических комиссий
+*/
+/* EVG Добавил приём структуры sfcontr для вызова из макроса sfacrpay.mac */
+macro CalcServiceSum( sfcontr_addr/*Договор обслуживания*/, BeginDate/*Начало периода*/, EndDate/*Конец периода*/,
+      sAddr /* EVG Какой-то ещё адрес */, sfcontrStruc /*Cтруктура sfcontr*/ )
+
+    record sfcontr( sfcontr );
+    var query, rs, stat;
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var retVal, Attrid, Code, Num;
+
+
+    /* EVG При вызове из sfacrpay.mac используем полученную структуру sfcontrStruc вместо адреса sfcontr_addr */
+    if ( ValType (sfcontr_addr) != V_UNDEF )
+       SetBuff( sfcontr, sfcontr_addr );
+    else
+       Copy ( sfcontr, sfcontrStruc );
+    end;
+
+    query = " Select paym.t_PaymentID, paym.t_Amount " +
+            "   From DPmPaym_dbt paym, DPmProp_dbt prop " +
+            "  Where paym.t_PayerAccount    = " + GetSQLString(sfcontr.Object) +
+            "    and paym.t_PaymStatus      = 32000 " +                                 // Только закрытые
+            "    and paym.t_ValueDate between " + GetSQLDate(BeginDate) +
+            "                             and " + GetSQLDate(BeginDate) +
+            "    and prop.t_PaymentID       = paym.t_PaymentID " +
+            "    and prop.t_DebetCredit     = 1 " +                                     // Получатель (кредит)
+            "    and prop.t_BankCode        = " + GetSQLString({MFO_Bank});
+
+    rs = rsdRecordSet(query);
+    while (rs and rs.moveNext())
+
+       ClearRecord(paym);
+       paym.PaymentID = rs.value(0, null, V_INTEGER);
+       
+       /* Получим значение категории "Вид тарифа комиссии 9.1/9.3 за выполнение функций валютного контроля" */
+       Num = "";
+       GetMainObjAttr (retVal, OBJTYPE_PAYMENT, UniID(paym, OBJTYPE_PAYMENT), GroupID, null, null, Num);
+
+       /* При подсчёте базовой суммы и количества, учитываются только документы с нужной категорией */
+       if (Num == TarifCatNumber)
+          CommSum   = CommSum + rs.value(1, null, V_MONEY);
+       end;
+       
+    end;
+
+    /* EVG При вызове из sfacrpay.mac возвращаем true в случае положительного результата расчёта */
+    if ( ValType (sfcontrStruc) != V_UNDEF )
+       if (CommSum > 0)
+          return true;
+       end;
+       return false;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType    = SF_BASETYPE_SUM;
+    sfbassum.baseSum     = CommSum;
+
+    sfbassum.baseType2   = SF_BASETYPE_SUM;
+    sfbassum.baseSum2    = CommSum;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+
+
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

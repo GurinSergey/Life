@@ -1,0 +1,1096 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: lib_pm_check.mac
+// @author  : 2013-01-03 zip_z. 
+// @desc    : пользовательские проверки платежа на шагах операции
+// @changes : joy 05.03.2013 Жаворонкова Н. C-1107 Функцинал оповещения об истечении срока действия полномочий сотрудника
+//            zmp 25.03.2013 C-17511
+//            TAM 07.05.2013 C-19427
+//          : 2013-06-20 zip_z. + PM_isExistDuplicatePayment
+//          : 2013-06-22 zip_z. + PM_IsOprStep_State
+//                              + PM_HasCarry_OprStep_State
+//                              + PM_GetDocKind
+//                              + PM_Opr_GetIdOperation
+//                              + PM_DeletePrimaryDocumentPaym
+//                              + PM_IsClientPSPayment
+//                              + PM_isLockedByFMControl
+//                              + PM_FindOperation
+//            TAM 29.07.2013 C-22139
+//            TAM 09.08.2013 C-21757
+//            RR  06.09.2013 Добавил RR_GetTPTorgNumber, RR_GetClientOborot, RR_CheckTPCompareTorg
+//            Gurin S. 03.10.2013 C-23782-6 Добавил PM_IsStepExist
+//            TAM 05.09.2013 C-23305 - функции поиска договора ЗДА и обновлении условия оплаты  
+//            TAM 29.10.2013 C-24556 - проверка на заполнение примечания для ТП значением "Пачка 915"          
+//            Gurin S. 29.10.2013 C-24064-6 Добавил PM_GetRest  
+//            joy 06.11.2013 Жаворонкова Н. Добавила функцию GoToPZO
+//            RR 30.12.2013 C-26027 - Костыли по 3063-У CheckUSRType_For_7777TerrCode, CheckExistsFMOprForPayment, CreateFMOperation
+//            KS 22.11.2013 Предварительная адаптация под 31ю сборку 
+//            TAM 11.02.2014 C-26779 - формирование наименования плательщика для ИП (107н)
+//            RR 14.03.2014 Добавляю PM_GetAcceptState возвращает значение акцепта по документу
+//            TAM 10.04.2014 C-28570 - функция заполнения УИН платежа
+//            VDN 17.06.2014 R-394437 - Проблема попадания платежа на согласование
+//            TAM 22.08.2014 C-25551  - нечеткий поиск ЗДА
+//            TAM 13.02.2015 C-34990  - функция проверки контрольного ключа УИН
+//            TAM 06.03.2015 C-37632  - функция определяет, является ли банк получателя Сбербанком
+//                                    - функция получает параметры для позиционирования на МФР на Саратов
+//            RR 15.12.2015 Доработки в соответствии с R-631562
+// -------------------------------------------------------------------------------------------------
+
+import bankinter, payminter, ctinter, ptinter, "pm_tools.mac", fminter;
+import oralib, likepy, globals, fg_Life_parm, pm_setst;
+import lib_compare, lib_const;
+import lib_account;
+
+//Gurin S. 03.06.2016 R-647756-2
+macro PM_isTaxPayment(ReceiverAccount)
+   return( ( substr(ReceiverAccount, 1, 5) == "40101")
+        or ( substr(ReceiverAccount, 1, 5) == "40302")
+        or ((substr(ReceiverAccount, 1, 5) == "40501") and (substr(ReceiverAccount , 14, 1)  == "2"))
+        or ((substr(ReceiverAccount, 1, 5) == "40503") and (substr(ReceiverAccount , 14, 1)  == "4"))
+        or ((substr(ReceiverAccount, 1, 5) == "40603") and (substr(ReceiverAccount , 14, 1)  == "4"))
+        or ((substr(ReceiverAccount, 1, 5) == "40703") and (substr(ReceiverAccount , 14, 1)  == "4"))
+        or ((substr(ReceiverAccount, 1, 5) == "40601") and (inList(substr(ReceiverAccount , 14, 1), "1", "3")))
+        or ((substr(ReceiverAccount, 1, 5) == "40701") and (inList(substr(ReceiverAccount , 14, 1), "1", "3"))))
+end;
+
+//Gurin 26.12.2014 C-36456-7
+macro PM_PaymOnIncomplete(pid)
+   var d, r, s = 0; //дата, рейс, сеанс
+   var str = RSL_GetRegistryValue ("PRBB/MCI/INCOMPLETE");
+   if (str != "")
+      str = split(str,";");
+      d = str(0); r = str(1); s = str(2);
+      var sql = "SELECT 1 "
+                "  FROM dwlsess_dbt sess, dwlmes_dbt mes, dwlmeslnk_dbt lnk, dwlpm_dbt wlpm "
+                " WHERE     mes.T_SESSIONID = sess.T_SESSIONID AND lnk.T_MESID = mes.T_MESID AND wlpm.T_WLPMID = lnk.T_OBJID "
+                "       AND sess.T_BANKDATE = :d AND sess.T_NUMBERRACE = :race AND sess.T_NUMBER = :sess AND WLPM.T_PAYMENTID = :pid ";
+      sql = execSqlSelect(sql, makeArray (SQLParam ("d", d), SQLParam ("r", r), SQLParam ("s", s), SQLParam ("pid", pid)));
+      return (sql.movenext());
+   end;
+   return false;
+end;
+
+// zmp 15.09.2014 C-32626
+macro PM_InsertOverComiss(pid)
+   rsdCommand("insert into usr_over_comiss values("+ pid + ")").execute;
+onError
+end;
+
+
+// LAO Интеграция ИКЮЛ
+macro PaymStatusToXml(p_pid,p_status)
+   private  var stat,cmd;
+   cmd=rsdcommand("begin ?:=PM_COMMON.PaymStatusToXmlAll(0,0,?,?); end;");
+   cmd.addParam("Stat",   RSDBP_OUT, V_STRING);
+   cmd.addParam("pid",   RSDBP_IN, p_pid);
+   cmd.addParam("status",   RSDBP_IN, p_status);
+   cmd.execute;
+   
+   stat = cmd.Param("Stat").value;
+   if (stat=="0")
+      return true;
+   else
+      return false;
+   end;
+onError
+ return false;
+end;
+
+
+
+// @desc  : платёж с такими реквизитами уже есть в БД ?
+// @return: V_BOOL (true = да)
+macro PM_isExistDuplicatePayment (docKind           :integer // вид документа
+                                 ,docValueDate      :date    // дата значения
+                                 ,docPayerAccount   :string  // счет плательщика (Дт)
+                                 ,docReceiverAccount:string  // счет получателя (Кт)
+                                 ,docAmount         :money   // сумма по Дт счета (t_amount)
+                                 ,docNumber         :string  // номер документа
+                                 ,docGround         :string  // основание
+                                 ):bool
+    var sql = "select 1 from dpmrmprop_dbt rm, dpmpaym_dbt pm " + "\n" + 
+              " where pm.t_paymentid = rm.t_paymentid and pm.t_valuedate = :m_valuedate and rm.t_ground = :m_ground "  + "\n" + 
+              "  and pm.t_payeraccount = :m_payeraccount and pm.t_receiveraccount = :m_receiveraccount "  + "\n" + 
+              "  and rm.t_number = :m_number and pm.t_amount = :m_amount and pm.t_dockind = :m_dockind";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_valuedate"      , docValueDate      ),
+                                         SqlParam ("m_ground"         , docGround         ),
+                                         SqlParam ("m_payeraccount"   , docPayerAccount   ),
+                                         SqlParam ("m_receiveraccount", docReceiverAccount),
+                                         SqlParam ("m_number"         , docNumber         ),
+                                         SqlParam ("m_amount"         , docAmount         ),
+                                         SqlParam ("m_dockind"        , docKind           )));
+    return sql.moveNext ();
+onError return false;
+end;
+
+//@desc: zmp 08.11.2013 R-279854-2 пользовательская проверка подсистемы
+macro RSL_GetIdentProgram() 
+   var cmd, cmdText;
+   cmdText = " declare                                                         "+
+             "    module_name varchar2(32767);                                 "+
+             "    action_name varchar2(32767);                                 "+
+             " begin                                                           "+
+             "    DBMS_APPLICATION_INFO.READ_MODULE(module_name, action_name); "+
+             "    ? := module_name ;                                           "+
+             " end;                                                            " ;           
+   cmd = RsdCommand(cmdText);
+   cmd.addparam("0", RSDBP_RETVAL, V_STRING);   
+   cmd.execute();
+   return strUpr(cmd.param("0").value);
+onError
+   return "";
+end;
+
+//@desc: zmp 20.12.2013 проверка на п-му, ф-я принимат буквенные параметры 
+macro RSL_IsIdentProgram()
+   var i = 0, parm; 
+   macro getTypeac(p :String)
+      var sql = "select t_name_type from dtypeac_dbt where T_INUMTYPE = 22 and t_type_account = :typeac ";
+      sql = execSQLSelect(sql, makeArray(SQLParam("", p)));
+      if (sql and sql.moveNext())
+         return strUpr(sql.value(0, NULL, V_STRING));
+      end;
+      return "no found";
+   onError
+      return "no found";
+   end;   
+   
+   while( getParm(i, parm) ) 
+      if (index(RSL_GetIdentProgram(), getTypeac(parm)) != 0) return true; end;
+      i = i + 1;      
+   end;
+
+   return false;
+onError
+   return false;
+end;
+
+//@desc: zmp 10.01.2014 проверка на автом. проведение документа
+macro checkAutoExecut(id :integer): bool
+   var sql = " select 1 FROM dobjatcor_dbt                   "+
+             "          WHERE t_objecttype = 501             "+
+             "            AND t_groupid = 1003               "+
+             "            AND t_attrid = 2                   "+
+             "            AND t_object = LPAD (?, 10, '0')   ";
+    sql = execSQLSelect(sql, makeArray(SQLParam("", ID)));
+    return (sql and sql.movenext());
+                                       
+end; 
+
+macro PM_isValidOrigin (docKind, docOrigin)
+    var sql = "select 1 from (      "
+              "       select 200 as m_dockind, t_element from dllvalues_dbt where t_list = 1660 union all" // SOA_PS_BUYCURORDER
+              "       select 201 as m_dockind, t_element from dllvalues_dbt where t_list = 1650 union all" // SOA_PS_PAYORDER
+              "       select  16 as m_dockind, t_element from dllvalues_dbt where t_list = 1665 union all" // SOA_DLDOC_BANKPAYMENT
+              "       select  70 as m_dockind, t_element from dllvalues_dbt where t_list = 1670 union all" // SOA_DLDOC_MEMORIALORDER
+              "       select  15 as m_dockind, t_element from dllvalues_dbt where t_list = 1671 union all" // SOA_CB_MULTYDOC
+              "       select 400 as m_dockind, t_element from dllvalues_dbt where t_list = 1672 union all" // SOA_CASH_BOF_ADDORDER
+              "       select 202 as m_dockind, t_element from dllvalues_dbt where t_list = 1655 union all" // SOA_PS_CPORDER
+              "       select  27 as m_dockind, t_element from dllvalues_dbt where t_list = 1665 union all" // SOA_BBANK_CPORDER
+              "       select 320 as m_dockind, t_element from dllvalues_dbt where t_list = 1674 union all" // SOA_WL_INDOC
+              "       select 286 as m_dockind, t_element from dllvalues_dbt where t_list = 1675     )    " // SOA_DLDOC_BANKORDER
+              " where m_dockind = decode (:m_docKind1, 410, 400, 420, 400, 430, 400, 440, 400, 17, 16, :m_docKind2) and t_element = :m_origin";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_docKind1", docKind), SqlParam ("m_docKind2", docKind), SqlParam ("m_origin", docOrigin)));
+    return sql.moveNext ();
+onError return false;
+end;
+
+
+
+
+// @desc  : платёж бюджетный?
+// @return: V_BOOL (true = да)
+macro PM_IsBPTaxPayment (obj:RsbPayment):bool
+   return ((obj.shifrOper == "06") and 
+           (InList (obj.priority, 1, 2, 3 /*, 4*/)) and //TAM 13.12.13 C-25730
+           (stringEqMask (obj.receiverAccount, "40101*,40401*,40302*"))
+          );
+end;
+
+// @desc  : платёж захвачен роботом ?
+// @return: V_BOOL (true = да)
+macro PM_IsOwnedByNightlyRobot (paymentID:integer):bool
+   var cmd = RsdCommand ("Select * from usr_doprtemp_tmp where T_DOCUMENTID=?");
+   cmd.addParam("paym_id", RSDBP_IN, paymentID);
+   var rs = RsdRecordSet (cmd);
+   return rs.moveNext ();
+end;
+
+// @desc    : 25.03.2013 zmp C-17511 проверка на документ ЕРЦ
+//VDN 17.06.2014 R-394437
+//Gurin S. 26.08.2015 I-00580825-2
+macro PM_IsPaymentERC(PaymentObj :RsbPayment) :bool
+   if(PaymentObj.DocKind == PS_PAYORDER)
+      var obj = GenObject("RsbPsPayOrder", PaymentObj.paymentid);
+      var Bank = fg_life_subject({OURBANK});    
+      return (((((Obj.Origin == USR_PAYMENT_OR_ABBYY_FC ) and (inList(PaymentObj.numberPack, 5002, 7005, 8002))) or
+               ((Obj.Origin == USR_PAYMENT_OR_365 ) and ( PaymentObj.numberPack == 1002 )) or
+               ((Obj.Origin == 19 /*PSPO_OR_PAYEEBANK*/  ) and ( PaymentObj.numberPack == 1003 )))and 
+              (Bank.is_PRBB)) or
+              ((((Obj.Origin == USR_PAYMENT_OR_ABBYY_FC ) and (inList(PaymentObj.ShifrOper, "02", "06"))) or
+               ((Obj.Origin == USR_PAYMENT_OR_365 ) and ( PaymentObj.numberPack == 1002 )) or
+               ((Obj.Origin == 19 /*PSPO_OR_PAYEEBANK*/  ) and ( PaymentObj.numberPack == 1003 )))and 
+              ((Bank.is_EXV) or (Bank.is_SLD) or (Bank.is_GEB))));
+   end;
+   return false;    
+end;
+
+//VV C-23920 
+macro BO_PaymCOM(PaymentObj :RsbPayment):bool
+ var Bank = fg_life_subject({OURBANK});
+ var rs;
+ rs=RsdRecordSet(string("SELECT  1 "+
+                         " FROM   dacclaim_dbt cl, dacclaimstate_dbt accl "+
+                         " WHERE       CL.T_CLAIMID = ACCL.T_CLAIMID "+
+                         "  AND CL.T_CLAIMKIND = 1 "+
+                         "  AND CL.T_RESTKIND = 2 "+
+                         "  AND CL.T_INITIATOR = 1 "+
+                         "  AND ACCL.T_STATE = 1 "+
+                         "  AND CL.T_ACCOUNT = '"+PaymentObj.PayerAccount+ "' "+
+                         "  AND accl.t_stateid = (SELECT   MAX (t_stateid) "+
+                     "                                  FROM   dacclaimstate_dbt "+
+                     "                                 WHERE   t_claimid = cl.t_claimid) " ));  
+   if(  ((Bank.is_VUZ) or (Bank.is_EXV) or (Bank.is_SLD)) //TAM 09.07.2014 R-409276
+       and (PaymentObj.Dockind==286)
+       and (PaymentObj.Origin==3)
+       and (PaymentObj.Defcomid!=0)
+       and(rs.movenext)
+       and(( PaymentObj.FeeType == 3 ) //един
+           or ( PaymentObj.FeeType == 1 ) //период
+           or ( PaymentObj.FeeType == 6 )//раз
+          )
+    )
+      return true;
+  end;  
+  return false;
+end;
+
+//@desc: TAM 07.05.2013 C-19427 - проверка на наличие слов в основании платежа: в ресстре должно быть значение аналогичное шаблону поиска oracle
+macro CheckStopPhraseInGround(paymentID:integer):bool
+   var mask = RSL_GetRegistryValue ("PRBB/PS/БАНКРОТ ОСНОВАНИЕ ПЛАТЕЖА");
+   var query = " SELECT 1 FROM dpmrmprop_dbt WHERE   t_paymentID = ? AND REGEXP_LIKE (UPPER (t_ground), REPLACE (UPPER(?), '_', '.*'))";
+   var cmd = RSDCommand(query);
+   cmd.addparam("pm", RSDBP_IN, paymentId);
+   cmd.addparam("msk", RSDBP_IN, mask);
+   var rs = rsdRecordSet(cmd);
+   if (rs and rs.MoveNext())
+      return true;
+   end;
+   return false;
+end;
+
+//@desc: LAO 13.03.2013 Добавление  на платеж временной блокировки для робота, отложенные платежи он не должен проводить 5 минут 
+macro PM_NightlyRobot_STOP (paymentID)
+var cmd;
+   cmd= RsdCommand("INSERT INTO USR_Nightly_TMP (T_PAYMENTID,T_START_DATE) VALUES (?,SYSDATE + interval '5' minute )");
+   cmd.AddParam("", RSDBP_IN,PaymentId);
+   cmd.execute();
+end;
+ 
+// @desc  : проверка существования сообщения по платежу
+// @return: V_BOOL (true = сообщение существует)
+macro WL_IsExistsMessage (paymentid:integer):bool
+   var sql = "select 1 from dwlpm_dbt where t_paymentid = :m_paymentid";
+   sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", paymentid)));
+   return sql.moveNext ();
+end;
+    
+// @desc  : получаем данные о сообщении по документу
+// @return: ид и вид сообщения
+macro getMessageInfo (paymentid, ID_Kind, MesID)
+   var sql = " SELECT mes.T_KIND kind, mes.T_MESID mid "+
+             "   FROM dwlpm_dbt dwp, dwlmeslnk_dbt lnk, dwlmes_dbt mes "
+             "  WHERE     dwp.t_paymentid = :m_paymentid "+
+             "        AND DWP.T_WLPMID = LNK.T_OBJID "+
+             "        AND lnk.t_mesid = (SELECT   MAX (t_mesid) "+
+             "                             FROM   dwlmeslnk_dbt "+
+             "                            WHERE   t_objid = LNK.T_OBJID) "+
+             "        AND LNK.T_OBJKIND = 501 "+
+             "        AND LNK.T_MESID = MES.T_MESID ";
+   sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", paymentid)));
+   if (sql and sql.moveNext())
+      SetParm(1, sql.value("kind"));
+      SetParm(2, sql.value("mid"));
+   end;
+end;
+
+// @desc  : обновляем данные по валютному документу при выгрузке сообщения
+// @return: 0 - все нормально, 1 - ошибка (WLD_POSTEXPORT_OK, WLD_POSTEXPORT_ERROR)
+macro updateCurrencyDocData(sessionid)
+   var sql = "BEGIN "+
+             "   UPDATE   dpmprop_dbt "+
+             "      SET   T_PROPSTATUS = 32000 "+
+             "    WHERE   T_PAYMENTID = "+
+             "               (SELECT   t_paymentid "+
+             "                  FROM   dwlpm_dbt "+
+             "                 WHERE   t_wlpmid = "+
+             "                            (SELECT   t_objid "+
+             "                               FROM   dwlmeslnk_dbt "+
+             "                              WHERE   t_objkind = 501 "+
+             "                                      AND t_mesid = "+
+             "                                            (SELECT   t_mesid "+
+             "                                               FROM   dwlmes_dbt "+
+             "                                              WHERE   t_sessionid = "+
+             "                                                         :m_sessionid1))) "+
+             "            AND T_PROPSTATUS != 32000; "+
+             "   UPDATE   dwlpm_dbt "+
+             "      SET   T_PROPSTATUS = 32000 "+
+             "    WHERE   T_WLPMID = "+
+             "               (SELECT   t_objid "+
+             "                  FROM   dwlmeslnk_dbt "+
+             "                 WHERE   t_objkind = 501 "+
+             "                         AND t_mesid = (SELECT   t_mesid "+
+             "                                          FROM   dwlmes_dbt "+
+             "                                         WHERE   t_sessionid = :m_sessionid2)) "+
+             "            AND T_PROPSTATUS != 32000; "+
+             "END; ";
+   sql = execSql (sql, makeArray (SqlParam ("m_sessionid1", sessionid), SqlParam ("m_sessionid2", sessionid)));
+   return RSL_EXIT_SUCCESS;
+onError
+   return RSL_EXIT_FAILURE;
+end;
+
+// @desc  : SDA 29.10.2011 фикс ошибки сегментов статусов для ответных межбанковских вводимых вручную 
+// @return: void
+macro WL_FixBadManualPayment (paymentObj:RsbPayment)
+   private const RSL_WL_INDOC = 320; // ответный платёж (введен автоматически) 
+   private const RSL_WL_WIPM  = 322; // ответный платёж (введен вручную)
+    
+   if ( ( paymentObj.Dockind == RSL_WL_INDOC) or ( paymentObj.Dockind == RSL_WL_WIPM) )
+      var cmd = RsdCommand (" MERGE INTO doprcurst_dbt t "+
+                          "\n   USING (SELECT t_id_operation "+
+                          "\n            FROM doproper_dbt o "+
+                          "\n           WHERE t_documentid = LPAD ( ?, 34, '0')) o  "+
+                          "\n   ON ((t.t_id_operation = o.t_id_operation) "+
+                          "\n       AND (t.t_statuskindid = 292) "+
+                          "\n       AND (t.t_dockind = 320)) "+
+                          "\n   WHEN MATCHED THEN "+
+                          "\n      UPDATE "+
+                          "\n         SET t.t_numvalue = 6 "+
+                          "\n   WHEN NOT MATCHED THEN "+
+                          "\n      INSERT (t.t_id_operation, t.t_statuskindid, t.t_numvalue, t.t_dockind) "+
+                          "\n      VALUES (o.t_id_operation, 292, 6, 320) ");
+      cmd.AddParam("", RSDBP_IN, paymentObj.PaymentId);
+      cmd.execute();
+   end;
+end;
+
+// @desc  : TAM 29.07.2013 C-22139 корректировка суммы всех выплат и даты последнего списания при удалении платежа по постоянным перечислениям.
+macro CorrectContractInfoByRegularPayment (amount, usr_field_val)
+    var cmd = RsdCommand (" UPDATE   usr_regular_contr_dbt cntr " +
+                          " SET   CNTR.T_PAID_AMOUNT = CNTR.T_PAID_AMOUNT - :pm_amount, " +
+                          " CNTR.T_LAST_PAY = " +
+                          " (CASE " +
+                            " WHEN cntr.T_PERIODICAL_BASIS = 0 " +
+                               " THEN " +
+                               "   cntr.T_LAST_PAY - INTERVAL '1' DAY " +
+                            " WHEN cntr.T_PERIODICAL_BASIS = 1 " +
+                               " THEN " +
+                               "   cntr.T_LAST_PAY - INTERVAL '7' DAY " +
+                            " WHEN cntr.T_PERIODICAL_BASIS = 2 " +
+                               " THEN " +
+                               "   cntr.T_LAST_PAY - INTERVAL '1' MONTH " +
+                            " WHEN cntr.T_PERIODICAL_BASIS = 3 " +
+                               " THEN " +
+                               "   cntr.T_LAST_PAY - INTERVAL '1' YEAR " +
+                            " END) " +
+                          " WHERE   CNTR.T_CONTR_ID = :contr_id");
+    cmd.AddParam("", RSDBP_IN, amount);
+    cmd.AddParam("", RSDBP_IN, usr_field_val);
+    cmd.execute();
+end;
+
+// @desc  : Проверка на вхождение платежа в состав сводного. TAM 09.08.2013 C-21757
+// @return: integer
+macro IsSinglePaymentInMultyPayment(PaymentId:integer)
+   var SelectStr: string;
+   var params   : TArray;
+   var rs       : object;
+   SelectStr = " select 1 from dpmlink_dbt lnk where LNK.T_PURPOSEPAYMENT = :pmid and LNK.T_LINKKIND = 9 ";
+   params = makeArray( SQLParam( "pmid", PaymentId ));
+   rs = execSQLselect( SelectStr, params, FALSE );
+   if( rs and rs.moveNext() )
+      return rs.value(0);
+   else
+      return 0;
+   end;
+end;
+
+// @desc  : Проверка на то, что сводный документ закрыт. TAM 09.08.2013 C-21757
+macro IsMultyClosed(PaymentID) 
+    var SelectStr: string;
+    var params   : TArray;
+    var rs       : object;
+    SelectStr = " SELECT   PM.T_PAYMENTID pmid, PM.T_PAYMSTATUS status FROM   dpmlink_dbt lnk, dpmpaym_dbt pm " +
+                " WHERE       LNK.T_PURPOSEPAYMENT = :pmid AND LNK.T_LINKKIND = 9 AND PM.T_PAYMENTID = LNK.T_INITIALPAYMENT ";
+    params = makeArray( SQLParam( "pmid", PaymentId ));
+    rs = execSQLselect( SelectStr, params, FALSE );
+    if( rs and rs.moveNext() )
+        return IfThenElse(string(rs.value("status")) == "32000", 1, 0);
+    else
+        return 0;
+    end;
+end;
+
+// @desc  : TAM 05.09.2013 C-23305  - поиск ЗДА для данного требования
+//          TAM 22.08.2014 C-25551  - нечеткий поиск ЗДА
+macro GetZdaContrForPayment(PaymentId:integer, ContrId:integer, ContragentName:string, ContrDate:string, Precision:bool):bool
+   var select : string;
+   var rs     : object;
+   var rsdcmd;
+   select = " WITH zda_contr " +
+            "        AS (SELECT   ZDA.T_CONTR_ID cntr_id,                                                      " +
+            "                     ZDA.T_CONTR_NUMBER cntr_number,                                              " +
+            "                     ZDA.T_CONTR_DATE cntr_date,                                                  " +
+            "                     ZDA.T_CLIENT_ID client_id,                                                   " +
+            "                     ZDA.T_ACCOUNT client_acc,                                                    " +
+            "                     ZDA.T_CONTRBANK_ID contr_bank_id,                                            " +
+            "                     ZDA.T_CONTRAGENT_ID contr_id,                                                " +
+            "                     NVL (CNTR_NAME.T_NAME, ZDA.T_CONTRAGENT_NAME) contr_name,                    " +
+            "                     NVL (ZDA.T_CONTRAGENT_ACC, '.') contr_acc,                                   " +
+            "                     USR_UF_GETINN (NVL (CONTR_INN.T_CODE, ZDA.T_CONTRAGENT_INN)) contr_inn,      " +
+            "                     NVL(TRIM(USR_UF_GETKPP(CONTR_INN.T_CODE)), ZDA.T_CONTRAGENT_KPP) contr_kpp,  " +
+            "                     NVL (ZDA.T_NOTE_FOR_GROUND, ' ') ground_note,                                " +
+            "                     ZDA.T_ZDA_END_DATE zda_end_date,                                                         " +
+            "                     ZDA.T_LIMITED_SUM limit_sum                                                              " +
+            "             FROM         usr_zda_contr_dbt zda                                                   " +
+            "             LEFT JOIN dparty_dbt cntr_name ON (ZDA.T_CONTRAGENT_ID = CNTR_NAME.T_PARTYID)  " +
+            "             LEFT JOIN dobjcode_dbt contr_inn ON ( ZDA.T_CONTRAGENT_ID = CONTR_INN.T_OBJECTID AND CONTR_INN.T_OBJECTTYPE = 3 AND CONTR_INN.T_CODEKIND = 16))                 " +
+            " SELECT   zda_contr.cntr_id contract, ZDA_CONTR.contr_name cntr_name,                                         " +
+            "          zda_contr.cntr_number cntr_number, TO_CHAR (zda_contr.cntr_date, 'dd.mm.yyyy') cntr_date            " +
+            " FROM   dpmpaym_dbt paym, zda_contr, dpmrmprop_dbt rmprop                                   " +
+            " WHERE       PAYM.T_PAYMENTID = ?                                                           " +
+            "         AND RMPROP.T_PAYMENTID = PAYM.T_PAYMENTID                                          " +
+            "         AND PAYM.T_PAYERACCOUNT = zda_contr.client_acc                                     " +
+            "         AND paym.t_payer = zda_contr.client_id                                             " +
+            "         AND CASE                                                                           " +
+            "               WHEN (zda_contr.contr_bank_id != 0) THEN PAYM.T_RECEIVERBANKID               " +
+            "               ELSE zda_contr.contr_bank_id                                                 " +
+            "             END = zda_contr.contr_bank_id                                                  " +
+            "         AND CASE                                                                                             " +
+            "               WHEN (zda_contr.limit_sum != 0) THEN zda_contr.limit_sum                                       " +
+            "               ELSE PAYM.T_AMOUNT                                                                             " +
+            "             END >= PAYM.T_AMOUNT                                                                             " + 
+            "         AND REGEXP_LIKE (PAYM.T_RECEIVERACCOUNT, zda_contr.contr_acc)                      " +
+            "         AND USR_UF_GETINN(RMPROP.T_RECEIVERINN) = zda_contr.contr_inn                      " +
+            "         AND REGEXP_LIKE (UPPER (RMPROP.T_GROUND),                                          " +
+            "             REPLACE (UPPER (zda_contr.ground_note), ' ', '.*'))                            " +
+            "         AND (ZDA_CONTR.zda_end_date = TO_DATE ('01.01.0001', 'dd.mm.yyyy')                 " +
+            "           OR ZDA_CONTR.zda_end_date >= TO_DATE('" + {curdate} + "','dd.mm.yyyy'))                            " +
+            "         AND REGEXP_LIKE (UPPER (RMPROP.T_GROUND), UPPER (ZDA_CONTR.cntr_number))                             " ;
+   if (Precision)
+      select = select + "   AND REGEXP_LIKE (REPLACE (UPPER (RMPROP.T_RECEIVERNAME), '" + "\"" + "'),                           " +
+            "                           REPLACE (UPPER (zda_contr.contr_name), '"  + "\"" + "'))                           " +
+            "               AND REGEXP_LIKE (UPPER (RMPROP.T_GROUND), UPPER (TO_CHAR (ZDA_CONTR.cntr_date, 'dd.mm.yyyy')))  " ;
+   else
+      select = select + "   AND (REGEXP_LIKE (REPLACE (UPPER (RMPROP.T_RECEIVERNAME), '" + "\"" + "'),                           " +
+            "                           REPLACE (UPPER (zda_contr.contr_name), '"  + "\"" + "'))                           " +
+            "              OR REGEXP_LIKE (UPPER (RMPROP.T_GROUND), UPPER (TO_CHAR (ZDA_CONTR.cntr_date, 'dd.mm.yyyy'))))  " ;
+   end;
+   rsdcmd = RSDCommand(select);
+   rsdcmd.AddParam("pmid", RSDBP_IN, PaymentId);
+   rs = RSDRecordset(rsdcmd, null, RSDVAL_STATIC);
+   if( rs and rs.moveNext() )
+      setParm(1, rs.value("contract"));
+      setParm(2, rs.value("cntr_name"));
+      setParm(3, rs.value("cntr_date"));
+      return true;
+   else
+      return false;
+   end;
+end;
+
+
+//@desc: joy C-1107 Функцинал оповещения о том, что закончился\заканчивается срок действия (если указан вообше) полномочий первой или второй подписи 
+MACRO CheckPersonSigns (payer)
+   var sql, cmd, rs, text, verb;
+   var date_to, sign, shortname;
+   
+   /* Заголовок и хвост  одинаковы для обоих сообщений*/
+   var title = "ВНИМАНИЕ!|У следующих представителей ";
+   var article = "";
+   var tail = "|Необходимо связаться с клиентом и запросить необходимые документы!";
+    
+   /*В заголовок вставляем сокращенное (в случае, если его нет - полное) наименование клиента по чеку*/
+   sql = " select decode (P.T_SHORTNAME, chr (1), p.t_name, P.T_SHORTNAME ) SHORTNAME " +
+         " from  dparty_dbt p " +
+         " where t_partyID = :partyID ";
+          
+   cmd = RSDCommand (sql);
+   cmd.addParam ("partyID", RSDBP_IN, payer);
+   rs = rsdRecordSet(cmd);
+   if (rs and rs.movenext ())
+      shortname = rs.value ("SHORTNAME");
+      title = title + shortname ;
+   end;
+   /* Первая проверка: отбираем тех сотрудников, у кого срок действия подписи уже закончился */
+   sql =   " select  decode (ff.t_PersonID, null, null, (select t_name  from dparty_dbt p  where p.t_PartyID = ff.t_PersonID)) SING," + 
+           "         FF.T_DATETO T_DATETO " +
+           " from dofficer_dbt ff, dparty_dbt p " +
+           " where ff.t_partyID = (select   p.t_partyid  from    dparty_dbt p " +
+           "                       where   p.t_partyid = :partyID) " +
+           " and (ff.t_isfirstperson = 'X' or FF.T_ISSECONDPERSON = 'X') " +
+           " and P.T_PARTYID = ff.t_partyID "
+           " and FF.T_DATETO <= :curdate "
+           " and FF.T_DATETO != to_date ('01.01.0001', 'dd.mm.yyyy')"; 
+   cmd = RSDCommand (sql);
+   cmd.addParam ("partyID", RSDBP_IN, payer);
+   cmd.addParam ("curdate", RSDBP_IN, {curdate});
+   rs = rsdRecordSet(cmd);
+
+   while (rs.movenext ())
+      sign = rs.value ("SING");
+      date_to = rs.value ("T_DATETO", null, V_DATE);
+      article =  article + sign + " полномочия истекли " +date_to + "|";
+   end;
+   if (article != "")
+      verb = " закончился срок действия полномочий:|";
+      text = title + verb + article + tail;
+      msgBoxEx (text, MB_OK );
+   end;
+    
+   /*Очищаем для второй проверки*/
+   article = "";
+   /* Вторая проверка: отбираем тех сотрудников, у кого срок действия подписи заканчивается менее, чем через месяц */
+   sql =   " select  decode (ff.t_PersonID, null, null, (select t_name  from dparty_dbt p  where p.t_PartyID = ff.t_PersonID)) SING," + 
+           "         FF.T_DATETO T_DATETO " +
+           " from dofficer_dbt ff, dparty_dbt p " +
+           " where ff.t_partyID = (select   p.t_partyid  from    dparty_dbt p " +
+           "                       where   p.t_partyid = :partyID) " +
+           " and (ff.t_isfirstperson = 'X' or FF.T_ISSECONDPERSON = 'X') " +
+           " and P.T_PARTYID = ff.t_partyID "
+           " and :curdate + to_char (last_day (:curdate), 'dd')  > ff.t_dateto "
+           " and FF.T_DATETO >= :curdate "
+           " and FF.T_DATETO != to_date ('01.01.0001', 'dd.mm.yyyy') ";
+        
+   cmd = RSDCommand (sql);
+   cmd.addParam ("partyID", RSDBP_IN, payer);
+   cmd.addParam ("curdate", RSDBP_IN, {curdate});
+   rs = rsdRecordSet(cmd);
+   while ( rs.movenext ())
+      sign = rs.value ("SING");
+      date_to = rs.value ("T_DATETO", null, V_DATE);
+      article =  article + sign + " полномочия истекают " +date_to + "|";
+   end;
+   if (article != "")
+      verb = " заканчивается срок действия полномочий:|";
+      text = title + verb + article + tail;
+      msgBoxEx (text, MB_OK );
+   end;
+           
+   return 0;
+END;
+
+
+//@desc: joy 06.11.2013 C-24098, R-278975Проверка, нужно ли отправлять платеж на шаг единовременной комиссии
+//       joy 08.11.2013 I-00441180 Только по платежным поручениям (шифр 01)
+//        RR 09.12.2013   по I-00449435-2
+macro GoToPZO (psobj): bool
+    var accpay = RSL_Account(psobj.PayerAccount, 0);
+    if  ((psobj.origin == 1) and (psobj.payment.shifrOper == "01") and stringEqMask (psobj.PayerAccount, "405*,406*,407*,40802*,40807*" ) and not (accpay.check_type_account ("L")))
+        return true;
+    else
+        return false;
+    end;
+end;
+
+
+
+//Получение номера тарифного плана Торговый
+ MACRO RR_GetTPTorgNumber()
+ 
+  var rs;
+  rs = rsdrecordset("select C.T_SFPLANID from dsfplan_dbt c where instr(lower(C.T_NAME) , 'торговый') != 0");
+  if (rs and rs.movenext())
+    return rs.value(0);
+  else
+    return -1;
+  end;
+  
+ END;
+ 
+//Обороты для чеков 420 dockind, по всем символам кроме 40 и 42
+ MACRO RR_GetClientOborot(partyid)
+  var rs, cmd;
+  cmd = RSDCommand (" SELECT    nvl(SUM (AR.T_SUM),0) oborot " +
+                     "   FROM   dpmpaym_dbt p, " +
+                     "          dpmdocs_dbt d, " +
+// KS 20.11.2013 Адаптация 31я сборка
+//                     "          darhdoc_dbt ar, " +
+                     "          dacctrn_dbt ar, " +
+                     "          dsymbcash_dbt sy " +
+                     "  WHERE       P.T_PAYERACCOUNT IN (SELECT   A.T_ACCOUNT " +
+                     "                                     FROM   daccount_dbt a " +
+                     "                                    WHERE   A.T_CLIENT = :client) " +
+                     "          AND P.T_DOCKIND = 420 " +
+                     "          AND D.T_PAYMENTID = P.T_PAYMENTID " +
+// KS 20.11.2013 Адаптация 31я сборка
+//                     "          AND AR.T_APPLICATIONKEY = D.T_APPLICATIONKEY " +
+                     "          AND AR.T_ACCTRNID = D.T_ACCTRNID " +
+//                     "          AND SY.T_APPLICATIONKEY = " +
+//                     "                LPAD (ar.t_iapplicationkind, 5, '0') || ar.t_applicationkey " +
+                     "          AND SY.T_ACCTRNID = ar.T_ACCTRNID " +
+                     "          AND SY.T_SYMBOL NOT IN (40, 42) " +
+                     "          AND AR.T_DATE_CARRY BETWEEN TRUNC (:begdate, 'MM') " +
+                     "                                 AND  :enddate ");
+  cmd.AddParam("client",  RSDBP_IN, partyid);
+  cmd.AddParam("begdate", RSDBP_IN, {curdate});
+  cmd.AddParam("enddate", RSDBP_IN, {curdate});
+  rs = rsdrecordset(cmd);
+  rs.movenext();
+  return rs.value("oborot");
+ END;
+ 
+ // Проверка совпадения Тарифного плана клиента с ТП Тороговый
+ MACRO RR_CheckTPCompareTorg(acc)
+ 
+  var rs, cmd, NumTpTorg, NumTpClient;
+  NumTpTorg = RR_GetTPTorgNumber;
+  cmd = RSDCommand (" SELECT   PL.T_SFPLANID " +
+                    "   FROM   DSFCONTR_DBT D, DSFCONTRPLAN_DBT PL " +
+                    "  WHERE       D.T_OBJECT = :account " +
+                    "          AND PL.T_SFCONTRID = D.T_ID " +
+                    "          AND PL.T_BEGIN = (SELECT   MAX (T_BEGIN) " +
+                    "                              FROM   DSFCONTRPLAN_DBT " +
+                    "                             WHERE   T_SFCONTRID = PL.T_SFCONTRID)");
+  cmd.AddParam("account", RSDBP_IN, acc);
+  rs = rsdrecordset(cmd);
+  if (rs and rs.movenext())
+    NumTpClient = rs.value(0);
+  else
+    NumTpClient = -1;
+  end;
+  
+  if (NumTpTorg == -1)
+    msgbox("Невозмоно определить номер \n ТП Торговый");
+    return false;
+  elif (NumTpClient == -1)
+    msgbox("Невозмоно определить номер \n ТП Клиента");
+  elif (NumTpClient == NumTpTorg)
+    return false;
+  else
+    return true;
+  end;
+  
+ END;
+
+// @desc  : есть шаг у платежа?
+// @return: V_BOOL (true = да)
+macro PM_IsStepExist (_paymid, _blockid, _numstep, _isexec):bool
+    var sql = execSQLSelect(" SELECT /*+ Leading(dopr,dstep) index(dstep DOPRSTEP_DBT_IDX0)*/ 1  FROM   doproper_dbt dopr, doprstep_dbt dstep "
+                            "  WHERE       dopr.t_documentid = LPAD (:paymid, 34, '0') "
+                            "          AND dopr.t_id_operation = dstep.t_id_operation AND dstep.t_blockid = :blockid "
+                            "          AND dstep.t_number_step = :numstep AND dstep.t_isexecute = :isexec ", 
+                            makeArray(SQLParam("", _paymid),  SQLParam("", _blockid), 
+                                      SQLParam("", _numstep), SQLParam("", _isexec)));
+    return (sql.moveNext());
+onError
+    return False;
+end;
+
+// @desc  : проверка на заполнение примечания для ТП значением "Пачка 915"
+// @return: V_BOOL (true = да)
+macro PM_Is915PackTP (client_id, account):bool
+   var sql = execSQLSelect( " SELECT   1                                                                     "
+                            " FROM   dsfcontr_dbt contr, dsfcontrplan_dbt cntr_plan, dsfplan_dbt sfplan      "
+                            " WHERE  CONTR.T_PARTYID = :ptid AND  CONTR.T_OBJECT = :acnt                     "
+                            "    AND CNTR_PLAN.T_SFCONTRID = CONTR.T_ID                                      "
+                            "    AND CNTR_PLAN.T_END = TO_DATE ('01.01.0001', 'dd.mm.yyyy')                  "
+                            "    AND SFPLAN.T_SFPLANID = CNTR_PLAN.T_SFPLANID                                "
+                            "    AND INSTR (SFPLAN.T_COMMENT, 'пачка 915') <> 0                              ",
+                            makeArray(SQLParam("", client_id),  SQLParam("", account)));
+    return (sql.moveNext());
+onError
+    return False;
+end;
+
+// @desc  : остаток на счете
+// @return: V_MONEY
+macro PM_GetRest( _Acc, _OperDate )
+  if (isNull(_OperDate)) _OperDate = {Curdate}; end;
+  var  sql;
+  sql = "SELECT USR_GET_REST (:acc, :operdate) rest from dual";
+  sql = execSqlSelect (sql, makeArray (SqlParam ("acc"      , _Acc      ),
+                                       SqlParam ("operdate" , _OperDate )));
+  if (sql and sql.movenext())
+      return money(sql.value("rest"));
+  end;
+onError
+  return $0;
+end;
+
+// @desc  : находится ли шаг с символом oprStepSymbol в состоянии oprStepState в операции по платежу PaymentId и видом документа docKind ?
+// @return: V_BOOL (true = да)
+macro PM_IsOprStep_State (paymentId:integer, docKind:integer, oprStepSymbol:string, oprStepState:string):bool
+    var sql = "SELECT 1" +
+              "   FROM doprstep_dbt s, doproper_dbt o" +
+              "  WHERE s.t_id_operation    = o.t_id_operation AND " +
+              "        s.t_kind_operation  = o.t_kind_operation AND"  +
+              "        o.t_documentid      = lpad (:m_paymentid, 34, '0') AND " +
+              "        o.t_dockind         = :m_dockind AND " +
+              "        s.t_symbol          = :m_symbol AND "  +
+              "        s.t_isexecute       = :m_isexecute";
+    var parm = makeArray (SqlParam ("m_paymentid" , paymentId     ),
+                          SqlParam ("m_dockind"   , docKind       ),
+                          SqlParam ("m_symbol"    , oprStepSymbol ),
+                          SqlParam ("m_isexecute" , oprStepState  ));
+    sql = execSqlSelect (sql, parm);
+    return sql.moveNext ();
+onError return false;
+end;
+
+// @desc  : есть ли проводка на шаге с символом oprStepSymbol в состоянии oprStepState в операции по платежу PaymentId и видом документа docKind ?
+// @return: V_BOOL (true = да)
+macro PM_HasCarry_OprStep_State (paymentId:integer, docKind:integer, oprStepSymbol:string, oprStepState:string):bool
+    var sql = "select 1 "
+            + "from doprdocs_dbt "
+            + "where ( t_id_operation, t_id_step ) = "
+            + "          any ( select s.t_id_operation, s.t_id_step "
+            + "               from doprstep_dbt s, doproper_dbt o "
+            + "               where s.t_id_operation = o.t_id_operation "
+            + "                 and s.t_kind_operation = o.t_kind_operation "
+            + "                 and o.t_documentid = lpad ( :m_paymentid, 34, '0' ) "
+            + "                 and o.t_dockind = :m_dockind "
+            + "                 and s.t_symbol = :m_symbol "
+            + "                 and s.t_isexecute = :m_isexecute ) "
+            + "  and t_dockind = 1";
+    var parm = makeArray (SqlParam ("m_paymentid" , paymentId     ),
+                          SqlParam ("m_dockind"   , docKind       ),
+                          SqlParam ("m_symbol"    , oprStepSymbol ),
+                          SqlParam ("m_isexecute" , oprStepState  ));
+    sql = execSqlSelect (sql, parm);
+    return sql.moveNext ();
+onError return false;
+end;
+
+// @desc  : определить Dockind по PaymentID
+// @return: V_INTEGER 
+macro PM_GetDocKind (pid:integer):integer
+    var sql = "select t_dockind from dpmpaym_dbt where t_paymentid = :m_paymentid";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", pid)));
+    if (sql.moveNext ())
+        return sql.value ("t_dockind", null, V_INTEGER);
+    end;
+    return 0;
+end;
+
+// @desc  : определить ID операции по PaymentID
+// @return: V_INTEGER 
+macro PM_Opr_GetIdOperation (paymentid:integer, docKind:integer):integer
+    private const OPR_ID_NOTFOUND = 0;
+    
+    var sql = "select t_id_operation from doproper_dbt where t_dockind = :m_docKind and t_documentid = lpad (to_char (:m_paymentid), 34, '0')";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_docKind", docKind), SqlParam ("m_paymentid", paymentid)));
+    if (sql.moveNext ())
+        return sql.value ("t_id_operation", null, V_INTEGER);
+    end;
+    
+    return OPR_ID_NOTFOUND;
+end;
+
+// @desc  : удалить первичку
+// @return: void
+macro PM_DeletePrimaryDocumentPaym (pid)
+    var sql = "select n.t_name m_tablename, f.t_name m_fieldname" +
+              " from fmt_keys k, fmt_fields f, fmt_names n" +
+              " where k.t_fmtid = n.t_id" +
+              "   and k.t_fmtfldid = f.t_id" +
+              "   and t_keynum = 0" +
+              "   and n.t_name = (select 'd' || replace ( t_dbfile, '.', '_' )" +
+              "                  from doprkdoc_dbt" +
+              "                  where t_dockind = :m_dockind and t_primary = chr ( 88 ))";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_dockind", PM_GetDocKind (pid))));
+    if (sql.moveNext ())
+        DB_DeleteValueByPrimaryKey (sql.value ("m_tablename", null, V_STRING), sql.value ("m_fieldname", null, V_STRING), pid);
+    end;
+end;
+// @desc  : является ли платёж рублёвым клиентским платежом (РКО)
+// @return: V_BOOL (true, если да)
+macro PM_IsClientPSPayment (pid:integer):bool
+    var sql = "select 1 from dpspayord_dbt where t_orderid = :m_orderid and t_origin < 1000 and t_origin != 2";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_orderid", pid)));
+    return sql.moveNext ();
+end;
+
+// @desc  : информация по платежу обработана ФМ ?
+// @return: V_BOOL (true, если да)
+//LAO сканирование по индексу при передачи числа в строковый индекс полная жесть, запрос отрабатывал 600 мс, сделал определение через to_char
+macro PM_isLockedByFMControl (pid:integer):bool
+    var sql = "SELECT 1 FROM dopcontr_dbt WHERE t_documentid = to_char(:m_paymentid) AND t_primdockind = 29 AND t_department = 1 AND t_status <> 4";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", pid)));
+    return sql.moveNext ();
+end;
+
+// @desc  : найти шаги операции по платежу 
+// @return: V_BOOL (true, если шаги есть)
+macro PM_FindOperation (paymentid:integer):bool
+    var sql = "select 1 from doprstep_dbt where t_id_operation = (select t_id_operation from doproper_dbt where t_documentid = lpad ( to_char ( :m_paymentid ), 34, '0' ))";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", paymentid)));
+    return sql.moveNext ();
+end;
+
+// @desc  : найти платеж
+// @return: V_BOOL (true)
+macro PM_FindPayment (paymentid:integer):bool
+    var sql = " SELECT  1 "+
+                       "\n            FROM dpmpaym_dbt doc "+
+                       "\n           WHERE doc.t_paymentid = ? ";
+    sql = execSqlSelect (sql, makeArray (SqlParam ("m_paymentid", paymentid)));
+    return sql.moveNext ();
+end;
+
+// @desc  : найти шаг операции с символом symbol и признаком выполненности isExecute по платежу paymentID
+// @return: V_BOOL (true, если шаг есть в таком состоянии) + заполняются исходящие параметры outIdOperation / outIdStep
+macro PM_FindOperation_Step (paymentID:integer, symbol:string, isExecute:string, outIdOperation:integer, outIdStep:integer):bool
+    var ret = false;
+    var sql = " select t_id_operation, t_id_step"
+            + "\n   from doprstep_dbt"
+            + "\n  where (t_id_operation, t_dockind) ="
+            + "\n    (select t_id_operation, t_dockind"
+            + "\n       from doproper_dbt"
+            + "\n      where (t_dockind, t_documentid) ="
+            + "\n        (select t_dockind, lpad (to_char (t_documentid), 34, '0')"
+            + "\n           from dpmpaym_dbt"
+            + "\n          where t_paymentid = :m_paymentid"
+            + "\n        )"
+            + "\n    ) and"
+            + "\n    t_symbol    = :m_symbol and"
+            + "\n    t_isexecute = :m_isexecute";
+    var parm = makeArray (SqlParam ("m_paymentid", paymentId ), SqlParam ("m_symbol", symbol ), SqlParam ("m_isexecute", isExecute ));
+    sql = execSqlSelect (sql, parm);
+    if (ret = sql.moveNext ()) // это ПРИСВАИВАНИЕ. Keep calm.
+        setParm (3, sql.value ("t_id_operation", null, V_INTEGER ));
+        setParm (4, sql.value ("t_id_step"     , null, V_INTEGER ));
+    end;
+    return ret;
+end;
+
+ MACRO CheckUSRType_For_7777TerrCode(account)
+
+  /* EVG 25/02/2014 Переходим на 2031
+  var rs = RSDRecordSet(" SELECT NVL ((SELECT 1 FROM   daccounts_dbt WHERE t_account = to_char("+account+") AND INSTR (t_usertypeaccount, '?') != 0), 0 ) RR " +*/
+  var rs = RSDRecordSet(" SELECT NVL ((SELECT 1 FROM   daccount_dbt WHERE t_account = to_char("+account+") AND INSTR (t_usertypeaccount, '?') != 0), 0 ) RR " +
+                        "   FROM   DUAL ");
+   rs.movenext();
+   if (rs.value("RR") == 1)
+     return true;
+   else
+     return false;
+   end;
+   
+ END;
+
+ MACRO CheckExistsFMOprForPayment(PaymentObj)
+ var rs = RSDRecordSet(" SELECT * FROM dopcontr_dbt opr " +
+                       " WHERE   OPR.T_DOCKIND = "+PaymentObj.DocKind+" AND OPR.T_DOCUMENTID = to_char("+PaymentObj.PaymentID+")");
+     if (rs and rs.movenext())
+       if (   (rs.value(1) == 7) 
+           or (rs.value(1) == 8) )
+         return false;
+       end;
+       return true;
+     else
+       return false;
+     end;
+ END;
+
+ MACRO CreateFMOperation(PaymentObj)
+  debugbreak;
+  var FMOPER = RsbFMOperation();
+  FMOPER.Sum = money(PaymentObj.BaseAmount);
+  FMOPER.FIID = PaymentObj.BaseFIID;
+  FMOPER.Date = {curdate};
+  FMOPER.Oper = {oper};
+  FMOPER.DocKind = PaymentObj.DocKind;
+  FMOPER.DocumentID = PaymentObj.PaymentID;
+  FMOPER.Ground = PaymentObj.Ground;
+  FMOPER.OprParty(_FM_PARTY_Payer).PartyID = PaymentObj.Payer;
+  FMOPER.OprParty(_FM_PARTY_Payer).Account = PaymentObj.PayerAccount;
+  FMOPER.OprParty(_FM_PARTY_Payer).BankID = PaymentObj.PayerBankID;
+  FMOPER.OprParty(_FM_PARTY_Payer).BankCode = PaymentObj.PayerBankCode;
+  FMOPER.OprParty(_FM_PARTY_RECEIVER).PartyID = PaymentObj.Receiver;
+  FMOPER.OprParty(_FM_PARTY_RECEIVER).Account = PaymentObj.ReceiverAccount;
+  FMOPER.OprParty(_FM_PARTY_RECEIVER).BankID = PaymentObj.ReceiverBankID;
+  FMOPER.OprParty(_FM_PARTY_RECEIVER).BankCode = PaymentObj.ReceiverBankCode;
+  FMOPER.AddCodeUO( "7777", "7777" );
+  FMOPER.Check(False,True);
+ END;
+
+
+// @desc  : сформировать наименование ИП по ID субъекта
+// @return: V_STRING
+ macro CreateEmploerPayerName(PartyId:integer):string
+   var sql = " SELECT   fio || prof || address payer_name                                       " +
+             " FROM   ( SELECT   (   DECODE (PRS.T_NAME1, CHR (1), '', PRS.T_NAME1)             " +
+             "                    || ' '                                                        " +
+             "                    || DECODE (PRS.T_NAME2, CHR (1), '', PRS.T_NAME2)             " +
+             "                    || ' '                                                        " +
+             "                    || DECODE (PRS.T_NAME3, CHR (1), '', PRS.T_NAME3))  fio,     " +
+             "                   (   ' ('                                                       " +
+             "                         || NVL (DECODE (ATR.T_ATTRID,                            " +
+             "                                           2, 'нотариус',                         " +
+             "                                           3, 'адвокат',                          " +
+             "                                           6,  'КФХ'), 'ИП')                      " +
+             "                         || ')')  prof,                                           " +
+             "                   (   '//'                                                       " +
+             "                         || (SELECT   NVL (DECODE (ADR.T_ADRESS,                  " +
+             "                                                   CHR (1), '',                   " +
+             "                                           ADR.T_ADRESS), '')                     " +
+             "                             FROM   dadress_dbt adr                               " +
+             "                             WHERE   ADR.T_PARTYID = PRT.T_PARTYID                " +
+             "                                 AND ADR.T_TYPE = 1)                              " +
+             "                         || '//') address                                         " +
+             "          FROM   dparty_dbt prt,                                                  " +
+             "                 dparty_dbt prt_atc LEFT JOIN dobjatcor_dbt atr                   " +
+             "                      ON (    ATR.T_OBJECTTYPE = 3                                " +
+             "                          AND ATR.T_GROUPID = 16                                  " +
+             "                          AND ATR.T_OBJECT = LPAD (PRT_atc.T_PARTYID, 10, '0')),  " +
+             "                 dpersn_dbt prs                                                   " +
+             "          WHERE       PRT.T_PARTYID = :party_id                                   " +
+             "                  AND PRT_ATC.T_PARTYID = PRT.T_PARTYID                           " +
+             "                  AND PRS.T_PERSONID = PRT.T_PARTYID)                             " ;
+   var parm = makeArray (SqlParam ("party_id" , PartyId ));
+   sql = execSqlSelect (sql, parm);
+   if (sql.moveNext ())
+      return sql.value ("payer_name", null, V_STRING);
+   else
+      return "";
+   end;
+onError 
+   return "";
+end;
+
+ MACRO PM_GetAcceptState(PiD)
+  var rs = RSDRecordset(" SELECT   NVL ( (SELECT   PAYDEM.T_ACCEPTTERM " +
+                        "                   FROM   DPSPAYDEM_DBT PAYDEM " +
+                        "                  WHERE   PAYDEM.T_ORDERID = to_number("+PiD+")), 0) " +
+                        "             ACCEPTTERM " +
+                        "   FROM   DUAL; ");
+  rs.movenext();
+  return rs.value("ACCEPTTERM");
+ END;
+ 
+ // TAM 10.04.2014 C-28570 - функция заполнения УИН платежа
+ macro SetPaymentUIN(Payment_Id:integer, UIN_Value:string)
+   var cmd = RsdCommand (" UPDATE dpmrmprop_dbt SET   t_UIN = ? WHERE t_paymentid = ?");
+   cmd.AddParam("", RSDBP_IN, UIN_Value);
+   cmd.AddParam("", RSDBP_IN, Payment_Id);
+   cmd.execute();
+end;
+
+//TAM 13.02.2015 C-34990  - функция проверки контрольного ключа УИН
+macro Check_UIN_Control_Key(Balance:string, Uin:string):bool
+   var Rec_Account_Waights:TArray = MakeArray(3,7,1,3,7);
+   var UIN_Weights:TArray = MakeArray(3,7,1,3,7,3,7,1,3,7,3,7,1,3,7,3);
+   var Check_Sum:integer = 0;
+   var i:integer = 0;
+   //произведения по счету
+   for(i, 0, Rec_Account_Waights.size-1, 1)
+      Check_Sum = Check_Sum + (int(substr(Balance, i+1, 1)) * Rec_Account_Waights(i));//произведения значений и весов
+   end;
+   //произведения по УИН
+   i = 0;
+   for(i, 0, UIN_Weights.size-1, 1)
+      Check_Sum = Check_Sum + (int(substr(UIN, i+1, 1)) * UIN_Weights(i));//произведения значений и весов
+   end;
+   if(mod(Check_Sum,10) == 0)
+      return true;
+   end;
+   return false;
+end;
+
+//TAM 06.03.2015 C-37632  - функция определяет, является ли банк получателя Сбербанком
+macro IsPartyTheSberbank(PartyId:integer):bool
+   var sql = " select 1 from dbankdprt_dbt dpt where DPT.T_PARTYID = :party_id and DPT.T_UERTYPE = 3 ";
+   var parm = makeArray (SqlParam ("party_id" , PartyId ));
+   sql = execSqlSelect (sql, parm);
+   if (sql.moveNext ())
+      return sql.value(0);
+   else
+      return false;
+   end;
+end;
+
+macro GetMfrParamsForExvBank(BankBic:string, TransportId:integer, SchemaId:integer, ReleaseId:integer, CorSchemaId:integer):bool
+   var ret = false;
+   var sql = " SELECT   TRP.T_NAME transport_name,                " +
+             "          TRP.T_TPID transport_id,                  " +
+             "          TPSCH.T_TPSHEMID schema_id,               " +
+             "          FRM.T_FORMID form_id,                     " +
+             "          RLS.T_RLSFORMID release_id,               " +
+             "          LNK.T_CORSCHEM cor_schem_id               " +
+             " FROM   DWLTRANSP_DBT trp,                          " +
+             "        DWLMESFRM_DBT frm,                          " +
+             "        DWLMESRLS_DBT rls,                          " +
+             "        DWLTPSHEM_DBT tpsch,                        " +
+             "        dcrstplnk_dbt lnk,                          " +
+             "        DCORSCHEM_DBT corsch                        " +
+             " WHERE       TRP.t_name LIKE '%ЭВ_МФР%'             " +
+             "         AND TPSCH.T_TPID = TRP.T_TPID              " +
+             "         AND FRM.T_TPID = TRP.T_TPID                " +
+             "         AND RLS.T_FORMID = FRM.T_FORMID            " +
+             "         AND LNK.T_TPSHEMID = tpSCH.T_TPSHEMID      " +
+             "         AND CORSCH.T_NUMBER = LNK.T_CORSCHEM       " +
+             "         AND CORSCH.T_CORRID =                      " +
+             "                   (SELECT   COD.T_OBJECTID         " +
+             "                    FROM   dobjcode_dbt cod         " +
+             "                    WHERE  COD.T_OBJECTTYPE = 3     " +
+             "                       AND COD.T_CODEKIND = 3       " +
+             "                       AND COD.T_STATE = 0          " +
+             "                       AND COD.T_CODE = :BicCode)   " +
+             "         AND CORSCH.T_FIID = 0                      " +
+             "         AND CORSCH.T_STATE = 0                     " +
+             "         AND CORSCH.T_ISNOSTRO = CHR (88)           ";
+   var parm = makeArray (SqlParam ("BicCode", BankBic ));
+   sql = execSqlSelect (sql, parm);
+   if (ret = sql.moveNext ())
+      setParm (1, sql.value ("transport_id", null, V_INTEGER ));
+      setParm (2, sql.value ("schema_id"   , null, V_INTEGER ));
+      setParm (3, sql.value ("release_id"  , null, V_INTEGER ));
+      setParm (4, sql.value ("cor_schem_id", null, V_INTEGER ));
+   end;
+   return ret;
+end;
+
+ MACRO CheckFillUIN(RSBPaym)
+  var PaymentObj:RsbPayment = RSBPaym;
+      /* При заведении платежа, установить контроль и запрет на сохранение и проведение  платежа, 
+      если счет получателя 40101*, КБК (поле 104) в разрядах с 4 по 9 содержат набор цифр 116300 (это штрафы ГИБДД), 
+      и при этом поле 22 пустое или <0>. При попытке сохранить и провести такой  платеж, должно выдаваться сообщение 
+      <Необходимо заполнение Уникального идентификатора платежа> в поле <код>. */
+   if (    ((CompareStrWithMasks ("40101*", PaymentObj.ReceiverAccount, 1)) == 0)
+       and (substr(PaymentObj.BttTICode, 4, 6) == "116300")
+       and (   (trim(PaymentObj.UIN) == "" ) 
+            or (PaymentObj.UIN == 0)
+           )  
+      )
+     return true;
+   end;
+   return false;
+ END;
+ 
+ MACRO CheckFillKPP(RSBPaym)
+  var PaymentObj:RsbPayment = RSBPaym;
+  var rs, cmd, KPP;
+   if (   ((CompareStrWithMasks ("40101*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40302*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40302*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40501????????2*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40601????????1*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40601????????3*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40701????????1*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40701????????3*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40503????????4*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40603????????4*", PaymentObj.ReceiverAccount, 1)) == 0)
+       or ((CompareStrWithMasks ("40703????????4*", PaymentObj.ReceiverAccount, 1)) == 0)
+      )
+     cmd = RSDCommand("SELECT USR_GET_KPP (:1) FROM dual");
+     cmd.addparam("1", RSDBP_IN, PaymentObj.ReceiverINN);
+     rs = RsdRecordset(cmd);
+     rs.movenext();
+     KPP = rs.value(0);
+     if(KPP == StrFor(0))
+       return true;
+     end;
+   end;
+   return false;
+ END;

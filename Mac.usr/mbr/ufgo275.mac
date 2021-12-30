@@ -1,0 +1,725 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/* Генерация ответа на запрос ED275                                         */
+/*                                                                          */
+/*  Имя файла: ufgo275.mac                                                  */
+/*  Создан:    16.10.13                                      Чукина Т.А.    */
+/****************************************************************************/
+
+import MesInter, oralib, likepy, CTInter, "wluftool.mac", WldInter,
+       "pmcarfun.mac", "pmlib.mac";
+
+private class TPaymData
+  var PaymentID             : integer = 0,
+      ShifrOper             : string  = "",
+      BaseAmount            : money   = $0,
+      PayerAccount          : string  = "",
+      DbBankCode            : string  = "",
+      PayerCorrAccNostro    : string  = "",
+      ReceiverAccount       : string  = "",
+      CrBankCode            : string  = "",
+      ReceiverCorrAccNostro : string  = "",
+      PaymStatus            : integer = 0;
+end;
+
+// Поиск отзываемого платежа
+private macro FindRevokedPayment(Trn : string) : TPaymData
+  var select = 
+    "Select pm.t_PaymentID, rm.t_ShifrOper, pm.t_BaseAmount, " +
+    "       pm.t_PayerAccount, db.t_BankCode as DbBankCode, rm.t_PayerCorrAccNostro," +
+    "       pm.t_ReceiverAccount, cr.t_BankCode as CrBankCode, rm.t_ReceiverCorrAccNostro, " +
+    "       pm.t_PaymStatus " +
+    "  from dwlmes_dbt mes, dwltpshem_dbt shem, dwlmesrls_dbt rls, dwlmesfrm_dbt frm," +
+    "       dwlmeslnk_dbt lnk, dpmpaym_dbt pm, dpmrmprop_dbt rm, " +
+    "       dpmprop_dbt db, dpmprop_dbt cr " +
+    " where mes.t_Trn        = :Trn " +
+    "   and mes.t_Direct     = 'X' /* WLD_MES_IN */" +
+    "   and mes.t_TpSchemID  = shem.t_TpShemID " +
+    "   and shem.t_TpID      = 9 /* TRANSP_UFBS */ " +
+    "   and mes.t_RlsFormID  = rls.t_RlsFormID " +
+    "   and rls.t_FormID     = frm.t_FormID " +
+    "   and frm.t_Name in ('ED113', 'ED114') " +
+    "   and lnk.t_MesID      = mes.t_MesID " +
+    "   and lnk.t_Direct     = 'X' /* WLD_MES_IN */" +
+    "   and lnk.t_ObjKind    = :ObjType " +
+    "   and lnk.t_ObjID      = pm.t_PaymentID " +
+    "   and rm.t_PaymentID   = pm.t_PaymentID " +
+    "   and db.t_PaymentID   = pm.t_PaymentID " +
+    "   and db.t_DebetCredit = 0 /* PRT_Debet */ " +
+    "   and cr.t_PaymentID   = pm.t_PaymentID " + 
+    "   and cr.t_DebetCredit = 1 /* PRT_Credit */ ";
+
+  var params : TArray = makeArray( SQLParam("Trn", Trn),
+                                   SQLParam("ObjType", OBJTYPE_PSPAYORD) );
+
+  var rs : RsdRecordset = execSQLselect(select, params);
+
+  if(rs and rs.moveNext())
+    var PaymData : TPaymData = PaymData();
+
+    PaymData.PaymentID = rs.value("t_PaymentID");
+    PaymData.ShifrOper = rs.value("t_ShifrOper");
+    PaymData.BaseAmount = rs.value("t_BaseAmount");
+    PaymData.PayerAccount = rs.value("t_PayerAccount");
+    PaymData.DbBankCode = rs.value("DbBankCode");
+    PaymData.PayerCorrAccNostro = rs.value("t_PayerCorrAccNostro");
+    PaymData.ReceiverAccount = rs.value("t_ReceiverAccount");
+    PaymData.CrBankCode = rs.value("CrBankCode");
+    PaymData.ReceiverCorrAccNostro = rs.value("t_ReceiverCorrAccNostro");
+    PaymData.PaymStatus = rs.value("t_PaymStatus");
+
+    return PaymData;
+  end;
+
+  // раз мы здесь оказались, значит, ничего не нашли
+  RsbThrow("По референсу сообщения " + Trn + " не удалось найти отзываемый платеж, автоматический отзыв невозможен ");
+end;
+
+private macro GetXMLField(wlmes, FormName) : object
+  var field_name, field_value;  
+  if( not СчитатьПоле( field_name, field_value ) )
+    RsbThrow("В сообщении по форме: " + FormName + " референс: " + wlmes.TRN + " " +
+             "|не заполнено поле '" + XMLField + "'" );
+  end;
+
+  var xml:object = ActiveX( "MSXML.DOMDocument" );
+  if ( not xml.loadXML(field_value) )
+    RsbThrow( "Неверный формат сообщения по форме " + FormName );
+  end;
+
+  return xml;
+end;
+
+// Проверка реквизитов платежа
+private macro CheckPaymAttrs(PaymData : TPaymData, xml : object, wlmes_in) : bool
+
+  macro IsEqOpt(PaymAttr : string, AttrName : string) : bool
+    var MesAttr : string = ReadOptinalAttribute(xml, AttrName);
+    if(not PaymAttr or not MesAttr or (PaymAttr == MesAttr))
+      return TRUE;
+    end;
+
+    return FALSE;
+  end;
+
+  if( ( PaymData.ShifrOper != ReadAttribute(xml, "TransKind") ) or
+      ( PaymData.BaseAmount != money(ReadAttribute(xml, "Sum"))/100 ) or
+      ( PaymData.PayerAccount != ReadOptinalAttribute(xml, "PayerPersonalAcc") ) or
+      ( PaymData.DbBankCode != ReadAttribute(xml, "PayerBIC") ) or
+      not IsEqOpt(PaymData.PayerCorrAccNostro, "PayerCorrespAcc") or
+      ( PaymData.ReceiverAccount != ReadOptinalAttribute(xml, "PayeePersonalAcc") ) or
+      ( PaymData.CrBankCode != ReadAttribute(xml, "PayeeBIC") ) or
+      not IsEqOpt(PaymData.ReceiverCorrAccNostro, "PayeeCorrespAcc")
+    )
+
+    // Пока только индивидуальный режим
+    //if(not IsOprMultiExec)
+      // В индивидуальном режиме вывести запрос 
+      // "Нет" - прервать выполнение процедуры. 
+      return ( MsgBoxEx
+               ( "Реквизиты платежа, соответствующего сообщению с референсом " +
+                 wlmes_in.RelatedRef + ", не совпадают с реквизитами отзываемого " +
+                 "распоряжения из сообщения с референсом " + wlmes_in.Trn +
+                 ". Отозвать платеж?", MB_YES+MB_NO, IND_NO 
+               ) == IND_YES 
+             );
+    //else
+    //  // В пакетном режиме прервать выполнение процедуры с ошибкой 
+    //  std.msg( "Реквизиты платежа, соответствующего сообщению с референсом " +
+    //           wlmes_in.RelatedRef + ", не совпадают с реквизитами отзываемого " +
+    //           "распоряжения из сообщения с референсом " + wlmes_in.Trn + "." );
+    //  return FALSE;
+    //end;
+  end;
+
+  return TRUE;
+end;
+
+// Проверка возможности отзыва платежа
+private macro IsPaymentRevocable(PaymData : TPaymData) : bool
+
+  if(PaymData.PaymStatus > PM_READY_TO_SEND)
+    return FALSE;
+  end;
+
+  var IrrevocRegVal : integer;
+  if( GetRegistryValue("CB\\PAYMENTS\\IRREVOCABILITY", V_INTEGER, IrrevocRegVal) != V_INTEGER )
+    IrrevocRegVal = 0;
+  end;
+
+  if(IrrevocRegVal != 2) // нужно проверять наличие проводок по платежу по главе А 
+    var rs : RsdRecordset;
+
+    if( ПолучитьВсеПроводки(PaymData.PaymentID, @rs, 1/*CHAPT1*/) and rs.moveFirst() )
+
+      if(IrrevocRegVal == 1) // не допускаются фактические
+
+        var IsFact : bool = ( rs.value("t_CarryStatus") == ACCTRN_STATUS_DOCUMENT );
+
+        while(not IsFact and rs.moveNext())
+          IsFact = ( rs.value("t_CarryStatus") == ACCTRN_STATUS_DOCUMENT );
+        end;
+
+        if(IsFact)
+          return FALSE;
+        end;
+      else // не должно быть никаких
+        return FALSE;
+      end;
+
+    end;
+
+  end;
+
+  // проверки пройдены
+  return TRUE;
+end;
+
+private macro GetSessBankDate(wlmes) : date
+  var rs = execSQLselect( "select t_BankDate " +
+                          "  from dwlsess_dbt " +
+                          " where t_SessionID = :SessionID ",
+                          makeArray( SQLParam("SessionID", wlmes.SessionID) )
+                        );
+
+  if(rs and rs.moveNext())
+    return date(rs.value(0));
+  end;
+
+  return date(0, 0, 0);
+end;
+
+private macro MakeDenial(PsOrder : RsbPSPayOrder, xml : object, DenialGround : string)
+  var Payment : RsbPayment = PsOrder.Payment;
+
+  var RecDenial : TRecHandler = TRecHandler("pmdenial");
+  RecDenial.Clear();
+
+  RecDenial.rec.DocumentKind = OBJTYPE_PMCHNDOC_KIND_INSTR; // Распоряжение
+  RecDenial.rec.Date = ToDate_( ReadAttribute(xml, "EDDate") );
+  RecDenial.rec.Number = ReadAttribute(xml, "EDNo");
+  RecDenial.rec.Ground = DenialGround;
+  RecDenial.rec.PaymentID = Payment.PaymentID;
+  RecDenial.rec.Department = Payment.StartDepartment;
+
+  if(PsOrder.CurrentState == PSPO_ST_I1)
+    RecDenial.rec.Amount = Payment.BaseAmount;
+    RecDenial.rec.IndexNum = PAYMENTS_INDEX_1;
+  else
+    RecDenial.rec.Amount = Payment.FutureBaseAmount;
+
+    if(PsOrder.CurrentState == PSPO_ST_I2)
+      RecDenial.rec.IndexNum = PAYMENTS_INDEX_2;
+    else
+      RecDenial.rec.IndexNum = PAYMENTS_INDEX_WP;
+    end;
+  end;
+
+  if(Payment.MakeDenial(RecDenial) != 0)
+    RunError("Ошибка формирования отказа от платежа");
+  end;
+
+end;
+
+private macro DelReqPspoLink(ReqID : integer, PaymentID : integer)
+    execSQL( "delete from dwlreqlnk_dbt              " +
+             " where t_ReqID     = :ReqID            " + 
+             "   and t_ObjID     = :PaymentID        " +
+             "   and t_ObjKind   = :OBJTYPE_PSPAYORD " + 
+             "   and t_ObjDirect = chr(0)            ",
+             makeArray( SQLParam("ReqID",            ReqID),
+                        SQLParam("PaymentID",        PaymentID),
+                        SQLParam("OBJTYPE_PSPAYORD", OBJTYPE_PSPAYORD) )
+           );
+
+end;
+
+// Отзыв платежа
+private macro RevokePayment(PaymData : TPaymData, wlmes, xml : object, wlreq)
+  var PsOrder : RsbPSPayOrder = RsbPSPayOrder(PaymData.PaymentID);
+  var Payment : RsbPayment = PsOrder.Payment;
+
+  // Присвоить категории платежа "Причина неисполнения платежа" значение "Отозван инициатором"
+  Payment.Categories.ConnectAttr(18, 1, NULL, NULL, {curdate});
+
+  // параметры вызова шагов
+  var PmOprMacParm : TPmOprMacParm = TPmOprMacParm();
+  PmOprMacParm.outIWPac = PS_OUTPLACEIWP_ACTION_RECALL;
+  PmOprMacParm.needDocumentRestart = false;
+
+  if( PsOrder.CurrentState == PSPO_ST_DEFERRED )
+    // Примечание вставится на предобработке при отзыве платежа
+    if( PsOrder.Update() != 0 )
+      RunError("Ошибка при сохранении изменений в платеже");
+    end;
+  else
+    // Заполнить примечание "Причина отказа (возврата)" 
+    var DenialGround = "Распоряжение отозвано банком получателя. Запрос об отзыве № " +
+                       wlmes.trn + " от " + GetSessBankDate(wlmes);
+
+    if( Payment.Notes.ReadNote(PM_NOTEKIND_DENIALGROUND, {curdate}) )
+      Payment.Notes.DelNote(PM_NOTEKIND_DENIALGROUND);
+    end;
+    Payment.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, DenialGround );
+
+    if( InList(PsOrder.CurrentState, PSPO_ST_I1, PSPO_ST_I2, PSPO_ST_IWP) )
+
+      MakeDenial(PsOrder, xml, DenialGround);
+
+      if  ( PsOrder.CurrentState == PSPO_ST_I1 ) // Платеж в картотеке №1
+        if( not PM_ExecuteOperation (Payment.PaymentID, Payment.DocKind) )
+          RunError("Ошибка при выполнении шага 'Изъятие из картотеки №1'");
+        end;
+      elif( PsOrder.CurrentState == PSPO_ST_IWP ) // Платеж в КОР
+        if( not PM_ExecuteOperation (Payment.PaymentID, Payment.DocKind, PmOprMacParm) )
+          RunError("Ошибка при выполнении шага 'Списание из картотеки ОР'");
+        end;
+      elif( PsOrder.CurrentState == PSPO_ST_I2 ) // Платеж в К2
+        if( not PM_InsertAndExecuteBranch(Payment.PaymentID, "", "R", OPRBR_REMOVE) )
+          RunError("Ошибка при вставке блока 'Возврат из картотеки'");
+        end;
+      end;
+    elif( PsOrder.CurrentState == PSPO_ST_REJECTED ) // Платеж отвергнут
+      if( not PM_ExecuteOperation (Payment.PaymentID, Payment.DocKind, PmOprMacParm) )
+        RunError("Ошибка при выполнении шага 'Обработка отвергнутого'");
+      end;
+    else // Платеж принят к обработке 
+      if( not PM_InsertAndExecuteBranch(Payment.PaymentID, FindPmReadyStepFromList(Payment), "8", OPRBR_REMOVE) )
+        RunError("Ошибка при вставке блока 'Возврат инициатору'");
+      end;
+    end;
+  end;
+
+  OnError(er) // обработка ошибок
+    // Удалить связку запроса с платежом
+    DelReqPspoLink(wlreq.ReqID, PaymData.PaymentID);
+
+    // прервать выполнение процедуры с ошибкой 
+    RsbThrow( "Не удалось отозвать платеж, соответствующий сообщению с референсом " +
+              wlmes.RelatedRef + ". Причина ошибки: " + RsbGetError(er) );
+end;
+
+private macro IsLinkedPspo(ReqID : integer) : bool
+  var s = "select 1 "
+          "  from dwlreqlnk_dbt reqlnk, dpspayord_dbt pspo "
+          " where reqlnk.t_ReqID     = :ReqID "
+          "   and reqlnk.t_ObjKind   = :OBJTYPE_PSPAYORD "
+          "   and reqlnk.t_ObjDirect = chr(0) "
+          "   and pspo.t_OrderID     = reqlnk.t_ObjID ";
+
+  var params = makeArray( SQLParam("ReqID", ReqID),
+                          SQLParam("OBJTYPE_PSPAYORD", OBJTYPE_PSPAYORD) );
+
+  var rs : RsdRecordset = execSQLselect(s, params);
+
+  if(rs and rs.moveNext())
+    return TRUE;
+  end;
+
+  return FALSE;
+end;
+
+// Формирование уведомления
+private macro CreateNotification(wlreq, InfoCode : integer, xml : object, wlmes, AnswerID : @integer) : bool
+  // Создать учетный объект "исходящий ответ"
+  RECORD answer (wlreq);
+  ClearRecord(answer);
+  answer.RelatedRef = wlreq.RelatedRef;
+  answer.Direct = ""; // WLD_MES_OUT
+  answer.Kind = MESKIND_ANSWER;
+  answer.OriginatorCode = wlreq.RecipientCode;
+  answer.OriginatorCodeKind = wlreq.RecipientCodeKind;
+  answer.OriginatorID = wlreq.RecipientID;
+  answer.OriginatorName = wlreq.RecipientName;
+  answer.RecipientCode = wlreq.OriginatorCode;
+  answer.RecipientCodeKind = wlreq.OriginatorCodeKind;
+  answer.RecipientID = wlreq.OriginatorID;
+  answer.RecipientName = wlreq.OriginatorName;
+  answer.InitDateMes = ToDate_( ReadAttribute(xml, "EDDate") );
+  answer.InitFormIDMes = GetFormIDByRlsID(wlmes.RlsFormID);
+  answer.Corschem = -1;
+  answer.FIID = -1;
+  answer.Queries = "InfoCode:" + InfoCode + "\n" +
+                   "InitialED:" + wlreq.Trn;
+  var TpID : integer = getTpIDofTpSchem(wlmes.TpSchemID);
+  answer.SubKind = WLD_SUBKIND_ANS_REC;
+  
+  // Пока только индивидуальный режим
+  //if(not IsOprMultiExec)
+    // Открыть панель ответа на редактирование с созданными параметрами 
+    if( WlExecuteReqEditPanel(answer, "", "", "", TpID, false, wlreq.ReqID, OBJTYPE_REQ, "X") != 0 )
+      msgbox("Ответ не был создан");
+      return FALSE;
+    end;
+  //else
+  //  // Вставляем безинтерфейсно
+  //  if( CreateQuery(answer, "", "", 0, 0, false, 0, 0, TpID, wlreq.ReqID, OBJTYPE_REQ, "X") != 0 )
+  //    return FALSE;
+  //  end;
+  //end;
+
+  AnswerID = answer.ReqID;
+
+  return TRUE;
+end;
+
+private macro GetLinkedAnswerID(RequestID : integer, AnswerStatus : @integer, AnswerTrn : @string) : integer
+  AnswerStatus = 0; AnswerTrn = "";
+  var s = "select wlreq.t_ReqID, wlreq.t_State, wlmes.t_Trn "  
+          "  from dwlreq_dbt wlreq, dwlreqlnk_dbt reqlnk, dwlmeslnk_dbt meslnk, dwlmes_dbt wlmes " 
+          " where reqlnk.t_ObjID = :RequestID "
+          "   and reqlnk.t_ObjKind = :ObjType "
+          "   and reqlnk.t_ObjDirect = 'X' "
+          "   and reqlnk.t_ReqID = wlreq.t_ReqID "
+          "   and wlreq.t_Kind = :MesKind "
+          "   and meslnk.t_ObjID = wlreq.t_ReqID "
+          "   and meslnk.t_ObjKind = :ObjType1 "
+          "   and meslnk.t_Direct = chr(0) /* WLD_MES_OUT */ "
+          "   and wlmes.t_MesID = meslnk.t_MesID ";
+
+  var rs = execSQLselect( s, makeArray( SQLParam("RequestID",   RequestID),
+                                        SQLParam("ObjType", OBJTYPE_REQ),
+                                        SQLParam("MesKind", MESKIND_ANSWER),
+                                        SQLParam("ObjType1", OBJTYPE_REQ) )
+                        );
+
+  if(rs and rs.moveNext())
+    AnswerStatus = rs.value("t_State");
+    AnswerTrn = rs.value("t_Trn");
+    return rs.value(0);
+  end;
+
+  return 0;
+end;
+
+private macro GetReqSessBankDate(ReqID : integer) : date
+  var rs = execSQLselect( "select sess.t_BankDate " +
+                          "  from dwlsess_dbt sess, dwlmeslnk_dbt lnk, dwlmes_dbt mes " +
+                          " where sess.t_SessionID = mes.t_SessionID " +
+                          "   and mes.t_MesID = lnk.t_MesID " +
+                          "   and lnk.t_ObjID = :ReqID " +
+                          "   and lnk.t_ObjKind = :ObjKind " +
+                          "   and lnk.t_Direct = chr(0) /* WLD_MES_OUT */ ",
+                          makeArray( SQLParam("ReqID", ReqID),
+                                     SQLParam("ObjKind", OBJTYPE_REQ) )
+                        );
+
+  if(rs and rs.moveNext())
+    return date(rs.value(0));
+  end;
+
+  return date(0, 0, 0);
+end;
+
+// Поиск платежа, для которого откатываем отзыв
+private macro FindUnRevokedPayment(Trn : string, PaymStatus : @integer) : integer
+  var select = 
+    "Select pm.t_PaymentID, pm.t_PaymStatus " +
+    "  from dwlmes_dbt mes, dwltpshem_dbt shem, dwlmesrls_dbt rls, dwlmesfrm_dbt frm," +
+    "       dwlmeslnk_dbt lnk, dpmpaym_dbt pm, dobjatcor_dbt oac " +
+    " where mes.t_Trn        = :Trn " +
+    "   and mes.t_Direct     = 'X' /* WLD_MES_IN */" +
+    "   and mes.t_TpSchemID  = shem.t_TpShemID " +
+    "   and shem.t_TpID      = 9 /* TRANSP_UFBS */ " +
+    "   and mes.t_RlsFormID  = rls.t_RlsFormID " +
+    "   and rls.t_FormID     = frm.t_FormID " +
+    "   and frm.t_Name in ('ED113', 'ED114') " +
+    "   and lnk.t_MesID      = mes.t_MesID " +
+    "   and lnk.t_Direct     = 'X' /* WLD_MES_IN */" +
+    "   and lnk.t_ObjKind    = :ObjType " +
+    "   and lnk.t_ObjID      = pm.t_PaymentID " +
+    "   and oac.t_ObjectType = :ObjectType " +
+    "   and oac.t_Object     = lpad(pm.t_PaymentID, 10, '0') " +
+    "   and oac.t_GroupID    = 18 " + // категории "Причина неисполнения платежа" 
+    "   and oac.t_AttrID     = 1 " +  // значение "Отозван инициатором"
+    "   and oac.t_ValidToDate >= :curdate" +
+    "   and oac.t_ValidFromDate <= :curdate ";
+
+  var params : TArray = makeArray( SQLParam("Trn",        Trn),
+                                   SQLParam("ObjType",    OBJTYPE_PSPAYORD),
+                                   SQLParam("ObjectType", OBJTYPE_PAYMENT),
+                                   SQLParam("curdate",    {curdate})
+                                 );
+
+  var rs : RsdRecordset = execSQLselect(select, params);
+
+  if(rs and rs.moveNext())
+    PaymStatus = rs.value("t_PaymStatus");
+    return rs.value("t_PaymentID");
+  end;
+
+  return 0;
+end;
+
+private macro GetLastOperStepID(PaymentID : integer, OperationID : @integer, StepID : @integer)
+  OperationID = StepID = 0;
+
+  var strSQL = "Select opr.t_ID_Operation, max(step.t_ID_Step) as StepID " +
+               "  from doprstep_dbt step, doproper_dbt opr " +
+               " where step.t_ID_Operation = opr.t_ID_Operation " +
+               "   and opr.t_DocKind    = :DocKind " +
+               "   and opr.t_DocumentID = LPad( :PaymentID, 34, '0' ) " +
+               "group by opr.t_ID_Operation ";
+
+  var params = makeArray( SQLParam("DocKind",   PS_PAYORDER),
+                          SQLParam("PaymentID", PaymentID)
+                        );
+  var rs : RsdRecordset = execSQLselect(strSQL, params);
+
+  if(rs and rs.moveNext())
+    OperationID = rs.value("t_ID_Operation");
+    StepID = rs.value("StepID");
+  end;
+end;
+
+private macro GetInMesLinkReqID(MesID : integer) : integer
+  var rs = execSQLselect( "select t_ObjID " + 
+                          "  from dwlmeslnk_dbt " +
+                          " where t_MesID = :MesID " +
+                          "   and t_ObjKind = :ObjType " +
+                          "   and t_Direct = 'X' /* WLD_MES_IN */ ",
+                          makeArray( SQLParam("MesID", MesID),
+                                     SQLParam("ObjType", OBJTYPE_REQ) )
+                        );
+
+  if( rs and rs.moveNext() )
+    return rs.value(0);
+  end;
+
+  return 0;
+end;
+
+
+
+private macro CheckExistingAnswer(RequestID : integer) : bool
+  var AnswerStatus : integer = 0, 
+      AnswerTrn : string = "",
+      AnswerID : integer = GetLinkedAnswerID(RequestID, @AnswerStatus, @AnswerTrn);
+
+  if(AnswerID > 0)
+    if(AnswerStatus < WLD_STATUS_REQ_SEND)
+      if( ConfWin( makeArray( "По запросу уже сформировано уведомление о результатах отзыва № " + AnswerTrn + ". Заменить его? " ),
+                   makeArray( "Да", "Нет" ), 1 ) == 0
+        )
+        if( WldDelReq(AnswerID) != 0 )
+          msgbox( GetErrMsg() );
+          return FALSE;
+        end;
+      else
+        return FALSE;
+      end;
+    else
+      msgbox( "Уведомление о результатах отзыва № " + AnswerTrn + 
+              " от " + GetReqSessBankDate(AnswerID) + 
+              " уже отправлено инициатору платежа. Создание нового ответа не требуется"
+            );
+      return FALSE;
+    end;
+  end;
+
+  return TRUE;
+end;
+
+// Формирование уведомления о результатах отзыва ED276
+// Вызывается из  МБР / Входящие / Запросы / * / Alt-F9, 
+// только в индивидуальном интерфейсном режиме
+macro CreateNotifED276(addrReq) : bool
+
+  macro GetXMLField(wlmes, FormName) : object
+    var field_value;  
+    if( not ПолучитьПоле( wlmes.MesID, XMLField, field_value ) )
+      msgbox("В сообщении по форме: " + FormName + " референс: " + wlmes.TRN + " " +
+             "|не заполнено поле '" + XMLField + "'" );
+      return NULL;
+    end;
+
+    var xml:object = ActiveX( "MSXML.DOMDocument" );
+    if ( not xml.loadXML(field_value) )
+      msgbox( "Неверный формат сообщения по форме " + FormName );
+      return NULL;
+    end;
+
+    return xml;
+  end;
+
+  // Параметры для передачи в CreateNotification
+  RECORD wlreq(wlreq);
+  var    InfoCode : integer; // Признак "ЭС отозвано" (1) / "Безотзывное ЭС" (2)
+  var    xml : object;
+  FILE   wlmes(wlmes);
+
+  SetBuff(wlreq, addrReq);
+
+  var rs = execSQLselect("select t_MesID from dwlmeslnk_dbt where t_ObjID = :ReqID " +
+                         "and t_ObjKind = :ObjType and t_Direct = 'X' /*WLD_MES_IN*/ ",
+                          makeArray( SQLParam("ReqID", wlreq.ReqID),
+                                     SQLParam("ObjType", OBJTYPE_REQ) )
+                        );
+  if(rs and rs.moveNext() and (wlmes.MesID = rs.value(0)) and GetEQ(wlmes))
+    xml = GetXMLField(wlmes, "ED275");
+    if(xml == null)
+      return FALSE;
+    end;
+  else
+    msgbox("Не найдено входящее сообщение запроса " + wlreq.Trn);
+    return FALSE;
+  end;
+
+  MACRO InsertAnswer() : bool
+    if(not CheckExistingAnswer(wlreq.ReqID))
+      return FALSE;
+    end;
+
+  InfoCode = ConfWin( makeArray( "Выберите код уведомления, направляемый в ответ на запрос об отзыве" ),
+                      makeArray( " ЭС отозвано ", " Безотзывное ЭС " ), 27 );
+  if(InfoCode == 27)
+    msgbox("Выполнение процедуры прервано пользователем");
+    return FALSE;
+  end;
+  InfoCode = InfoCode + 1;
+
+  // Формирование уведомления
+  return CreateNotification(wlreq, InfoCode, xml, wlmes);
+  END;
+
+  macro TrnFunc
+    if( not InsertAnswer() )
+      AbortTrn();
+    end;
+  end;
+
+  if(not ProcessTrn(null, @TrnFunc))
+    return FALSE;
+  end;
+
+  return TRUE;
+
+end;
+
+macro GenObj( addrMes, mode )
+  RECORD wlmes(wlmes);
+  SetBuff( wlmes, addrMes );
+  debugbreak;
+  if(not mode)
+    mode = WLD_GENOBJ_ACTION_EXECUTE; // по умолчанию - обработка
+  end;
+
+  FILE wlreq(wlreq);
+  RECORD pmpaym(pmpaym);
+  var AnswerID : integer = 0;
+
+  if  (mode == WLD_GENOBJ_ACTION_EXECUTE) // Обработка
+    // Поиск отзываемого платежа
+    var PaymData : TPaymData = FindRevokedPayment(wlmes.RelatedRef);
+
+    var xml:object = GetXMLField(wlmes, "ED275");
+
+    ClearRecord(wlreq);
+    var ReqID : integer = GetInMesLinkReqID(wlmes.MesID);
+
+    if(ReqID and (wlreq.ReqID = ReqID) and GetEQ(wlreq))
+
+      // Проверка реквизитов платежа
+      if( not CheckPaymAttrs(PaymData, xml, wlmes) )
+        return FALSE;
+      end;
+
+      var InfoCode : integer = 2; // "Безотзывное ЭС"
+      if( IsPaymentRevocable(PaymData) ) // Проверка возможности отзыва платежа
+        // Отзыв платежа
+
+        // Создать связку запроса с платежом
+        if( WldCreateReqLink(wlreq.ReqID, PaymData.PaymentID, OBJTYPE_PSPAYORD, "" /*WLD_MES_OUT*/) != 0 )
+          RunError("Не удалось создать связку запроса с платежом");
+        end;
+
+        // Собственно отзыв. Вся обработка ошибок - внутри RevokePayment
+        RevokePayment(PaymData, wlmes, xml, wlreq);
+
+        InfoCode = 1; // "ЭС отозвано"
+      end;
+
+      // Формирование уведомления
+      if( CreateNotification(wlreq, InfoCode, xml, wlmes, @AnswerID) )
+        // Связать ответ с платежом (чтобы иметь возможность проверять на предобработке для отложенных)
+        if(InfoCode == 1)
+          if( WldCreateReqLink(AnswerID, PaymData.PaymentID, OBJTYPE_PSPAYORD, "" /*WLD_MES_OUT*/) != 0 )
+            RunError("Не удалось создать связку ответа с платежом");
+          end;
+        end;
+      else
+        return FALSE;
+      end;
+    else
+      RunError("Не найден входящий запрос по сообщению с референсом " + wlmes.Trn);
+    end;
+
+  elif(mode == WLD_GENOBJ_ACTION_ROLLBACK) // Откат обработки
+    // Найти уведомление о результатах отзыва (ответ ED276 wlreq_new), 
+    // связанное с запросом
+    ClearRecord(wlreq);
+    AnswerID = GetLinkedAnswerID(wlmes.MesID);
+
+    // Если есть объекты, которые нужно откатить
+    if(AnswerID and (wlreq.ReqID = AnswerID) and GetEQ(wlreq))
+      if(wlreq.State >= WLD_STATUS_REQ_SEND)
+        std.msg( "Уведомление о результатах отзыва № " + wlreq.Trn + " от " +
+                 GetReqSessBankDate(wlreq.ReqID) + " уже отправлено инициатору платежа, откатить отзыв невозможно");
+        return FALSE;
+      end;
+
+      // Поиск платежа, для которого откатываем отзыв
+      var PaymStatus : integer = 0;
+      var PaymentID = FindUnRevokedPayment(wlreq.RelatedRef, @PaymStatus);
+
+      // удалить уведомление
+      if( WldDelReq(AnswerID) != 0 )
+        // Если удалить уведомление не удалось, прервать выполнение процедуры
+        std.msg( GetErrMsg() );
+        return FALSE;
+      end;
+
+      // Если найден платеж
+      if(PaymentID)
+        if(PaymStatus == PM_FINISHED)
+          var OperationID : integer = 0, StepID : integer = 0;
+          GetLastOperStepID(PaymentID, @OperationID, @StepID);
+          var stat = PM_RollbackStep(PaymentID, OperationID, StepID);
+          if(stat)
+            var msg="Не удалось откатить отзыв платежа, соответствующего сообщению " +
+                    "с референсом " + wlmes.RelatedRef + ". Уведомление об отзыве " +
+                    "платежа удалено. Откатите операцию по платежу вручную или " + 
+                    "восстановите уведомление об отзыве" ;
+
+            if(not IsOprMultiExec)
+              MemoryError(stat);
+              DisplayError();
+              msgbox(msg);
+            else
+              //std.msg(msg);
+              MemoryError(null, msg);
+              return FALSE;
+            end;
+          end;
+        end;
+        
+        // Очистить категорию платежа "Причина неисполнения платежа", примечание "Причина отказа (возврата)"
+        pmpaym.PaymentID = PaymentID;
+        DisconnectObjAttr(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, null, pmpaym), 18);
+        // при откате шага примечание грохается само
+
+        DelReqPspoLink( GetInMesLinkReqID(wlmes.MesID), PaymentID );
+      end;
+    end;
+  else
+    RunError("Неверный код режима обработки");
+  end;
+
+  return TRUE;
+  
+  OnError(er) // обработка ошибок времени выполнения
+    std.msg(String(RsbGetError(er), "|Модуль: ", er.Module, " Строка: ", er.Line));
+    return FALSE;
+end;

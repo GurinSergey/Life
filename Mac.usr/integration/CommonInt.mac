@@ -1,0 +1,344 @@
+/******************************************************************************/
+//   Имя файла.:       CommonInt.mac
+//   Назначение:       Общие функции работы с RS-Bank V.6
+//   Дата......:       22.08.2008
+//   Автор.....:       Стадник Александр
+//   Changes:
+//     KS 10.07.2012 C-12598
+//     LAO 03.10.2012 не всегда отрабатывает GETEQ I-00261631-3
+//     LAO 05.11.12 добавлена вставка примечания на мемордер
+//     TAM 02.09.2013 R-237948 - канал для списания К2 по комиссиям
+/******************************************************************************/
+import BankInter, CTInter, FIInter, RSD, RsbDataSet;
+
+const chrDelimiter = strfor(3);
+const no_error_msg = "no_error";
+const no_debug_info    = 0;
+const short_debug_info = 1;
+const full_debug_info  = 2;
+
+//здесь устанавливается режим вывода отладочной информации
+var DebugMode = full_debug_info;
+
+//const OutputServ            = "..";
+private var err:integer;
+var TempDir:string;
+/*GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TempDir, err);
+if( err != 0)
+   msgbox("Не определена директория временных файлов");
+   exit(1);
+end;*/
+
+const LogPathAccounts         = GetTxtFileName("accounts")+UserNumber ();
+const LogPathCategories       = GetTxtFileName("categories")+UserNumber ();
+const LogPathNotes            = GetTxtFileName("notes")+UserNumber ();
+const LogPathClients          = GetTxtFileName("clients")+UserNumber ();
+const LogPathCarries          = GetTxtFileName("carries")+UserNumber ();
+const LogPathBackoutCarries   = GetTxtFileName("backout_carries")+UserNumber ();
+const LogPathRunOperationStep = GetTxtFileName("operations")+UserNumber ();
+const LogPathServErrors       = GetTxtFileName("service_errors")+UserNumber ();
+
+
+var pipe_server_interbank;
+var pipe_server_finereader;
+var pipe_server_k2;
+var pipe_server_arm;
+var pipe_server_erc;
+var pipe_server_mci;
+var pipe_server_roboplan;
+var pipe_server_k2_comission; //TAM 02.09.2013 R-237948-2
+
+// KS 25.08.2010 Чтение имен каналов
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_INTERBANK", V_STRING, pipe_server_interbank, err);
+if( err != 0)
+   pipe_server_interbank = "rsbank.service.interbank";
+end;
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_FINEREADER", V_STRING, pipe_server_finereader, err);
+if( err != 0)
+   pipe_server_finereader = "rsbank.service.finereader";
+end;
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_K2", V_STRING, pipe_server_k2, err);
+if( err != 0)
+   pipe_server_k2 = "rsbank.service.k2";
+end;
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_ARM", V_STRING, pipe_server_arm, err);
+if( err != 0)
+   pipe_server_arm = "rsbank.service.arm";
+end;
+// KS 10.07.2012 C-12598 Новый обработчик для документов ЕРЦ
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_ERC", V_STRING, pipe_server_erc, err);
+if( err != 0)
+   pipe_server_erc = "rsbank.service.erc";
+end;
+//LAO 04.09.2012 обработчки для МЦИ
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_MCI", V_STRING, pipe_server_mci, err);
+if( err != 0)
+   pipe_server_mci = "rsbank.service.mci";
+end;
+//Golovkin 11.10.2012 роботы-планироващики 
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_ROBOPLAN", V_STRING, pipe_server_roboplan, err);
+if( err != 0)
+   pipe_server_roboplan = "rsbank.service.roboplan";
+end;
+//TAM 02.09.2013 R-237948-2
+GetRegistryValue("COMMON\\PIPELISTENER\\PIPENAME_COMISS_K2", V_STRING, pipe_server_k2_comission, err);
+if( err != 0)
+   pipe_server_k2_comission = "rsbank.service.k2_";
+end;
+
+macro set_pipe_server(pipe_serv)  
+   var cmd = RSDCommand(
+                        "begin " +
+                        "   usr_common.gv_pipename := ?; " +
+                        "end; "
+                       );
+   cmd.addparam("pipeserv",RSDBP_IN,pipe_serv);
+   cmd.execute;
+end;
+
+
+
+macro ParseStringToArray(Str : string, Arr : TArray);
+   var tmpStr;
+   var iPos;
+   var iCount = 0;
+
+   tmpStr = Str;
+   Arr.Size = 0;
+   iPos = Index(tmpStr, chrDelimiter);
+   while (iPos != 0)
+      Arr(iCount) = SubStr(tmpStr, 1, iPos - 1);      
+      iCount = iCount + 1;
+      tmpStr = SubStr(tmpStr, iPos + 1);
+      iPos   = Index(tmpStr, chrDelimiter);
+   end;
+end;
+
+macro GetFIIDFromAccount(Account : string, ErrorMessage : @string)
+   var Command, DataSet;
+   var FIID = -1, FICode = "", FIKind = FIKIND_CURRENCY;
+   FICode = SubStr(Account, 6, 3);
+
+   Command = RsdCommand("SELECT t_fiid FROM dfininstr_dbt WHERE t_fi_kind = ? and t_CodeInAccount = ?");
+   Command.addParam("", RSDBP_IN, FIKind);
+   Command.addParam("", RSDBP_IN, FICode);
+   Command.Execute(); 
+   DataSet = TRsbDataSet(Command);
+   if (DataSet.MoveNext())
+      FIID = DataSet.FIID;
+   else
+      ErrorMessage = "Не найдена валюта для счета " + Account;
+   end;
+   return FIID;
+
+   OnError(Error)
+        ErrorMessage = "Ошибка определения валюты для счета " + Account + ": " + Error.Message;
+        return -1;
+end;
+
+macro GetBalanceFromAccount(Account : string)
+   return SubStr(Account, 1, 5);
+end;
+
+macro GetChapterFromAccount(Account : string)
+   var Balance; 
+   var Chapter;
+   Balance = Int(GetBalanceFromAccount(Account));
+   if ((Balance >= 98000) and (Balance <= 98090))
+      Chapter = 5;    
+   elif ((Balance >= 93001) and (Balance <= 97001))      
+      Chapter = 4;
+   elif (((Balance >= 90601) and (Balance <= 91904)) or (Balance == 99999) or (Balance == 99998))      
+      Chapter = 3;
+   elif ((Balance >= 80101) and (Balance <= 85501))      
+      Chapter = 2;
+   else
+      Chapter = 1;
+   end;
+   return Chapter;
+end;   
+
+macro GetKindAccFromBalance(Balance : string, Chapter : integer, ErrorMessage : @string)
+   var Command, DataSet;
+   var KindAccount = "";
+    
+   Command = RsdCommand("SELECT t_kind_account FROM dbalance_dbt WHERE t_balance = ? and t_chapter = ? and t_inumplan = 0");
+   Command.addParam("", RSDBP_IN, Balance);
+   Command.addParam("", RSDBP_IN, Chapter);
+   Command.Execute(); 
+
+   DataSet = TRsbDataSet(Command);
+   if (DataSet.MoveNext())
+      KindAccount = DataSet.Kind_Account;
+   else
+      ErrorMessage = "Не определен вид счета для номера балансового счета " + Balance;
+   end;
+   return KindAccount;
+   OnError(Error)
+      ErrorMessage = "Ошибка определения вида счета для номера балансового счета " + Balance + ": " + Error.Message;
+      return Int(-1);                                                               
+end;
+
+macro GetUniID(ObjectType, ObjectID, ErrorMessage : @string)
+   file PartyFile(party)    key 0;
+   file PaymentFile(pmpaym) key 0;
+   file AccountFile(account) key 0;
+   file MemorderFile(cb_doc) key 0;
+   var UniObjectID  = "";
+   private  var rspm;
+   private  var cmd;
+   ErrorMessage = "";
+
+   if (ObjectType == OBJTYPE_PARTY)
+      ClearRecord(PartyFile);
+      PartyFile.PartyID = Int(ObjectID);
+      if (GetEQ(PartyFile))
+         UniObjectID = UniID(PartyFile, ObjectType);
+      else
+         ErrorMessage = "Не найден субъект " + ObjectID;
+      end;
+   elif (ObjectType == OBJTYPE_PAYMENT)
+      ClearRecord(PaymentFile);
+      PaymentFile.PaymentID = Int(ObjectID);
+      if  (GetEQ(PaymentFile))
+         UniObjectID = UniID(PaymentFile, ObjectType);
+      else
+         /*LAO 03.10.2012 проверяем повторно! есть предположение что GetEQ не может записать данные в структуру и возвращает false */
+         /*если ошибка исчезнет тогда проверку (GetEQ(PaymentFile) заменю */
+         cmd =    " SELECT  1 as ch "+
+                     "\n            FROM dpmpaym_dbt doc "+
+                     "\n           WHERE doc.t_paymentid = ? ";
+         cmd = RSDCommand(cmd);
+         cmd.addParam("paymid", RSDBP_IN, PaymentFile.PaymentID);
+         rspm = RSDRecordset(cmd);
+         if (rspm.movenext) 
+            UniObjectID = UniID(PaymentFile, ObjectType);
+         else
+            ErrorMessage = "Не найден платеж " + ObjectID;
+         end;
+         /******************Конец проверки************/
+      end;
+   /*01.11.12 LAO C-15259-6  Добавляем еще МЕМОРДЕР к интерфейсной вставке примечания*/
+   elif (ObjectType == 70)
+      cmd =    " SELECT   lpad(doc.T_DOCUMENTID,34,'0') unidoc "+
+                    "\n            FROM dpmpaym_dbt doc "+
+                    "\n           WHERE doc.t_paymentid = ? ";
+      cmd = RSDCommand(cmd);
+      cmd.addParam("paymid", RSDBP_IN, Int(ObjectID));
+      rspm = RSDRecordset(cmd);
+         if (rspm.movenext) 
+            UniObjectID = rspm.value("unidoc");
+         else
+            ErrorMessage = "Не найден платеж " + ObjectID;
+         end;
+   elif (ObjectType == OBJTYPE_ACCOUNT)
+      ClearRecord(AccountFile);
+      AccountFile.Account = ObjectID;
+      AccountFile.Chapter = GetChapterFromAccount(AccountFile.Account);       
+      if (GetEQ(AccountFile))
+         AccountFile.Code_Currency = GetFIIDFromAccount(AccountFile.Account, @ErrorMessage);       
+         if (strlen(ErrorMessage) == 0)
+            UniObjectID = UniID(AccountFile, ObjectType);
+         end;
+      else
+         ErrorMessage = "Не найден счет " + ObjectID;
+      end;
+   else
+      ErrorMessage = "Ошибка при формировании строкового идентификатора объекта: неверно задан вид объекта (" + ObjectType + ")";
+   end;
+
+   if ((strlen(UniObjectID) == 0) and (strlen(ErrorMessage) == 0))
+      ErrorMessage = "Ошибка при формировании строкового идентификатора объекта" + ObjectID;
+   end;
+
+   return UniObjectID;  
+end;
+
+macro GetErrorMessage(stat : integer)
+   var ErrorMessage = "";
+   InitError();
+   MemoryError(stat);
+   ErrorMessage = GetErrMsg();
+    
+   return ErrorMessage;
+end;
+
+//--------------- [Вспомогательные функции для работы с клиентом] ---------------//
+// присваивание переменной var1 значения var2, если var2 не пусто
+macro Assign(var1, var2)
+   if ((ValType(var2) == V_STRING) and (var2 == " "))        
+      SetParm(0, "");                                     
+   elif (strlen(string(var2)) != 0)
+      SetParm(0, var2);    
+   end;
+end;
+
+// проверка существования клиента с заданным идентификатором
+macro CheckPartyID(PartyID, ErrorMessage)
+   var Command, DataSet;
+   var bResult = true;    
+   ErrorMessage = "";
+   Command = RsdCommand("SELECT t_partyid FROM dparty_dbt WHERE t_partyid = ?");
+   Command.addParam("", RSDBP_IN, PartyID);    
+   Command.Execute(); 
+   DataSet = TRsbDataSet(Command);
+   if (not DataSet.MoveNext())        
+      ErrorMessage = "Не найден клиент с идентификатором " + PartyID;
+      bResult = false;
+   end;    
+   SetParm(1, ErrorMessage);
+
+   return bResult;
+   OnError(Error)
+      ErrorMessage = "Ошибка при проверке клиента с идентификатором " + PartyID + ": " + Error.Message;
+      SetParm(1, ErrorMessage);
+      return false;
+end;
+
+// проверка существования вида обслуживания
+macro CheckServKind(ServKind, ErrorMessage)
+   var Command, DataSet;
+   var bResult = true; 
+   ErrorMessage = "";
+    
+   Command = RsdCommand("SELECT t_servisekind FROM dservkind_dbt WHERE t_servisekind = ?");
+   Command.addParam("", RSDBP_IN, ServKind);    
+   Command.Execute(); 
+   DataSet = TRsbDataSet(Command);
+   if (not DataSet.MoveNext())        
+      ErrorMessage = "Не найден вид обслуживания с идентификатором " + ServKind;
+      bResult = false;
+   end;   
+   SetParm(1, ErrorMessage);
+    
+   return bResult;
+   OnError(Error)
+      ErrorMessage = "Ошибка при проверке вида обслуживания " + ServKind + ": " + Error.Message;
+      SetParm(1, ErrorMessage);
+      return false;
+end;
+
+// клиент инфо
+macro GetClientInfo(oper)
+   return "["+oper+"]:  Обработка сообщений из программного канала";
+end;
+
+// проверка на то, является ли данная сессия обработчиком ли нет
+macro CheckAgent(oper)
+   var Command, DataSet;
+   Command = RsdCommand("select 1 " +
+                        "  from v$session s " +
+                        " where s.SID = userenv('SID') " +
+                        "   and s.CLIENT_INFO = ?");
+   Command.addParam("", RSDBP_IN, GetClientInfo(oper));
+   Command.Execute(); 
+
+   DataSet = TRsbDataSet(Command);
+   if (DataSet.MoveNext())        
+      return true;
+   end;    
+   
+   return false;
+   OnError(Error)
+      return false;
+end;

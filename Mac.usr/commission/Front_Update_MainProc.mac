@@ -1,0 +1,421 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: Front_Update_MainProc.mac
+// @author  : 2012-12-20 zip_z. 
+// @desc    : Обновление информации по корпоративным картам из Front (процедура)
+// @changes : none
+// @todo    : написать обработку ошибок (для гурманов)
+// Изменения:
+// 30.09.2014 joy C-27764 Новые условия по корпоративным картам
+// 07.10.2014 joy C-27764 добавлена возможность задавать пользовательскую дату + увеличен диапазон проверки (5 лет вместо 3-х)
+// 17.10.2014 joy C-27764 если счетов СКС несколько, то подключение только по одному ДО
+// 27.01.2015 joy добавлена проверка на банк Солидарность
+// 17.02.2015 RR Адаптировано для ПОЙДЕМа
+// 04.08.2015 RR Макрос переезжает в Front_Update_MainProc.mac, нужно для того, чтобы робот мог выполнять обновление данных. 
+// -------------------------------------------------------------------------------------------------
+
+import globals, oralib, frontCommon, likepy, lib_registry, TReport, lib_fc_corporate, lib_front, lib_const, RSD, fg_Life_parm;
+
+private var LifeBank = fg_life_subject({OurBank});
+
+const PRODUCT_9604 = 9604;
+const PRODUCT_9605 = 9605;
+// 17.09.2014 joy C-27764 Новые коды продуктов
+const PRODUCT_5917 = 5917; // новый код для 12.1.2 для ПРББ и ГЭБ
+const PRODUCT_9607 = 9607; // новый код для 12.1.1 и 12.1.2 для ЭВ
+
+var OperDate;
+/*Номера комиссий и строки для хранения id договоров для подключения той или иной комиссии*/
+var CONTRS_FOR_CONNECT_1211_DMSB   = "";
+var CONTRS_FOR_CONNECT_1212_DMSB   = "";
+var CONTRS_FOR_CONNECT_1211_DRB    = "";
+// var CONTRS_FOR_CONNECT_1212_DRB    = "";
+var CONTRS_FOR_CONNECT_12110_DMSB  = "";
+var CONTRS_FOR_CONNECT_12110_DRB   = "";
+debugbreak;
+//30.09.2014 joy C-27764 перенесла определение переменных сюда
+var C_1211_DMSB   ;   
+var C_1212_DMSB   ;   
+var C_1211_DRB    ;   
+// var C_1212_DRB    ; 
+var C_12110_DMSB  ; 
+var C_12110_DRB   ;
+var COMISS_NUMBERS;
+
+
+if (LifeBank.is_PRBB or LifeBank.is_SLD or LifeBank.is_GO)
+     C_1211_DMSB      = 1087;
+     C_1212_DMSB      = 1088;
+     C_1211_DRB       = 1131;
+//     C_1212_DRB       = 1132; 30.09.2014 joy C-27764 12.1.2 осталась только 1 комиссия
+     C_12110_DMSB     = 1089;
+     C_12110_DRB      = 1133;
+     COMISS_NUMBERS   = "1087,1088,1131,1089,1133";
+     if (LifeBank.is_SLD)
+        COMISS_NUMBERS   = "1087,1088,1131,1089";
+     end;
+// 30.09.2014 joy C-27764 добавляем номера комиссиий для ГЭБ и ЭВ
+elif (LifeBank.is_GEB)
+     C_1211_DMSB      = 1095;
+     C_1212_DMSB      = 1096;
+     C_1211_DRB       = 1157;
+//     C_1212_DRB       = 1132; 30.09.2014 joy C-27764 12.1.2 осталась только 1 комиссия
+//     C_12110_DMSB     = 1089;
+//     C_12110_DRB      = 1133;
+     COMISS_NUMBERS   = "1095,1096,1157";
+elif (LifeBank.is_EXV)
+    if (LifeBank.is_EXV_Voronezh or LifeBank.is_EXV_Volgograd or LifeBank.is_EXV_Stavropol)
+        C_1211_DMSB      = 1082;
+        C_1212_DMSB      = 1083;
+    COMISS_NUMBERS   = "1082,1083";
+    else
+        C_1211_DMSB      = 1083;
+        C_1212_DMSB      = 1084;
+//     C_1211_DRB       = 1131; 30.09.2014 joy C-27764 12.1.1 для ЭВ одн
+//     C_1212_DRB       = 1132; 30.09.2014 joy C-27764 12.1.2 осталась только 1 комиссия
+//     C_12110_DMSB     = 1089;
+//     C_12110_DRB      = 1133;
+     COMISS_NUMBERS   = "1083,1084";
+     end;
+end;
+// @desc: получение параметров карты из Фронта
+private macro GetFrontOutParams (_conn, NeedPrintLog)
+    array param, out;
+    
+    RSLDefCon.BeginTrans (); 
+    var sqlQuery = "   INSERT INTO usr_front_cardinfo (rs_code_client, fc_name, rsbcode, date_begin, date_end, "
+                   "\n                                cardkind_name, cardtype, status, sms) "
+                   "\n VALUES (concat ('01', lpad (:m_rs_code_client, 10, '0')), :m_fc_name, :m_rsbcode, :m_date_begin, :m_date_end, "
+                   "\n       :m_cardkind_name, :m_cardtype, :m_status, :m_sms) ";
+    var sqlParams = TArray ();
+    
+    param [0] = {MFO_BANK};
+    var ado = RSADORecordset (ExecuteFrontProcEx ("ask_client_card_for_rs", param, _conn, 26, Out));
+    
+    initProgress (ado.rs.RecordCount);
+    execSQL ("delete from usr_front_cardinfo ");
+    while (ado.movenext ())
+        useProgress (ado.rs.AbsolutePosition);
+        //debugbreak ();
+        sqlParams = makeArray (SQLParam ("m_rs_code_client" ,ado.m_value [0]),    // RS-код
+                               SQLParam ("m_fc_name"        ,ado.m_value [1]),    // Клиент
+                               SQLParam ("m_rsbcode"        ,ado.m_value [2]),    // Код продукта
+                               SQLParam ("m_date_begin"     ,ado.m_value [3]),    // Начало
+                               SQLParam ("m_date_end"       ,ado.m_value [4]),    // Окончание
+                               SQLParam ("m_cardkind_name"  ,ado.m_value [5]),    // Вид карты
+                               SQLParam ("m_cardtype"       ,ado.m_value [6]),    // Тип карты
+                               SQLParam ("m_status"         ,ado.m_value [7]),    // Состояние
+                               SQLParam ("m_sms"            ,ado.m_value [8])     // SMS
+                               );
+        if (ado.m_value [7] == FC_STATE_SERVED)
+            // пока вставляем информацию только по картам, которые обслуживаются
+            execSQL (sqlQuery, sqlParams, true ); 
+        end;
+    end; 
+    RemProgress ();
+    RSLDefCon.CommitTrans ();
+    return RSL_EXIT_SUCCESS;
+onError
+    RSLDefCon.RollbackTrans ();
+    return RSL_EXIT_FAILURE;
+end;
+
+private macro DisconnectCommissions()
+  message ("Отключение комиссий 12.1.х ...");
+  var sql = RSDCommand(
+                "\n  UPDATE   dsfconcom_dbt " +
+                "\n     SET   t_status = 1 " +
+                "\n   WHERE       t_commnumber IN ("+COMISS_NUMBERS+") " +
+                "\n  AND t_feetype = 1 " +
+                "\n  AND t_objecttype = 659 " +
+                "\n  AND t_status = 0 ");
+  sql.execute();
+end;
+
+private macro ConnectCommission(comissnumber,contrsstring)
+
+  if ((valtype(comissnumber)!= V_UNDEF) and (valtype(contrsstring)!= V_UNDEF) and (contrsstring != ""))
+      var sql = RSDCommand(
+                    "\n  UPDATE   dsfconcom_dbt " +
+                    "\n     SET   t_status = 0 " +
+                    "\n   WHERE       t_commnumber = "+comissnumber+" " +
+                    "\n  AND t_feetype = 1 " +
+                    "\n  AND t_objecttype = 659 " +
+                    "\n  AND t_objectid in ("+contrsstring+") " +
+                    "\n  AND t_status = 1");
+      sql.execute();
+  end;
+  
+end;
+// 07.10.2014 joy C-27764 добавлена возможность задавать дату из диалогового окна, вьюшка теперь собирает данные по всем клиентам, а отбор по годам происходит в запросе ниже
+// 08.10.2014 joy C-27764 увеличен период проверки, 5 лет вместо 3-х
+// 17.10.2014 joy C-27764 если счетов СКС несколько, то подключение только по одному ДО
+private macro ConnectCommissionMain()
+    message ("Подключение комиссий 12.1.х ...");
+    var rs,rrs;
+    var sqwyrt =             "  SELECT   distinct(t1.contr_id), t2.t_number, t1.m_sms, t1.RSBCODE" ;
+        sqwyrt =   sqwyrt +  "\n  FROM   (SELECT   CTR.T_ID contr_id, VW.RSBCODE, VW.M_PRIORITY_PASS, VW.M_SMS " ;
+        sqwyrt =   sqwyrt +  "\n            FROM   usr_vw_com_cardinfo vw, dsfcontr_dbt ctr /*, daccount_dbt ac*/" ;
+        //LAO 15/05/2016 Интервал плохо обрабатывает занчения высокосного года. Переделал на add_months
+        /*
+        sqwyrt =   sqwyrt +  "\n           WHERE   ( (VW.DATE_BEGIN BETWEEN (SELECT   TRUNC ("+getSQLDate(OperDate)+", 'month') - INTERVAL '5' YEAR FROM   DUAL) " ;
+        sqwyrt =   sqwyrt +  "\n                                     AND  (SELECT   TO_DATE (LAST_DAY ("+getSQLDate(OperDate)+")) - INTERVAL '5' YEAR FROM   DUAL)) " ;
+        
+        sqwyrt =   sqwyrt +  "\n                    OR  (VW.DATE_BEGIN BETWEEN (SELECT   TRUNC ("+getSQLDate(OperDate)+", 'month') - INTERVAL '4' YEAR FROM   DUAL) " ;
+        sqwyrt =   sqwyrt +  "\n                                     AND  (SELECT   TO_DATE (LAST_DAY ("+getSQLDate(OperDate)+")) - INTERVAL '4' YEAR FROM   DUAL) ) " ;
+        
+        sqwyrt =   sqwyrt +  "\n                    OR  (VW.DATE_BEGIN BETWEEN (SELECT   TRUNC ("+getSQLDate(OperDate)+", 'month') - INTERVAL '3' YEAR FROM   DUAL) " ;
+        sqwyrt =   sqwyrt +  "\n                                     AND  (SELECT   TO_DATE (LAST_DAY ("+getSQLDate(OperDate)+")) - INTERVAL '3' YEAR FROM   DUAL) ) " ;
+        
+        sqwyrt =   sqwyrt +  "\n                    OR  (VW.DATE_BEGIN BETWEEN (SELECT   TRUNC ("+getSQLDate(OperDate)+", 'month') - INTERVAL '2' YEAR FROM   DUAL) " ;
+        sqwyrt =   sqwyrt +  "\n                                     AND  (SELECT   TO_DATE (LAST_DAY ("+getSQLDate(OperDate)+")) - INTERVAL '2' YEAR FROM   DUAL) ) " ;
+        
+        sqwyrt =   sqwyrt +  "\n                    OR  (VW.DATE_BEGIN BETWEEN (SELECT   TRUNC ("+getSQLDate(OperDate)+", 'month') - INTERVAL '1' YEAR FROM   DUAL) " ;
+        sqwyrt =   sqwyrt +  "\n                                     AND  (SELECT   TO_DATE (LAST_DAY ("+getSQLDate(OperDate)+")) - INTERVAL '1' YEAR FROM   DUAL) ) )" ;
+        */
+        //LAO так и красивее выглядит
+        sqwyrt =   sqwyrt +  "\n          WHERE ((VW.DATE_BEGIN BETWEEN  add_months(TRUNC("+getSQLDate(OperDate)+",'month'),-60 ) and ADD_MONTHS (LAST_DAY ("+getSQLDate(OperDate)+"), -60))";
+        sqwyrt =   sqwyrt +  "\n             OR (VW.DATE_BEGIN BETWEEN  add_months(TRUNC("+getSQLDate(OperDate)+",'month'),-48 )  and ADD_MONTHS (LAST_DAY ("+getSQLDate(OperDate)+"), -48))";
+        sqwyrt =   sqwyrt +  "\n             OR (VW.DATE_BEGIN BETWEEN  add_months(TRUNC("+getSQLDate(OperDate)+",'month'),-36 )  and ADD_MONTHS (LAST_DAY ("+getSQLDate(OperDate)+"), -36))";
+        sqwyrt =   sqwyrt +  "\n             OR (VW.DATE_BEGIN BETWEEN  add_months(TRUNC("+getSQLDate(OperDate)+",'month'),-24 )  and ADD_MONTHS (LAST_DAY ("+getSQLDate(OperDate)+"), -24))";
+        sqwyrt =   sqwyrt +  "\n             OR (VW.DATE_BEGIN BETWEEN  add_months(TRUNC("+getSQLDate(OperDate)+",'month'),-12 )  and ADD_MONTHS (LAST_DAY ("+getSQLDate(OperDate)+"), -12)))";
+
+        
+        sqwyrt =   sqwyrt +  "\n                   AND CTR.T_PARTYID = VW.T_OBJECTID " ;
+        sqwyrt =   sqwyrt +  "\n                   and ctr.t_id =                     ";
+        sqwyrt =   sqwyrt +  "\n                           (select   min (t_id)       "; // 17.10.2014 joy C-27764  счетов СКС несколько? - подключение  по одному ДО
+        sqwyrt =   sqwyrt +  "\n                              from   dsfcontr_dbt c, daccount_dbt ac   ";
+        sqwyrt =   sqwyrt +  "\n                             where c.t_partyid = ctr.t_partyid         ";
+        sqwyrt =   sqwyrt +  "\n                                AND AC.T_ACCOUNT = C.T_OBJECT " ;
+        sqwyrt =   sqwyrt +  "\n                                AND REGEXP_LIKE (ac.t_account, '^40[5-7]|^4080[2,7]') " ;
+        sqwyrt =   sqwyrt +  "\n                                AND REGEXP_LIKE (TO_CHAR (ac.t_balance),'^40[5-7]|^4080[2,7]') " ;
+        sqwyrt =   sqwyrt +  "\n                                AND ac.t_open_close = CHR (0) " ;
+        sqwyrt =   sqwyrt +  "\n                                AND ac.t_chapter = 1 " ;
+        sqwyrt =   sqwyrt +  "\n                                AND (   INSTR (ac.t_usertypeAccount, 'D') > 0 " ;
+        if (not LifeBank.is_EXV) // joy C-27764 Для ЭВ условия поиска счета СКС  отличаются
+            sqwyrt =   sqwyrt +  "\n               AND SUBSTR (ac.t_account, 11, 1) = '9') " ; // joy C-27764 заменла or на and, Петренко О.сказала, D-обязательное условие
+        else
+            sqwyrt =   sqwyrt +  "\n               AND ( SUBSTR (ac.t_account, 11, 1) = '9' or SUBSTR (ac.t_account, 12, 1) = '9' )  ) " ;
+        end;
+        sqwyrt =   sqwyrt +  "\n                     ) ) t1, " ;
+        sqwyrt =   sqwyrt +  "\n         (SELECT   CM.T_NUMBER, " ;
+        sqwyrt =   sqwyrt +  "\n                   CM.T_FEETYPE, " ;
+        sqwyrt =   sqwyrt +  "\n                   (SELECT   t_numinlist " ;
+        sqwyrt =   sqwyrt +  "\n                      FROM   dobjattr_dbt " ;
+        sqwyrt =   sqwyrt +  "\n                     WHERE   (t_objecttype, t_groupid, t_attrid) = " ;
+        sqwyrt =   sqwyrt +  "\n                                (SELECT   t_objecttype, t_groupid, t_attrid " ;
+        sqwyrt =   sqwyrt +  "\n                                   FROM   dobjatcor_dbt at " ;
+        sqwyrt =   sqwyrt +  "\n                                  WHERE       t_objecttype = 650 " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_groupid = 101 " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_validtodate = '31.12.9999' " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_object =CONCAT (LPAD (cm.t_feetype,5,'0'),LPAD (cm.t_number, 5, '0')))) m_rsbcode, " ;
+        sqwyrt =   sqwyrt +  "\n                   (SELECT   t_chattr " ;
+        sqwyrt =   sqwyrt +  "\n                      FROM   dobjattr_dbt " ;
+        sqwyrt =   sqwyrt +  "\n                     WHERE   (t_objecttype, t_groupid, t_attrid) = " ;
+        sqwyrt =   sqwyrt +  "\n                                (SELECT   t_objecttype, t_groupid, t_attrid " ;
+        sqwyrt =   sqwyrt +  "\n                                   FROM   dobjatcor_dbt at " ;
+        sqwyrt =   sqwyrt +  "\n                                  WHERE       t_objecttype = 650 " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_groupid = 102 " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_validtodate = '31.12.9999' " ;
+        sqwyrt =   sqwyrt +  "\n                                          AND t_object =CONCAT (LPAD (cm.t_feetype,5,'0'),LPAD (cm.t_number, 5, '0')))) m_priority_pass_1 " ;
+        sqwyrt =   sqwyrt +  "\n            FROM   dsfcomiss_dbt cm " ;
+        sqwyrt =   sqwyrt +  "\n           WHERE   REGEXP_INSTR (TRIM (cm.t_code), '^(12.1.[1-2])') = 1 " ;
+        sqwyrt =   sqwyrt +  "\n                   AND cm.t_feetype = 1) t2 " ;
+        sqwyrt =   sqwyrt +  "\n WHERE   t1.RSBCODE = t2.M_RSBCODE " ;
+        sqwyrt =   sqwyrt +  "\n         AND t1.M_PRIORITY_PASS = t2.M_PRIORITY_PASS_1 ";
+    rs = RSDRecordSet(sqwyrt);
+    
+    while (rs and rs.movenext())
+      if (rs.value("T_NUMBER") == C_1211_DMSB)
+        if ( not CONTRS_FOR_CONNECT_1211_DMSB == "")
+          CONTRS_FOR_CONNECT_1211_DMSB = CONTRS_FOR_CONNECT_1211_DMSB + ", " + rs.value("CONTR_ID");
+        else
+          CONTRS_FOR_CONNECT_1211_DMSB = CONTRS_FOR_CONNECT_1211_DMSB + rs.value("CONTR_ID");
+        end;
+      elif (rs.value("T_NUMBER") == C_1212_DMSB)
+        if ( not CONTRS_FOR_CONNECT_1212_DMSB == "")
+          CONTRS_FOR_CONNECT_1212_DMSB = CONTRS_FOR_CONNECT_1212_DMSB + ", " + rs.value("CONTR_ID");
+        else
+          CONTRS_FOR_CONNECT_1212_DMSB = CONTRS_FOR_CONNECT_1212_DMSB + rs.value("CONTR_ID");
+        end;
+      elif (rs.value("T_NUMBER") == C_1211_DRB)
+        if ( not CONTRS_FOR_CONNECT_1211_DRB == "")
+          CONTRS_FOR_CONNECT_1211_DRB = CONTRS_FOR_CONNECT_1211_DRB + ", " + rs.value("CONTR_ID");
+        else
+          CONTRS_FOR_CONNECT_1211_DRB = CONTRS_FOR_CONNECT_1211_DRB + rs.value("CONTR_ID");
+        end;
+    /*  30.09.2014 joy C-27764 Теперь 12.1.2 одна комиссия
+      elif (rs.value("T_NUMBER") == C_1212_DRB)
+        if ( not CONTRS_FOR_CONNECT_1212_DRB == "")
+          CONTRS_FOR_CONNECT_1212_DRB = CONTRS_FOR_CONNECT_1212_DRB + ", " + rs.value("CONTR_ID");
+        else
+          CONTRS_FOR_CONNECT_1212_DRB = CONTRS_FOR_CONNECT_1212_DRB + rs.value("CONTR_ID");
+        end;*/
+      end;
+    end;
+    
+    if ( LifeBank.is_PRBB or LifeBank.is_SLD) // 30.09.2014 joy C-27764 в ГЭБе и ЭВ таких комиссий нет
+        rrs = RSDRecordSet(sqwyrt);
+        
+        while (rrs and rrs.movenext())
+          if ((rrs.value("RSBCODE") == PRODUCT_9604) and (rrs.value("M_SMS") == 1))
+              if ( not CONTRS_FOR_CONNECT_12110_DMSB == "")
+                CONTRS_FOR_CONNECT_12110_DMSB = CONTRS_FOR_CONNECT_12110_DMSB + ", " + rrs.value("CONTR_ID");
+              else
+                CONTRS_FOR_CONNECT_12110_DMSB = CONTRS_FOR_CONNECT_12110_DMSB + rrs.value("CONTR_ID");
+              end;
+          elif ((rrs.value("RSBCODE") == PRODUCT_9605) and (rrs.value("M_SMS") == 1) and (LifeBank.is_PRBB))
+              if ( not CONTRS_FOR_CONNECT_12110_DRB == "")
+                CONTRS_FOR_CONNECT_12110_DRB = CONTRS_FOR_CONNECT_12110_DRB + ", " + rrs.value("CONTR_ID");
+              else
+                CONTRS_FOR_CONNECT_12110_DRB = CONTRS_FOR_CONNECT_12110_DRB + rrs.value("CONTR_ID");
+              end;
+          end;
+        end;
+    end;
+                                                                                                      /*
+                                                                                                      println("1211_DMSB " + CONTRS_FOR_CONNECT_1211_DMSB); 
+                                                                                                      println("1212_DMSB " + CONTRS_FOR_CONNECT_1212_DMSB); 
+                                                                                                      println("1211_DRB " + CONTRS_FOR_CONNECT_1211_DRB); 
+                                                                                                      println("1212_DRB " + CONTRS_FOR_CONNECT_1212_DRB); 
+                                                                                                      println("12110_DMSB " + CONTRS_FOR_CONNECT_12110_DMSB); 
+                                                                                                      println("12110_DRB " + CONTRS_FOR_CONNECT_12110_DRB); */
+    //Последовательно подключаем каждую комиссию
+    ConnectCommission(C_1211_DMSB, CONTRS_FOR_CONNECT_1211_DMSB);
+    ConnectCommission(C_1212_DMSB, CONTRS_FOR_CONNECT_1212_DMSB); 
+    if (not LifeBank.is_EXV) // 30.09.2014 joy C-27764 Для ЭВ теперь 12.1.1 одна
+        ConnectCommission(C_1211_DRB, CONTRS_FOR_CONNECT_1211_DRB);
+    end;
+//    ConnectCommission(C_1212_DRB, CONTRS_FOR_CONNECT_1212_DRB);  30.09.2014 joy C-27764 теперь 12.1.2 одна
+    if ( LifeBank.is_PRBB or LifeBank.is_SLD)  // 30.09.2014 joy C-27764 в ГЭБе и ЭВ таких комиссий нет
+        ConnectCommission(C_12110_DMSB, CONTRS_FOR_CONNECT_12110_DMSB);
+        if ( LifeBank.is_PRBB)
+            ConnectCommission(C_12110_DRB, CONTRS_FOR_CONNECT_12110_DRB);
+        end;
+    end;
+end;
+
+// @desc: печать отчёта
+private macro PrintReport ()
+    message ("Печать отчёта...");
+    
+    PrintLn ("ПОДКЛЮЧЕНЫ КОМИССИИ 12.1.х ПО ДОГОВОРАМ ОБСЛУЖИВАНИЯ");
+    var sql = "\n   SELECT   t_object, " ;
+        sql = sql + "\n          (SELECT   t_code " ;
+        sql = sql +  "\n             FROM   dobjcode_dbt " ;
+        sql = sql +  "\n            WHERE       t_objecttype = 3 " ;
+        sql = sql +  "\n                    AND t_codekind = 1 " ;
+        sql = sql +  "\n                    AND t_state = 0 " ;
+        sql = sql +  "\n                    AND t_objectid = c.t_partyid) " ;
+        sql = sql +  "\n             m_code, " ;
+        sql = sql +  "\n          (SELECT   t_name " ;
+        sql = sql +  "\n             FROM   dparty_dbt " ;
+        sql = sql +  "\n            WHERE   t_partyid = c.t_partyid) " ;
+        sql = sql +  "\n            m_client " ;
+        sql = sql +  "\n   FROM   dsfcontr_dbt c " ;
+        sql = sql +  "\n  WHERE   C.T_ID IN " ;
+        sql = sql +  "\n                (SELECT   DISTINCT (t_objectid) " ;
+        sql = sql +  "\n                   FROM   dsfconcom_dbt " ;
+        sql = sql +  "\n                  WHERE       t_commnumber IN ("+COMISS_NUMBERS+") " ;
+        sql = sql +  "\n                          AND t_feetype = 1 " ;
+        sql = sql +  "\n                          AND t_objecttype = 659 " ;
+        sql = sql +  "\n                          AND t_status = 0 " ;
+        sql = sql +  "\n                          AND (t_dateend = '01.01.0001' OR t_dateend > SYSDATE)) " ;
+        sql = sql +  "\n          AND C.T_OBJECT IN " ;
+        sql = sql +  "\n                   (SELECT   t_account " ;
+        sql = sql +  "\n                      FROM   daccount_dbt " ;
+        sql = sql +  "\n                     WHERE   REGEXP_LIKE (t_account, '^40[5-7]|^4080[2,7]') " ;
+        sql = sql +  "\n                             AND REGEXP_LIKE (TO_CHAR (t_balance),'^40[5-7]|^4080[2,7]') " ;
+        sql = sql +  "\n                             AND t_open_close = CHR (0) " ;
+        sql = sql +  "\n                             AND t_chapter = 1 " ;
+        sql = sql +  "\n                             AND (   INSTR (t_usertypeAccount, 'D') > 0 " ;
+        if (not LifeBank.is_EXV) // 30.09.2014 joy C-27764 Для ЭВ условия поиска счета СКС  отличаются
+            sql = sql +  "\n                         AND SUBSTR (t_account, 11, 1) = '9')) " ;
+        else
+            sql = sql +  "\n                         AND (SUBSTR (t_account, 11, 1) = '9' or SUBSTR (t_account, 12, 1) = '9' ))) " ;
+        end;
+        sql = sql +  "\n          AND t_objectType = 1 " ;
+        sql = sql +  "\n          AND t_servKind = 3 ";
+    
+    sql = execSqlSelect (sql);
+    
+    var table = CTableReport();
+    table.addColumn ("Лицевой счет",      22, AL_LEFT);
+    table.addColumn ("Код",               12, AL_LEFT);
+    table.addColumn ("Клиент",            90, AL_LEFT);
+    table.printHead ();
+    while (sql.movenext)
+        table.printStringTransferByWord ( sql.value ("t_object", null, V_STRING), 
+                                          sql.value ("m_code"  , null, V_STRING), 
+                                          sql.value ("m_client", null, V_STRING));
+    end;
+    table.printBottom ();
+    table = null;
+    
+    
+    sql = FC_GetSqlQuery ();
+    sql = execSqlSelect (sql);
+    
+    
+    PrintLn ("ЗАГРУЖЕНА ИНФОРМАЦИЯ ПО КАРТАМ ФРОНТ");
+    
+    table = CTableReport();
+    table.addColumn ("RS-код",               12, AL_LEFT);
+    table.addColumn ("Клиент",               70, AL_LEFT);
+    table.addColumn ("Продукт",               5, AL_LEFT);
+    table.addColumn ("Номер карты",          18, AL_LEFT);
+    table.addColumn ("Начало",               10, AL_LEFT);
+    table.addColumn ("Окончание",            10, AL_LEFT);
+    table.addColumn ("Вид карты",            15, AL_LEFT);
+    table.addColumn ("Тип карты",            25, AL_LEFT);
+    table.addColumn ("Состояние",            20, AL_LEFT);
+    table.addColumn ("SMS",                  10, AL_LEFT);
+    table.printHead ();
+    
+    while (sql.movenext)
+        table.printStringTransferByWord ( sql.value ("rs_code_client", null, V_STRING  ), // RS-код
+                                          sql.value ("t_name"        , null, V_STRING  ), // Клиент (имя)
+                                          sql.value ("rsbcode"       , null, V_STRING  ), // Код продукта
+                                          sql.value ("fc_name"       , null, V_STRING  ), // Клиент (карта)
+                                          sql.value ("date_begin"    , null, V_DATE    ), // Начало
+                                          sql.value ("date_end"      , null, V_DATE    ), // Окончание
+                                          sql.value ("cardkind_name" , null, V_STRING  ), // Вид карты
+                                          sql.value ("cardtype"      , null, V_STRING  ), // Тип карты
+                                          sql.value ("status"        , null, V_STRING  ), // Состояние
+                                          sql.value ("sms"           , null, V_STRING  )  // SMS             
+                                        );                                          
+    end;
+    
+    table.printBottom ();
+end;
+
+// @desc: старт процедуры обновления
+private macro initUpdateOperation (NeedPrintLog)
+    var c    = FR_GlobalConnection (FR_INDIVIDUAL, "RS-Bank::Обновление информации по картам ФЛ");
+    var conn = c.StartPooling (); 
+
+    message ("Выполняется обновление...");
+
+    getFrontOutParams (conn, NeedPrintLog);
+    c.endPooling (); 
+    
+    c = null; 
+
+    message ("Обновление завершено");
+end;
+
+
+// -------------------------------------------------------------------------------------------------
+
+MACRO Main_Unit(Update_Date, NeedPrintLog)
+
+ OperDate = Update_Date;
+ initUpdateOperation (NeedPrintLog);  // обновление
+ DisconnectCommissions(NeedPrintLog); // отключатор
+ ConnectCommissionMain (NeedPrintLog);    // подключатор
+ 
+ if (NeedPrintLog)
+   PrintReport ();          // отчет (печать полной таблицы)
+   exit (RSL_EXIT_SUCCESS); // нормальный человеческий выход (0 = видно печатную форму отчёта)
+ end;
+ 
+END;

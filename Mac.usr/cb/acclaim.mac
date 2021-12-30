@@ -1,0 +1,498 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: acclaim.mac
+// @desc    : макрос скроллинга претензий к лицевому счёту
+// @changes :  2012-07-16 Lavrenov C-12448-6 Печать входящих сообщений RPO по претензии
+//             2012-07-13 zip_z Смена инициатора 5.0 на претензии
+//             2013-02-05 zip_z Поборол отвал при вызове из листалки счетов ББ
+//             2013-08-05 Gurin S. C-17880
+//             2013-08-20 LAO Добавил отправку писем в Лотус по претензиям 
+//             2013-11-13 R-283396-2 Gurin S. перенес C-17880 на ГЕБ
+//             2013-11-25 KS Адаптация под 31ю сборку
+//             2014-17-03 Исправление адаптации TAM R-344678-2
+//             2014-07-14 R-409824-2 Gurin S. перенес C-17880 на Солидарность
+// -------------------------------------------------------------------------------------------------
+import BankInter, rsd, rsexts;
+import /*"acs_func.mac",*/ "claim.mac", "claim_change.mac", "KeyCodes.mac", autoKOR, "fg_Life_parm.mac","claimrur.mac";
+
+private Record Претензия( acclaim );
+private Record СтараяПретензия( acclaim );
+
+private Record ИзменяющийДокумент      ( acclmcng );
+private Record СтарыйИзменяющийДокумент( acclmcng );
+
+
+private const fgBank = fg_life_subject({OurBank});
+
+private macro Новая_Претензия()
+  return 0;
+end;
+
+
+// 2012-07-13 zip_z Обновление инициатора претензии
+private macro updateClaimInit (m_claimid:integer, m_init:integer)
+   if (execSQL ("UPDATE dacclaim_dbt SET t_initiator = :init WHERE t_claimid = :claimid", 
+                 makeArray (SQLParam ("init", m_init), SQLParam ("claimid", m_claimid))))
+      msgbox ("Обновление выполнено");
+   else
+      msgbox ("Обновление НЕ выполнено");
+   end;
+end;
+
+private macro check_insertclaim() 
+   var ret_val = 0; 
+   var st =1;
+   var cmr;
+   var cmd:RsdCommand;
+   if  (Претензия.Incremental=="")
+      st=0;
+   end ; 
+   //проверим дату старта претензии
+   cmd = RsdCommand(" SELECT   MIN (T_CURDATE) a_CurDate"
+                   +" FROM   DCURDATE_DBT"
+                   +" WHERE   T_ISCLOSED = CHR (0)"
+                   +" AND T_BRANCH IN (SELECT   T_CODE  FROM   DDP_DEP_DBT WHERE   T_ACCESSMODE = 1)"
+                   +" having MIN (T_CURDATE)<=?");
+   cmd.AddParam("sdate", RSDBP_IN, Претензия.StartDate);
+   cmr = RsdRecordSet(cmd);
+   if ((cmr.movenext) and (Претензия.StartDate>=Претензия.docdate))
+      cmd = RsdCommand( "BEGIN ? := USR_CLAIMS.USR_CheckInsUpdAcClaim(?, ?, ?, ?, ?, ?, ? /*to_date('23.07.2013','dd.mm.yyyy')*/, ?, ?); END;");
+      cmd.addParam( "ret_val", RSDBP_OUT, V_INTEGER );
+      cmd.addParam( "", RSDBP_IN, Претензия.Chapter );
+      cmd.addParam( "", RSDBP_IN, Претензия.Account );
+      cmd.addParam( "", RSDBP_IN, Претензия.FIID );
+      cmd.addParam( "", RSDBP_IN, Претензия.ClaimKind );
+      cmd.addParam( "", RSDBP_IN, Претензия.RestKind );
+      cmd.addParam( "", RSDBP_IN, Претензия.StartDate );
+      cmd.addParam( "", RSDBP_IN, Претензия.StartAmount );
+      cmd.addParam( "", RSDBP_IN, Претензия.Priority );
+      cmd.addParam( "", RSDBP_IN,st);
+      cmd.execute();
+      ret_val=cmd.param("ret_val").value;
+      return (ret_val ==0);
+   else
+      return false;
+   end;
+end;
+
+private macro letter_claim( p_account,
+                            p_datedoc,
+                            p_docnum,
+                            p_sum,
+                            p_comment,
+                            p_sdate,
+                            p_fdate,
+                            p_sysdate,
+                            p_claimkindspr,
+                            p_restkindspr,
+                            p_initkind,
+                            p_letter)
+   var Letter = "";
+   var rs,cmd,SQL;
+   SQL = "SELECT  ACC.T_NAMEACCOUNT, claimkindspr.T_NAME claimname, restkindspr.T_NAME restname,/* statespr.T_NAME statname,*/ initkind.T_NAME initname"
+          +" FROM   dllvalues_dbt claimkindspr,"
+          +"       dllvalues_dbt restkindspr,"
+          +"       dllvalues_dbt initkind,"
+          +"       daccount_dbt acc"
+          +" WHERE       claimkindspr.t_list = 2520"
+          +"        AND restkindspr.t_list = 2522"
+          +"        AND initkind.t_list = 2523"
+          +"        AND claimkindspr.t_element(+) = ?"
+          +"        AND restkindspr.t_element(+) = ?"
+          +"        AND initkind.t_element(+) = ?"
+          +"        and acc.t_account=?";
+   cmd = RsdCommand(SQL);
+   cmd.AddParam("cclaim", RSDBP_IN, p_claimkindspr);
+   cmd.AddParam("rkind", RSDBP_IN, p_restkindspr);
+   cmd.AddParam("inits", RSDBP_IN, p_initkind);
+   cmd.AddParam("acc", RSDBP_IN, p_account);
+   rs = RsdRecordSet(cmd);
+   if (rs.movenext) 
+      Letter = rs.value("T_NAMEACCOUNT")+";\n"+
+               "Счет:"+p_account+";\n"+ 
+               "Системная дата: "+p_sysdate+";\n"+   
+               "Дата документа: "+p_datedoc+";\n"+
+               "Номер документа: "+p_docnum+";\n"+
+               "Вид претензии: "+rs.value("claimname")+";\n"+
+               "Тип претензии: "+rs.value("restname")+";\n"+
+               "Инициатор: "+rs.value("initname")+";\n"+
+               "Сумма: "+p_sum+";\n"+
+               "Срок действия документа с " + p_sdate+  " до " + p_fdate +  ";\n"+
+               "Примечание: "+p_comment+".\n";
+      SetParm(11, letter);
+      return 0;
+   end;
+
+   return -71;
+
+   OnError
+      return -79;
+end;
+
+/*
+ * Режимы: 
+ * OBJ_INSERT - вставка
+ * OBJ_UPDATE - редактирование
+ * OBJ_DELETE - удаление 
+ */
+private macro Проверить_Претензию( Режим )
+   var rsd;
+   var v_letter="";
+   if (Режим == OBJ_DELETE)
+      rsd = rsdrecordset(rsdcommand(string("Select 1 from usr_claim where t_claimid =",Претензия.claimid," and t_enternum <> '0' and t_changedoc = chr(0) and t_flag = chr(88)")));
+      if (rsd.movenext())
+         msgbox("Запрещено удалять зарегистрированную претензию");
+         return 1;
+      end;
+   elif (Режим == OBJ_INSERT)
+      if (Претензия.fiid == 0)
+         rsd = rsdrecordset(rsdcommand(string("SELECT 1 FROM daccount_dbt WHERE t_account = '",Претензия.account,"' AND (   t_type_account LIKE '%П%' "+
+                                           " OR t_type_account LIKE '%U%'  OR t_type_account LIKE '%Н%' )" )));
+         if (rsd.movenext())
+            msgbox("Запрещено вводить претензию к счету покрытия");
+            return 1;
+         end;
+         if ((fgBank.is_EXV) or (fgBank.is_VUZ) or (fgBank.is_GEB) or (fgBank.is_SLD))
+            if (((Претензия.initiator == 1) or (Претензия.initiator == 100))and (Претензия.claimkind == 1) and (Претензия.restkind == 2))
+               execmacrofile("autoKOR.mac", "TransferInKORFromK2", Претензия.account);
+               execmacrofile("autoKOR.mac", "ProtocolTransferProcedure");
+            end;
+         end;
+      end;
+      if (Претензия.initiator != 5) //20.08.2013 LAO Добавил отправку писем в Лотус по претензиям 
+         letter_claim( Претензия.Account,
+                       Претензия.DOCDATE,
+                       Претензия.DOCNUMBER,
+                       Претензия.STARTAMOUNT,
+                       Претензия.COMMENT,
+                       Претензия.STARTDATE,
+                       Претензия.FINISHDATE,
+                       Претензия.SYSDATE,
+                       Претензия.CLAIMKIND,
+                       Претензия.RESTKIND,
+                       Претензия.INITIATOR,v_letter);
+         //отправим письмо 
+         if (v_letter!="")
+            //проверяем возможность отправки
+            if (check_insertclaim())
+               sendClaimMails(0,Претензия.Account
+                               ,"Уведомление о заведении претензии по счету(ручная)"
+                               ,v_letter);
+            end;
+         end;
+      end;
+   end; 
+
+   return 0;
+end;
+
+/******************************************************************/
+private macro ПроверитьИсполнение(claimid, fiid, amount)
+   var SQL, cmd, rs, table = "";
+   /* EVG 08.07.2010 Может быть ситуация, когда платежа по претензии нет в базе. Такую претензию
+     удалять можно. */
+   SQL = "select pm.t_paymstatus " +
+         "  from dacclmdoc_dbt clmdoc, dpmpaym_dbt pm " +
+         " where clmdoc.t_claimid = ? and pm.t_paymentid = clmdoc.t_documentid ";
+   cmd = RsdCommand(SQL);
+   cmd.AddParam("claim", RSDBP_IN, claimid);
+   rs = RsdRecordSet(cmd);
+   if (not rs.movenext)
+      return true;
+   end;
+
+   //Seleznev
+   SQL = "select pm.t_paymstatus " +
+         "  from dacclmdoc_dbt clmdoc, dpmpaym_dbt pm " +
+         " where clmdoc.t_claimid = ? and pm.t_paymentid = clmdoc.t_documentid and pm.t_paymstatus in (100, 2000)";
+   cmd = RsdCommand(SQL);
+   cmd.AddParam("claim", RSDBP_IN, claimid);
+   rs = RsdRecordSet(cmd);
+   if (rs.movenext)
+      return true; //Можно удалять претензии по отвергнутым платежам t_paymstatus == 100
+   end;
+
+   SQL = "select nvl(sum(ad.t_sum_payer),-1) as summa " +
+         "  from dacclmdoc_dbt clmdoc, dacclaim_dbt clm, dpmdocs_dbt pdcar, dacctrn_dbt ad " +
+         " where clmdoc.t_documentid = pdcar.t_paymentid " +
+         "   and clmdoc.t_claimid = clm.t_claimid " +
+         "   and clm.t_claimkind = 3 " + 
+         "   and clmdoc.t_claimid = ? " +
+         "   and pdcar.T_ACCTRNID = ad.T_ACCTRNID " +
+         "   and ad.t_account_payer = clm.t_account " +
+         "   and ad.t_chapter = 1";
+
+   cmd = RsdCommand(SQL);
+   cmd.AddParam("claim", RSDBP_IN, claimid);
+   cmd.execute();
+
+   rs = RsdRecordSet(cmd);
+
+   if ((rs.MoveNext()) and (rs.value(0) != -1)) 
+      if (round(rs.Value(0),2) == round(amount,2))  /* Выполнены все проводки по исполнению платежа, породившего претензию, значит претензия зависшая, можно удалить */
+         return true;
+      else
+         return false; /* Сумма проводок по платежу менее, чем сумма претензии, порожденной платежом, испонены не все проводки, претензию удалять запрещено */
+      end;
+   else
+      return false;    /* Нет проводок по исполнению платежа, породившего претензию, удалять запрещено */
+   end;
+end;
+
+
+//Lavrenov: 16.07.2012 C-12448-6 Печать входящих сообщений RPO по претензии
+macro print_mes_by_claim(account, chapter, fiid, claimid, ref)
+   var TXT_DIR, errCode, i = 1, file_name;
+   var rs, str, is_print = false;
+   //Читаем настройку временного каталога
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TXT_DIR, errCode);
+   if ( errCode > 0 )
+      msgbox("Проверьте наличие настройки: BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR");
+      return;
+   else
+      if (SubStr(TXT_DIR, StrLen(TXT_DIR), 1)!="\\")
+         TXT_DIR = TXT_DIR + "\\";
+      end;
+   end;  
+   file_name = TXT_DIR+"acclmes_"+{oper}+"_"+i+".txt"; 
+   while( existfile( file_name ))
+      i = i + 1;
+      file_name = TXT_DIR+"acclmes_"+{oper}+"_"+i+".txt"; 
+   end;
+   
+   str = "SELECT /*+ index(a dwlacclnk_dbt_idx0)*/ f.t_name, t.t_value " +
+         "   FROM dwlmesval_dbt t, dwlmeslnk_dbt l, dwltpfld_dbt f, " +
+         "        dwlmesfld_dbt m, dwlacclnk_dbt a " +
+         "  WHERE m.t_fieldid = t.t_fieldid " +
+         "    AND f.t_tpfieldid = t.t_tpfieldid   " +
+         "    AND t.t_mesid = l.t_mesid " +
+         "    AND l.t_objkind = 505 " +
+         "    AND l.t_objid = a.t_objectid " +
+         "    AND a.t_objecttype = 505 " +
+         "    AND a.t_lnkobjecttype = 455 " +
+         "    AND a.t_account = '"+account+"' " +
+         "    AND a.t_fiid = " + fiid + 
+         "    AND a.t_lnkobjectid = " + claimid +
+         "    AND A.T_CHAPTER =  " + chapter +
+         //Gurin S. 16.07.2013 I-00399673-2
+         "    AND a.t_objectid = (SELECT   MIN (t_objectid) "
+         "                          FROM   dwlacclnk_dbt "
+         "                         WHERE   t_lnkobjectid = a.t_lnkobjectid) "
+         "ORDER BY t_index "; 
+  
+   rs = trsbdataset(str);
+   setoutput(file_name,true);
+   while (rs and rs.movenext)
+      is_print = true;
+      [############### : #](rs.t_name, rs.t_value);
+   end;
+   setoutput(null,true);
+   if (is_print)
+      viewfile(file_name);
+      removefile(file_name);
+      return;
+   else
+      //Lavrenov: 17.07.2012 Если не нашли по wlacclnk_dbt то ищем по dwlmes_dbt.t_trn
+      if((StrLen(ref) == 0) or (valtype(ref) == 0) or (substr(ref,1,3) != "RPO") )
+         msgbox("Сообщение не найдено");
+         return;
+      end;
+      str = "SELECT f.t_name, t.t_value " +
+            "   FROM dwlmesval_dbt t, dwlmes_dbt l, dwltpfld_dbt f, dwlmesfld_dbt m " +
+            "  WHERE m.t_fieldid = t.t_fieldid " +
+            "    AND f.t_tpfieldid = t.t_tpfieldid " +
+            "    AND t.t_mesid = l.t_mesid " +
+            "    AND l.t_trn = '"+ref+"' " +
+            "ORDER BY t_index " ; 
+         
+      rs = trsbdataset(str);
+      setoutput(file_name,true);
+      while (rs and rs.movenext)
+         is_print = true;
+         [############### : #](rs.t_name, rs.t_value);
+      end;
+      setoutput(null,true);
+      if (is_print)
+         viewfile(file_name);
+         removefile(file_name);
+         return;
+      else
+         msgbox("Сообщение не найдено");
+      end;
+   end;
+end;
+
+/******************************************************************/
+private macro ФункцияПользователя()
+   array m;
+   m(0) = "1. Удалить претензию ";
+   m(1) = "2. Просмотреть регистрационный номер Претензии";
+   m(2) = "3. Просмотреть регистрационный номер Изменяющего документа";
+   m(3) = "4. Изменить вид инициатора претензии";
+   m(4) = "5. Печать сообщения 365П";
+   if ((претензия.initiator == 3) and (Претензия.fiid != 0)) //LAO только для претензии от Судебных приставов
+        m(5) = "6. Изменить рублевый эквивалент претензии";
+   end;
+   var n = menu (m,null,"Выберите действие над записью");
+   var SQL, SQL1, cmd, reff;
+   debugbreak;
+   if ( n == 0)
+      if(ВходитВГруппу({oper},159))
+         if (Претензия.claimkind == 3) //резервирование
+            if (ПроверитьИсполнение(Претензия.claimid, Претензия.fiid, Претензия.startamount)) 
+               RslDefCon.BeginTrans();
+               SQL = "declare\n" +
+                     "v_claim integer;\n" +
+                     "begin\n" +
+                     "   v_claim := ?;\n" +
+                     "   delete from dacclaim_dbt where t_claimid = v_claim;\n" +
+                     "   delete from dacclaimstate_dbt where t_claimid = v_claim;\n" +
+                     "   delete from dacclmdoc_dbt where t_claimid = v_claim;\n" +
+                     " end;";
+               cmd = RsdCommand(SQL);
+               cmd.AddParam("", RSDBP_IN, Претензия.claimid);
+               cmd.execute();
+               /*SDA 24.03.2012 - корректируем сумму претензий */
+               //КорректировкаСуммПр(Претензия.Account);
+               RslDefCon.CommitTrans();
+               msgbox("Претензия удалена!|Нажмите Ctrl+R для обновления списка претензий!");
+            else
+               // 2012-10-01 R-108184 детализация сообщения об ошибке
+               msgbox ( "Удаление этой претензии запрещено|" +
+                        "Разрешается удаление претензий по:  |" +
+                        " - отвергнутым платежам;|" +
+                        " - отсутствующим в БД платежам;|" +
+                        " - или если выполнены все проводки по исполнению платежа, породившего претензию" );
+            end;
+         else
+            msgbox("Ручное удаление претензий данного типа не предусмотрено!");
+         end;
+      else
+         msgbox("Вам запрещено удаление претензий данного типа!");
+      end;
+   elif ( n == 1)
+      if (претензия.initiator == 1)
+         if (претензия.claimid > 0)
+            look_reg(претензия.claimid, претензия.initiator, претензия.account);
+         else
+            msgbox("Необходимо сохранить претензию");
+         end;
+      else
+         msgbox("В настоящий момент реализовано только для Инициатора - Налоговые органы");
+      end;
+   elif ( n == 2)
+      if (претензия.initiator == 1)
+         if (претензия.claimid > 0)
+            viewclaim(претензия.claimid, претензия.initiator, претензия.account);
+         else
+            msgbox("Необходимо сохранить претензию");
+         end;
+      else
+         msgbox("В настоящий момент реализовано только для Инициатора - Налоговые органы");
+      end;
+   elif ( n == 3 ) // zip_z add >
+      var m_list = makeArray ("Налоговые органы",
+                              "Судебные органы",
+                              "Служба судебных приставов",
+                              "Органы казначейства",
+                              "Обслуживающий банк",
+                              "Таможенные органы",
+                              "Инициатор 5.0"
+                              );
+      var q = menu (m_list, null, "Выберите инициатора ареста");
+      if (q == -2)
+         return 0;
+      end;
+      if (q ==  7)
+         q = 100;
+      else
+         q = q + 1;
+      end;
+      updateClaimInit (претензия.claimid, q);
+      // < 2012-07-13 zip_z
+   elif ( n == 4)
+      //Lavrenov: 17.07.2012 - формируем значение из имени файла(точно так же, как при генерации сообщения), которое у нас фигурирует в примечании  
+      reff = StrSubSt( StrSubSt( substr(претензия.comment,1,31), "_", "" ), SubStr( {MFO_Bank}, 3, 7 ), "" );
+      //Lavrenov: 16.07.2012 C-12448-6 Печать входящих сообщений RPO по претензии
+      print_mes_by_claim(претензия.account, претензия.chapter, претензия.fiid, претензия.claimid, reff);
+   elif ( n == 5)
+     //Если выбрали изменений суммы нац валюты.
+     setclaimRur(претензия.account, претензия.chapter, претензия.fiid, претензия.claimid);
+     
+   end;
+   return 0;
+OnError
+   If(RslDefCon.IsInTrans)
+      RslDefCon.RollBackTrans();
+   end;
+   return 1;
+end;
+
+/*
+ * Функция, вызываемая перед началом ввода нового документа,
+ * изменяющего претензию
+ *
+ * Заполнение глобальных буферов
+ *   Претензия       - заполнен данными изменяемой претензии (ReadOnly)
+ *   СтараяПретензия - заполнен данными изменяемой претензии (ReadOnly)
+ *
+ *   ИзменяющийДокумент       - заполнен данными нового документа, доступен для изменения
+ *   СтарыйИзменяющийДокумент - не заполняется
+ *
+ */
+private macro Новый_ИзменяющийДокумент()
+   return 0;
+end;
+
+/*
+ * Функция, вызываемая перед изменением в БД документа,
+ * изменяющего претензию
+ *
+ * Параметры функции
+ *   - Режим - вид изменения, может принимать значения
+ *             OBJ_INSERT - вставка нового документа
+ *             OBJ_UPDATE - редактирование документа
+ *             OBJ_DELETE - удаление документа
+ *
+ *
+ * Заполнение глобальных буферов
+ *   Претензия       - заполнен данными изменяемой претензии (ReadOnly)
+ *   СтараяПретензия - заполнен данными изменяемой претензии (ReadOnly)
+ *
+ *   ИзменяющийДокумент - заполняется в зависимости от значения параметра Режим
+ *                        Режим == OBJ_INSERT - буфер заполнен данными для вставки
+ *                        Режим == OBJ_UPDATE - буфер заполнен данными для обновления
+ *                        Режим == OBJ_DELETE - буфер заполнен данными удаляемого документа
+ *   СтарыйИзменяющийДокумент - заполняется в зависимости от значения параметра Режим
+ *                              Режим == OBJ_INSERT - буфер обнулен
+ *                              Режим == OBJ_UPDATE - буфер заполнен данными документа до изменения
+ *                              Режим == OBJ_DELETE - буфер обнулен
+ *
+ */
+private macro Проверить_ИзменяющийДокумент( Режим : integer )
+   if (Режим == OBJ_INSERT)
+      if (ИзменяющийДокумент.Changekind == 3)
+         //Gurin S. 08.01.2014 По необходимости сюда перенести C-17880
+      end;
+   end;
+   return 0;
+end;
+
+/*
+ * Функция, вызываемая перед отзывом документа,
+ * изменяющего претензию
+ *
+ * Параметры функции
+ *   - ДатаОтзыва
+ *   - ПричинаОтзыва
+ *
+ * Заполнение глобальных буферов
+ *   Претензия       - заполнен данными изменяемой претензии (ReadOnly)
+ *   СтараяПретензия - заполнен данными изменяемой претензии (ReadOnly)
+ *
+ *   ИзменяющийДокумент       - заполнен данными отзываемого документа (ReadOnly)
+ *   СтарыйИзменяющийДокумент - не заполняется
+ *
+ */
+private macro Отзыв_ИзменяющийДокумент( ДатаОтзыва : date, ПричинаОтзыва : string )
+   return 0;
+end;

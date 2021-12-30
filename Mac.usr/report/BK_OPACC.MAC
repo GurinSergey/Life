@@ -1,0 +1,897 @@
+/*───────────────────────────────────────────────────────────────────────────┐
+  Книга регистрации открытых счетов
+  Ведомость открытых и закрытых счетов
+
+  File Name     : bk_opacc.mac
+  Call functions: Report(...), ReportSb(...)
+  Menu          : Счета->Книга регистрации открытых счетов (во Внутр. отчётности),
+                  Отчетность->Счета->Книга регистрации (в Отчётности СБ РФ)
+
+DESCRIPTION: Для нормальной работы отчёта необходимо в макросе печати формы
+             установить константы, определяющие параметры вашего принтера
+             а также некоторые поля отчета.
+AAN 23.03.2012 I-00164116-2 поправил что бы в Книгу за период не выводились все счета до указанного начала периода
+//Lavrenov: 31.05.2012 I-00201906-2
+//Gurin S.: 24.08.2012 I-00242636-2
+      AAN : 29.03.2013 I-00328074-2 проблема с номерами сообщений в налоговую. в отчёт всегда попадал номер последнего сообщения,
+      а это неправильно, в первую табл надо ставить номер сообщения об открытии счёта, а вот вторую табл сообщ о закрытии счёта
+  DAI     : 25.06.2014 C-29673, C-28953, С-30730 и сопутствующая чистка кода
+          : 21.11.2014 R-496579-2 DPN Добавил проверку на задвоение заявлений на закрытие счета, иначе отчет падал с ошибкой БД
+
+└───────────────────────────────────────────────────────────────────────────*/
+import RsbDataSet;
+import Reporting;
+import BankInter;
+import CTInter;
+import PTInter;
+import globals;
+import lib_arr;
+import cb_sql;
+import ocp;
+import FIInter;
+import rep_lib;
+import ofstream;
+import "fg_Life_parm.mac"; // Lavrenov: 31.05.2012 I-00201906-2
+
+
+/*------------------ Константы ---------------------------------------*/
+/* EVG 16/12/2013 Переход на 2031
+private const fgBank = fg_life_subject({SelfID});    Lavrenov: 31.05.2012 I-00201906-2*/
+private const fgBank = fg_life_subject({OurBank});
+const                          /* типы примечаний */
+   NOTEKIND_PURP_ACC     =  7, /* Наименование (цель) счета */
+   NOTEKIND_NUMB_CONTR   =  8, /* номер договора обслуживания */
+   NOTEKIND_DATE_CONTR   =  9, /* дата договора обслуживания */
+   NOTEKIND_GROUND_OPEN  = 10, /* Основание открытия счета */
+   NOTEKIND_GROUND_CLOSE = 11, /* Основание закрытия счета */
+   NOTEKIND_PERIODICITY  = 20, /* Порядок и периодичность выдачи выписок по счету */
+   NOTEKIND_TAXMSGDATE   = 23; /* Дата сообщения налоговому органу */
+
+const                          /* Виды обслуживания (из справочника servkind)*/
+    SERVKIND_ARM         = 9,  /* АРМ позиционера */
+    SERVKIND_RKO         = 3;  /* РКО */
+
+/*01 Aug 07 Wed 11:06:33 Malakhova Irina 110772*/
+const                          /*Виды дат*/
+    OPEN_DATE            = 1,  /*Дата сообщения в налоговые органы об открытии счета*/
+    CLOSE_DATE           = 2;  /*Дата сообщения в налоговые органы о закрытии счета*/
+
+/*************** Константы для значений, получаемых из панели *****************/
+const  RegBook           = 0,  /* Книга регистрации */
+       OpenCloseList     = 1,  /* Ведомость откр./закр. счетов */
+       RegBookOnDate     = 2;  /* Книга регистрации на дату */
+
+const  DepartmentAll     = 0;  /* Все филиалы */
+
+const  ChapterAll        = 0;  /* Все главы */
+
+const  ALLCURRENCY       = -2; /* Все ин валюты*/
+
+const  ВсеСчета          = 1,  /* только для Внутренней */
+       СчетаБанка        = 2,
+       СчетаКлиентов     = 3,  /* только для Внутренней */
+       СчетаФизиков      = 4,  /* только для Сбера */
+       СчетаЮриков       = 5;  /* только для Сбера */
+
+const  БезПокрытия       = 3;
+
+const  ВО  = 0,
+       ОСБ = 1;
+
+var reportBodyFileName;
+
+/******************* Чтение настроек ******************************************/
+var МаскаСчетовКлиентов, МаскаСчетовССообВМНС; //МаскаСчетовФизЛиц,
+var ПериодичностьВыдачиВыписок, ДатаСообщенияМнс, ФормаОтчета;
+//DAI
+var ДатаПоЛС = FALSE; //Дистрибутивное определение даты - по сообщению в МНС
+                      //Только для ускорения выпуска Книги регистрации 
+                      //можно перевести в TRUE
+                      //Переменная задается в настройке реестра: REPORT\Книга регистрации\ДАТА ПО ЛС
+                      //Менять можно только в ПРББ для остальных жестко FALSE
+
+if(fgBank.is_PRBB)//Lavrenov: 31.05.2012 I-00201906-2
+   getRegistryValue( "REPORT\\Книга регистрации\\СЧЕТА КЛИЕНТОВ", V_STRING, МаскаСчетовКлиентов, NULL );
+else
+   getRegistryValue( "PS\\REQOPENACC\\СЧЕТА КЛИЕНТОВ", V_STRING, МаскаСчетовКлиентов, NULL ); //vihrov 28.07.2010 по заявке I-049830
+end;
+getRegistryValue( "REPORT\\Книга регистрации\\СЧЕТА С СООБЩЕНИЕМ В МНС", V_STRING, МаскаСчетовССообВМНС, NULL );
+//getRegistryValue( "PS\\REQOPENACC\\СЧЕТА ФИЗИЧЕСКИХ ЛИЦ", V_STRING, МаскаСчетовФизЛиц, NULL );
+getRegistryValue( "REPORT\\Книга регистрации\\Периодичность выдачи выписок", V_STRING, ПериодичностьВыдачиВыписок, NULL );
+getRegistryValue( "REPORT\\Книга регистрации\\ДАТА СООБЩЕНИЯ МНС", V_BOOL, ДатаСообщенияМнс, NULL );
+if (fgBank.is_PRBB)
+   getRegistryValue( "REPORT\\Книга регистрации\\ДАТА ПО ЛС", V_BOOL, ДатаПоЛС, NULL );
+end;
+getRegistryValue( "REPORT\\Книга регистрации\\ФОРМА ПО ВНУТРИБАНК. СЧЕТАМ", V_BOOL, ФормаОтчета, NULL );
+
+/*************** Глобальные переменные ****************************************/
+private const TempTableName = "dbk_opacc_tmp";  /* имя врем. табл. */
+
+private var prForm; /* печатная форма */
+private var params; /* параметры отчета */
+private var СНакопительнымиИТранзитными = TRUE;
+/******************************************************************************/
+/* Класс, инкапсулирующий печатную форму. */
+/* mfile - имя макрофайла печати (необяз.)
+   mfunc - имя или указатель на функцию печати (необяз.)
+*/
+private CLASS TPrintForm( mfile, mfunc )
+    private var MacroFile = mfile;
+    private var MacroFunc = mfunc;
+
+    /* Печать отчёта в соответствии с формой и параметрами */
+    /* params - параметр, передаваемый в функцию печати (необяз.) */
+    /* hasData - признак наличия данных для отчета, по умолчанию считается что данные есть, необязательный */
+    MACRO Print( params, hasData )
+        if( MacroFile == NULL )
+            return ExecMacro2( MacroFunc, params, nvl(hasData, true) );
+        else
+            return ExecMacroFile( MacroFile,  MacroFunc, params, nvl(hasData, true) );
+        end;
+    END;
+END;
+
+/******************************************************************************/
+/* Структура параметров отчёта.
+   Параметры и их порядок в точности совпадают с данными-членами, поэтому такие имена. */
+private CLASS TParams( mod, rk, ss, df, bf, bdf, ocpf, bd, ed, ad, pn, ch, typ, cur, acc, op, cl, ev, pf )
+    var Module                         = mod;    /* Модуль: ВО или ОСБ */
+    var ReportKind                     = rk;     /* Вид отчёта: RegBook или OpenCloseList */
+    var Subsystem                      = ss;     /* Подсистема: REP_SUBSYSTEMS_ALL, ...Cb, ...Loans, ...Retail */
+    var AccDprtFilter                  = df;     /* Фильтр л/с по подразделениям (объект RepAccountFilter) */
+    var BranchFieldFilter              = bf;     /* Фильтр л/с по подразделениям (объект RepBranchFieldFilter) */
+    var BranchAndDepartmentFieldFilter = bdf;    /* Фильтр л/с по подразделениям (объект RepBranchAndDepartmentFieldFilter) */
+    var ocpAccountServer               = ocpf;   /* Сервер счетов ОВП (объект RepOcpAccountServer) */
+    var BeginDate                      = bd;     /* Дата начала периода */
+    var EndDate                        = ed;     /* Дата окончания периода */
+    var ArchDate                       = ad;     /* Дата сдачи в архив */
+    var PlanNums                       = pn;     /* Номер плана */
+    var Chapter                        = ch;     /* Номер главы счетов или ChapterAll */
+    var AccountType                    = typ;    /* Принадлежность счетов: ВсеСчета, СчетаБанка, СчетаКлиентов etc. */
+    var CurrencyId                     = cur;    /* ID валюты или CurrencyAll */
+    var AccountMask                    = acc;    /* Маска счетов(для ОСБ) */
+    var NeedAccOpen                    = op;     /* Открытые счета (bool) */
+    var NeedAccClose                   = cl;     /* Закрытые счета (bool) */
+    var NeedEveryDay                   = ev;     /* За каждый день (bool) (только для Ведомости) */
+    var NeedPrintFunds                 = pf;     /* Печатать данные о фондах (bool) */
+
+    /* Получить номер плана счетов для главы */
+    MACRO GetPlanNum( ch )
+        if( ch == NULL )
+            ch = Chapter;
+        end;
+        return PlanNums;
+    END;
+END;
+
+/*************** Вспомогательные функции **************************************/
+macro  Предприниматель( ClientID )
+  FILE Person( persn );
+  Person.PersonID = ClientID;
+  if ( getEQ(Person) and ( Person.IsEmployer > 0 ) )
+          return TRUE;
+    else 
+        return FALSE;
+  end;
+end;
+
+/* Признак клиента - физ.лицо-НЕ предприниматель */
+macro IsFizAndNotBisness( client )
+  if ((client.LegalForm == PTLEGF_PERSN)  and    /*  физ.лицо */
+        not Предприниматель(client.PartyID ) )
+          return TRUE;
+    else
+        return FALSE;
+  end;
+end;
+
+/*01 Aug 07 Wed 11:02:48 Malakhova Irina 110772*/
+/*Добавила параметр с видом даты*/
+/* Получить значение для графы "дата сообщения налоговым органам". */
+MACRO GetTaxMsgDate( temp, client, dateKind)
+    var d_set;
+    /* Первая проверка для Loans и Retail, для кот. не надо выводить.*/
+    if( ( temp.TaxMsgOpenDate == NULL ) or CompareStrWithMasks( МаскаСчетовКлиентов, temp.Balance )
+                or IsFizAndNotBisness( client )
+                or in(temp.backOffice, REP_SUBSYSTEMS_LOANS, REP_SUBSYSTEMS_DEPOSITS, REP_SUBSYSTEMS_RETAIL)
+      )
+        return "";
+    else
+        if (dateKind == OPEN_DATE) //брать из сообщения в МНС
+            // DAI: запрос переписан на основании заявления на открытие. 
+            // Сама дата все так же берется из сообщения в МНС
+            d_set = TRsbDataSet("SELECT   wltpfld.t_name,                               "+"\n"+
+                                "         wlmesval.t_value,                             "+"\n"+
+                                "         lnk.t_objkind,                                "+"\n"+
+                                "         wlmesval.t_mesid,                             "+"\n"+
+                                "         WLMESVAL.T_BANKDATE                           "+"\n"+
+                                "  FROM   dreqopena_dbt req,                            "+"\n"+
+                                "         DWLMESLNK_DBT lnk,                            "+"\n"+
+                                "         dwlmesval_dbt wlmesval,                       "+"\n"+
+                                "         dwltpfld_dbt wltpfld,                         "+"\n"+
+                                "         dwlmesfld_dbt wlmesfld                        "+"\n"+
+                                " WHERE       req.t_account = '"+temp.T_ACCOUNT+"'      "+"\n"+
+                                "         AND wlmesval.t_mesid = lnk.t_mesid            "+"\n"+
+                                "         AND lnk.t_objkind = 450                       "+"\n"+
+                                "         AND req.t_requestid = lnk.t_objid             "+"\n"+
+                                "         AND wlmesfld.t_TpFieldID = wltpfld.t_TpfieldID"+"\n"+
+                                "         AND wlmesval.t_FieldID(+) = wlmesfld.t_FieldID"+"\n"+
+                                "         AND wltpfld.t_name = 'ДатаОткрСч'");
+
+                                /*
+                                "  SELECT A.T_BANKDATE FROM dwlmesval_dbt A, dwlmes_dbt B  " +
+                                "  WHERE A.T_VALUE = '" + temp.T_ACCOUNT + "'" + // zip_z.
+                                "      AND B.T_MESID = A.T_MESID                           " +
+                                "      AND B.T_KIND = 13                                   " +
+                                "      AND B.T_STATE = 40                                  " +
+                                "      AND A.T_FIELDID = 6467 ");
+                                */
+            if (d_set.Next )
+                return string(date(d_set.T_BANKDATE):f);
+            else
+                return "";
+            end;
+            //return string(Date(temp.TaxMsgOpenDate):f);
+        elif (dateKind == CLOSE_DATE)
+                return string(Date(temp.TaxMsgCloseDate):f);
+            end;
+        end;
+END;
+
+/* Инициализация */
+private MACRO Initialize( )
+    SQL_Truncate( TempTableName );
+    return true;
+END;
+
+/* Деинициализация */
+private MACRO Uninitialize( )
+    SQL_Truncate( TempTableName );
+    return true;
+END;
+
+/* Выбирает данные, заносит во временную таблицу. */
+
+private MACRO GetAccData( params )
+    const nullStr = GetSqlString( "" );
+    const nullDate= GetSqlDate(Date(0,0,0));
+
+    /*02 Aug 07 Thu 17:26:35 Malakhova Irina 110772*/
+    const REQOPENA  = 230;
+    const REQCLOSEA = 231;
+
+    /* Вершина дерева ТС. Ипользуется в алгоритме поиска "настоящего" клиента счёта. */
+    var topData = TRsbDataSet("SELECT t_partyId topId FROM ddp_dep_dbt WHERE  t_parentCode = 0");
+    topData.SetFieldType("topId", V_INTEGER);
+    topData.Next;
+    const topId = topData.TopId;
+debugbreak;
+    var DataOpenForSQL;
+    var DataCloseForSQL;
+    var TaxMsgFunc;
+    if (ДатаПоЛС)
+        DataOpenForSQL  =  "   a.t_Open_Date   reqOpenAFormDate,";
+        DataCloseForSQL =  "   a.t_Close_Date  reqCloseAFormDate,";
+    if( ДатаСообщенияМнс )
+        TaxMsgFunc = "ps.PSREQ_GetMesFormDate";
+    else
+        TaxMsgFunc = "ps.PSREQ_GetMesSendDate";
+    end;
+    else
+    /* PL/SQL-функция, с пом. кот. вычисляется дата сообщения в ГНИ */
+/*    var TaxMsgFunc;*/
+    if( ДатаСообщенияМнс )
+        TaxMsgFunc = "ps.PSREQ_GetMesFormDate";
+    else
+        TaxMsgFunc = "ps.PSREQ_GetMesSendDate";
+    end;
+        DataOpenForSQL  = TaxMsgFunc + "(" + REQOPENA + ","
+                          + "\n" + "     a.t_Account,"
+                          + "\n" + "     a.t_Chapter,"
+                          + "\n" + "     a.t_Code_Currency,"
+                          + "\n" + "     1) reqOpenAFormDate,";
+        DataCloseForSQL = TaxMsgFunc + "(" + REQCLOSEA + ","
+                          + "\n" + "     a.t_Account,"
+                          + "\n" + "     a.t_Chapter,"
+                          + "\n" + "     a.t_Code_Currency,"
+                          + "\n" + "     1) reqCloseAFormDate,";
+    end;
+
+    var AccumAndTransit = "";
+    if (not СНакопительнымиИТранзитными)
+        AccumAndTransit =  "\n" + "                   AND INSTR (a.t_type_account, 'L') = 0"
+                         + "\n" + "                   AND INSTR (a.t_type_account, 'Y') = 0 ";
+    end;
+
+    var accountTableName = "daccount_dbt";
+
+    private macro getDateFilterText(openDateAlias, closeDateAlias) // "a.t_Open_Date", "a.t_Close_Date"
+        var filter;
+
+        /* Вспомогательные константы, чтобы дальше было проще. */
+        const filterOpen = ternary(params.BeginDate == params.EndDate,
+                     "                       " + openDateAlias + "  = " + GetSQLDate(params.BeginDate),
+                     "                       " + openDateAlias + "  >= " + GetSQLDate(params.BeginDate)
+            + "\n" + "                   AND " + openDateAlias + "  <= " + GetSQLDate(params.EndDate)
+            );
+        const filterClose = ternary(params.BeginDate == params.EndDate,
+                     "                       " + closeDateAlias + " = " + GetSQLDate(params.BeginDate),
+                     "                       " + closeDateAlias + " >= " + GetSQLDate(params.BeginDate)
+            + "\n" + "                   AND " + closeDateAlias + " <= " + GetSQLDate(params.EndDate)
+            );
+        if  ( params.ReportKind == RegBook ) // по этой форме всегда params.NeedAccOpen = true
+            if( params.NeedAccOpen and params.NeedAccClose )
+                /* Открытые хотя бы 1 день в течение периода */
+                /* AAN 23.03.2012 I-00164116-2 */
+                filter =     "                       " + openDateAlias + " between " + GetSQLDate(params.BeginDate) + " and " + GetSQLDate(params.EndDate)
+                    + "\n" + "                   AND ( " + closeDateAlias + " between " + GetSQLDate(params.BeginDate) + " and " + GetSQLDate(params.EndDate)
+                    + "\n" + "                        OR a.t_open_close = CHR(0))";
+            else    /* только Open (открытые в период). Ситуацию, когда ни одного флага, проверили в начале */
+                filter = filterOpen;
+            end;
+        elif( params.ReportKind == OpenCloseList )
+            if(   params.NeedAccOpen )
+                if( params.NeedAccClose )
+                filter =     "                   (("
+                    + "\n" +                       filterOpen
+                    + "\n" + "                    )"
+                    + "\n" + "                    OR"
+                    + "\n" + "                    ("
+                    + "\n" +                       filterClose
+                    + "\n" + "                   ))";
+                else
+                    filter = filterOpen;
+                end;
+            elif( params.NeedAccClose )    
+                filter = filterClose;
+            end;
+        elif (params.ReportKind == RegBookOnDate)
+            filter =     "                       " + openDateAlias + " <= " + GetSQLDate(params.EndDate)
+                + "\n" + "                   AND (   " + closeDateAlias + " > " + GetSQLDate(params.EndDate)
+                + "\n" + "                        OR a.t_open_close = CHR(0))";
+        else
+            RunError( "Ошибка программирования: некорректный вид отчёта" );
+        end;
+
+        return filter;
+    end;
+
+    private class auxPairLink()
+        private var one;
+        private var manyText;
+
+        macro add(_one, _many)
+            var i = 0;
+            var haveOne = false;
+
+            while(i < one.size)
+                if (_one == one[i])
+                    manyText[i] = manyText[i] + ", " + string(_many);
+                    haveOne = true;
+                end;
+                i = i + 1;
+            end;
+
+            if (not haveOne)
+                one[one.size] = _one;
+                manyText[manyText.size] = string(_many);
+            end;
+        end;
+
+        macro constructorAuxPairLink()
+            one = TArray();
+            manyText = TArray();
+        end;
+
+        constructorAuxPairLink();
+    end;
+
+    private class (auxPairLink) planChaptersLink()
+        macro plan()
+            return one;
+        end;
+
+        macro chaptersText()
+            return manyText;
+        end;
+
+        macro constructorPlanChaptersLink()
+            initAuxPairLink();
+        end;
+
+        constructorPlanChaptersLink();
+    end;
+
+    private macro getChapterPlanFilterText(planNumAlias, chapterAlias)
+        var filter = "";
+
+        filter = "(" +     planNumAlias + " = " + params.getPlanNum()
+        + "\n" + " AND " + getChapterFilterSqlClause(params.getPlanNum(), params.chapter, chapterAlias)
+        + "\n" + ")";
+
+        return filter;
+    end;
+
+    private macro getJoinNoteQueryText(joinAlias, purpose)
+        return   "       LEFT OUTER JOIN dnotetext_dbt " + joinAlias + " ON (    " + joinAlias + ".t_ObjectType = " + OBJTYPE_ACCOUNT
+        + "\n" + "                                                           AND " + joinAlias + ".t_documentId = a.documentId"
+        + "\n" + "                                                           AND " + joinAlias + ".t_NoteKind = " + purpose
+        + "\n" + "                                                           AND " + joinAlias + ".t_ValidToDate >= " + GetSqlDate(params.EndDate)
+        + "\n" + "                                                           AND " + joinAlias + ".t_Date <= " + GetSqlDate(params.EndDate)
+        + "\n" + "                                                           AND " + joinAlias + ".t_text NOT LIKE '00%'"
+        + "\n" + "                                                          )"
+    end;
+
+    //Gurin S. 24.08.2012 I-00242636-2
+    if ((params.AccountType == СчетаКлиентов) and (fgBank.is_VUZ))
+        МаскаСчетовКлиентов = МаскаСчетовКлиентов + ",42309*";    
+    end;
+
+    var cmd =    "INSERT INTO " + TempTableName
+        + "\n" + "   (t_Account, t_AccountCb, t_Balance, t_Code_Currency, t_Chapter,"
+        + "\n" + "    t_Open_Date, t_Close_Date, t_Client, t_NameAccount, t_OpenGround, t_CloseGround,"
+        + "\n" + "    t_ContractNumber, t_ContractDate, t_ExtractPeriod,"
+        + "\n" + "    t_TaxMsgOpenDate, t_TaxMsgCloseDate, t_backOffice, t_AccountType, t_Name_Account)"
+        + "\n" + "WITH acc AS("
+        + "\n" + "            SELECT /*+ INDEX_JOIN(a)*/"
+        + "\n" + "                   a.t_Chapter                             t_Chapter,"
+        + "\n" + "                   b.t_Balance                             t_Balance,"
+        + "\n" + "                   b.t_name_part                           t_name_part,"
+        + "\n" + "                   a.t_Account                             t_Account,"
+        + "\n" + "                   a.t_Code_Currency                       t_Code_Currency,"
+        + "\n" + "                   a.t_Open_Date                           t_Open_Date,"
+        + "\n" + "                   a.t_Close_Date                          t_Close_Date,"
+        + "\n" + "                   a.t_Client                              t_Client,"
+        + "\n" + "                   a.t_Branch                              t_Branch,"
+        + "\n" + "                   a.t_type_account                        t_type_account,"
+        + "\n" + "                   a.t_NameAccount                         t_NameAccount,"
+        + "\n" + "                   TO_CHAR(a.t_chapter, 'FM0x')"
+        + "\n" + "                   || TO_CHAR(a.t_code_currency, 'FM0xxxxxx')"
+        + "\n" + "                   || a.t_account                          documentId,"
+        + "\n" + "                   " + TaxMsgFunc + "(" + REQOPENA + ","
+        + "\n" + "                                            a.t_Account,"
+        + "\n" + "                                            a.t_Chapter,"
+        + "\n" + "                                            a.t_Code_Currency,"
+        + "\n" + "                                            1)             reqOpenAFormDate,"
+        + "\n" + "                   " + TaxMsgFunc + "(" + REQCLOSEA + ","
+        + "\n" + "                                            a.t_Account,"
+        + "\n" + "                                            a.t_Chapter,"
+        + "\n" + "                                            a.t_Code_Currency,"
+        + "\n" + "                                            1)             reqCloseAFormDate,"
+        + "\n" + "                   CASE"
+        + "\n" + "                       WHEN (" + ConvertMaskToSQLFormat(МаскаСчетовКлиентов, "a.t_Balance") + ")"
+        + "\n" + "                       THEN 1"
+        + "\n" + "                       ELSE 0"
+        + "\n" + "                   END isClientBalance"
+        + "\n" + "              FROM " + accountTableName + " a,"
+        + "\n" + "                   dbalance_dbt b"
+        + "\n" + "             WHERE"
+        + "\n" +                     getDateFilterText("a.t_Open_Date", "a.t_Close_Date")
+                                     /* фильтр по маске счета */
+               +                     ternary(params.accountMask == "", "",
+          "\n" + "                   AND (" + ConvertMaskToSQLFormat(params.AccountMask, "a.t_Account") + ")"
+                                     )
+                                     /* фильтр по валюте */
+               +                     ternary(   (params.CurrencyId == ALLFININSTR)
+                                             or (params.CurrencyId == ALLCURRENCY), "",
+          "\n" + "                   AND a.t_code_currency   = " + params.CurrencyId
+                                     )
+                                     /* СчетаБанка */
+               +                     ternary(params.AccountType == СчетаБанка,
+          "\n" + "                   AND (   NOT(" + ConvertMaskToSQLFormat(МаскаСчетовКлиентов, "a.t_Balance") + ")"
+          "\n" + "                        OR (rsb_rep_pt.is_our_bank(a.t_Client, " + topId + ") = 1))"
+                                     , ""
+                                     )
+                                     /* СчетаКлиентов */
+               +                     ternary(params.AccountType == СчетаКлиентов,
+          "\n" + "                   AND (" + ConvertMaskToSQLFormat( МаскаСчетовКлиентов, "a.t_Balance") + ")"
+          "\n" + "                   AND (rsb_rep_pt.is_our_bank(a.t_Client, " + topId + ") = 0)"
+                                     , ""
+                                     )
+        + "\n" + "                   AND " + params.AccDprtFilter.GetAsSqlString( "a" )
+        + "\n" +                    AccumAndTransit
+
+                                     /*DAI по I-00013775 не включать накопительные и транзитные счета*/
+
+/*        + "\n" + "                   AND INSTR (a.t_type_account, 'L') = 0"
+        + "\n" + "                   AND INSTR (a.t_type_account, 'Y') = 0"
+*/                                     /* Кроме ОВП */
+               +                     ternary(FlagOfPrintAccountsOCP, "",
+          "\n" + "                   AND NOT " + params.ocpAccountServer.getAsSqlString("a")
+                                     )
+        + "\n" + "                   AND"
+        + "\n" +                     getChapterPlanFilterText("b.t_iNumPlan", "b.t_Chapter")
+        + "\n" + "                   AND INSTR(b.t_type_balance, 'T') = 0"
+                                     /* связи */
+        + "\n" + "                   AND a.t_Chapter = b.t_Chapter"
+        + "\n" + "                   AND a.t_balance = b.t_balance"
+                                     /* Проверка, что в Loans и Retail нет таких счетов */
+               +                     ternary(params.Subsystem == REP_SUBSYSTEMS_CB, "",
+          "\n" + "                   AND NOT EXISTS(SELECT NULL"
+        + "\n" + "                                    FROM dbk_opacc_tmp dt"
+        + "\n" + "                                   WHERE dt.t_accountCb = a.t_account"
+        + "\n" + "                                     AND dt.t_backoffice IN (" + REP_SUBSYSTEMS_RETAIL + ", " + REP_SUBSYSTEMS_LOANS + ", " + REP_SUBSYSTEMS_DEPOSITS + "))"
+                                     )
+        + "\n" + "           ),"
+        + "\n" + "    note AS("
+        + "\n" + "            SELECT acc.t_account,"
+        + "\n" + "                   acc.t_chapter,"
+          "\n" + "                   acc.t_code_currency,"
+        + "\n" + "                   nt.t_NoteKind,"
+        + "\n" + "                   CASE"
+        + "\n" + "                        WHEN nt.t_NoteKind != 9"
+        + "\n" + "                            THEN rsb_kernel.ExtractText(nt.t_text)"
+        + "\n" + "                        ELSE NULL"
+        + "\n" + "                   END noteText,"
+        + "\n" + "                   CASE"
+        + "\n" + "                        WHEN nt.t_NoteKind = 9"
+        + "\n" + "                            THEN rsi_rsb_kernel.ExtractDate(nt.t_text)"
+        + "\n" + "                        ELSE NULL"
+        + "\n" + "                   END noteDate,"
+        + "\n" + "                   nt.t_text"
+        + "\n" + "              FROM dnotetext_dbt nt, acc"
+        + "\n" + "             WHERE     nt.t_ObjectType = " + OBJTYPE_ACCOUNT
+        + "\n" + "                   AND nt.t_NoteKind IN(" + NOTEKIND_PURP_ACC + ", "
+                                                            + NOTEKIND_NUMB_CONTR + ", "
+                                                            + NOTEKIND_DATE_CONTR + ", "
+                                                            + NOTEKIND_GROUND_OPEN + ", "
+                                                            + NOTEKIND_GROUND_CLOSE + ", "
+                                                            + NOTEKIND_PERIODICITY + ")"
+        + "\n" + "                   AND nt.t_Date <= " + GetSqlDate(params.EndDate)
+        + "\n" + "                   AND nt.t_ValidToDate >= " + GetSqlDate(params.EndDate)
+        + "\n" + "                   AND nt.t_text NOT LIKE '00%'"
+        + "\n" + "                   AND nt.t_DocumentId = acc.documentId"
+        + "\n" + "            ),"
+        + "\n" + " objname AS ("
+        + "\n" + "             SELECT oac.t_Object, oa.t_FullName"
+        + "\n" + "               FROM dobjattr_dbt oa, dobjatcor_dbt oac"
+        + "\n" + "              WHERE     oac.t_ObjectType = oa.t_ObjectType"
+        + "\n" + "                    AND oac.t_GroupId = oa.t_GroupId"
+        + "\n" + "                    AND oac.t_AttrId = oa.t_AttrId"
+        + "\n" + "                    AND oac.t_ObjectType = " + OBJTYPE_ACCOUNT
+        + "\n" + "                    AND oac.t_GroupId = " + OBJ_ACCOUNT_GROUP_KIND
+        + "\n" + "                    AND oac.t_General = 'X'"
+        + "\n" + "                    AND " + GetSqlDate( params.EndDate ) + " BETWEEN oac.t_ValidFromDate AND oac.t_ValidToDate"
+        + "\n" + "            )"
+        + "\n" + "SELECT a.t_Account,"
+        + "\n" + "       a.t_Account,"
+        + "\n" + "       a.t_Balance,"
+        + "\n" + "       a.t_Code_Currency,"
+        + "\n" + "       a.t_Chapter,"
+        + "\n" + "       a.t_Open_Date,"
+        + "\n" + "       a.t_Close_Date,"
+        + "\n" + "       CASE"
+        + "\n" + "           WHEN a.isClientBalance = 1"
+        + "\n" + "               THEN a.t_Client"
+        + "\n" + "           ELSE"
+        + "\n" + "               DECODE (rsb_rep_pt.is_our_bank (a.t_Client, " + topId + "),"
+        + "\n" + "                       0, (SELECT t_PartyId"
+        + "\n" + "                             FROM ddp_dep_dbt"
+        + "\n" + "                            WHERE t_Code = a.t_Branch),"
+        + "\n" + "                       a.t_Client)"
+        + "\n" + "       END t_Client,"
+        + "\n" + "       NVL(rsb_kernel.ExtractText(noteNameAccount.t_text),"
+        + "\n" + "           CASE"
+        + "\n" + "               WHEN a.isClientBalance = 1"
+        + "\n" + "                   THEN NVL("
+        + "\n" + "                            (SELECT t_FullName"
+        + "\n" + "                               FROM objname"
+        + "\n" + "                              WHERE t_Object = a.documentId"
+        + "\n" + "                            ),"
+        + "\n" + "                            a.t_NameAccount"
+        + "\n" + "                        )"
+        + "\n" + "               ELSE"
+        + "\n" + "                   a.t_NameAccount"
+        + "\n" + "           END"
+        + "\n" + "       ) t_NameAccount,"
+        + "\n" + "       NVL(rsb_kernel.ExtractText(noteOpenGround.t_text),  " + nullStr + ") t_OpenGround,"
+        + "\n" + "       NVL(rsb_kernel.ExtractText(noteCloseGround.t_text), " + nullStr + ") t_CloseGround,"
+        + "\n" + "       NVL("
+        + "\n" + "           NVL("
+        + "\n" + "               NVL( (SELECT t_Number"
+        + "\n" + "                       FROM dsfcontr_dbt"
+        + "\n" + "                      WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND t_ServKind = " + SERVKIND_ARM + ")," //TAM 16.05.2014 AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + "),"
+        + "\n" + "                    (SELECT t_Number"
+        + "\n" + "                       FROM dsfcontr_dbt"
+        + "\n" + "                      WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND t_ServKind = " + SERVKIND_RKO + ")" // TAM 16.05.2014 AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + ")),"
+        + "\n" + "                  ),"
+        + "\n" + "               (SELECT t_Number"
+        + "\n" + "                  FROM dsfcontr_dbt"
+        + "\n" + "                 WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND ROWNUM < 2 ) " // TAM 16.05.2014 + " AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + ")"
+        + "\n" + "           ),"
+        + "\n" + "           NVL (rsb_kernel.ExtractText(noteContractNumber.t_text), " + nullStr + ")"
+        + "\n" + "       ) t_ContractNumber,"
+        + "\n" + "       NVL("
+        + "\n" + "           NVL("
+        + "\n" + "               NVL( (SELECT t_DateBegin"
+        + "\n" + "                       FROM dsfcontr_dbt"
+        + "\n" + "                      WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND t_ServKind = " + SERVKIND_ARM + "), " //TAM 16.05.2014 AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + "),"
+        + "\n" + "                    (SELECT t_DateBegin"
+        + "\n" + "                       FROM dsfcontr_dbt"
+        + "\n" + "                      WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND t_ServKind = " + SERVKIND_RKO + "))," //TAM 16.05.2014 AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + ")),"
+        + "\n" + "               (SELECT t_DateBegin"
+        + "\n" + "                  FROM dsfcontr_dbt"
+        + "\n" + "                 WHERE t_ObjectType = 1 AND t_Object = a.t_Account AND t_FIID = a.t_Code_Currency AND ROWNUM < 2 )" //TAM 16.05.2014  + " AND t_DateBegin BETWEEN " + GetSqlDate( params.BeginDate ) + " AND " + GetSqlDate( params.EndDate ) + ")"
+        + "\n" + "           ),"
+        + "\n" + "           NVL (rsb_kernel.ExtractDate(noteContractDate.t_text), " + nullDate + ")"
+        + "\n" + "       ) t_ContractDate,"
+        + "\n" + "       NVL (rsb_kernel.ExtractText(noteExtractPeriod.t_text), " + GetSqlString(ПериодичностьВыдачиВыписок) + ") t_extractPeriod,"
+        + "\n" + "       CASE "
+        + "\n" + "           WHEN (INSTR(a.t_type_account, 'L') = 0)"
+        + "\n" + "               THEN "
+        + "\n" + "                   DECODE (reqOpenAFormDate, " + nullDate + ", a.t_Open_Date,"
+        + "\n" + "                           reqOpenAFormDate)"
+        + "\n" + "               ELSE " + GetSQLDate( date( 0, 0, 0 ) )
+        + "\n" + "       END  t_TaxMsgOpenDate,"
+        + "\n" + "       CASE "
+        + "\n" + "           WHEN (INSTR(a.t_type_account, 'L') = 0)"
+        + "\n" + "               THEN "
+        + "\n" + "                   DECODE (reqCloseAFormDate, " + nullDate + ", a.t_Close_Date,"
+        + "\n" + "                           reqCloseAFormDate)"
+        + "\n" + "               ELSE " + GetSQLDate( date( 0, 0, 0 ) )
+        + "\n" + "       END  t_TaxMsgCloseDate,"        + "\n" + "       " + REP_SUBSYSTEMS_CB + " t_backOffice,"
+        + "\n" + "       CASE"
+        + "\n" + "           WHEN     a.isClientBalance = 1"
+        + "\n" + "                AND rsb_rep_pt.is_our_bank (a.t_Client, " + topId + ") = 0"
+        + "\n" + "           THEN " + СчетаКлиентов
+        + "\n" + "           ELSE " + СчетаБанка
+        + "\n" + "       END t_AccountType,"
+        + "\n" + "       a.t_name_part"
+        + "\n" + "  FROM acc a"
+        + "\n" +         getJoinNoteQueryText("noteNameAccount",    NOTEKIND_PURP_ACC)
+        + "\n" +         getJoinNoteQueryText("noteContractNumber", NOTEKIND_NUMB_CONTR)
+        + "\n" +         getJoinNoteQueryText("noteContractDate",   NOTEKIND_DATE_CONTR)
+        + "\n" +         getJoinNoteQueryText("noteOpenGround",     NOTEKIND_GROUND_OPEN)
+        + "\n" +         getJoinNoteQueryText("noteCloseGround",    NOTEKIND_GROUND_CLOSE)
+        + "\n" +         getJoinNoteQueryText("noteExtractPeriod",  NOTEKIND_PERIODICITY);
+
+    SQL_Execute( cmd, "Отбор лицевых счетов по Главной книге" );
+
+    return true;
+END;
+
+
+
+/* Расчёт и занесение во временный файл по ГК */
+private MACRO CalculateCb( params )
+    var stat = true;
+
+    Message( "Расчёт по данным Главной книги" );
+    stat = GetAccData(params);
+
+    return stat;
+END;
+
+/* Расчёт и занесение во временный файл */
+MACRO Calculate( params )
+    if( not params.NeedAccOpen and not params.NeedAccClose )
+        /* Всё нормально, просто ничто не подходит. */
+        return true;
+    end;
+
+    if(   params.Subsystem == REP_SUBSYSTEMS_ALL )
+        return ExecMacroFile( "bk_opacc_Retail",   "CalculateRetail",   params, TempTableName )
+           and ExecMacroFile( "bk_opacc_Loans",    "CalculateLoans",    params, TempTableName )
+           and ExecMacroFile( "bk_opacc_Deposits", "calculateDeposits", params, TempTableName )
+           and CalculateCb( params );
+    elif( params.Subsystem == REP_SUBSYSTEMS_CB )
+        return CalculateCb( params );
+    elif( params.Subsystem == REP_SUBSYSTEMS_RETAIL )
+        return ExecMacroFile( "bk_opacc_Retail", "CalculateRetail", params, TempTableName );
+    elif( params.Subsystem == REP_SUBSYSTEMS_LOANS )
+        return ExecMacroFile( "bk_opacc_Loans", "CalculateLoans", params, TempTableName );
+    elif( params.Subsystem == REP_SUBSYSTEMS_DEPOSITS )
+        return ExecMacroFile( "bk_opacc_Deposits", "calculateDeposits", params, TempTableName );
+    else
+        msgbox("Ошибка! Неизвестная подсистема!");
+        return false;
+    end;
+END;
+
+/* Печать отчёта. prForm - печатная форма (TPrintForm) */
+private MACRO PrintReportWithForm( prForm, params )
+debugbreak;
+    var result = false;
+    var hasData = false;
+    var j;
+
+    message("Печать отчёта");
+    var output = TOFStream("bk_opacc_rep");
+    output.setOutputFile();
+    reportBodyFileName = output.getFileName();
+    
+    //21.11.2014 R-496579-2 DPN
+    if (prForm == 10)
+        println();
+            [  Существуют дубли заявлений на закрытие следующих счетов:  ];
+            [          ┌─────────────────────┬─────────────┐ ];
+            [          │     Номер счета     │    Дата     │ ];
+            [          ├─────────────────────┼─────────────┤ ];
+        for(j,0,params.size-2,2)
+            
+            [          │#################### │ ##########  │ ] (params(j), date(params(j+1)));
+            [          ├─────────────────────┼─────────────┤ ];
+            
+ 
+        end;
+            [          └─────────────────────┴─────────────┘ ];
+            [  По одному счету не может быть более одного заявления на закрытие в состоянии "Закрыто"!];
+        
+    else
+        
+        
+
+        // Проверим, нашли ли что-нибудь
+        /*23 Mar 07 Malakhova Irina 103782*/
+        var queryText = "";
+        var data;
+        queryText = "SELECT CASE WHEN EXISTS(SELECT NULL FROM " + TempTableName + ")"
+           + "\n" + "            THEN 1"
+           + "\n" + "            ELSE 0"
+           + "\n" + "       END AS t_hasRecords"
+           + "\n" + " FROM DUAL";
+
+        data = TRsbDataset(queryText);
+        data.next();
+        hasData = (data.hasRecords != 0);
+
+        if (    (not hasData)
+            and (   params.NeedEveryDay
+                 or (params.accountType == ВсеСчета)
+                 or (    (params.ReportKind == OpenCloseList)
+                     and (params.NeedAccOpen == params.NeedAccClose)
+                    )
+                )
+           )
+            msgBox("Нет данных для отчета");
+            println("Данные отсутствуют");
+            result =  false;
+        else
+            result = prForm.print(params, hasData);
+        end;
+    end;
+    output.resetOutputFile();
+    output.show();
+
+    return result;
+
+END;
+
+//21.11.2014 R-496579-2 DPN
+macro checkDublers(beginDate,endDate, dataout) //проверяет, есть ли задвоенные заявления на закрытие счета
+    var flag = 0; //0 - дублей нет, 1- дубли есть
+    var i = 0;
+    var element = tarray;
+        
+   //Gurin S. 16.04.2015 I-00562504-2
+   /* var sel = "  SELECT t_account, TMP.T_CLOSEDATE " +
+              "  FROM dreqclosa_dbt tmp " +
+              "  where TMP.T_CLOSEDATE between to_date('"+beginDate+"','dd.mm.yyyy') and to_date('"+endDate+"','dd.mm.yyyy') " +
+              "  and TMP.T_CURRENTSTATE = 30 " +
+              "  GROUP BY   tmp.T_ACCOUNT,  TMP.T_CLOSEDATE " +
+              "  HAVING   COUNT ( * ) > 1 ";*/
+
+    var sel = "   SELECT c.t_account, c.t_closedate " +
+              "     FROM dreqclosa_dbt c " +
+              "    WHERE EXISTS (SELECT   COUNT ( * ) " +
+              "                      FROM   dreqclosa_dbt "+
+              "                     WHERE   C.T_ACCOUNT = t_account "+
+              "                    HAVING   COUNT ( * ) > 1) "+
+              "          and c.t_currentstate = 30 ";
+
+    var  DataS=TRsbDataSet(sel);
+    while( DataS.moveNext())
+        element(i) = datas.value(0);
+        element(i+1)=datas.value(1);
+        i = i + 2;
+        flag = 1;
+    end;
+    dataout = element;
+    if (flag == 1)
+        setParm(2, dataout);
+        return false;
+    else 
+        return true;
+    end;
+end;
+
+/******************************************************************************/
+/* Основная функция для Внутренней отчётности - вызывается из панели */
+MACRO Report( repKind, subsystem, dprtId, orgStructure, issueMode, begDate, endDate, archDate, planNums,
+    chapter, accType, currId, needAccOpen, needAccClose, needEveryDay,
+    needPrintFunds
+)
+    /* Инициализация фильтра счетов по ТС/РС */
+    var dprtList      = RepDepartmentList( orgStructure, issueMode, dprtId );
+    var accFilter     = RepAccountFilter( dprtList );
+    var brnFilter     = RepBranchFieldFilter( dprtList );
+    var brnDprtFilter = RepBranchAndDepartmentFieldFilter( dprtList );
+    var ocpAccServer  = RepOcpAccountServer(chapter, currId, dprtList);
+    if (repKind == OpenCloseList)
+        СНакопительнымиИТранзитными = GetTrue(TRUE,"Включать в ведомость накопительные и транзитные счета?\n"+
+                                                   "'Не включать, только при формировании ведомости для ЮЛ'");
+    else
+      СНакопительнымиИТранзитными = TRUE;
+    end;    
+    var out;
+debugbreak;
+    /* Контроль опердней */
+    if( not RepOperdaysOpened( dprtList, begDate, endDate ).ShouldContinue ) //21.11.2014 R-496579-2 DPN
+        return false;
+    end;
+    
+    params = TParams( ВО, repKind, subsystem, accFilter, brnFilter, brnDprtFilter, ocpAccServer, begDate,
+                      endDate, archDate, planNums, chapter, accType, currId, "", needAccOpen,
+                      needAccClose, needEveryDay, needPrintFunds );
+    var stat = Initialize( params );
+    
+    if( (params.ReportKind == RegBook) or (params.ReportKind == RegBookOnDate) )
+        prForm = TPrintForm( "bk_opacc_print.mac", "PrintAccRegBook" );
+    elif( params.ReportKind == OpenCloseList )
+        if(checkDublers(begDate,endDate, out) == true) //если нет дублей- продолжаем выпуск отчета
+            prForm = TPrintForm( "jrnacc02.mac", "PrintAccOpenCloseList" );
+        else //если есть дубли - выведем на экран, по каким счетам
+            stat = PrintReportWithForm( 10, out );
+        end;
+    else
+        return false;
+    end;
+
+    
+    if( stat )
+        stat = Calculate( params );
+//        Uninitialize( params );
+    end;
+
+
+    return stat;
+END; /* Report */
+
+/******************************************************************************/
+/* Основная функция для Отчётности СБ РФ - вызывается из панели */
+MACRO ReportSb( repKind, subsystem, dprtId, orgStructure, issueMode, begDate, endDate,
+    archDate, planNums, chapter, accType, currId, accountMask, needAccOpen, needAccClose
+)
+    /* Инициализация фильтра счетов по ТС/РС */
+    var dprtList      = RepDepartmentList( orgStructure, issueMode, dprtId );
+    var accFilter     = RepAccountFilter( dprtList );
+    var brnFilter     = RepBranchFieldFilter( dprtList );
+    var brnDprtFilter = RepBranchAndDepartmentFieldFilter( dprtList );
+    var ocpAccServer  = RepOcpAccountServer(chapter, currId, dprtList);
+
+    /* Контроль опердней */
+    if( not RepOperdaysOpened( dprtList, begDate, endDate ).ShouldContinue )
+        return false;
+    end;
+
+    var params = TParams( ОСБ, repKind, subsystem, accFilter, brnFilter, brnDprtFilter, ocpAccServer, begDate,
+                          endDate, archDate, planNums, chapter, accType, currId, accountMask, needAccOpen,
+                          needAccClose );
+
+    var mfile;
+    if(   (params.ReportKind == RegBook) or (params.ReportKind == RegBookOnDate) )
+        mfile = "SbAccBookPrint.mac";
+    elif( params.ReportKind == OpenCloseList )
+        mfile = "SbAccOCListPrint.mac";
+    else
+        return false;
+    end;
+
+    var prForm = TPrintForm( mfile, "PrintReport" );
+
+    var stat = Initialize( params );
+    if( stat )
+        stat = Calculate( params );
+        if ( stat )
+            stat = PrintReportWithForm( prForm, params );
+        end;
+        Uninitialize( params );
+    end;
+
+    return stat;
+END; /* Report */
+
+// Вывод отчета на экран (пока только для отчета ВО)
+macro showReport()
+    return PrintReportWithForm( prForm, params );
+end;

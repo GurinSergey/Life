@@ -1,0 +1,464 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: soa_carry_class.mac v.3
+// @author  : 2013-07-02 zip_z. 
+// @desc    : ТК Life часть II - реализация API класса SOACarry
+// @changes : none
+// -------------------------------------------------------------------------------------------------
+import BankInter, PaymInter, CTInter;
+import soa_core,lib_pm_check,soa_const;
+
+class SOACarry ()
+   // var autokey           :integer; // NUMBER(10)    //LAO 20.31
+    var paymentid         :integer; // NUMBER(10)     
+    var operationid       :integer; // NUMBER(10)     
+    var carrynum          :integer; // NUMBER(5)      
+    var fiid              :integer; // NUMBER(5)      
+    var FIID_PAYER        :integer; // NUMBER(5)    //LAO 20.31
+    var FIID_RECEIVER     :integer; // NUMBER(5)    //LAO 20.31
+    var chapter           :integer; // NUMBER(5)     
+    var payer_account     :string;  // VARCHAR2(25)   
+    var receiver_account  :string;  // VARCHAR2(25)   
+    var sum               :money;   // NUMBER(32,12)  
+    var SUM_PAYER         :money;   // NUMBER(32,12)   //LAO 20.31
+    var SUM_RECEIVER      :money;   // NUMBER(32,12)   //LAO 20.31
+    var date_carry        :date;    // DATE           
+    var oper              :integer; // NUMBER(5)      
+    var pack              :integer; // NUMBER(5)      
+    var num_doc           :string;  // VARCHAR2(15)   
+    var ground            :string;  // VARCHAR2(600)  
+    var department        :integer; // NUMBER(5)      
+    var vsp               :integer; // NUMBER(5)      
+    var kind_oper         :string;  // VARCHAR2(2)    
+    var shifr_oper        :string;  // VARCHAR2(6)    
+    var error_text        :string;  // VARCHAR2(4000) 
+    var create_time       :date;    // DATE
+    
+    // ---------------------------------------------------------------------------------------------
+    // private
+    // ---------------------------------------------------------------------------------------------
+    
+    // заполняются на предобработке (makeRunCarryStepPrepare)
+    private var pvt_docKind  :integer;
+    private var pvt_idStep   :integer;
+    
+    //LAO 20.31
+    //Проверка на допустимость фазы по счету
+    private macro    getAccPhase ():bool // --checkphacc (curp,curr, acc_rec, acc_pay, carry_date, oper, msg)
+
+        if (this.date_carry == {CURDATE}) return true; end;
+
+            var cmd = RSDCommand (
+            " select max(ph.t_phase) " +
+            "   from daccount_dbt ac, dopdphase_dbt ph " +
+            "  where     (ac.t_account = ? or ac.t_account = ?)" +
+            "        and ac.t_chapter = usr_common.get_chapter (ac.t_account) " +
+            "        and (ac.t_code_currency = ?  or ac.t_code_currency = ? )" +
+            "        and ph.t_account = ac.t_account " +
+            "        and ph.t_chapter = ac.t_chapter " +
+            "        and ph.t_currency = ac.t_code_currency " +
+            "        and ph.t_phasedate >= (select max (t_phasedate) " +
+            "                                 from dopdphase_dbt " +
+            "                                where     t_account = ac.t_account " +
+            "                                      and t_chapter = ac.t_chapter " +
+            "                                      and t_currency = ac.t_code_currency " +
+            "                                      and t_phasedate <= ? )" 
+            );
+    
+            cmd.addparam("acc_pay", RSDBP_IN, this.payer_account );
+            cmd.addparam("acc_rec", RSDBP_IN, this.receiver_account );
+            cmd.addparam("fiidp", RSDBP_IN, this.FIID_PAYER);
+            cmd.addparam("fiidr", RSDBP_IN, this.FIID_RECEIVER);
+            cmd.addparam("carry_date", RSDBP_IN, this.date_carry );
+    
+            var rs = RSDRecordset(cmd);
+    
+            if ((rs.movenext) and (valtype(rs.value(0)) != V_SPECIAL_VALUE /*null*/))
+                if( not( CheckObjectRestriction(92, 0, 0,"dphases_dbt" ,  "t_Phase = "+int(rs.value(0)), "", null, int(oper)) ));
+                  //  setparm(6,"Нет доступа к счету находящемуся в фазе "+int(rs.value(0)));
+                    return false;   
+                end;
+                return true;
+            else
+                return true; //если не записи в dopdphase_dbt то значит оба счета - покрытие, фазу не проверяем
+            end;
+    onerror return true;
+    end;
+
+    
+    
+    
+    // @desc  : проверка разнесения по сумме (упрощенный вариант), выполняется ПОСЛЕ вставки
+    // @return: V_BOOL (true, если все верно)
+    private macro checkCarrySum ():bool
+        // проверки только по первой главе (как в outsidecarry)
+        if (this.chapter != 1) return true; end;
+        
+        var sql = "select round(sum ( u.SUM_PAYER ),2) t_carryamount, round(p.t_amount,2) t_amount, p.t_baseamount, p.t_payamount, p.t_dockind"
+                + "  from usr_pmdocs u, dpmpaym_dbt p"
+                + " where u.paymentid = p.t_paymentid and u.paymentid = :pid and u.chapter = 1"
+                + " group by p.t_amount, p.t_baseamount, p.t_payamount, p.t_dockind";
+        
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)), false);
+        if (sql.moveNext ())
+            // для мультиков проверки нет. Бред. Нужно повторять метод мультивалютной проводки и проверять суммы.
+            if (sql.value ("t_dockind", null, V_INTEGER) == SOA_CB_MULTYDOC)
+                return true;
+            end;
+            
+            // для прочих - проверяем как Селезнев, по сумме дебета, и пофиг на валюту. Бред.
+            return (sql.value ("t_carryamount", null, V_MONEY) <= sql.value ("t_amount", null, V_MONEY));
+        end;
+        return true;
+    end;
+    
+    // @desc  : получить код филиала по родительскому платежу
+    // @return: V_INTEGER
+    private macro getPackByPaymentID () :integer
+        var sql = "select t_numberpack from dpmpaym_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_numberpack", null, V_INTEGER);
+        end;
+        return zeroValue (V_INTEGER);
+    end;
+    
+    // @desc  : получить дату проводки (проводка уходит датой значения платежа, а не curdate, если это явно не указано!!!)
+    // @return: V_DATE
+    private macro getDateCarry () :date
+        var sql = "select t_valuedate from dpmpaym_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_valuedate", null, V_DATE);
+        end;
+        return {CURDATE};
+    end;
+    
+    // @desc  : получить ID операции по документу
+    // @return: V_INTEGER
+    private macro getOperationID () :integer
+        return PM_Opr_GetIdOperation (this.paymentid, pvt_docKind);
+    end;
+    
+    // @desc  : получить порядковый номер проводки (до триггеров на usr_pmdocs пока будет вот так)
+    // @return: V_INTEGER
+    private macro getCarryNum ():integer
+        var sql = "select nvl (max (carryNum + 1 ), 1) carrynum from usr_pmdocs where paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("carrynum", null, V_INTEGER);
+        end;
+        return zeroValue (V_INTEGER);
+    end;
+    
+    //LAO 20.31
+    // @desc  : получить ФИ для проводки
+    // @return: V_INTEGER
+    // LAO ОВП не проработано
+    
+    
+    // @desc  : получить главу для проводки
+    // @return: V_INTEGER
+    private macro getChapter ():integer
+        if (inList ("ОВП", this.payer_account, this.receiver_account))
+            return 1;
+        end;
+        
+        // паранойя, привет!
+        var p = Acc_GetChapterByAccount (this.payer_account);
+        //var r = Acc_GetChapterByAccount (this.receiver_account);
+       // if (p != r) runError ("Корреспондирующие счета принадлежат разным главам балансовых, проводка запрещена"); end;
+        
+        return p;
+    end;
+    
+    // @desc  : получить номер операциониста по родительскому платежу
+    // @return: V_STRING
+    private macro getOper ():integer
+        var sql = "select t_oper from dpmpaym_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_oper", null, V_INTEGER);
+        end;
+        return {oper};
+    end;
+    
+    // @desc  : получить номер документа по родительскому платежу
+    // @return: V_STRING
+    private macro getNumDoc ():string
+        var sql = "select t_number from dpmrmprop_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_number", null, V_STRING);
+        end;
+        return zeroValue (V_STRING);
+    end;
+    
+    // @desc  : получить основание проводки по родительскому платежу
+    // @return: V_STRING
+    private macro getGround ():string
+        var sql = "select t_ground from dpmrmprop_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_ground", null, V_STRING);
+        end;
+        return zeroValue (V_STRING);
+    end;
+    
+    // @desc  : получить код филиала по родительскому платежу
+    // @return: V_INTEGER
+    private macro getDepartment ():integer
+        var sql = "select t_department from dpmpaym_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if  (sql.moveNext ())
+           return sql.value ("t_department", null, V_INTEGER);
+        end;
+        return {operdprt};
+    end;
+    
+    // @desc  : получить узел операциониста по родительскому платежу
+    // @return: V_INTEGER
+    private macro getOperDprt ():integer
+        var sql = "select t_opernode from dpmpaym_dbt where t_paymentid = :pid";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_opernode", null, V_INTEGER);
+        end;
+        return {operDprtNode};
+    end;
+    
+    // @desc  : получить вид проводки (Kind_Oper). На самом деле поле ничем не регламентируется и является
+    //          нашим внутренним, в реальном мире используется только " 3" для кассовых проводок, поэтому
+    //          с требованиями выставить в вид что-то еще можно засылать в сад
+    // @return: V_INTEGER
+    private macro getKindOper ()         
+        if ((acc_isCash (this.payer_account)) or (acc_isCash (this.receiver_account)))
+            return " 3";
+        end;
+        return " 6";
+    end;
+    
+    // @desc  : получить шифр операции по родительскому платежу
+    // @return: V_STRING
+    private macro getShifrOper ()        
+        var sql = "select t_shifroper from dpmrmprop_dbt where t_paymentid = :pid and t_shifroper != chr(1)";
+        sql = execSqlSelect (sql, makeArray (SQLParam ("pid", this.paymentid)));
+        if (sql.moveNext ())
+            return sql.value ("t_shifroper", null, V_STRING);
+        end;
+        return "09";
+    end;
+    
+    // @desc: добавление в журнал проводок
+    private macro addCarryToRegTable ()
+        var sql = " insert into usr_pmdocs" 
+         + "\n" + "  (ACCTRNID  , paymentid , operationid, carrynum, FIID_PAYER,FIID_RECEIVER, chapter, payer_account, receiver_account, sum,SUM_PAYER,SUM_RECEIVER, date_carry, oper, pack, " 
+         + "\n" + "    num_doc, ground, department, vsp, kind_oper, shifr_oper, error_text" 
+         + "\n" + "  )" 
+         + "\n" + "  values" 
+         + "\n" + "  (null, :m_paymentid, :m_operationid, :m_carrynum, :m_fiidp,:m_fiidr, :m_chapter, :m_payer_account, :m_receiver_account, :m_sum,:m_sump,:m_sumr, :m_date_carry, :m_oper, :m_pack," 
+         + "\n" + "    :m_num_doc, :m_ground   , :m_department , :m_vsp     , :m_kind_oper, :m_shifr_oper, :m_error_text" 
+         + "\n" + "  )";
+        var parm = makeArray (SQLParam ("m_paymentid"        , this.paymentid        )
+                             ,SQLParam ("m_operationid"      , this.operationid      )
+                             ,SQLParam ("m_carrynum"         , this.carrynum         )
+                             ,SQLParam ("m_fiidp"            , this.FIID_PAYER       ) //LAO 20.31
+                             ,SQLParam ("m_fiidr"            , this.FIID_RECEIVER    ) //LAO 20.31
+                             ,SQLParam ("m_chapter"          , this.chapter          )
+                             ,SQLParam ("m_payer_account"    , this.payer_account    )
+                             ,SQLParam ("m_receiver_account" , this.receiver_account )
+                             ,SQLParam ("m_sum"              , this.sum              )
+                             ,SQLParam ("m_sump"             , this.SUM_PAYER        )
+                             ,SQLParam ("m_sumr"             , this.SUM_RECEIVER     )
+                             ,SQLParam ("m_date_carry"       , this.date_carry       )
+                             ,SQLParam ("m_oper"             , this.oper             )
+                             ,SQLParam ("m_pack"             , this.pack             )
+                             ,SQLParam ("m_num_doc"          , this.num_doc          )
+                             ,SQLParam ("m_ground"           , this.ground           )
+                             ,SQLParam ("m_department"       , this.department       )
+                             ,SQLParam ("m_vsp"              , this.vsp              )
+                             ,SQLParam ("m_kind_oper"        , this.kind_oper        )
+                             ,SQLParam ("m_shifr_oper"       , this.shifr_oper       )
+                             ,SQLParam ("m_error_text"       , this.error_text       ));
+        execSql (sql, parm, false);
+    end;
+    
+    /* var FIID_PAYER        :integer; // NUMBER(5)    //LAO 20.31
+    var FIID_RECEIVER     :integer; // NUMBER(5)    //LAO 20.31
+    var chapter           :integer; // NUMBER(5)     
+    var payer_account     :string;  // VARCHAR2(25)   
+    var receiver_account  :string;  // VARCHAR2(25)   
+    var sum               :money;   // NUMBER(32,12)  
+    var SUM_PAYER         :money;   // NUMBER(32,12)   //LAO 20.31
+    var SUM_RECEIVER      :money;   // NUMBER(32,12)   //LAO 20.31*/
+    // ---------------------------------------------------------------------------------------------
+    // public (для использования извне)
+    // ---------------------------------------------------------------------------------------------
+    
+    // @desc: удаление из журнала проводок
+    macro delCarryFromRegTable ()
+        var sql = "delete from usr_pmdocs where paymentid = :m_paymentid";
+        var parm = makeArray (SQLParam ("m_paymentid", this.paymentid));
+        execSql (sql, parm, false);
+    end;
+    
+    // @desc: обновить состояние проводки
+    macro updateCarryState (errortext:string)
+        execSql ("update usr_pmdocs set error_text = :txt where paymentid = :pid and carrynum = :cn", 
+                makeArray (SQLParam ("txt", errortext), SQLParam ("pid", this.paymentid), SQLParam ("cn", this.carrynum)));
+    end;
+    
+    // @desc: проверки по обязательным реквизитам
+    macro checkCarryBL ()
+        if (isNull (this.paymentid         )) runError ("Не задан PaymentID");        end;
+        if (isNull (this.payer_account     )) runError ("Не задан счет плательщика"); end;
+        if (isNull (this.receiver_account  )) runError ("Не задан счет получателя");  end;
+        if (isNull (this.sum               )) runError ("Не задана сумма проводки");  end;
+    end;
+    
+    // @desc: проверки со стороны БД - пока не пересадим usr_pmdocs на check-constraintы, будет вот так (+ 90 мс на всё)
+    macro checkCarryDB ()
+        if (not (DB_FindValueByPrimaryKey ("dpmpaym_dbt", "t_paymentid", this.paymentid)))
+            runError ("Платёж с paymentid = " + this.paymentid + " не существует");
+        end;
+/*
+        04.04.2014 Golovkin убрал, не нужно, да и не правильно
+        if (not (DB_FindValueByPrimaryKey ("daccount_dbt", "t_account", this.payer_account, " t_open_close != 'З' ")))
+            runError ("Открытый счёт плательщика " + this.payer_account + " не существует");
+        end;
+        if (not (DB_FindValueByPrimaryKey ("daccount_dbt", "t_account", this.receiver_account, " t_open_close != 'З' ")))
+            runError ("Открытый счёт получателя " + this.receiver_account + " не существует");
+        end;
+*/        
+        /* LAO  12.12.2013 временно убрал
+        //if (isNull (this.fiid        )) this.fiid        = getFiid ();            end;
+        // ??? стоит ли...
+           
+        if (not getAccPhase ())
+            runError ("Нет доступа к счетам в текущей фазе операционного дня");
+        end;
+         */
+    end;
+    
+    // @desc: проверки по опциональным реквизитам и дозаполнение всего, что мы можем угадать сами
+    macro checkCarryActuate ()
+        pvt_docKind = PM_GetDocKind (this.paymentid);
+        
+        if (isNull (this.pack        )) this.pack        = getPackByPaymentID (); end;
+        if (isNull (this.date_carry  )) this.date_carry  = getDateCarry ();       end;
+        if (isNull (this.operationid )) this.operationid = getOperationID ();     end;
+        if (isNull (this.carrynum    )) this.carrynum    = getCarryNum ();        end;
+      //  if (isNull (this.fiid        )) this.fiid        = getFiid ();            end;
+        if (isNull (this.FIID_PAYER   )) this.FIID_PAYER           = Acc_GetFiidByAccount (this.payer_account); end;//LAO 20.31
+        if (isNull (this.FIID_RECEIVER)) this.FIID_RECEIVER        = Acc_GetFiidByAccount (this.receiver_account); end;//LAO 20.31
+        if (this.SUM_PAYER == 0       )  this.SUM_PAYER   = this.SUM;             end;//LAO 20.31
+        if (this.SUM_RECEIVER == 0    )  this.SUM_RECEIVER= this.SUM;             end;//LAO 20.31
+        if (isNull (this.chapter     )) this.chapter     = getChapter ();         end;
+        if (isNull (this.oper        )) this.oper        = getOper ();            end;
+        if (isNull (this.num_doc     )) this.num_doc     = getNumDoc ();          end;
+        if (isNull (this.ground      )) this.ground      = getGround ();          end;
+        if (isNull (this.department  )) this.department  = getDepartment ();      end;
+        if (isNull (this.vsp         )) this.vsp         = getOperDprt ();        end;
+        if (isNull (this.kind_oper   )) this.kind_oper   = getKindOper ();        end;
+        if (isNull (this.shifr_oper  )) this.shifr_oper  = getShifrOper ();       end;
+        if (isNull (this.error_text  )) this.error_text  = ACCTRN_STATE_WAITING;  end; 
+    end;
+    
+    // @desc: предтранзакционные действия перед запуском RSBAccTransaction
+    macro makeRunCarryStepPrepare ()
+        checkCarryBL ();         // проверки по бизнес-логике
+        checkCarryDB ();         // проверки со стороны БД
+        checkCarryActuate ();    // заполнение недостающих реквизитов
+        addCarryToRegTable ();   // регистрация отложенной проводки
+        
+        // проверка на сумму платежа; управление транзакцией происходит в вызывающей функции,
+        // так что по runError () случается откат
+        if (not checkCarrySum ()) runError ("Сумма проводок не соответствует сумме платежа"); end;
+    end;
+    
+    // @desc: заполнение буферов carryprm / arhdoc и запуск RunCarry
+    macro makeRunCarryStepExecute ()
+        var trn = RSBAccTransaction ();
+        
+        // если шага зачисления еще нет - ничего не делаем. Проводка уже зарегистрирована, остальное
+        // выполнит outsidecarry
+        if (not PM_FindOperation_Step (this.paymentid, "6", OPR_STEP_EXECSTEP, this.operationid, pvt_idStep))
+            return;
+        end;
+        
+        trn.Chapter           = this.chapter;
+        trn.FIIDReceiver      = this.FIIDReceiver;
+        trn.FIIDPayer         = this.FIIDPayer;
+        trn.FIID              = this.fiid;
+        trn.AccountPayer      = this.payer_account;
+        trn.AccountReceiver   = this.receiver_account;
+        trn.SumReceiver       = this.sum;
+        trn.SumPayer          = this.sum;
+        trn.Sum               = this.sum;
+        trn.Ground            = this.ground;
+        trn.Date_Carry        = this.date_carry;
+        trn.Numb_Document     = this.num_doc;
+        trn.Number_Pack       = this.pack;
+        trn.Shifr_Oper        = this.shifr_oper;
+        trn.Kind_Oper         = this.kind_oper;
+        trn.Oper              = this.oper;
+        trn.Department        = this.department;
+        trn.ID_Operation      = this.operationid;
+        trn.ID_Step           = pvt_idStep;
+        
+        // Добавим кассовые символы, если они есть в платеже
+        if (inList (pvt_docKind, SOA_CASH_BOF_ADDORDER, SOA_CASH_PS_INCORDER, SOA_CASH_PS_OUTORDER, SOA_CASH_BOF_INCORDER, SOA_CASH_BOF_OUTORDER))
+            var pm = RsbPayment (this.paymentid);
+            
+            if (pm.CashSymbolDebet ) trn.AddCashSymbol (pm.CashSymbolDebet , trn.SumPayer   , CASHSYMB_TYPE_DEBET      ); end;
+            if (pm.CashSymbolCredit) trn.AddCashSymbol (pm.CashSymbolCredit, trn.SumReceiver, CASHSYMB_TYPE_CREDIT     ); end;
+            if (pm.SymbNotBalDebet ) trn.AddCashSymbol (pm.SymbNotBalDebet , trn.SumPayer   , CASHSYMB_TYPE_NOTB_DEBET ); end;
+            if (pm.SymbNotBalCredit) trn.AddCashSymbol (pm.SymbNotBalCredit, trn.SumReceiver, CASHSYMB_TYPE_NOTB_CREDIT); end;
+            
+            var stat = pm.update ();
+            if (stat != EXIT_SUCCESS)
+                RSL_GetSystemError (stat);
+            end;
+        end;
+        
+        var errm;
+        if( not trn.Carry(ACCTRN_STATUS_DATE_CARRY, errm) )
+            updateCarryState (errm);
+            runError (errm);
+        else
+            updateCarryState (ACCTRN_STATE_COMPLETED);
+        end;
+    end;
+    
+    // @desc: регистрация данных для отката проводки
+    macro makeRunCarryStepPostAction ()
+        // если шага зачисления еще нет - ничего не делаем. Проводка уже зарегистрирована, остальное
+        // выполнит outsidecarry
+        if (not PM_FindOperation_Step (this.paymentid, "6", OPR_STEP_EXECSTEP, this.operationid, pvt_idStep))
+            return;
+        end;
+        
+        var sql = "INSERT INTO doprdocs_dbt"
+                + "        ("
+                + "           t_dockind   , t_documentid, t_id_operation, t_id_step  , t_part,"
+                + "           t_status    , t_origin    , t_servdockind , t_servdocid, t_autokey,"
+                + "           t_launchoper, t_fmtblobdata_xxxx"
+                + "        )"
+                + "        VALUES"
+                + "        ("
+                + "            1005 /*DLDOC_SQLQUERY*/, chr (1), :p_id_operation, :p_id_step, 1,"
+                + "            0             , 0      , 0             , 0        , 0,"
+                + "            chr (0)       , utl_raw.cast_to_raw ("
+                + "            'update usr_pmdocs set autokey = null, error_text = ''Проводка ожидает выполнения'' where paymentid = ' ||"
+                + "            :p_paymentid                                                                                            ||"
+                + "            ' and carrynum = '                                                                                      ||"
+                + "            :p_carrynum)"
+                + "        ) ";
+        var parm = makeArray ( SQLParam ("p_id_operation"     , this.operationid )
+                              ,SQLParam ("p_id_step"          , pvt_idStep       )  
+                              ,SQLParam ("p_paymentid"        , this.paymentid   )
+                              ,SQLParam ("p_carrynum"         , this.carrynum    ));
+                              
+        sql = execSql (sql, parm, true);
+    onerror (e)
+    end;
+end;

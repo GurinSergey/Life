@@ -1,0 +1,476 @@
+/******************************************************************************
+   Имя файла.:       PaymProc.mac
+   Назначение:       Реализация интерфейса "Платеж"
+   Дата......:       22.08.2008
+   Автор.....:       Стадник Александр, Селезнёв Владимир
+                     Golovkin 11.10.2012 I-00267230-2 ещё округления
+                     Teleshova 18.12.2014 C-35507 заполнение оставшихся парметров для insert_payment
+******************************************************************************/
+
+import globals, RSD, oralib;
+
+// виды платежных документов
+const dockind_cash_in      = 430;     // кассовый, приходный
+const dockind_cash_out     = 440;     // кассовый, расходный
+const dockind_cash_inout   = 400;     // кассовый, подкрепление
+const dockind_memorder     = 70;      // мемориальный ордер
+const dockind_multycarry   = 15;      // мультивалютный
+const dockind_bank_paym    = 16;      // платеж ББ
+const dockind_bank_order   = 17;      // требование ББ (только рубли)
+const dockind_client_paym  = 2011;    // платеж РКО
+const dockind_client_order = 2012;    // требование РКО (только рубли)
+
+const dockind_client_cash_in  = 410;  //объявление на взнос наличных
+const dockind_client_cash_out = 420;  //чек
+
+const skip_payacc_exists = 1; //не проверять наличие счета плательщика
+const skip_payname_match = 2; //не проверять наименование плательщика
+const skip_recacc_exists = 4; //не проверять наличие счета получателя
+const skip_recname_match = 8; //не проверять наименование получателя
+const skip_pay_inn_fill  =16; //не проверять/заполнять ИНН плательщика
+const skip_rec_inn_fill  =32; //не проверять/заполнять ИНН получателя
+const skip_payacc_exists_full =64;  //не проверять наличие счета плательщика вообще
+const skip_recacc_exists_full =128; //не проверять наличие счета получател вообще
+const skip_bic =256;                //не проверять бики
+
+//Gurin S. 24.09.2013 C-23092
+Class TSkipArr()
+    private var _skip_payacc_exists       = False; 
+    private var _skip_payname_match       = False; 
+    private var _skip_recacc_exists       = False; 
+    private var _skip_recname_match       = False; 
+    private var _skip_pay_inn_fill        = False; 
+    private var _skip_rec_inn_fill        = False; 
+    private var _skip_payacc_exists_full  = False; 
+    private var _skip_recacc_exists_full  = False; 
+    private var _skip_bic                 = False; 
+
+    macro Set_skip_payacc_exists()
+        _skip_payacc_exists = True;
+    end;
+    macro Set_skip_payname_match()
+        _skip_payname_match = True;
+    end;
+    macro Set_skip_recacc_exists()
+        _skip_recacc_exists = True;
+    end;
+    macro Set_skip_recname_match()
+        _skip_recname_match = True;
+    end;
+    macro Set_skip_pay_inn_fill()
+        _skip_pay_inn_fill = True;
+    end;
+    macro Set_skip_rec_inn_fill()
+        _skip_rec_inn_fill = True;
+    end;
+    macro Set_skip_payacc_exists_full()
+        _skip_payacc_exists_full = True;
+    end;
+    macro Set_skip_recacc_exists_full()
+        _skip_recacc_exists_full = True;
+    end;
+    macro Set_skip_bic()
+        _skip_bic = True;
+    end;
+
+    macro GetResultSum():integer;
+        var ResultSum = 0;
+        if (_skip_payacc_exists      )  ResultSum = ResultSum + skip_payacc_exists;      end;
+        if (_skip_payname_match      )  ResultSum = ResultSum + skip_payname_match;      end;
+        if (_skip_recacc_exists      )  ResultSum = ResultSum + skip_recacc_exists;      end;
+        if (_skip_recname_match      )  ResultSum = ResultSum + skip_recname_match;      end;
+        if (_skip_pay_inn_fill       )  ResultSum = ResultSum + skip_pay_inn_fill;       end;
+        if (_skip_rec_inn_fill       )  ResultSum = ResultSum + skip_rec_inn_fill;       end;
+        if (_skip_payacc_exists_full )  ResultSum = ResultSum + skip_payacc_exists_full; end;
+        if (_skip_recacc_exists_full )  ResultSum = ResultSum + skip_recacc_exists_full; end;
+        if (_skip_bic                )  ResultSum = ResultSum + skip_bic;                end;
+
+        return ResultSum;
+    end;
+end;
+
+// класс платежа
+Class UsrPayment
+
+    private var cmd;    
+    private var err_init;
+    private var err_rs:object;
+
+    var PayerAccount,
+        PayerName,
+        PayerBIC,
+        PayerINN,
+        PayerKPP,
+        ReceiverAccount,
+        ReceiverName,
+        ReceiverBIC,
+        ReceiverINN, 
+        ReceiverKPP, 
+        Oper,
+        Pack,
+        Corschem,
+        NumOperation,
+        NumDoc,
+        TypeDoc,
+        UserTypeDoc,
+        DebetSum,
+        CreditSum,
+        Rate,
+        Ground,
+        Department,
+        Priority,                  
+        Shifr,
+        ValueDate,
+        DocDate,
+        DocKind,
+        CashSymbols,
+        ClientFIO,
+        UserField1,
+        UserField2,
+        UserField3,
+        UserField4,
+        AcceptTerm,
+        AcceptDate,
+        PayCondition,
+        AcceptPeriod,
+        CreatorStatus,
+        KbkCode,
+        OkatoCode,
+        GroundTaxDoc,
+        TaxPeriod,
+        NumTaxDoc,
+        TaxDate,
+        TaxType,
+        Origin,
+        SkipCheckMask,
+        CheckExists,
+        RunOperation,
+        PackMode,
+        MakeCarryFromPayment,
+        PaymentID,
+        ErrorMessage,
+
+        transaction_mode,
+        doc_cur_iso,
+        receiver_account_cur_iso,
+        comiss_acc,
+        expense_transfer,
+        vo_code,
+        gtd,
+        gtd_date,
+        gtd_cur_iso,
+        deal_passport,
+        deal_date,
+        med_bankname,
+        med_bic,
+        receiver_bankname,
+        receiver_bankcoracc,
+        receiver_bank_bic,
+        ground_add,
+        transfer_date,
+        //TAM 18.12.2014 C-35507
+        bosspost,
+        bossfio,
+        paymentkind,
+        autorun_operation,
+        paperkind,
+        paperseries,
+        papernumber,
+        paperissueddate,
+        paperissuer,
+        payerchargeoffdate,
+        paytype,
+        subkindmessagedebet,
+        subkindmessagecredit,
+        UIN,
+        
+        OprExecErrMsg,    //ошибка пакетного выполнения операции
+        OprErrMsg,        //ошибка на шаге выполнения операции 
+        OprErrCount,      //количество ошибок в пакете
+        OprPackID;        //ID пакета
+
+    // Инициализация 
+    macro Initialization()
+        err_init                = false;
+        PayerAccount            = null;
+        PayerName               = null;
+        PayerBIC                = null;
+        PayerINN                = null;
+        PayerKPP                = null;
+        ReceiverAccount         = null;
+        ReceiverName            = null;
+        ReceiverBIC             = null;
+        ReceiverINN             = null; 
+        ReceiverKPP             = null; 
+        Oper                    = null;
+        Pack                    = null;
+        Corschem                = null;
+        NumOperation            = null;
+        NumDoc                  = null;
+        TypeDoc                 = null;
+        UserTypeDoc             = null;
+        DebetSum                = null;
+        CreditSum               = null;
+        Rate                    = null;
+        Ground                  = null;
+        Department              = null;
+        Priority                = null;             
+        Shifr                   = null;
+        ValueDate               = null;
+        DocDate                 = null;
+        DocKind                 = null;
+        CashSymbols             = null;
+        ClientFIO               = null;
+        UserField1              = null;
+        UserField2              = null;
+        UserField3              = null;
+        UserField4              = null;
+        AcceptTerm              = null;
+        AcceptDate              = null;
+        PayCondition            = null;
+        AcceptPeriod            = null;
+        CreatorStatus           = null;
+        KbkCode                 = null;
+        OkatoCode               = null;
+        GroundTaxDoc            = null;
+        TaxPeriod               = null;
+        NumTaxDoc               = null;
+        TaxDate                 = null;
+        TaxType                 = null;
+        Origin                  = null;
+        SkipCheckMask           = null;
+        CheckExists             = null;
+        RunOperation            = null;
+        PackMode                = null;
+        MakeCarryFromPayment    = null;
+        PaymentID               = null;
+        transaction_mode        = null;
+        doc_cur_iso             = null;
+        receiver_account_cur_iso= null;
+        comiss_acc              = null;
+        expense_transfer        = null;
+        vo_code                 = null;
+        gtd                     = null;
+        gtd_date                = null;
+        gtd_cur_iso             = null;
+        deal_passport           = null;
+        deal_date               = null;
+        med_bankname            = null;
+        med_bic                 = null;
+        receiver_bankname       = null;
+        receiver_bankcoracc     = null;
+        receiver_bank_bic       = null;
+        ground_add              = null;
+        transfer_date           = null;
+        //TAM 18.12.2014 C-35507
+        bosspost                = null;
+        bossfio                 = null;
+        paymentkind             = null;
+        autorun_operation       = null;
+        paperkind               = null;
+        paperseries             = null;
+        papernumber             = null;
+        paperissueddate         = null;
+        paperissuer             = null;
+        payerchargeoffdate      = null;
+        paytype                 = null;
+        subkindmessagedebet     = null;
+        subkindmessagecredit    = null;
+        UIN                     = null;
+        
+        ErrorMessage;    
+     end;
+
+    macro ConvertEmptyValuesToNull()
+        
+    end;
+    
+    // вставка платежа
+    macro InsertPayment()     
+        /* 2012-09-19 zip_z. >> 
+        if(DebetSum!=null)
+          DebetSum = round(DebetSum, 2);
+          DebetSum = substr(string(DebetSum),1,index(string(DebetSum),".")+2);  // 19.09.12 Golovkin убираю лишние знаки после запятой  I-00255010-2,I-00254901-2,I-00254920-2
+        end;
+
+        if(CreditSum!=null)
+          CreditSum = round(CreditSum, 2);
+          CreditSum = substr(string(CreditSum),1,index(string(CreditSum),".")+2);
+        end;
+         */
+        if (DebetSum != null) 
+            DebetSum  = money (round (DebetSum, 2));
+            DebetSum  = round (DebetSum, 2); // 11.10.2012 Golovkin I-00267230-2 нужно больше округлений о_О
+        end;
+        
+        if (CreditSum != null)
+            CreditSum = money (round (CreditSum, 2));
+            CreditSum = round (CreditSum, 2); // 11.10.2012 Golovkin I-00267230-2 
+        end;
+        
+        // << end 2012-09-19 zip_z.
+        debugbreak;
+        cmd = RsdCommand("begin usr_payments.insert_payment(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ? /*round(?,2)*/, ? /*round(?,2)*/,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?); end;");
+                                                                                                                                                                        
+        cmd.addParam("PayerAccount",         RSDBP_IN,  PayerAccount);                                                                                               
+        cmd.addParam("PayerName",            RSDBP_IN,  PayerName);                                                                                                  
+        cmd.addParam("PayerBIC",             RSDBP_IN,  PayerBIC);                                                                                                   
+        cmd.addParam("PayerINN",             RSDBP_IN,  PayerINN);                                                                                                   
+        cmd.addParam("PayerKPP",             RSDBP_IN,  PayerKPP);          
+        cmd.addParam("ReceiverAccount",      RSDBP_IN,  ReceiverAccount);   
+        cmd.addParam("ReceiverName",         RSDBP_IN,  ReceiverName);      
+        cmd.addParam("ReceiverBIC",          RSDBP_IN,  ReceiverBIC);       
+        cmd.addParam("ReceiverINN",          RSDBP_IN,  ReceiverINN);       
+        cmd.addParam("ReceiverKPP",          RSDBP_IN,  ReceiverKPP);       
+        cmd.addParam("Oper",                 RSDBP_IN,  Oper);              
+        cmd.addParam("Pack",                 RSDBP_IN,  Pack);              
+        cmd.addParam("Corschem",             RSDBP_IN,  Corschem);          
+        cmd.addParam("NumOperation",         RSDBP_IN,  NumOperation);      
+        cmd.addParam("NumDoc",               RSDBP_IN,  NumDoc);            
+        cmd.addParam("TypeDoc",              RSDBP_IN,  TypeDoc);           
+        cmd.addParam("UserTypeDoc",          RSDBP_IN,  UserTypeDoc);       
+        cmd.addParam("DebetSum",             RSDBP_IN,  DebetSum);          
+        cmd.addParam("CreditSum",            RSDBP_IN,  CreditSum);         
+        cmd.addParam("Rate",                 RSDBP_IN,  Rate);
+        cmd.addParam("Ground",               RSDBP_IN,  Ground);
+        cmd.addParam("Department",           RSDBP_IN,  Department);
+        cmd.addParam("Priority",             RSDBP_IN,  Priority);
+        cmd.addParam("Shifr",                RSDBP_IN,  Shifr);
+        cmd.addParam("ValueDate",            RSDBP_IN,  ValueDate);
+        cmd.addParam("DocDate",              RSDBP_IN,  DocDate);
+        cmd.addParam("DocKind",              RSDBP_IN,  DocKind);
+        cmd.addParam("CashSymbols",          RSDBP_IN,  CashSymbols);
+        cmd.addParam("ClientFIO",            RSDBP_IN,  ClientFIO);
+        cmd.addParam("UserField1",           RSDBP_IN,  UserField1);
+        cmd.addParam("UserField2",           RSDBP_IN,  UserField2);
+        cmd.addParam("UserField3",           RSDBP_IN,  UserField3);
+        cmd.addParam("UserField4",           RSDBP_IN,  UserField4);
+        cmd.addParam("AcceptTerm",           RSDBP_IN,  AcceptTerm);           
+        cmd.addParam("AcceptDate",           RSDBP_IN,  AcceptDate);
+        cmd.addParam("PayCondition",         RSDBP_IN,  PayCondition);
+        cmd.addParam("AcceptPeriod",         RSDBP_IN,  AcceptPeriod);
+        cmd.addParam("CreatorStatus",        RSDBP_IN,  CreatorStatus);
+        cmd.addParam("KbkCode",              RSDBP_IN,  KbkCode);
+        cmd.addParam("OkatoCode",            RSDBP_IN,  OkatoCode);
+        cmd.addParam("GroundTaxDoc",         RSDBP_IN,  GroundTaxDoc);
+        cmd.addParam("TaxPeriod",            RSDBP_IN,  TaxPeriod);
+        cmd.addParam("NumTaxDoc",            RSDBP_IN,  NumTaxDoc);
+        cmd.addParam("TaxDate",              RSDBP_IN,  TaxDate);        
+        cmd.addParam("TaxType",              RSDBP_IN,  TaxType);
+        cmd.addParam("Origin",               RSDBP_IN,  Origin);
+        cmd.addParam("SkipCheckMask",        RSDBP_IN,  SkipCheckMask);
+        cmd.addParam("CheckExists",          RSDBP_IN,  CheckExists);
+        cmd.addParam("RunOperation",         RSDBP_IN,  RunOperation);          
+        cmd.addParam("PackMode",             RSDBP_IN,  PackMode);
+        cmd.addParam("MakeCarryFromPayment", RSDBP_IN,  MakeCarryFromPayment);
+        cmd.addParam("PaymentID",            RSDBP_OUT, V_INTEGER);             
+        cmd.addParam("RetValue",             RSDBP_OUT, V_STRING,1024);             
+
+        cmd.addParam("transaction_mode"         ,RSDBP_IN,  transaction_mode);
+        cmd.addParam("doc_cur_iso"              ,RSDBP_IN,  doc_cur_iso);
+        cmd.addParam("receiver_account_cur_iso" ,RSDBP_IN,  receiver_account_cur_iso);
+        cmd.addParam("comiss_acc"               ,RSDBP_IN,  comiss_acc);
+        cmd.addParam("expense_transfer"         ,RSDBP_IN,  expense_transfer);
+        cmd.addParam("vo_code"                  ,RSDBP_IN,  vo_code);
+        cmd.addParam("gtd"                      ,RSDBP_IN,  gtd);
+        cmd.addParam("gtd_date"                 ,RSDBP_IN,  gtd_date);
+        cmd.addParam("gtd_cur_iso"              ,RSDBP_IN,  gtd_cur_iso);
+        cmd.addParam("deal_passport"            ,RSDBP_IN,  deal_passport);
+        cmd.addParam("deal_date"                ,RSDBP_IN,  deal_date);
+        cmd.addParam("med_bankname"             ,RSDBP_IN,  med_bankname);
+        cmd.addParam("med_bic"                  ,RSDBP_IN,  med_bic);
+        cmd.addParam("receiver_bankname"        ,RSDBP_IN,  receiver_bankname);
+        cmd.addParam("receiver_bankcoracc"      ,RSDBP_IN,  receiver_bankcoracc);
+        cmd.addParam("receiver_bank_bic"        ,RSDBP_IN,  receiver_bank_bic);
+        cmd.addParam("ground_add"               ,RSDBP_IN,  ground_add);              
+        cmd.addParam("transfer_date"            ,RSDBP_IN,  transfer_date);
+        //TAM 18.12.2014 C-35507
+        cmd.addParam("bosspost"                 ,RSDBP_IN,  bosspost);
+        cmd.addParam("bossfio"                  ,RSDBP_IN,  bossfio);
+        cmd.addParam("paymentkind"              ,RSDBP_IN,  paymentkind);
+        cmd.addParam("autorun_operation"        ,RSDBP_IN,  autorun_operation);
+        cmd.addParam("paperkind"                ,RSDBP_IN,  paperkind);
+        cmd.addParam("paperseries"              ,RSDBP_IN,  paperseries);
+        cmd.addParam("papernumber"              ,RSDBP_IN,  papernumber);
+        cmd.addParam("paperissueddate"          ,RSDBP_IN,  paperissueddate);
+        cmd.addParam("paperissuer"              ,RSDBP_IN,  paperissuer);
+        cmd.addParam("payerchargeoffdate"       ,RSDBP_IN,  payerchargeoffdate);
+        cmd.addParam("paytype"                  ,RSDBP_IN,  paytype);
+        cmd.addParam("subkindmessagedebet"      ,RSDBP_IN,  subkindmessagedebet);
+        cmd.addParam("subkindmessagecredit"     ,RSDBP_IN,  subkindmessagecredit);
+        cmd.addParam("uin"                      ,RSDBP_IN,  UIN);
+        
+        cmd.execute();
+
+        PaymentID    = cmd.Param("PaymentID").value;
+        ErrorMessage = cmd.Param("RetValue").value; 
+
+        return (index(ErrorMessage, "no_error")!=0); 
+                
+        OnError(err) 
+           ErrorMessage = getRSDErrorsString(cmd);
+            //ErrorMessage = err.Message;            
+            return false;
+    end;   
+
+    //выполнение операции по вставленным платежам
+    macro PmRunOperation()
+
+        cmd = RsdCommand("{call usr_payments.run_operation(?,?,?)}");
+                                                                                                                                                                        
+        cmd.addParam("PackID",             RSDBP_OUT, V_INTEGER);             
+        cmd.addParam("ErrorCnt",           RSDBP_OUT, V_INTEGER);             
+        cmd.addParam("ErrorOpr",           RSDBP_OUT, V_STRING, 1024);             
+
+        cmd.execute();
+
+        OprPackID       = cmd.Param("PackID").value;
+        OprErrCount     = cmd.Param("ErrorCnt").value;
+        OprExecErrMsg   = cmd.Param("ErrorOpr").value;     
+
+        //возвращается количество ошибок
+        return OprErrCount;
+    end; 
+    
+    macro DeletePayment(PaymentID)
+
+        cmd = RsdCommand("{call usr_payments.delete_payment(?,?,?)}");
+                                                                                                                                                                        
+        cmd.addParam("PaymentID",RSDBP_IN,PaymentID);             
+        cmd.addParam("Oper",RSDBP_IN,{oper});             
+        cmd.addParam("RetValue",             RSDBP_OUT, V_STRING,1024);             
+
+        cmd.execute();
+
+        ErrorMessage = cmd.Param("RetValue").value; 
+        return (index(ErrorMessage, "no_error")!=0); 
+
+    end; 
+                               
+
+    macro OprGetErrorMsg(packid)
+
+       if (err_init == false)
+          err_init = true;
+          cmd = RSDCommand("select up.paymentid, up.ndoc, up.payeracc, up.receiveracc, up.amount, "+
+                           "'ошибка \"'||ud.error_text||'\" в проводке #'||ud.num_doc||' Дт '|| ud.PAYER_ACCOUNT||' Кт '||ud.RECEIVER_ACCOUNT||' на сумму '||ud.sum error_text "+
+                           "from usr_pmdocs ud, usr_payments_log up where ud.autokey = 0 and up.paymentid = ud.paymentid and up.pack_id = ? and ud.error_text <> 'no_error'");
+
+          cmd.addParam("PackID",RSDBP_IN,  packid);
+          err_rs = RSDRecordset(cmd);
+       end;
+
+       if (err_rs.MoveNext)
+          PaymentID      = err_rs.value("paymentid");
+          PayerAccount   = err_rs.value("payeracc");
+          ReceiverAccount= err_rs.value("receiveracc");
+          NumDoc         = err_rs.value("ndoc");
+          DebetSum       = err_rs.value("amount");
+          OprErrMsg      = err_rs.value("error_text");
+          return true;
+       else
+          return false;
+       end;
+    end;
+
+End;

@@ -1,0 +1,296 @@
+/*Макрос печати отчета по закрытым счетам.            */
+/*Гогильчин А.В  R-Style Ukraine, Kiev 07.08.2008     */
+/*Версия 1.0                                          */
+
+import globals, oralib, bankinter, "KeyCodes.mac", repforms, likePy, xlrep, PTInter;
+
+record Department ("dp_dep.dbt");
+
+var path = "",
+    pathfile = "",
+    filen = "RSU.lbr";
+
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+pathfile = FindPath(filen,path);
+	if (not pathfile)
+		msgbox("Не найдена LBR");
+		exit();
+	end;
+
+var dlg = TRecHandler("closeAcc",pathfile,True);
+
+record superior(ptoffice);
+record officet(ptoffice);
+
+var toExcel    = False,
+    Date_Begin = {curdate},
+    Date_End   = {curdate},
+    mask_RUR   = "",
+    mask_CUR   = "",
+    rselect = "";  
+   
+
+Private macro PrintHead(_beginDate, _EndDate)
+[                       Сведения о закрытых рублевых расчетных(текущих), бюджетных и валютных счетах 
+
+                            за период с ########### по ###########
+                             
+ ┌─────┬───────────────────────┬────────────────────┬────────────┬─────────────────────┬───────────────┬─────────────┐
+ │  №  │ Наименование юр. лица │ Юридический адрес. │  Вид счета │    Номер счета      │ Дата закрытия │ Код клиента │
+ │ п.п.│  и иной организации   │        ИНН         │            │                     │               │             │
+ ├─────┼───────────────────────┼────────────────────┼────────────┼─────────────────────┼───────────────┼─────────────┤
+](trim(string(_BeginDate)):c, trim(string(_EndDate)):c);
+end;
+
+private macro PrintLine(_Nr, _clientName, _INN, _accountType, _account, _closeDate:date, _code)
+
+[│#####│ ##################### │ ################## │############│#####################│###############│#############│
+ │     │                       │                    │            │                     │               │             │
+](_Nr:c, _clientName:w, _INN:w, _accountType:c:w, _account:c:w, trim(string(_closeDate)):c, _code);
+end;
+
+Private macro PrintBottom()
+[└─────┴───────────────────────┴────────────────────┴────────────┴─────────────────────┴───────────────┴─────────────┘
+]
+end;
+
+private macro GetResultGrid(AccRurList, AccCurList, DateBegin, DateEnd);
+  private macro MakeStr(str:string): string;
+
+    if (strlen(str) == 0)
+       return "NULL"
+    else 
+       /*Пробелы заменим на запятые */
+       str = StrSubst(str, ", ", ",");
+       str = StrSubst(str, " ", ",");
+       /*уберем повторяющеися запятые*/
+       while (index(str,",,") != 0)
+          str = strSubst(str, ",,", ",");
+       end;
+       /*расставим кавычки*/
+       str = strSubst(str, ",", "','");
+       str = "'"+str+"'";
+
+       return(str);
+    end;
+  end;
+   var rs:object = NULL;
+   var Query = "";
+   query = 
+           "select distinct client.t_name,\n" +
+           "                client.t_partyid,\n" + 
+           "                'ИНН ' || (select t.t_code\n" + 
+           "                             from dobjcode_dbt t\n" + 
+           "                            where t.t_objectid = accs.t_client\n" + 
+           "                              and t.t_codekind = 16\n" + 
+           "                              and t.t_state = 0) as INN,\n" + 
+           "                accs.t_type_account,\n" + 
+           "                accs.t_account,\n" + 
+           "                accs.t_close_date,\n" + 
+           "                (select t.t_code\n" + 
+           "                   from dobjcode_dbt t\n" + 
+           "                  where t.t_objectid = accs.t_client\n" + 
+           "                    and t.t_codekind = 1\n" + 
+           "                    and t.t_state = 0) as clientCode\n" + 
+           "  from (select *\n" + 
+           "          from daccount_dbt acc\n" + 
+           "         where acc.t_balance in\n" + 
+           "               ("+makeStr(AccRurList)+")\n" + 
+           "        UNION ALL\n" + 
+           "        select *\n" + 
+           "          from daccount$_dbt accv\n" + 
+           "         where accv.t_balance in\n" + 
+           "               ("+makeStr(AccCurList)+")) accs\n" + 
+           " inner join dparty_dbt client on accs.t_client = client.t_partyid\n" + 
+           " where accs.t_close_date between '"+trim(string(datebegin))+"' and '"+trim(string(dateEnd))+"'\n"; 
+   if (OperSelect != "")
+     query = query +
+           "   AND accs.t_oper like '"+OperSelect+ "'\n";
+   end;
+     query = query +
+           " order by clientcode asc";
+
+   rs = execSQLSelect(query);
+//   getstring(query);
+//   debugbreak;
+   if (rs and rs.movenext())
+      return rs;
+   else 
+      return NULL;
+   end;
+
+   OnError(Err)
+     MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module);
+end;
+
+private macro PrintItAll()
+
+  /*переменные для шаблона .xlt*/
+  var Template:string = "closeacc.xlt";
+  var Rep:object = NULL ;
+  var RegParam:string = "";
+
+  var grid: object = Null;
+  var Number = 0;
+  var Next = true;
+
+  private macro ТипСчета(Str:string):string
+     var rs:object = NULL;
+     var next = TRUE;
+     var Query = "";
+     var result = "";
+     query = 
+             "select tac.*\n" +
+             "  from dtypeac_dbt tac\n" + 
+             " where tac.t_inumtype = 1\n" + 
+             "   and instr('"+trim(str)+"',tac.t_type_account) != 0";
+
+     rs = execSQLSelect(query);
+
+     while (rs.movenext())
+        result = result +" "+ rs.value("t_name_type");
+     end;
+
+     return result;
+
+     OnError(Err)
+       MsgBox(Err.Message,"| at ",Err.Line,"|in ",Err.Module);
+  end;
+
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,RegParam);
+  Template = regparam + "\\cb\\" + Template;
+  grid = GetResultGrid(mask_RUR, mask_CUR, date_Begin, Date_end);
+
+  if (Valtype(grid) == V_UNDEF)
+     PrintLn("\t\t\tНет данных для отчета");
+  else 
+     if (not toExcel)
+        printHead(date_begin, date_end);
+        while (next)
+           number = number + 1;
+           printline(number,  grid.value("t_name"), grid.value("INN"), ТипСчета(grid.value("t_type_account")), 
+                     grid.value("t_account"), grid.value("t_close_date"), grid.value("clientCode"));
+           next = grid.movenext();
+        end;
+        printBottom;
+     else
+
+        Rep = CExcelRepMaker(Template);
+        while (next)
+           Rep.WriteReportRow(number, grid.value("t_name"), grid.value("INN"), ТипСчета(grid.value("t_type_account")), 
+                        string(grid.value("t_account")), date(grid.value("t_close_date")), grid.value("clientCode"));
+           next = grid.movenext();
+        end;
+
+        Rep.TransferReportData("DATARANGE");
+        Rep.DefaultPaintRange("DATARANGE", Rep.RowsWritten);
+        Rep.WriteReportRow(date_begin);
+        Rep.TransferReportData("date_begin");
+        Rep.DefaultPaintRange("date_begin",1);
+        Rep.WriteReportRow(date_end);
+        Rep.TransferReportData("date_end");
+        Rep.DefaultPaintRange("date_end",1);
+        Rep.axExcel.Visible = true;
+        Rep.axExcel.WindowState = xlWindowMaximized;
+
+        Println("\tОтчет отправлен в Excel...");
+     end;
+  end;
+
+end;
+
+/*Обработчик диалоговой панели ввода исходных данных для печати*/
+MACRO Event (dlg, cmd, id, key)
+
+   var mess = "~F2~ Продолжить ~ESC~ Выход ";
+   var PartyID:integer = {OurBank};
+   var OrgDate:date = {curdate} + 1;
+   var NoChangeDate:bool = false;
+
+   if(cmd == DLG_INIT)
+      dlg.rec.Date_report_begin = {curdate}-1;
+      dlg.rec.Date_report_end   = {curdate}-1;
+      dlg.rec.output            = "текст";
+      dlg.rec.account_RUR       = "40106, 40107, 40203, 40206, 40502, 40503, 40602, 40603, 40701, 40702, 40703, 40802, 40804, 40805";
+      dlg.rec.account_CUR       = "40502, 40503, 40602, 40603, 40701, 40702, 40703, 40802, 40807";
+      dlg.rec.oper     = "";
+      dlg.rec.opername = "все операциониты";
+      UpdateFields(dlg); 
+   end;
+   if (cmd==DLG_SETFOCUS)
+       message(mess);
+   end;
+   
+   if (cmd == DLG_REMFOCUS)
+       if (FldName(dlg,id)=="Date_report_begin")
+          if ( dlg.rec.Date_report_begin > dlg.rec.Date_report_end ) 
+             MsgBox("Дата начала больше даты окончания отчетного периода");
+             return CM_CANCEL;
+          elif ( dlg.rec.Date_report_begin > {curdate} )
+             MsgBox("Дата начала больше даты текущего операционного дня"); 
+             return CM_CANCEL;
+          end;
+       elif (FldName(dlg,id)=="Date_report_end") 
+          if (dlg.rec.Date_report_end < dlg.rec.Date_report_begin )
+             MsgBox("Дата окончания меньше даты начала отчетного периода"); 
+             return CM_CANCEL;
+          elif ( dlg.rec.Date_report_end > {curdate} )
+             MsgBox("Дата окончания больше даты текущего операционного дня");
+             return CM_CANCEL;
+          end;
+        end;
+      UpdateFields(dlg);
+   end; 
+
+   if (cmd==DLG_KEY)
+       if (KEY==KEY_ESC)
+           return exit(1);
+       elif (KEY==KEY_SPACE)
+          if (FldName(dlg,id) == "output")
+              if (dlg.rec.output == "Excel")
+                 dlg.rec.output =  "текст";
+              else
+                 dlg.rec.output = "Excel";
+              end;
+          end;
+       elif (KEY == KEY_F3)
+         if(FldName(dlg,id) == "oper")
+              rselect = "select t.t_oper, t.t_name " +   
+                        " from dperson_dbt t inner join ddp_dep_dbt v on v.t_name = '000' and t.t_codedepart = v.t_code;";
+   
+              cmd = RSDCommand(rselect);
+              rsrec = RSDRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+              if (RunScroll(rsrec, 0, 0, "Опера", @EvProc, "Список операционистов", "~Enter~ выбор сотрудника ~Esc~ выход", true))
+                dlg.rec.oper = rsrec.value (0);
+                dlg.rec.OperName = rsrec.value (1);
+                UpdateFields(dlg);
+                OperSelect = rsrec.value (0);
+              end;
+         end;
+
+       elif ( KEY==KEY_F2 )
+             Date_begin = dlg.rec.Date_report_begin;
+             Date_end   = dlg.rec.Date_report_end;
+             mask_RUR   = dlg.rec.account_RUR;
+             mask_CUR   = dlg.rec.account_CUR;
+             toExcel = ifThenElse(dlg.rec.output == "Excel", TRUE, FALSE);
+             /*02/09/2008 Новиков С. С. добавил возможность формирования отчета только при корректных значениях*/
+             if ((Date_begin <= Date_end) and (Date_begin <= {curdate})
+                and (Date_end >= Date_begin) and (Date_end <= {curdate}) ) 
+               Return CM_SAVE;
+             else
+               MsgBox("Не все поля корректны!");
+             end;
+             /***************************************************************************************************/
+       
+             
+       elif ( (KEY==KEY_ENTER) and (FldName(dlg,id)=="output") )
+          SetFocus(dlg, 0);
+          Return CM_IGNORE;
+       end;
+   end;
+END;
+
+if ( RunDialog(dlg, "Event"))
+   printItAll();
+end;

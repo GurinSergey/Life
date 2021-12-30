@@ -1,0 +1,378 @@
+//*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : rejectFromBranch.mac v.1                                     */
+/*  Created     : 16.11.2015                                                   */
+/*  Programmer  : Ващенко Д.Н.                                                 */
+/*  Description : Макрос отзыва документов КОР и К1 в филиале пользователя     */
+/*  Изменен     :                                                              */
+/*******************************************************************************/
+
+import oralib,
+       rcw,
+       globals, 
+       PaymInter, 
+       pm_setst, 
+       cbsttls,
+       catfdoc,
+       opr_engine,
+       keyCodes,
+       ldmklbr;
+
+private class Payment()
+   private var payment : rsbPayment;
+   private var carry   : rsbAccTransaction; 
+   private var sfContrId;
+   private var account;
+   private var operationId = 0;
+   private var maxIdStep   = 0;
+   private var link; 
+
+   macro init( v_paymentId, v_account, v_link )
+      file operation( oproper ) key 1;       
+      link                 = v_link;
+
+      payment              = rsbPayment( v_paymentId );
+      account              = v_account;
+      payment.valueDate    = {curdate};
+
+      operation.DOCUMENTID = string( int( payment.paymentid ) : 34 : o );;
+      operation.DOCKIND    = payment.docKind;
+
+      if( getEQ( operation ) ) operationId = operation.ID_OPERATION; end;
+
+      private var cmd = execSQLselect( " SELECT MAX (T_ID_STEP) MAXSTEP FROM doprstep_dbt WHERE T_ID_OPERATION = :idop AND T_ISEXECUTE != chr(0) ", makeArray( sqlParam( "idop", operationId ) ) );     
+      if( cmd.moveNext() ) maxIdStep = int( cmd.value( "MAXSTEP" ) ); end; 
+   end;
+
+   private macro chechForTransferPayment()
+      return execSQLselect( " SELECT   1 "
+                            "   FROM   " + link + ".DPMPAYM_DBT PAYM, " + link + ".USR_TRANSFER_LOG LOG " 
+                            "  WHERE   PAYM.T_PAYMENTID = LOG.T_PAYMENTID "
+                            "          AND LOG.T_DEPPAYMENTID = " + payment.paymentId ).moveNext(); 
+   onError 
+      return false;
+   end;
+
+   private macro setValueDate( v_valueDate )
+       execSQL( "UPDATE DPMPAYM_DBT SET T_VALUEDATE = :valueDate WHERE T_PAYMENTID = :paymentId", makeArray( sqlParam( "valueDate", v_valueDate ),
+                                                                                                             sqlParam( "paymentId", payment.paymentId ) ) ); 
+   end;
+
+   private macro setPayerAmount( v_amount )
+       execSQL( "UPDATE DPMPAYM_DBT SET T_AMOUNT = :payerAmount WHERE T_PAYMENTID = :paymentId", makeArray( sqlParam( "valueDate", v_amount ),
+                                                                                                            sqlParam( "paymentId", payment.paymentId ) ) ); 
+   end;
+
+   private macro setTransferDate( v_transferDate )
+       execSQL( "UPDATE DPMPROP_DBT SET T_TRANSFERDATE = :valueDate WHERE T_PAYMENTID = :paymentId AND T_DEBETCREDIT = 1", makeArray( sqlParam( "valueDate", v_transferDate ),
+                                                                                                                                      sqlParam( "paymentId", payment.paymentId ) ) ); 
+   end;
+
+   private macro saveLogError( errmsg )
+      var cmd =  rsdCommand( " BEGIN " + link + ".USR_TRANSFERFROMBRANCH.saveLogError( :account, :type, :errmsg ); END; " );
+      cmd.addparam( "account", RSDBP_IN, account           );
+      cmd.addparam( "type",    RSDBP_IN, payment.paymentId );
+      cmd.addparam( "errmsg",  RSDBP_IN, errmsg            );
+      cmd.execute();
+   end;
+
+   private macro makkeCarry() 
+      setValueDate( {curdate} );
+
+      carry = payment.makeTransaction();      
+
+      carry.id_operation    = operationId;
+      carry.id_step         = maxIdStep;
+      carry.chapter         = 3;                                            
+      carry.date_Carry      = {curdate};
+      carry.number_Pack     = payment.numberPack;
+      carry.numb_Document   = payment.number;
+      carry.kind_Oper       = " 1";
+      carry.shifr_Oper      = "09";
+      carry.department      = payment.department;
+      carry.fiId            = 0;
+      carry.accountPayer    = notBalCorrAcc_FirstDoc( "П" ).findAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+
+      /**
+        * Платеж Картотеки ОР
+       */
+
+      if( payment.shifrOper == "06" )
+         sfContrID = PM_GetSfContrID( payment );
+         if( sfContrID == 0 ) runError( "Не найден договор обслуживания счета плательщика." ); end; 
+ 
+         carry.accountReceiver = tIndexWPPrimDoc( sfContrId, payment.paymentId ).findAndOpenSysAccount( "Карт ОР", isOprMultiExec() );
+         carry.Ground          = "Отзыв с картотеки ОР документа № " + payment.number + " от " + payment.Date + " к счету " + payment.payerAccount;
+         carry.resultCarry     = 76;
+         carry.sum             = payment.futureReceiverAmount;
+
+         if( payment.docKind != PS_INRQ ) carry.sum = carry.sumPayer = carry.sumReceiver = payment.futurePayerAmount; end;
+
+      /**
+        * Платеж Картотеки 1
+       */     	
+
+      elif( payment.shifrOper == "02" )
+
+         carry.accountReceiver = paymIndex1_firstDoc( payment.paymentId ).findAndOpenAccount( "Картотека 1", 0, payment.payerBankEnterDate );
+         carry.Ground          = "Отказ от акцепта документа № " + payment.number + " от " + paymIndex1_firstDoc( payment.paymentId ).GetDate() + " к счету " + payment.payerAccount;
+         carry.resultCarry     = 49;
+         carry.sum             = payment.denialAmount;
+
+         /**
+           * Сумма к оплате в платеже 0
+          */
+
+         setPayerAmount( 0 );
+
+         /**
+           * ДПП
+          */
+
+         setTransferDate( pmGetDefaultOutTransferDate( payment ) );
+ 
+      end;
+
+      if( not carry.carry() ) runError( "Ошибка при актуализации платежа" ); end;
+   end;
+
+   private macro rejectChange()
+      var imode = setDialogFlag( 0 );
+
+      rslDefCon.BeginTrans();
+      var stat = PM_RollbackStep( payment.paymentId, operationId, maxIdStep );
+
+      setDialogFlag( imode );
+      if( not stat ) saveLogError( getErrMsg ); end;
+
+      setPayerAmount( payment.futurePayerAmount );
+
+      rslDefCon.CommitTrans();
+   onError ( e )
+      if ( rslDefCon.IsInTrans() ) rslDefCon.RollbackTrans(); end;   
+      saveLogError( e.message );
+   end;
+
+   private macro closeDoc()  
+      if( operationId == 0 ) runError( "Не найдена операция по платежу" ); end;         
+
+      opr_engine.change_opr_stat      ( 291,       3,                 maxIdStep,   operationId );
+      opr_engine.execute_step         ( maxIdStep, operationId                                 );
+      opr_engine.change_payment_status( 32000,     payment.paymentId, operationId, maxIdStep   );
+
+      var cmd = RsdCommand( " BEGIN ? := ps_payord.changePayOrderStatus( :paymentid, :status, :operationId, :idStep, :oper, 'X' ); END; " );
+          cmd.addParam( "", RSDBP_OUT, V_INTEGER         );
+          cmd.addParam( "", RSDBP_IN,  payment.paymentId );
+          cmd.addParam( "", RSDBP_IN,  15                );
+          cmd.addParam( "", RSDBP_IN,  operationId       );
+          cmd.addParam( "", RSDBP_IN,  maxIdStep         );
+          cmd.addParam( "", RSDBP_IN,  {oper}            );
+          cmd.execute();
+   end;
+
+   macro reject()
+      if( not chechForTransferPayment() ) runError( "Документ ещё не перенесен. Id: " + payment.paymentId ); end;
+
+      closeDoc(); 
+      makkeCarry();
+      saveLogError( "Документ отозван с картотеки. Id: " + payment.paymentId );
+
+    onError( e )
+      rejectChange();
+      saveLogError( e.message );
+   end;
+
+end;
+
+private class UtilCardFile()
+   private var repName = GetTXTFileName( "rejectDocuments" );
+   private var countAccounts;
+   private var branch;
+   private var typeCardFile;
+   private var link = "RSBANK_EVS";
+
+   macro init( v_branch, v_typeCardFile, v_test )
+      branch        = v_branch;
+      typeCardFile  = v_typeCardFile;
+
+      if( v_test ) link = "RSSAR_TEST"; end;
+
+   end;
+
+   macro printErrors()
+      setOutput( repName, false ); 
+      private var errorsRSet = execSQLselect( " SELECT   nvl(PMPROP.T_NUMBER,         ' ') T_NUMBER, "
+                                              "          PMPROP.T_DATE                     T_DATE,"
+                                              "          nvl(PAYM.T_PAYERACCOUNT,     ' ') T_PAYERACCOUNT, "
+                                              "          nvl(PAYM.T_RECEIVERACCOUNT,  ' ') T_RECEIVERACCOUNT, "
+                                              "          nvl(PAYM.T_FUTUREPAYERAMOUNT, 0 ) T_AMOUNT, "
+                                              "          RECALL.T_ERRORTXT "
+                                              "   FROM   " + link + ".USR_TRANSFERACCDATA_RESULT_TMP RECALL, "
+                                              "          DPMRMPROP_DBT PMPROP, "
+                                              "          DPMPAYM_DBT PAYM "
+                                              "  WHERE   RECALL.t_actiontype = PMPROP.T_PAYMENTID(+) "
+                                              "          AND RECALL.t_actiontype = PAYM.T_PAYMENTID(+) "
+                                              "          AND LENGTH(RECALL.t_actiontype) > 2 " ); 
+
+            [                                                     Отзыв из картотеки. Результат
+              ┌─────────┬──────────────────┬──────────────────────────┬─────────────────────────┬─────────────────────┬─────────────────────────────────────────────────┐
+              │    №    │       Дата       │     Счет плательщика     │     Счет получателя     │    Сумма платежа    │                    Результат                    │ 
+              ├─────────┼──────────────────┼──────────────────────────┼─────────────────────────┼─────────────────────┼─────────────────────────────────────────────────┤ ]; 
+
+        while( errorsRSet.movenext )
+            [ │ ####### │ ################ │ ######################## │ ####################### │ ################### │ ############################################### │ ]
+            ( errorsRSet.value( "T_NUMBER" ):c, date( errorsRSet.value( "T_DATE" ) ):c, errorsRSet.value( "T_PAYERACCOUNT" ), errorsRSet.value( "T_RECEIVERACCOUNT" ), errorsRSet.value( "T_AMOUNT" ), errorsRSet.value( "T_ERRORTXT" ):w );
+        end;
+            [ └─────────┴──────────────────┴──────────────────────────┴─────────────────────────┴─────────────────────┴─────────────────────────────────────────────────┘ ];
+ 
+      setOutput( null, false );
+      viewFile( repName );
+   end;
+
+   macro makeReject()  
+
+      private var conformityAccTable = execSQLselect( " SELECT COUNT(*) T_CNT FROM " + link + ".USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = :branch", makeArray( sqlParam( "branch",  branch ) ) );
+      conformityAccTable.moveNext();
+      countAccounts = int(conformityAccTable.value( "T_CNT" ) );
+
+      conformityAccTable = execSQLselect( " SELECT * FROM " + link + ".USR_CONFORMITY_ACC_TABLE_DBT WHERE T_BRANCH = :branch", makeArray( sqlParam( "branch",  branch ) ) );
+
+      private var payments;
+      private var curPayment;
+      private var oldAcc;
+ 
+      private var i = 0;
+
+      execSQL( " DELETE FROM " + link + ".USR_TRANSFERACCDATA_RESULT_TMP " );
+
+      initProgress( countAccounts, "Отзыв картотеки", "Отзыв картотеки" );
+
+      while( conformityAccTable.moveNext() ) 
+         oldAcc = conformityAccTable.value( "T_ACCOUNT_BRANCH" );
+ 
+         if   ( typeCardFile == 0 )
+            payments = execSQLselect( " SELECT * FROM DPMPAYM_DBT WHERE T_PAYERACCOUNT = :ACC AND T_PAYMSTATUS = 2100 AND T_DOCKIND = 201 ", makeArray( sqlParam( "ACC", oldAcc ) ) );
+         elif ( typeCardFile == 1 )
+            payments = execSQLselect( " SELECT * FROM DPMPAYM_DBT WHERE T_PAYERACCOUNT = :ACC AND T_PAYMSTATUS = 1000 AND T_PAYMENTID IN "
+                                      "(SELECT T_ORDERID FROM DPSPAYORD_DBT WHERE T_ORDERID = T_PAYMENTID AND T_CURRENTSTATE = 3) ", makeArray( sqlParam( "ACC", oldAcc ) ) );
+         end;
+
+         while( payments.moveNext() )
+            curPayment = Payment();
+            curPayment.init( payments.value( "t_paymentid" ), oldAcc, link );
+            curPayment.reject();                                    
+         end;
+
+         i = i + 1;
+         useProgress( i );
+      end;
+
+      remProgress;      
+   end;  
+end; 
+ 
+class ( TRecHandler ) Form ( lbrName )    
+  InitTRecHandler( "reject", ( lbrName ), true ); 
+
+  var typeCardFile = 0;
+  var branch;
+  var test;
+  var thisName = lbrName;
+
+  macro handler( dlg, cmd, id, key ) 
+     Array menuItem; 
+
+     if( ( cmd == DLG_KEY ) and ( KEY == KEY_F2) )
+        if( inList("", dlg.( "documents" ), dlg.( "branch" ) ) ) 
+           msgBox( "Заданы не все параметры!" ); 
+           return;
+        end;
+
+        if( not execMacroFile("loadConformityTable.mac", "conformityTableEditor", branch ) ) return; end;  
+
+        var cardFile = UtilCardFile();
+            cardFile.init( branch, typeCardFile, test );
+            cardFile.makeReject ();
+            cardFile.printErrors();                                                  
+
+     elif( ( cmd == DLG_KEY ) and ( KEY == KEY_F3 ) )
+ 
+        if( id == FldIndex( "documents" ) )        
+           menuItem( 0 ) = "Картотека ОР";
+           menuItem( 1 ) = "Картотека №1";
+
+           typeCardFile = menu( menuItem, "Документы", "Документы" );
+           typeCardFile = ifThenElse( typeCardFile == -2, 0, typeCardFile );
+           dlg.( "documents" ) = menuItem( typeCardFile );                      
+        end;                                                                                                                  	  
+
+        if( id == FldIndex( "branch" ) )        
+           menuItem( 0 ) = string( "ЭВ-Ставрополь" : 20 );
+           menuItem( 1 ) = string( "ЭВ-Воронеж"    : 20 );
+           menuItem( 2 ) = string( "ЭВ-Волгоград"  : 20 );
+
+           branch = menu( menuItem, "Выберите филиал", "Филиал" );
+           branch = ifThenElse( branch == -2, 0, branch );
+           dlg.( "branch" ) = menuItem( branch );                      
+        end;
+     elif( ( cmd == DLG_KEY ) and ( KEY == KEY_SPACE ) )
+        if( id == FldIndex( "test" ) )        
+           menuItem( 0 ) = string( "Нет" : 15 );
+           menuItem( 1 ) = string( "Да"  : 15 ); 
+
+           test = menu( menuItem, "Тестирование", "Тестирование" );
+           test = ifThenElse( test == -2, 0, test );
+           dlg.( "test" ) = menuItem( test );
+        end;
+     end;
+  end;         
+
+  macro run()
+    return RunDialog( this, R2M ( this, "Handler" ) );
+  onError
+    delFile( thisName );
+  end;
+End; 
+
+macro createForm()
+    private var fullOutputLbr, 
+                outPutLbr = "reject.lbr", 
+                outLbr, 
+                lbr, 
+                rc,                                                                                                	
+                elem;
+
+    GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR",V_STRING, outLbr );
+    fullOutputLbr = outLbr + "\\" + outPutLbr;
+    lbr = TLbrFile( fullOutputLbr, "C" );
+
+    rc = lbr.AddPanel( "reject", 40, 14, 29, 4, lbr.EColour.SHLP, lbr.EFRame.UNARY );
+    rc.title = "Отзыв документов в филиале"; 
+    
+    elem = rc.addFrame(  0, 0, 29, 6, 2 );
+    elem = rc.addLabel(  1, 1, "Документы: " );
+    elem = rc.addField( 12, 1, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "documents", 15, 1, 15 );
+
+    elem = rc.addLabel(  1, 2, "Филиал: " );
+    elem = rc.addField( 12, 2, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "branch", 15, 1, 20 );
+
+    elem = rc.addLabel(  1, 4, "Тестирование: " ); 
+    elem = rc.addField( 22, 4, lbr.EFieldType.VIEW, lbr.EFocus.YES, lbr.EDataType.V_STRING, "test", 5, 1, 5 );
+
+    lbr.save(); 
+    lbr = null;
+
+    return fullOutputLbr;
+end;           
+
+/***************************************************************************/
+
+private var parm = Form( createForm() );  
+parm.run();
+exit( 1 );
+
+
+
+
+    

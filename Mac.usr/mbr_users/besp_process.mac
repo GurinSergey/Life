@@ -1,0 +1,443 @@
+/* MEV, RSSL, 03/06/2009, 4PRBB
+ * Обработка рейсов входящих сообщений по транспорту УФЭБС (БЭСП)
+ * Каждому рейсу соответствует вложенная папка внутри основной.
+ *
+ * Настройки читаются из реестра (ветка PRBB\\BESP). Если какая-либо настройка не задана, используются значения
+ * по умолчанию, указанные в макросе
+ **************************************************************************************************
+ * Порядок инсталляции:
+ * 1. Создать модуль пользователя (макрос, отчёт) для МБР, использующий макрос besp_process.mac.
+ * 2. Включить в меню пользователю системный модуль МБР с номером 2140 (генерация учётных объектов по сообщениям)
+ *    Если этот шаг не выполнять, на 2029 107 не зовётся модуль 2140 из макроса, т.е. не запускается автоматом
+ *    генерация платежей после загрузки сообщений.
+ * 3. Включить в меню пользователя пользовательский модуль МБР, описанный в п.1.
+ * 4. Для действующего по умолчанию формата транспорта УФЭБС на закладке "Импорт" поставить вид действия после 
+ *    обработки - "Удалить".
+ * 5. Настроить параметры работы процедуры в реестре: PRBB\BESP.
+ * 6. Выключить показ проводок. ГКБО, Справочники\Операции\Виды операций, 24001, Ctrl+S, установить отметку для 
+ *    операционистов, запускающих загрузку рейсов.
+ * 7. Можно пользоваться.
+ */
+import BankInter, rsexts, MesInter, WldInter, globals, rsd, oralib, CTInter, "timestat.mac";
+import "lib_registry.mac";
+private const  BASE_PATH_MCI = "$C:\\RSPAR\\MCI\\", 
+            DEFAULT_FILE_MASK = "044525000_30101810600000000986*.xml",
+            DEFAULT_SERVER_TMP_DIR = "",
+            RACE_1_PATH = "1\\",
+            RACE_2_PATH = "2\\",
+            RACE_3_PATH = "3\\",
+            RACE_4_PATH = "4\\",
+            RACE_5_PATH = "5\\";
+
+private var    DIR_RACE_1, DIR_RACE_2, DIR_RACE_3, DIR_RACE_4, DIR_RACE_5, DIR_BASE_MCI, RACE_FILE_MASK, SERVER_TMP_FOLDER;
+private var    racesFound = false;;
+
+private macro LogError(Category, Message)
+   println(Category, ": ", Message);
+end;
+
+private macro normalizePath(path)
+    if (SubStr(path, StrLen(path), 1)!="\\")
+      path = path + "\\";
+    end;
+    return path;
+end;
+
+private macro getSetting(regkey, defaultPath)
+   var regval:string, error;
+
+   GetRegistryValue(regkey, V_STRING, RegVal, error );
+    
+   if(( error != 0) or ((error==0) and (trim(RegVal)=="")))
+      LogError("Предупреждение", "Не найдено значение настройки реестра "+regkey+". Установлено значение: "+defaultPath);
+      RegVal = defaultPath;
+   end;
+
+   return RegVal;
+end;
+
+private macro readSettings()  /* Считать параметры из реестра */
+   DIR_BASE_MCI   = normalizePath(getSetting("PRBB\\BESP\\BASE_PATH", BASE_PATH_MCI));
+   DIR_RACE_1     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\BESP\\RACE_1_PATH", RACE_1_PATH));
+   DIR_RACE_2     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\BESP\\RACE_2_PATH", RACE_2_PATH));
+   DIR_RACE_3     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\BESP\\RACE_3_PATH", RACE_3_PATH));
+   DIR_RACE_4     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\BESP\\RACE_4_PATH", RACE_4_PATH));
+   DIR_RACE_5     = DIR_BASE_MCI + normalizePath(getSetting("PRBB\\BESP\\RACE_5_PATH", RACE_5_PATH));
+   if (not (SERVER_TMP_FOLDER = RSL_GetRegistryValue("PRBB/BESP/SERVER_DIR", true)))
+       exit();
+   end;
+   SERVER_TMP_FOLDER = normalizePath(SERVER_TMP_FOLDER);
+   //SERVER_TMP_FOLDER = normalizePath(getSetting("PRBB\\BESP\\SERVER_DIR", DEFAULT_SERVER_TMP_DIR));
+   
+   RACE_FILE_MASK  = getSetting("PRBB\\BESP\\FILE_MASK", DEFAULT_FILE_MASK);
+end;
+
+private var FileNamesArray;
+
+private macro CreateFileList(FileNamesArray:TArray, SourceFilesPath:string);
+    var i = 0, DirList;
+
+    DirList = TDirList(SourceFilesPath + RACE_FILE_MASK);   
+   
+    while (i < DirList.Count)
+        if (StrLen(DirList.Name(i)) > 10)
+            FileNamesArray(FileNamesArray.Size()) = DirList.Name(i);
+        end;
+        i = i + 1;
+    end;   
+end;
+
+/* Проверить наличие файлов в папке рейса */
+private macro isFilesExist(Folder)
+   var filesFound = false; 
+   
+   FileNamesArray = null;
+   FileNamesArray = TArray();
+    
+    CreateFileList(FileNamesArray, Folder);
+    if (FileNamesArray.Size()>0)
+      filesFound = true;
+    end;
+    return filesFound;
+end;
+
+private macro DateToStr(IDate, delim:string)
+    var day, month, year;
+    
+    if (ValType(delim)==V_UNDEF)
+      delim = "";
+    end;
+    if ((ValType (IDate) == V_UNDEF) or (IDate == Date (0,0,0)))
+        return "00000000";
+    end;
+    DateSplit (IDate, day, month, year);
+    if (day < 10)
+        day = String ("0"+day);
+    else
+        day = String (day);
+    end;
+    if (month < 10)
+        month = String ("0"+month);
+    else
+        month = String (month);
+    end;
+    return String (day+delim+month+delim+year);
+end;
+
+
+private macro sqlTime2Time(sqlDate:variant):time
+  var dt:date, tm:time;
+  DtTmSplit( sqlDate, dt, tm );
+  if(tm == NULL)
+    dt = time(12,0,0);
+  end;
+  return tm;
+end;
+
+private macro printHead(SrcFileName)
+   var cmd, sql, rs, hasData = false;
+   sql = "select seance.t_sysdate seance_date, seance.t_systime seance_time, seance.t_numberrace num_race, 'Дата пакета ЭД' carry_date,";
+    sql = sql+"   seance.t_filename seance_filename, seance.t_sessuid packed_epd_no, seance.t_bankdate packet_epd_date";
+    sql = sql+"     from dwlsess_dbt seance";
+    sql = sql+"    where seance.t_filename = ?";
+
+   cmd = RsdCommand(sql);
+   cmd.addparam("filename", RSDBP_IN, SrcFileName);
+    rs = RSDRecordset(cmd);
+    if ((rs!=null) and (rs.movenext()))
+      hasData = true;
+[
+Загрузка сообщений из РЦ
+
+  Дата выполнения процедуры: ########## ########    Сеанс: #
+  Схема расчетов:            0  Основная: ОПЕРУ ГУ БАНКА РОССИИ
+  Корсчет, корреспондент:    30101810600000000986  044525000 ОПЕРУ ГУ БАНКА РОССИИ ПО Г.МОСКВЕ   г. МОСКВА 35
+  Дата проводки документов:  Дата пакета ЭД
+  Номер пачки документов:    ###
+
+ Файл загрузки: ########################################################################################################
+-T-----------T-------------------------------T--------------------------------T---T----------------T---------T-----------
+!│Формат ED  │ Реквизиты сообщения           │ Реквизиты исходного документа  │ № │ Сумма          │ БИК корр│ Примечание                                    
+-+-----------+-------------------------------+--------------------------------+---+----------------+---------+-----------
+  │PacketEPD  │#######   ##########           │                                │   │                │         │
+](DateToStr(sqlDate2date(rs.value("seance_date")),"."),sqlTime2Time(rs.value("seance_time")), rs.value("num_race"), 880+rs.value("num_race"), rs.value("seance_filename"), rs.value("packed_epd_no"), DateToStr(sqlDate2date(rs.value("packet_epd_date")), "."));
+    end;
+    return hasData;
+end;
+
+private var sess_count = 0, sess_sum = $0, race_count = 0, race_sum = $0;
+
+private macro DateFromStr(str)
+   var y, m, d;
+   y = int(SubStr(str, 1, 4));
+   m = int(SubStr(str, 6, 2));
+   d = int(SubStr(str, 9, 2));
+   return Date(d, m, y);
+end;
+
+private macro printTable(SrcFileName)
+   var cmd, sql, rs, stat, hasData = false, sum;
+
+   sql = "select t_numberpack, formnum,";
+    sql = sql+"          substr (eddate, eddate1 + 1, eddate2 - eddate1 - 1) eddat,";
+    sql = sql+"          substr (edauthor, edauthor1 + 1, edauthor2 - edauthor1 - 1) edauthor, substr (edno, edno1 + 1, edno2 - edno1 - 1) edno,";
+    sql = sql+"          substr (docno, docno1 + 1, docno2 - docno1 - 1) docno, substr (edsum, sum1 + 1, sum2 - sum1 - 1) edsum,";
+    sql = sql+"          substr (bic, bic1 + 1, bic2 - bic1 - 1) bic";
+    sql = sql+"     from (select t_numberpack, formnum, eddate,";
+    sql = sql+"                  instr (eddate, '\"', 1, 1) eddate1, instr (eddate, '\"', 1, 2) eddate2, edauthor,";
+    sql = sql+"                  instr (edauthor, '\"', 1, 1) edauthor1, instr (edauthor, '\"', 1, 2) edauthor2, edno, instr (edno, '\"', 1, 1) edno1,";
+    sql = sql+"                  instr (edno, '\"', 1, 2) edno2, docno, instr (docno, '\"', 1, 1) docno1, instr (docno, '\"', 1, 2) docno2, edsum,";
+    sql = sql+"                  instr (edsum, '\"', 1, 1) sum1, instr (edsum, '\"', 1, 2) sum2, bic, instr (bic, '\"', 1, 1) bic1,";
+    sql = sql+"                  instr (bic, '\"', 1, 2) bic2";
+    sql = sql+"             from (select pm.t_numberpack, substr (msg_parm.t_value, 2, instr (msg_parm.t_value, 'xml') - 2) formnum,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'eddate') + 6)) eddate,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'edno') + 4)) edno,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'edauthor') + 8)) edauthor,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'accdocno') + 8)) docno,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'sum') + 3)) edsum,";
+    sql = sql+"                          substr (msg_parm.t_value, (instr (lower (msg_parm.t_value), 'bank bic') + 3)) bic";
+    sql = sql+"                     from dwlsess_dbt seance,";
+    sql = sql+"                          dwlmes_dbt msg,";
+    sql = sql+"                          dwlmesval_dbt msg_parm,";
+    sql = sql+"                          dwlmeslnk_dbt lnk,";
+    sql = sql+"                          dwlpm_dbt wlpm,";
+    sql = sql+"                          dpmpaym_dbt pm";
+    sql = sql+"                    where seance.t_filename = ?";
+    sql = sql+"                      and msg.t_sessionid = seance.t_sessionid";
+    sql = sql+"                      and msg_parm.t_mesid = msg.t_mesid";
+    sql = sql+"                      and msg_parm.t_index = 1";
+    sql = sql+"                      and lnk.t_mesid = msg.t_mesid";
+    sql = sql+"                      and wlpm.t_wlpmid = lnk.t_objid";
+    sql = sql+"                      and lnk.t_objkind = 501";
+    sql = sql+"                      and pm.t_paymentid = wlpm.t_paymentid))";
+   
+   cmd = RsdCommand(sql);
+   cmd.addparam("filename", RSDBP_IN, SrcFileName);
+    rs = RSDRecordset(cmd);
+
+    sess_count = 0;
+    sess_sum = $0;
+
+    stat = ((rs!=null) and (rs.moveNext()));
+    while(stat)
+      sum = money(rs.value("edsum"))/100.0;
+[ │########## │########  ########## ##########│                                │###│################│#########│](
+   rs.value("formnum"),rs.value("edno"),DateToStr(DateFromStr(rs.value("eddat")), "."),rs.value("edauthor"),rs.value("docno"),sum:a,rs.value("bic")
+);
+      sess_count = sess_count + 1;
+      sess_sum = sess_sum + sum;
+      stat = rs.movenext();
+    end;
+[-+-----------+-------------------------------+--------------------------------+---+----------------+---------+-----------
+Обработка пакета завершена. Пакет загружен в систему.
+Итого по пакету:
+  Количество ЭД:                 ######  
+     Кол-во ответных документов: ######   Сумма:  #################
+     Рассмотрено подтверждений:   0
+](sess_count, sess_count, sess_sum:a);
+   race_count = race_count + sess_count;
+   race_sum = race_sum + sess_sum;
+end;
+
+private macro printSeanceReport(SrcFileName)
+   if (printHead(SrcFileName))
+      printTable(SrcFileName);
+   end;
+end;
+
+private macro closeReport()
+[
+ИТОГО ответных документов:
+ Всего в пакетах:    ######   Сумма: ##################
+ Успешно обработано: ######   Сумма: ##################
+](race_count, race_sum:r:a, race_count, race_sum:r:a);
+
+end;
+
+private macro printTotalReport(RaceNo)
+    var i = 0, SrcFileName;
+
+      race_count = 0;
+   race_sum = $0;
+
+    while (i < FileNamesArray.Size())
+        SrcFileName = SERVER_TMP_FOLDER + DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+       printSeanceReport(SrcFileName);
+       i = i+1;
+    end;
+    closeReport();   
+end;
+
+/*
+private macro updateSess(SrcFileName, RaceNo)
+    var cmd = RsdCommand("update dwlsess_dbt set t_numberrace = ? where t_filename = ? ");
+    cmd.addparam("raceno", RSDBP_IN, RaceNo);
+    cmd.addparam("filename", RSDBP_IN, SrcFileName);
+debugbreak;
+    cmd.execute();
+
+    return true;
+end;
+*/
+
+private macro updateSess(SrcFileName, RaceNo)
+    var cmd = RsdCommand("update dwlsess_dbt set t_numberrace = "+RaceNo+" where t_filename = '"+SrcFileName+"' ");
+//    cmd.addparam("raceno", RSDBP_IN, RaceNo);
+//    cmd.addparam("filename", RSDBP_IN, SrcFileName);
+debugbreak;
+    cmd.execute();
+
+    return true;
+end;
+
+
+/* передать все файлы рейса из локальной папки во временную папку на сервере */
+private macro copyAllFiles(From, To, RaceNo)
+    var i = 0, SrcFileName, TmpFileName;
+
+    while (i < FileNamesArray.Size())
+        SrcFileName = From + FileNamesArray(i);
+        TmpFileName = To + DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+
+        if (not CopyFile(SrcFileName, TmpFileName, true, FileNamesArray(i)))
+           LogError("!!!ОШИБКА", "Ошибка копирования файла " + SrcFileName + " в " + TmpFileName);
+        end;
+        i = i + 1;
+    end;
+end;
+
+private macro deleteAllFiles(From)
+    var i = 0, SrcFileName;
+
+    while (i < FileNamesArray.Size())
+        SrcFileName = From + FileNamesArray(i);
+       if (not RemoveFile(SrcFileName))
+         LogError("Предупреждение", "Файл "+SrcFileName+" не удалён!");
+       end;
+       i = i+1;
+    end;
+end;
+
+private macro setRaceNumInSess(RaceNo)
+    var i = 0, SrcFileName;
+
+    while (i < FileNamesArray.Size())
+       SrcFileName = SERVER_TMP_FOLDER + DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+       if (not updateSess(SrcFileName, RaceNo))
+          LogError("Предупреждение", "В сеансе загрузки из файла "+SrcFileName+" не удалось обновить номер рейса!");
+       end;
+       i = i+1;
+    end;
+end;
+
+
+private macro getsessnumbers(RaceNo)
+    var i = 0, SrcFileName;
+    var rs, sess="";
+
+    while (i < FileNamesArray.Size())
+
+       SrcFileName = SERVER_TMP_FOLDER + DateToStr({curdate})+"_"+string(RaceNo)+"_"+ FileNamesArray(i);
+       rs = RsdRecordset("select t_number from dwlsess_dbt where t_filename = '"+SrcFileName+"' and t_numberrace = "+RaceNo);
+       if (rs.movenext)
+          sess = sess + rs.value(0)+" ";
+       end;
+       i = i + 1;
+    end;
+
+    return sess;
+
+end;
+
+
+private macro generatePayments()
+   /* Запуск генерации учётных объектов по сообщениям */
+    /* ВАЖНО: модуль 2140 (МБР) должен быть подключён в меню пользователя, который будет запускать эту процедуру (на 2029 107)*/
+   /* TODO: проверить необходимость настройки фильтра для модуля 2140 */
+   if (racesFound)   /* Если рейсы не загружались, генерировать сообщения не нужно */
+           System(2140, CodeFor("W"), " -tp:9");
+   end;
+end;
+
+private macro processRace(Folder, RaceNo)
+   var success = true;
+   /* 1. Если в папке рейса нет файлов - ничего не делать */
+   if (isFilesExist(Folder))
+        /* 2. Иначе */
+      if (GetTrue(true, "В папке рейса #"+string(RaceNo)+" найдены входящие сообщения. Загрузить?"))
+         racesFound = true;
+         
+         /* 2.1. Скопировать файлы на терминал */
+         message("Передача файлов на сервер...");
+         copyAllFiles(Folder, SERVER_TMP_FOLDER, RaceNo);
+                /* 2.2. Запустить загрузку сообщений */
+                message("Загрузка файлов рейса...");
+         if (not ImportFileDir (SERVER_TMP_FOLDER, TRANSP_UFBS, RaceNo))
+            /* Записать номер рейса в сеанс */
+            setRaceNumInSess(RaceNo);
+            success = false;
+            LogError("Рейс "+string(RaceNo), "Ошибка обработки рейса");
+         else
+            /* Записать номер рейса в сеанс */
+            setRaceNumInSess(RaceNo);
+//            msgbox("Сформированы сеансы: "+getsessnumbers(RaceNo));
+//падает здесь
+            msgbox("Сформированы сеансы");
+            /* Удалить обработанные файлы из исходной папки */
+            deleteAllFiles(Folder);
+            /* Сформировать платежи по сообщениям */
+            debugbreak;
+            deleteAllFiles( SERVER_TMP_FOLDER );
+            //generatePayments();   
+                /* Сформировать отчёт по итогам обработки рейса */
+                //printTotalReport(RaceNo);
+         end; 
+      end;
+   end;
+   return success;
+end;
+
+private macro processAllRaces()
+    private var log_name;
+    file log() txt;
+   log_name = GetTxtFileName("mciprocess");
+   SetOutput(log_name);
+   if (not processRace (DIR_RACE_1, 1))
+      LogError("Рейс 1", "Ошибка обработки рейса");
+   end; 
+   if (not processRace (DIR_RACE_2, 2))
+      LogError("Рейс 2", "Ошибка обработки рейса");
+   end; 
+   if (not processRace (DIR_RACE_3, 3))
+      LogError("Рейс 3", "Ошибка обработки рейса");
+   end; 
+   if (not processRace (DIR_RACE_4, 4))
+      LogError("Рейс 4", "Ошибка обработки рейса");
+   end; 
+   if (not processRace (DIR_RACE_5, 5))
+      LogError("Рейс 5", "Ошибка обработки рейса");
+   end;
+    
+   SetOutput(null, true);  /* вернуть вывод в стандартный поток */
+   /* Вывести на экран протокол работы процедуры */
+   if (open(log, log_name))
+      ViewFile(log);
+   end;
+   close(log);
+end;
+
+macro process()
+
+  SaveBeginTime ();//Старт
+   
+   readSettings();   /* Считать параметры из реестра */
+   DebugBreak;
+   processAllRaces();   /* Обработать файлы рейсов */
+
+
+SaveEndTime (7); //Закончили
+
+end;
+
+/*****START*****/
+process();

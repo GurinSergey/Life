@@ -1,0 +1,1028 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: Protinp.mac 
+// @author  : Тихомиров А.Н. 25.05.2009
+// @desc    : Протокол обработки входящих платежей
+// @changes : 
+// #1 EVG 26/08/2010 Реализация возможности выпуска отчёта по номеру сессии вместо номера рейса (нужно 
+// для дочерних банков, т.к. у них безрейсовая обработка). 
+// #2 Зубко С. 15.03.2011 SDA реализовал пользовательское заполнение поля "рейс" какими-то номерами. 
+// В связи с этим, он попросил переделать отчет по диапазону рейсов, по дате, по транспортной схеме 
+// #3 ZMP 26.09.2012 C-14246 - ED273
+// #4 TAM 20.08.2013 C-21757 - ED108
+// #5 Gurin S. 10.12.2013 C-20624-6  Обернул все в PrintReport() + добавил  
+//                                   "Ведомость загруженных файлов" для планировщика
+// #6 zmp 14.05.2014 R-376623 ED273
+// -------------------------------------------------------------------------------------------------
+import globals, cb_sql, "lib_sqltools.mac", lib_types;
+array tp_schem_id;
+array tp_schem_nm;
+var i_tsa:integer = 0;
+var v_sel_shem:integer = 0;
+//var v_tpsh:integer = 0;
+var v_tpsh;
+var v_cur_date:date = {curdate};
+
+macro PrintReport(m_tpsh, m_cur_date, m_race)
+if (isNull (m_race)) m_race = false;   end;
+var cmd:object,
+    rs:object,
+    sql:string;
+
+var tp, 
+    dat, 
+    all,
+    hands,
+    bug, 
+    opens, 
+    vk, 
+    closed, 
+    name, 
+    data, 
+    total, 
+    front, 
+    all110,
+    all273,
+    ed108,
+    ed108_pm,
+    allr,
+    UseRaces, 
+    LastSession, 
+    LastSession_saved, 
+    SessionToBegin, 
+    RaceSessClause, 
+    Str_RaceSess, 
+    Parm, 
+    errCode,
+    sql_pm,
+    data_pm;
+
+if (isNull (m_tpsh))
+    //Выберем формат обмена
+    sql = " SELECT sh.t_tpfrmtid, RPAD(sh.t_tpfrmtid, 3)||'|'||RPAD(TR.T_NAME, 20)||'|'||SH.T_NAME t_name" + 
+          " FROM dwltpfrmt_dbt sh, dwltransp_dbt tr " +
+          " WHERE tr.t_tpid = sh.t_tpid " +
+          " AND sh.t_state != 3 " +
+          " AND sh.t_userid != 9999 " + //Чтобы убрать те, к которым никогда не прикасались
+          " AND tr.t_state = 1 " +
+          " AND tr.t_name not like '%SWIFT%' " +
+          " order by sh.t_tpfrmtid"; 
+
+    cmd = RsdCommand(sql);
+    cmd.execute();
+    rs = RsdRecordSet(cmd);
+    while ( rs.moveNext() )
+        tp_schem_id(i_tsa) = rs.Value("t_tpfrmtid");
+        tp_schem_nm(i_tsa) = rs.Value("t_name");
+        i_tsa = i_tsa + 1;
+    end;  
+
+    v_sel_shem = menu(tp_schem_nm, "Транспортная схема", "Выберите ТР. СХ. :");
+    if (v_sel_shem < 0)
+        msgbox("Не выбрана транспортная схема!");
+        exit(0);
+    end;
+
+    //Запоминаем ID транспортной схемы по позиции
+    v_tpsh = tp_schem_id(v_sel_shem);
+else 
+    v_tpsh = m_tpsh;
+end;
+
+if (isNull (m_cur_date))
+    if (not getdate(v_cur_date, "Введите дату отчета"))
+        msgbox("Не выбрана дата отчета!");
+        exit(0);
+    end;
+else
+    v_cur_date = m_cur_date;
+end;
+
+// Определим последний номер сеанса загрузки 
+sql = " SELECT max(t_numberrace) maxrace" +
+      " FROM dwlsess_dbt " +
+      " WHERE  t_TpFrmtID in (" + v_tpsh +")"       
+      "    and t_Direct   = CHR(88) " +                      // прием
+      "    and t_State    = 50 " +                           // Сеанс завершен
+      "    and t_BankDate =  " +GetSQLDate( v_cur_date );
+rs = RsdRecordSet(sql);
+if ( rs.moveNext() )
+   LastSession = rs.Value("maxrace");
+   if ( (valType(LastSession) == V_UNDEF) or (valType(LastSession) == 26 /*SPECVAL*/) )
+      LastSession = 0;
+   else
+      //Если выпускаем в текущем дне, то найденный сеанс еще имеет какой-то смысл
+      if(v_cur_date == {curdate})
+         LastSession = int(rs.Value("maxrace"));
+      else
+         LastSession = 0;
+      end;
+   end;
+end;
+
+//SDA 16.04.2012 - последний загруженный рейс 
+SessionToBegin = LastSession;
+
+if (not m_race)
+    if (not getInt( SessionToBegin, "Пожалуйста, введите номер рейса, за который \n" +
+                                    "необходимо формировать отчёт:", 3))
+        exit (1);
+    end;
+end;
+Str_RaceSess = "Рейсы номер: ";
+RaceSessClause = " and dwlsess_dbt.t_NumberRace = " + SessionToBegin +
+                 " and dwlsess_dbt.T_TPFRMTID in (" + v_tpsh +")"; 
+tp = SessionToBegin;
+GetTxtFileName("Protdoc");
+/* EVG Далее во всех SQL-запросах фильтрация по dwlsess_dbt.t_NumberRace заменена на условие RaceSessClause, так как отчёт может выпускаться как по номеру рейса, так и по номеру сеанса (в зависимости от настройки реестра PRBB\MCI, см. выше). */
+//ВСЕ ПО РЕЙСУ
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      "FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlsess_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dpmrmprop_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "  AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "  AND dwlpm_dbt.t_direct = CHR (88) "+
+      "  AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "  AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "  AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "  AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 исключаем ED108
+      "  AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      " and dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      " and dwlsess_dbt.t_bankdate = to_date('"+ v_cur_date +"','DD.MM.YYYY')"+
+      RaceSessClause;
+all=trsbdataset(sql); 
+if (all.movenext()) end;
+
+//Не загруженные ED110
+sql = "SELECT  count(1) as cnt "+
+      " FROM  dwlsess_dbt, dwlmes_dbt, dwlmesval_dbt "+
+      "  WHERE  dwlmesval_dbt.t_mesid = dwlmes_dbt.t_mesid "+
+      "  AND dwlmesval_dbt.T_BANKDATE = dwlsess_dbt.t_bankdate "+
+      "  AND dwlmesval_dbt.t_index = 1 "+
+      "  AND  instr(dwlmesval_dbt.t_value, 'ED110') >0 "+
+      "  AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+
+      "  AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+all110=trsbdataset(sql); 
+if (all110.movenext()) end;
+
+//TAM 20.08.2013 C-21757
+//Загруженные ED108 (сводные)
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      " FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dwlsess_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID = 369 " + //TAM 20.08.2013 учитываем только ED108
+      "   AND dpmpaym_dbt.t_dockind = 320 " +
+      "   AND DPMPAYM_DBT.T_PURPOSE = 32 " +
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ 
+      RaceSessClause;
+ed108=trsbdataset(sql); 
+if (ed108.movenext()) end;
+
+//Загруженные ED273
+//26.09.2012 C-14246 zmp
+sql = " SELECT   COUNT (1) AS cnt, NVL (SUM (PM.T_AMOUNT), 0) summ     "+
+      " FROM   dwlmes_dbt mes,                                         "+
+      "   dwlsess_dbt ses,                                             "+
+      "   dpmpaym_dbt pm,                                              "+
+      "   dwlmeslnk_dbt lnk                                            "+
+      " WHERE   MES.T_RLSFORMID in (362/*ED114*/, 361 /*ED113*/)       "+
+      "   AND ses.T_BANKDATE = to_date('"+v_cur_date+"','DD.MM.YYYY')  "+
+      "   AND SES.T_SESSIONID = MES.T_SESSIONID                        "+
+      "   AND LNK.T_MESID = MES.T_MESID                                "+
+      "   AND LNK.T_OBJID = PM.T_PAYMENTID                             "+
+      "   AND ses.t_NumberRace = "+ SessionToBegin +                    
+      "   AND ses.T_TPFRMTID   in ("+v_tpsh+")                         ";                       
+
+all273=trsbdataset(sql); 
+if (all273.movenext()) end;
+
+//TAM 20.08.2013 C-21757
+//Загруженные ED108 (платежи в составе сводного на ручной обработке)
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      "FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dwlsess_dbt, "+
+      "     dpmrmprop_dbt, "+
+      "     doproper_dbt, "+
+      "     doprstep_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID = 369 " + //TAM 20.08.2013 учитываем только ED108 на ручной обработке
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+      "   AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+      "   AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+ 
+      "   AND doprstep_dbt.t_isexecute = 'R' "+
+      "   AND doprstep_dbt.t_symbol = 'З'  "+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+ed108_pm=trsbdataset(sql);
+if (ed108_pm.movenext()) end;
+
+//Сообщений в рейсе
+sql = "SELECT  count(1) as cnt "+
+      " FROM  dwlsess_dbt, dwlmes_dbt "+
+      "  WHERE  dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+
+      "     and dwlsess_dbt.t_Direct   = " + GetSQLChar("X") +            // прием
+      "     and dwlsess_dbt.t_State    = 50 " +                           // Сеанс завершен
+      "     and dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+allr=trsbdataset(sql); 
+if (allr.movenext()) end;
+
+//НА РУЧНОЙ
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      "FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dwlsess_dbt, "+
+      "     dpmrmprop_dbt, "+
+      "     doproper_dbt, "+
+      "     doprstep_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 исключаем ED108
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+      "   AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+      "   AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+         //!!!!!!!!!!!!!!!!!!!!!
+      "   AND doprstep_dbt.t_isexecute = 'R' "+
+      "   AND doprstep_dbt.t_symbol = 'З'  "+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+Hands=trsbdataset(sql);
+if (hands.movenext()) end;
+
+//НА ВК
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      "FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dwlsess_dbt, "+
+      "     dpmrmprop_dbt, "+
+      "     doproper_dbt, "+
+      "     doprstep_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+      "   AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+         
+      "   AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+      "   AND doprstep_dbt.t_isexecute = 'R' "+
+      "   AND doprstep_dbt.t_symbol = '7'  "+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+vk=trsbdataset(sql);
+if (vk.movenext()) end;
+
+//прочие состояния
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      "FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dwlsess_dbt, "+
+      "     dpmrmprop_dbt, "+
+      "     doproper_dbt, "+
+      "     doprstep_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 исключаем ED108
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+         //!!!!!!!!!!!!!!!!!!!!!
+      "   AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+      "   AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+      "   AND doprstep_dbt.t_isexecute = 'R' "+
+      "   AND doprstep_dbt.t_symbol not in ('З','U','f','n','7') "+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause;
+opens=trsbdataset(sql);
+if (opens.movenext()) end;
+
+//Невыясненные
+sql = "select count (*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      " FROM dwlpm_dbt, "+
+      "     dpmpaym_dbt, "+
+      "     dwlmeslnk_dbt, "+
+      "     dwlmes_dbt, "+
+      "     dpmrmprop_dbt, "+
+      "     dwlsess_dbt, "+
+      "     doproper_dbt, "+
+      "     doprstep_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 исключаем ED108
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+        
+      "   AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+      "   AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+      "   AND doprstep_dbt.t_isexecute = 'R' "+
+      "   AND doprstep_dbt.t_symbol = 'U' "+
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      RaceSessClause;
+bug=trsbdataset(sql);
+if (bug.movenext()) end;
+
+//Закрыты
+sql = "SELECT count(*) as cnt, nvl(sum(dpmpaym_dbt.t_amount),0) as summa "+
+      " FROM dwlpm_dbt, "+
+      "      dpmpaym_dbt, "+
+      "      dwlmeslnk_dbt, "+
+      "      dwlsess_dbt, "+
+      "      dwlmes_dbt, "+
+      "      dpmrmprop_dbt "+
+      " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dwlpm_dbt.t_wlpmnum = 0 "+
+      "   AND dwlpm_dbt.t_direct = CHR (88) "+
+      "   AND dwlmeslnk_dbt.t_objkind = 501 "+
+      "   AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+      "   AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+      "   AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 исключаем ED108
+      "   AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      "   AND dpmpaym_dbt.t_paymstatus = 32000 "+
+      "   AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      "   AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      RaceSessClause;
+closed=trsbdataset(sql);
+if (closed.movenext()) end;
+
+sql = 
+   "  select /*+ORDERED*/ " +
+   "        count ( * ) as cnt, nvl (sum (dpmpaym_dbt.t_amount), 0) as summa " +
+   "    from   dwlsess_dbt, " +
+   "           dwlmes_dbt, " +
+   "           dwlmeslnk_dbt, " +
+   "           dwlpm_dbt, " +
+   "           dpmpaym_dbt, " +
+   "           doproper_dbt, " +
+   "           doprstep_dbt, " +
+   "           dpmrmprop_dbt, " +
+   "           dobjatcor_dbt, " +
+   "           dobjattr_dbt "+
+   " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid  "+
+   " AND dwlpm_dbt.t_wlpmnum = 0  "+
+   " AND dwlpm_dbt.t_direct = CHR (88)  "+
+   " AND dwlmeslnk_dbt.t_objkind = 501  "+
+   " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid  "+
+   " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid  "+
+   " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid  "+
+   " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation  "+
+   " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+        
+   " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0')  "+
+   " AND doprstep_dbt.t_isexecute = 'R'  "+
+   " AND (doprstep_dbt.t_symbol = 'f' or doprstep_dbt.t_symbol = 'n')  "+      // Пока оставлю так. 
+   " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+   " AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+   RaceSessClause +
+   " AND (    dobjatcor_dbt.t_objecttype =501 "+
+          " AND dobjatcor_dbt.t_object = lpad(dpmpaym_dbt.t_paymentid,10,'0') "+
+          " AND dobjatcor_dbt.t_groupid = 121 "+
+          " AND dobjatcor_dbt.t_attrid = dobjattr_dbt.t_attrid "+
+          " AND dobjattr_dbt.t_groupid = dobjatcor_dbt.t_groupid  ) "+
+" order by dobjattr_dbt.t_name ";
+front=trsbdataset(sql);
+if (front.movenext()) end;
+
+GetTxtFileName("Protocol");
+[ОТЧЕТ  ПО   ЗАГРУЗКЕ  ДОКУМЕНТОВ  В  ОПЕРДЕНЬ
+                            #№ # 
+                     ЗА  ##########
+            ДАТА ФОРМИРОВАНИЯ ОТЧЕТА ########## ########
+
+┌────────────────────────────────────────────────┬────────────┬────────────────┐
+│               Состояние                        │   кол-во   │      сумма     │
+├────────────────────────────────────────────────┼────────────┼────────────────┤
+│Проведено  документов  на счета                 │ ########## │ ############## │
+│Документов  на невыясненные                     │ ########## │ ############## │
+│Документы невыясн.  на ручной обработке         │ ########## │ ############## │
+│Документы ожидают выгрузки во Фронт             │ ########## │ ############## │
+│Документы ожидающие валютного контроля          │ ########## │ ############## │
+│                                                │            │                │
+│Документы в прочих состояниях (открыт/отвергнут)│ ########## │ ############## │
+│Документы сводные ED108                         │ ########## │ ############## │
+│                                                │            │                │
+│                                                │            │                │
+├──────────────────────────────────────────┬─────┴────────────┼────────────────┤
+│ИТОГО   ЗАГРУЖЕНО                         │  ############### │ ############## │
+│ИТОГО   ED110                             │  ############### │                │
+│ИТОГО   В РЕЙСЕ                           │  ############### │                │
+│ИТОГО   ED273                             │  ############### │ ############## │
+│ИТОГО   п\п реестра ED108                 │  ############### │ ############## │
+└──────────────────────────────────────────┴──────────────────┴────────────────┘
+](Str_RaceSess:r, tp, v_cur_date, date(), time(), int(closed.cnt):r,                                                
+             money(closed.summa):r, 
+               int(bug.cnt):r,
+             money(bug.summa):r, 
+               int(hands.cnt):r,
+             money(hands.summa):r, 
+               int(front.cnt):r,
+             money(front.summa):r, 
+               int(vk.cnt):r,
+             money(vk.summa):r, 
+               int(opens.cnt):r, 
+             money(opens.summa):r, 
+               int(ed108.cnt):r, //TAM 20.08.2013 C-21757
+             money(ed108.summa):r, //TAM 20.08.2013 C-21757
+               int(all.cnt):r,
+             money(all.summa):r, 
+              int(all110.cnt):r,
+              int(allr.cnt):r,
+              int(all273.cnt):r,
+             money(all273.summ):r,
+              int(ed108_pm.cnt):r, //TAM 20.08.2013 C-21757
+             money(ed108_pm.summa):r //TAM 20.08.2013 C-21757
+);
+
+[              Ведомость расхождений наименования получателя средств (на ручной обработке).
+                                #: ############
+                              За #############
+┌──────────────────┬────────────────────────┬────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│    Ном.          │      Счет              │    Сумма       │     Наименование получателя по RS-Bank/В платеже                                                               │
+│  документа       │     получателя         │                │                                                                                                                │
+├──────────────────┼────────────────────────┼────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤]
+(Str_RaceSess:r, tp:l, {curdate});
+
+sql = "SELECT dpmpaym_dbt.t_paymentid, "+
+      " dpmpaym_dbt.t_payerbankid, dpmpaym_dbt.t_payeraccount, "+
+      " dpmpaym_dbt.t_receiveraccount, dpmpaym_dbt.t_amount, "+
+      " dpmrmprop_dbt.t_payername, dpmrmprop_dbt.t_receivername, "+
+      " dpmrmprop_dbt.t_number, "+
+             " NVL ((SELECT UTL_RAW.cast_to_varchar2 (t_text) "+
+             "  FROM dnotetext_dbt "+
+             " WHERE t_objecttype(+) = 501 "+
+             "   AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') "+
+             "   AND t_notekind = 130), "+
+            " 'не заполнено примечание 130' "+
+           " ) AS reson "+
+  " FROM dwlpm_dbt, "+
+      " dpmpaym_dbt, "+
+      " dwlmeslnk_dbt, "+
+      " dwlmes_dbt, "+
+      " dpmrmprop_dbt, "+
+      " dwlsess_dbt, "+
+      " doproper_dbt, "+
+      " doprstep_dbt "+
+ "WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+   "AND dwlpm_dbt.t_wlpmnum = 0 "+
+   "AND dwlpm_dbt.t_direct = CHR (88) "+
+   "AND dwlmeslnk_dbt.t_objkind = 501 "+
+   "AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+   "AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+   "AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 ED108 не учитываем - для них отдельная песня
+   "AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+   "AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+   "AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+   "AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+ 
+   "AND doprstep_dbt.t_isexecute = 'R' "+
+   "AND doprstep_dbt.t_symbol = 'З'  "+
+   "AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ 
+   "AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+   RaceSessClause +
+   " order by dpmpaym_dbt.t_amount ";
+total = 0;
+data=trsbdataset(sql);
+while (data.movenext())
+   if ((data.reson=="Наименование получателя и владельца счета получателя различны") or
+       (data.reson=="Несоответствие номера счета наименованию получателя" ))
+      total=total+1;
+      if (strbrk(data.reson,"плательщ")>0)
+         dat = trsbdataset(string("select t_name from daccount_dbt acc, dparty_dbt party where     acc.t_client=party.t_partyid and acc.t_account ='",data.receiveraccount,"'"));
+         if(dat.movenext())  end;
+            [│##################│########################│################│################################################################################################################│]
+            (data.number, data.receiveraccount,data.amount, data.receivername);
+            if (strlen(data.receivername)>63)
+               [│                  │                        │                │################################################################################################################│]
+               (substr(data.receivername,64));
+            end;
+            [│                  │                        │                │################################################################################################################│]
+            (dat.name);
+         else
+            dat = trsbdataset(string("select t_name from daccount_dbt acc, dparty_dbt party where acc.t_client=party.t_partyid and acc.t_account ='",data.payeraccount,"'"));
+            if(dat.movenext())           end;
+            [│##################│########################│################│################################################################################################################│]
+            (data.number, data.payeraccount,data.amount, data.payername);
+            if (strlen(data.receivername)>63)
+               [│                  │                        │                │################################################################################################################│]
+               (substr(data.receivername,64));
+            end;
+            [│                  │                        │                │################################################################################################################│]
+            (dat.name);
+         end;
+      end;
+   end;                         
+[└──────────────────┴────────────────────────┴────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                            Итого: ####################
+
+
+               Ведомость загруженных невыясненных документов.
+                                 #: ############
+                                За #############
+┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┬──────────────────────────────────────────────────┐
+│ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │            Примечание                            │
+│докум. │плательщика│      плательщика       │      получателя        │                 │                                                  │
+├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┼──────────────────────────────────────────────────┤]
+(total, Str_RaceSess:r, tp:l, v_cur_date);
+sql = " SELECT dpmpaym_dbt.t_paymstatus, dpmpaym_dbt.t_paymentid, "+
+      " dpmpaym_dbt.t_payerbankid, dpmpaym_dbt.t_payeraccount, "+
+      " dpmpaym_dbt.t_receiveraccount, dpmpaym_dbt.t_amount, "+
+      " dpmrmprop_dbt.t_payername, dpmrmprop_dbt.t_receivername, "+
+      " dpmrmprop_dbt.t_number, "+
+      " doprstep_dbt.t_symbol, "+
+      " dobjcode_dbt.t_code, "+
+             " NVL ((SELECT UTL_RAW.cast_to_varchar2 (t_text) "+
+             "  FROM dnotetext_dbt "+
+             " WHERE t_objecttype(+) = 501 "+
+             "   AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') "+
+             "   AND t_notekind = 42), "+
+            " 'не заполнено примечание 42' "+
+           " ) AS reson "+
+  " FROM dwlpm_dbt, "+
+      " dpmpaym_dbt, "+
+      " dobjcode_dbt, "+
+      " dwlmeslnk_dbt, "+
+      " dwlmes_dbt, "+
+      " dpmrmprop_dbt, "+
+      " doproper_dbt, "+
+      " dwlsess_dbt, "+
+      " doprstep_dbt "+
+  " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+  " AND dwlpm_dbt.t_wlpmnum = 0 "+
+  " AND dwlpm_dbt.t_direct = CHR (88) "+
+  " AND dwlmeslnk_dbt.t_objkind = 501 "+
+  " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+  " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+  " AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 ED108 не учитываем - для них отдельная песня
+  " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+  " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+        
+  " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+  " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+  " AND doprstep_dbt.t_isexecute = 'R' "+
+  " AND doprstep_dbt.t_symbol = 'U' "+
+  " AND dobjcode_dbt.t_objecttype = 3 "+
+  " AND dobjcode_dbt.t_codekind=3 "+
+  " AND dpmpaym_dbt.t_payerbankid=dobjcode_dbt.t_objectid "+
+  " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+   " and dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+   RaceSessClause +
+   " order by dpmpaym_dbt.t_amount ";
+
+total=0;
+data=trsbdataset(sql);
+while (data.movenext())
+   total=total+1;
+   [│#######│###########│########################│########################│#################│##################################################│]
+   (data.number, data.code,data.payeraccount, data.receiveraccount,data.amount, data.reson);
+end;
+[└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┴──────────────────────────────────────────────────┘
+                                                           Итого: ##################
+
+
+               Ведомость загруженных невыясненных, ожидающих ручной обработки документов (Все, кроме расхождения наименования).
+                                 #: ############
+                                За #############
+┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┬──────────────────────────────────────────────────┐
+│ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │            Примечание                            │
+│докум. │плательщика│      плательщика       │      получателя        │                 │                                                  │
+├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┼──────────────────────────────────────────────────┤]
+(total, Str_RaceSess:r, tp:l, v_cur_date);
+sql = " SELECT dpmpaym_dbt.t_paymentid, dpmpaym_dbt.t_payerbankid, "+
+      " dpmpaym_dbt.t_payeraccount, dpmpaym_dbt.t_receiveraccount, "+
+      " dpmpaym_dbt.t_amount, dpmrmprop_dbt.t_payername, "+
+      " dpmrmprop_dbt.t_receivername, dpmrmprop_dbt.t_number, "+
+      " dobjcode_dbt.t_code, "+
+      " NVL ((SELECT UTL_RAW.cast_to_varchar2 (t_text) "+
+      "         FROM dnotetext_dbt "+
+      "        WHERE t_objecttype(+) = 501 "+
+      "          AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') "+
+      "          AND t_notekind = 130), "+
+      "      'не заполнено примечание 130' "+
+      "     ) AS reson "+
+  " FROM dwlpm_dbt, "+
+  "     dpmpaym_dbt, "+
+  "     dobjcode_dbt, "+
+  "     dwlmeslnk_dbt, "+
+  "     dwlmes_dbt, "+
+  "     dpmrmprop_dbt, "+
+      " dwlsess_dbt, "+
+  "     doproper_dbt, "+
+  "     doprstep_dbt "+
+ " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+  " AND dwlpm_dbt.t_wlpmnum = 0 "+
+  " AND dwlpm_dbt.t_direct = CHR (88) "+
+  " AND dwlmeslnk_dbt.t_objkind = 501 "+
+  " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+  " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+  " AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 ED108 не учитываем - для них отдельная песня
+  " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+         
+  " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+  " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+  " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+  " AND doprstep_dbt.t_isexecute = 'R' "+
+  " AND doprstep_dbt.t_symbol = 'З' "+
+  " AND dobjcode_dbt.t_objecttype = 3 "+
+  " AND dobjcode_dbt.t_codekind=3 "+
+  " AND dpmpaym_dbt.t_payerbankid=dobjcode_dbt.t_objectid "+
+  " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+  " AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+  RaceSessClause +
+  " order by dpmpaym_dbt.t_amount ";
+
+data=trsbdataset(sql);
+total=0;
+while (data.movenext())
+   if ((substr(data.reson,1,30)!="Несоответствие номера счета на") and 
+       (data.reson!="Наименование получателя и владельца счета получателя различны"))
+      total=total+1;
+      [│#######│###########│########################│########################│#################│##################################################│]
+      (data.number, data.code,data.payeraccount, data.receiveraccount,data.amount, data.reson);
+   end;
+end;
+[└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┴──────────────────────────────────────────────────┘
+                                                     Итого: #######################]
+(total);
+
+[
+
+               Ведомость документов ожидающих выгрузки во Фронт.
+                                 #: ############
+                                За #############
+┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┬──────────────────────────────────────────────────┐
+│ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │            Категория платежа                     │
+│докум. │плательщика│      плательщика       │      получателя        │                 │                                                  │
+├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┼──────────────────────────────────────────────────┤]
+(Str_RaceSess:r, tp:l, v_cur_date);
+sql = 
+   "select /*+ORDERED*/ " +
+   "        dpmpaym_dbt.t_paymentid, " +
+   "           dpmpaym_dbt.t_payerbankid, " +
+   "           dpmpaym_dbt.t_payeraccount, " +
+   "           dpmpaym_dbt.t_receiveraccount, " +
+   "           dpmpaym_dbt.t_amount, " +
+   "           dpmrmprop_dbt.t_payername, " +
+   "           dpmrmprop_dbt.t_receivername, " +
+   "           dpmrmprop_dbt.t_number, " +
+   "           dobjcode_dbt.t_code, " +
+   "           dobjattr_dbt.t_fullname " +
+   "    from   dwlsess_dbt, " +
+   "           dwlmes_dbt, " +
+   "           dwlmeslnk_dbt, " +
+   "           dwlpm_dbt, " +
+   "           dpmpaym_dbt, " +
+   "           doproper_dbt, " +
+   "           doprstep_dbt,            " +
+   "           dobjcode_dbt, " +
+   "           dpmrmprop_dbt, " +
+   "           dobjatcor_dbt, " +
+   "           dobjattr_dbt " +
+   " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid  "+
+   " AND dwlpm_dbt.t_wlpmnum = 0  "+
+   " AND dwlpm_dbt.t_direct = CHR (88)  "+
+   " AND dwlmeslnk_dbt.t_objkind = 501  "+
+   " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid  "+
+   " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid  "+
+   " AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 ED108 не учитываем - для них отдельная песня
+   " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid  "+
+   " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation  "+
+   " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0')  "+
+   " AND doprstep_dbt.t_isexecute = 'R'  "+
+   " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+         
+   " AND (doprstep_dbt.t_symbol = 'f' or doprstep_dbt.t_symbol = 'n')  "+  // Выгружены и проведены
+   " AND dobjcode_dbt.t_objecttype = 3  "+
+   " AND dobjcode_dbt.t_codekind=3  "+
+   " AND dobjcode_dbt.t_state = 0  "+ //Gurin S. 21.09.2015 R-620358-2
+   " AND dpmpaym_dbt.t_payerbankid=dobjcode_dbt.t_objectid  "+
+   " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+   " AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+   RaceSessClause +
+   " AND (    dobjatcor_dbt.t_objecttype =501 "+
+          " AND dobjatcor_dbt.t_object = lpad(dpmpaym_dbt.t_paymentid,10,'0') "+
+          " AND dobjatcor_dbt.t_groupid = 121 "+
+          " AND dobjatcor_dbt.t_attrid = dobjattr_dbt.t_attrid "+
+          " AND dobjattr_dbt.t_groupid = dobjatcor_dbt.t_groupid  ) "+
+" order by dobjattr_dbt.t_name    , dpmpaym_dbt.t_amount ";
+data=trsbdataset(sql);
+total = 0;
+while (data.movenext())
+   total = total+1;
+   [│#######│###########│########################│########################│#################│##################################################│]
+   (data.number, data.code,data.payeraccount, data.receiveraccount,data.amount, data.fullname);
+end;
+[└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┴──────────────────────────────────────────────────┘
+                                                     Итого: #######################]
+(total);
+
+
+if (int(vk.cnt) > 0)
+   [              Перечень документов ожидающих валютного контроля
+                                    #: ############
+                                   За #############
+   ┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┐
+   │ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │
+   │докум. │плательщика│      плательщика       │      получателя        │                 │
+   ├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┤]
+   (Str_RaceSess:r, tp:l, v_cur_date);
+   sql = " SELECT dpmpaym_dbt.t_paymstatus, dpmpaym_dbt.t_paymentid, "+
+         " dpmpaym_dbt.t_payerbankid, dpmpaym_dbt.t_payeraccount, "+
+         " dpmpaym_dbt.t_receiveraccount, dpmpaym_dbt.t_amount, "+
+         " dpmrmprop_dbt.t_payername, dpmrmprop_dbt.t_receivername, "+
+         " dpmrmprop_dbt.t_number, "+
+         " doprstep_dbt.t_symbol, "+
+         " dobjcode_dbt.t_code, "+
+                " NVL ((SELECT UTL_RAW.cast_to_varchar2 (t_text) "+
+                "  FROM dnotetext_dbt "+
+                " WHERE t_objecttype(+) = 501 "+
+                "   AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') "+
+                "   AND t_notekind = 42), "+
+               " 'не заполнено примечание 42' "+
+              " ) AS reson "+
+     " FROM dwlpm_dbt, "+
+         " dpmpaym_dbt, "+
+         " dobjcode_dbt, "+
+         " dwlmeslnk_dbt, "+
+         " dwlmes_dbt, "+
+         " dpmrmprop_dbt, "+
+         " doproper_dbt, "+
+         " dwlsess_dbt, "+
+         " doprstep_dbt "+
+    " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      " AND dwlpm_dbt.t_wlpmnum = 0 "+
+     " AND dwlpm_dbt.t_direct = CHR (88) "+
+     " AND dwlmeslnk_dbt.t_objkind = 501 "+
+     " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+     " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+     " AND DWLMES_DBT.T_RLSFORMID <> 369 " + //TAM 20.08.2013 ED108 не учитываем - для них отдельная песня
+     " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+     " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+     " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+     " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+        
+     " AND doprstep_dbt.t_isexecute = 'R' "+
+     " AND doprstep_dbt.t_symbol  = '7' "+
+     " AND dobjcode_dbt.t_objecttype = 3 "+
+     " AND dobjcode_dbt.t_codekind=3 "+
+     " AND dpmpaym_dbt.t_payerbankid=dobjcode_dbt.t_objectid "+
+     " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+     " AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+      RaceSessClause +
+     " order by dpmpaym_dbt.t_amount ";
+   data=trsbdataset(sql);
+   total = 0;
+   while (data.movenext())
+      total = total+1;
+      [│#######│###########│########################│########################│#################│]
+      (data.number, data.code,data.payeraccount, data.receiveraccount,data.amount);
+   end;
+   [└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┘
+                                                        Итого: #######################]
+   (total);
+end;
+
+if (int(opens.cnt) > 0)
+   [              Перечень документов с неопределенным состоянием
+                                    #: ############
+                                   За #############
+   ┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┐
+   │ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │
+   │докум. │плательщика│      плательщика       │      получателя        │                 │
+   ├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┤]
+   (Str_RaceSess:r, tp:l, v_cur_date);
+
+   sql = " SELECT dpmpaym_dbt.t_paymstatus, dpmpaym_dbt.t_paymentid, "+
+         " dpmpaym_dbt.t_payerbankid, dpmpaym_dbt.t_payeraccount, "+
+         " dpmpaym_dbt.t_receiveraccount, dpmpaym_dbt.t_amount, "+
+         " dpmrmprop_dbt.t_payername, dpmrmprop_dbt.t_receivername, "+
+         " dpmrmprop_dbt.t_number, "+
+         " doprstep_dbt.t_symbol, "+
+         " dobjcode_dbt.t_code, "+
+                " NVL ((SELECT UTL_RAW.cast_to_varchar2 (t_text) "+
+                "  FROM dnotetext_dbt "+
+                " WHERE t_objecttype(+) = 501 "+
+                "   AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') "+
+                "   AND t_notekind = 42), "+
+               " 'не заполнено примечание 42' "+
+              " ) AS reson "+
+     " FROM dwlpm_dbt, "+
+         " dpmpaym_dbt, "+
+         " dobjcode_dbt, "+
+         " dwlmeslnk_dbt, "+
+         " dwlmes_dbt, "+
+         " dpmrmprop_dbt, "+
+         " doproper_dbt, "+
+         " dwlsess_dbt, "+
+         " doprstep_dbt "+
+    " WHERE dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+      " AND dwlpm_dbt.t_wlpmnum = 0 "+
+     " AND dwlpm_dbt.t_direct = CHR (88) "+
+     " AND dwlmeslnk_dbt.t_objkind = 501 "+
+     " AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid "+
+     " AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid "+
+     " AND dpmrmprop_dbt.t_paymentid = dpmpaym_dbt.t_paymentid "+
+     " AND doproper_dbt.t_id_operation = doprstep_dbt.t_id_operation "+
+     " AND doproper_dbt.t_documentid = lpad(dpmpaym_dbt.t_paymentid, 34, '0') "+
+     " AND doprstep_dbt.t_isexecute = 'R' "+
+     " AND dpmpaym_dbt.t_dockind = doproper_dbt.t_dockind "+        
+     " AND doprstep_dbt.t_symbol not in ('З','U','f','n','7') "+
+     " AND dobjcode_dbt.t_objecttype = 3 "+
+     " AND dobjcode_dbt.t_codekind=3 "+
+     " AND dpmpaym_dbt.t_payerbankid=dobjcode_dbt.t_objectid "+
+     " AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+     " AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+     RaceSessClause +
+     " order by dpmpaym_dbt.t_amount ";
+   data=trsbdataset(sql);
+   total = 0;
+   while (data.movenext())
+      total = total+1;
+      [│#######│###########│########################│########################│#################│]
+      (data.number, data.code,data.payeraccount, data.receiveraccount,data.amount);
+   end;
+   [└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┘
+                                                        Итого: #######################]
+   (total);
+end;
+
+//26.09.2012 C-14246 zmp
+if(all273.cnt > 0)
+[              Перечень документов в составе ED 273
+                                    #: ############
+                                   За #############
+ ┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┬─────────┐
+ │ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │Форма ED │
+ │докум. │плательщика│      плательщика       │      получателя        │                 │         │
+ ├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┼─────────┤]
+   (Str_RaceSess:r, tp:l, v_cur_date);
+startQueryCapture ();
+[
+SELECT   RMPROP.T_NUMBER docnum,
+         PROP.T_BANKCODE BICPayer,
+         PM.T_PAYERACCOUNT PayerAcc,
+         PM.T_RECEIVERACCOUNT ReceiverACC,
+         PM.T_AMOUNT summ,
+         DECODE(MES.T_RLSFORMID,362,'ED114',361,'ED113') EDFRM
+  FROM   dwlmes_dbt mes,
+         dwlsess_dbt ses,         
+         dpmpaym_dbt pm,
+         dpmprop_dbt prop,
+         dpmrmprop_dbt rmprop,
+         dwlmeslnk_dbt lnk
+ WHERE   MES.T_RLSFORMID in (362/*ED114*/, 361 /*ED113*/)         
+         
+         AND PM.T_PAYMENTID = PROP.T_PAYMENTID
+         AND RMPROP.T_PAYMENTID = PM.T_PAYMENTID
+         AND PROP.T_DEBETCREDIT = 0
+         AND LNK.T_MESID = MES.T_MESID
+         AND LNK.T_OBJID = PM.T_PAYMENTID
+         AND ses.T_BANKDATE =:MesDate
+         AND SES.T_SESSIONID = MES.T_SESSIONID
+         AND regexp_like (ses.T_TPFRMTID, :TPFRMTID)
+         AND SES.T_NUMBERRACE =:NUMBERRACE 
+         ORDER BY pm.t_amount
+];
+var    osql = endQueryCapture ();
+       osql = execSqlSelect (osql, makeArray (SqlParam ("MesDate",    v_cur_date),
+                                              SqlParam ("TPFRMTID",   strsubst(string(v_tpsh),",","|")),
+                                              SqlParam ("NUMBERRACE", SessionToBegin )));
+    while(osql.moveNext ())                                          
+      [│#######│###########│########################│########################│#################│   ##### │]
+      (osql.value("docnum"),osql.value("BICPayer"),osql.value("PayerAcc"),osql.value("ReceiverAcc"),osql.   value("summ"),osql.value("EDFRM"));
+    end;
+   [└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┴─────────┘]
+end;
+
+//TAM 20.08.2013 C-21757
+if(ed108.cnt > 0)
+[     
+      
+      Ведомость загруженных ожидающих ручной обработки реестров платежей в составе ED108 в разрезе сводных
+                                    #: ############
+                        За #############
+]
+    (Str_RaceSess:r, tp:l, v_cur_date);
+sql = " SELECT   DWLMES_DBT.T_TRN mes_num, " +
+               " dpmpaym_dbt.t_paymstatus, " +
+               " dpmpaym_dbt.t_paymentid pmid, " +
+               " dpmpaym_dbt.t_payerbankid, " +
+               " dpmpaym_dbt.t_payeraccount payer_acc," +
+               " dpmpaym_dbt.t_receiveraccount receiver_acc, " +
+               " dpmpaym_dbt.t_amount amnt, " +
+               " dpmrmprop_dbt.t_payername, " +
+               " dpmrmprop_dbt.t_receivername, " +
+               " dpmrmprop_dbt.t_number doc_num, " +
+               " NVL ( (SELECT   UTL_RAW.cast_to_varchar2 (t_text) " +
+               "        FROM   dnotetext_dbt " +
+               "        WHERE   t_objecttype(+) = 501 " +
+               "            AND t_documentid(+) = LPAD (dpmpaym_dbt.t_paymentid, 10, '0') " +
+               "        AND t_notekind = 42), 'не заполнено примечание 42' )  AS reson " +
+      " FROM   dwlpm_dbt, dpmpaym_dbt, dpmrmprop_dbt, dwlmeslnk_dbt, dwlmes_dbt, dwlsess_dbt " +
+      " WHERE       dwlpm_dbt.t_paymentid = dpmpaym_dbt.t_paymentid " +
+      "         AND DPMRMPROP_DBT.T_PAYMENTID = DPMPAYM_DBT.T_PAYMENTID " +
+      "         AND dwlpm_dbt.t_wlpmnum = 0 " +
+      "         AND dwlpm_dbt.t_direct = CHR (88) " +
+      "         AND dwlmeslnk_dbt.t_objkind = 501 " +
+      "         AND dwlmeslnk_dbt.t_objid = dwlpm_dbt.t_wlpmid " +
+      "         AND dwlmes_dbt.t_mesid = dwlmeslnk_dbt.t_mesid " +
+      "         AND DWLMES_DBT.T_RLSFORMID = 369 " +
+      "         AND dpmpaym_dbt.t_dockind = 320 " +
+      "         AND DPMPAYM_DBT.T_PURPOSE = 32 " +
+      "         AND dwlmes_dbt.t_sessionid = dwlsess_dbt.t_sessionid "+ // Если нужен номер сеанса
+      "         AND dwlsess_dbt.t_bankdate = to_date('"+v_cur_date+"','DD.MM.YYYY')"+
+     RaceSessClause;
+     data = trsbdataset(sql);
+while(data.movenext())
+[    
+     Сообщение ED108: Референс #################### Номер документа ######## 
+     Счет получателя #################### Счет плетльщика ####################
+ ┌───────┬───────────┬────────────────────────┬────────────────────────┬─────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ Ном.  │   БИК     │       Счет             │       Счет             │     Сумма       │                              Примечание                                 │
+ │докум. │плательщика│      плательщика       │      получателя        │                 │                                                                         │
+ ├───────┼───────────┼────────────────────────┼────────────────────────┼─────────────────┼─────────────────────────────────────────────────────────────────────────┤
+] (data.mes_num, data.doc_num, data.payer_acc, data.receiver_acc);
+   sql_pm = " SELECT   PM.T_PAYMSTATUS, PM.T_PAYMENTID, PROP.T_BANKCODE bank_code, PM.T_PAYERACCOUNT payeraccount, " +
+                     " PM.T_RECEIVERACCOUNT receiveraccount, PM.T_AMOUNT amount, RMPROP.T_PAYERNAME, " +
+                     " RMPROP.T_RECEIVERNAME, RMPROP.T_NUMBER num, " +
+                     " NVL ( (SELECT   UTL_RAW.cast_to_varchar2 (t_text) FROM   dnotetext_dbt " +
+                           " WHERE       t_objecttype(+) = 501 AND t_documentid(+) = LPAD (PM.T_PAYMENTID, 10, '0') " +
+                                   " AND t_notekind = 130), 'Не заполнено примечание 130' )  AS reson " +
+            " FROM   dpmlink_dbt lnk, dpmpaym_dbt pm, dpmrmprop_dbt rmprop, dpmprop_dbt prop " +
+            " WHERE       LNK.T_INITIALPAYMENT = " + data.pmid +
+            "         AND LNK.T_LINKKIND = 9 " +
+            "         AND LNK.T_PURPOSEPAYMENT = PM.T_PAYMENTID " +
+            "         AND RMPROP.T_PAYMENTID = PM.T_PAYMENTID " +
+            "         AND PM.T_PAYMENTID = PROP.T_PAYMENTID " +
+            "         AND PROP.T_DEBETCREDIT = 0";
+   data_pm = trsbdataset(sql_pm);
+   total = 0;
+   while (data_pm.movenext())
+      total = total+1;
+      [│#######│###########│########################│########################│#################│#########################################################################│]
+      (data_pm.num, data_pm.bank_code,data_pm.payeraccount, data_pm.receiveraccount,data_pm.amount, data_pm.reson);
+   end;
+   [└───────┴───────────┴────────────────────────┴────────────────────────┴─────────────────┴─────────────────────────────────────────────────────────────────────────┘]
+end;
+end;
+
+//Gurin S. 10.12.2013 C-20624-6
+if (m_race)
+[     
+      
+               Ведомость загруженных файлов.
+                                 #: ############
+                                За #############
+]
+    (Str_RaceSess:r, tp:l, v_cur_date);
+     sql = "SELECT   t_filename fname"
+           "  FROM   dwlsess_dbt "
+           " WHERE   T_NUMBERRACE = "+ tp +" AND t_tpid = 9 AND t_BankDate =  " +GetSQLDate( v_cur_date );
+     data_pm = trsbdataset(sql);
+         [┌───────────────────────────────────────────────────────────────────────────────────────┐];
+     while (data_pm.movenext())
+         [│#######################################################################################│]
+         (data_pm.fname);
+     end;
+         [└───────────────────────────────────────────────────────────────────────────────────────┘];
+end;
+end;
+
+//PrintReport();

@@ -1,0 +1,1138 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File Name   : fns_gmBV.mac                                                 */
+/*  Created     : 01.02.2012                                                   */
+/*  Programmer  : Chesnokov D.                                                 */
+/*  Description : Макрос генерации выписки по операциям на счете,              */
+/*                в автоматическом режиме в МБР                                */
+/*                                                                             */
+/*  Изменен     : 27.02.2012 Chesnokov D по заявке I-00158420                  */
+/*              : 02.03.2012 Chesnokov D исправлены сообщения о переходе на 5.0*/
+/*                переопределение КодНО, обороты и остатки при периоде из 5.0  */
+/*              : 02.03.2012 Chesnokov D. если дата открытия счета явно в 6.0  */
+/*                сообщение о проверке в 5.0 не появляется                     */
+/*              : 19.03.2012 Chesnokov D. убрал непечатные символы в основании,*/
+/*                имени плательщика и получателя платежа                       */
+/*              : 21.03.2012 Lavrenov А. C-9681 тянем данные из darhdoc_5_dbt  */
+/*              : 25.04.2012 Lavrenov A  C-10647 так же для Пойдем             */
+/*              : 28.04.2012 Chesnokov D.S. для поля НомДок сделал проверку    */
+/*                на пробелы и нулевую длинну. При совпадении ставим точку     */
+/*              : 06.07.2012 Chesnokov D.S. По запросу I-00217839 исправил     */
+/*                формирование НаимБП                                          */
+/*              : 06.07.2012 Chesnokov D.S. I-00199042 убрал непечатный символ */
+/*                CHR(13) в основании имени плательщика и получателя платежа   */
+/*              : 12.07.2012 Chesnokov D.S. C-12669 тянем данные из            */
+/*                darhdoc_5_dbt для ГЭБ                                        */
+/*              : 17.07.2012 Chesnokov D.S. I-00222961 изменение логики выборки*/
+/*                данных из 5.0 для реквизитов ИННПП и КПППП                   */
+/*              : 27.07.2012 Chesnokov D.S. I-00228058 если нет наименования в */
+/*               в платеже, ставим точку                                       */
+/*              : 01.11.2012 Chesnokov D.S. I-00278072 переписан механизм      */
+/*               определения конца выборки  при разбивке файлов                */
+/*              : 09.04.2013 Chesnokov D.S. I-00353655 привел длинну строки    */
+/*                НаимПП в соответствие с форматом 160 символов                */
+/*              : 04.06.2013 Chesnokov D.S. C-24079 изменено определение       */
+/*                суммы документа, корреспондирующего счета и основания.       */
+/*                Если проводка была выгруженна из внешней системы, то данные  */
+/*                выбираем из провоки.                                         */
+/*              : 13.12.2013 Chesnokov D.S. убрал изменения Аркадия, пересобрал*/
+/*                основной курсор с локацией RSDVAL_SERVER                     */
+/*              : 31.07.2015 Golovkin C-40714  оптимизация выписки             */
+/*                перенос части функционала в функцию usr_getFnsOperations     */
+/*******************************************************************************/
+import "FNS_lib.mac", "repforms.mac", Reporting;
+import "fg_Life_parm.mac";
+
+private Const fdBank = fg_life_subject({OurBank});
+
+private var errCode, TxtFileDir, refnumber, ExpPath, ДолжнПрБ, ФИОПрБ;
+private var docnumber, СчетаБанка, CodeClient, ДатаПерехода, РазмерВыписки;
+var len = 0, str = TArray(), persn;
+var INN, KPP;
+var INNClient, KPPClient;
+var stroka, rs_acc, rs_doc, progress, query;
+var EOF:bool = false; // Признак конца выборки
+var parrent_wlreq:TRecHandler = TRecHandler( "wlreq", "bank.def" );
+record Acc(account);
+ClearRecord( Acc );
+
+macro ПрочитатьНастройки
+
+  GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, TxtFileDir, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR");
+    return false;
+  end;
+  
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\РЕФЕРЕНС_СПРАВКАОСТ", V_INTEGER, refnumber, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\РЕФЕРЕНС_СПРАВКАОСТ");
+    return false;
+  end;
+  
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ", V_STRING, ExpPath, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ ВРУЧНУЮ\\ДИРЕКТОРИЯ ВЫГРУЗКИ");
+    return false;
+  end;  
+    
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СПРАВКИ_ИФНС_ДОЛЖ", V_STRING, ДолжнПрБ, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СПРАВКИ_ИФНС_ДОЛЖ");
+    return false;
+  end;
+  
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СПРАВКИ_ИФНС_ФИО", V_STRING, ФИОПрБ, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СПРАВКИ_ИФНС_ФИО");
+    return false;
+  end;
+  
+  //Получаем маски счетов банка
+  GetRegistryValue("PS\\REQOPENACC\\СЧЕТА БАНКА", V_STRING, СчетаБанка, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: \"PS\\REQOPENACC\\СЧЕТА БАНКА\"");
+    return false;
+  end;
+
+  //Получаем дату перехода банка
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА", V_STRING, ДатаПерехода, errCode);
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\ДАТА ПЕРЕХОДА");
+    return false;
+  end;
+
+  GetRegistryValue("PS\\REQOPENACC\\OPERATION\\РАЗМЕР_ФАЙЛА_ВЫПИСКИ", V_STRING, РазмерВыписки, errCode, false, {oper});
+  if ( errCode > 0 )
+    msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\РАЗМЕР_ФАЙЛА_ВЫПИСКИ");
+    return false;
+  end;
+
+  persn = Tbfile("persn.dbt", "r");
+
+  return true;
+end;
+
+private macro get_documents(acc, fiid, date_begin, date_end, mes)
+
+  var docInfoServer;
+  var tablename, rs, cacheQueryText, str;
+  var NameFile;
+
+  record Acc_op(account);
+  ClearRecord( Acc_op );
+
+  docInfoServer = RepDocInfoServer(PTCK_ALL, 0); // создание сервера (0 - по платежам)
+
+  tablename = "dacctrn_dbt";
+
+  SplitFile(mes.FileName, NameFile);
+  
+  ПолучитьСчет(fiid, Acc, Acc_op);
+  
+  if (Acc_op.Open_Date < date(ДатаПерехода))
+    if((date(ДатаПерехода) > date_begin) and  (fdBank.is_SLD))
+      msgbox("Дата начала выписки по л/с ", acc, " в файле ", NameFile ," меньше даты перехода Банка на RS-Bank v.6| Установлена дата начала выписки ", date(ДатаПерехода),"| Проверьте наличие операций в Диасофт 5NT");
+      date_begin = date(ДатаПерехода);
+    elif ((date(ДатаПерехода) > date_begin) and ( (fdBank.is_PRBB) or (fdBank.is_VUZ) or (fdBank.is_NBS) ))
+      msgbox("Дата начала выписки по л/с ", acc, " в файле ", NameFile ," меньше даты перехода Банка на RS-Bank v.6| Установлена дата начала выписки ", date(ДатаПерехода),"| Проверьте наличие операций в RS-Bank v.5");
+      date_begin = date(ДатаПерехода);
+    elif( (date("01.01.2011") > date_begin) and ((fdBank.is_EXV) or (fdBank.is_GO))) //Lavrenov: Для ЭВ дата предкновения - 01.01.2011  
+                                                                                     //Lavrenov: C-10647 25.04.2012 так же для Пойдем  
+      msgbox("Дата начала выписки по л/с ", acc, " в файле ", NameFile ," меньше 01.01.2011 | Установлена дата начала выписки ", date("01.01.2011"),"| Проверьте наличие операций в RS-Bank v.5");
+      date_begin = date("01.01.2011");
+    elif( (date("14.11.2009") > date_begin) and (fdBank.is_GEB))                     //Chesnokov: Для ГЭБ дата предкновения - 14.11.2009
+                                                                                     // заявка C-12669
+      msgbox("Дата начала выписки по л/с ", acc, " в файле ", NameFile ," меньше 14.11.2009 | Установлена дата начала выписки ", date("14.11.2009"),"| Проверьте наличие операций в RS-Bank v.5");
+      date_begin = date("14.11.2009");
+    end;
+  end;
+/*
+  cacheQueryText = "SELECT " + docInfoServer.getFieldListasString() +
+                   " FROM " + tablename +
+                   " where ( t_account_payer = '"+acc+"' "   +
+                   " OR t_account_receiver = '"+acc+"' ) " +
+                   " AND T_STATE = 1 "; /*VDN 14.04.2015 R-568830-2*/ 
+                   if ((fdBank.is_SLD) and (fiid != 0)) //zmp 17.06.2014 
+                     cacheQueryText = cacheQueryText + " and t_rate != 0 " ;
+                   end;
+                     cacheQueryText = cacheQueryText + " AND t_date_carry BETWEEN TO_DATE ('"+date_begin+"', 'dd.mm.yyyy') " +
+                                                       " AND TO_DATE ('"+date_end+"', 'dd.mm.yyyy') ";
+ 
+  docInfoServer.cacheInformation(cacheQueryText); // кеширование информации (сбор инф. по проводкам)
+
+  str =  " SELECT decode(t.t_payeraccount,'"+acc+"',1,2) as t_sort,                              " +
+         "        t.t_autokey as t_acctrnid,                                                     " +
+         "        DECODE(                                                                        " +
+         "         (select count(0) from usr_pmdocs where acctrnid = t.t_autokey and paymentid = " +
+         "          t.t_paymentid), 0, t.t_payeraccount, decode(t.t_payeraccount,'"+acc+"',      " +
+         "          t.t_payeraccount, doc.t_account_payer)) as t_payeraccount,                   " +
+         "        regexp_replace(t.t_payername, '[' || chr(10) || chr(11) || chr(13) ||':]+', '') as t_payername, " +
+         "        t.t_payercodekind as t_payercodekind,                                          " +
+         "        t.t_payerfiid as t_payerfiid,                                                  " +
+         "        DECODE(                                                                       " +
+         "         (select count(0) from usr_pmdocs where acctrnid = t.t_autokey and paymentid = " +
+         "          t.t_paymentid), 0, t.t_receiveraccount, decode(t.t_payeraccount,'"+acc+"',   " +
+         "          doc.t_account_receiver, t.t_receiveraccount )) as t_receiveraccount,         " +
+         "        regexp_replace(t.t_receivername, '[' || chr(10) || chr(11) || chr(13) ||':]+', '') as t_receivername, " +
+         "        t.t_receiverfiid as t_receiverfiid,                                            " +
+         "        t.t_receiveramount as t_receiveramount,                                        " +
+         "        t.t_paymentid as t_paymentid,                                                  " +
+         "        t.t_fiid as t_fiid,                                                            " +
+         "        DECODE(                                                                        " +
+         "         (select count(0) from usr_pmdocs where acctrnid = t.t_autokey and paymentid = " + 
+         "          t.t_paymentid), 0, t.t_amount, DECODE(t.t_payeraccount, '"+acc+"', doc.t_sum_payer, doc.t_sum_receiver)) as t_amount, " + 
+         "        t.t_date_carry as t_date_carry,                                                " +
+         "        regexp_replace(t.t_numb_document, '^[   ]+', '') as t_numb_document, " + 
+         "        t.t_shifr_oper as t_shifr_oper,                                                " +
+         "        regexp_replace(DECODE(                                                         " +
+         "                              (select count(0) from usr_pmdocs where                   " +
+         "                               acctrnid = t.t_autokey and paymentid = t.t_paymentid),  " +
+         "                       0, t.t_ground, doc.t_ground), '[' || chr(10) || chr(11) || chr(13) ||':]+', '') as t_ground, " +
+         "        t.t_purpose as t_purpose                                                       " +
+         "  FROM " + docInfoServer.getCacheTableName() + " t, " + tablename + " doc              " +
+         " WHERE t.t_autokey = doc.t_acctrnid order by t.t_date_carry, t_sort, t_payeraccount, t_amount ";
+*/         
+    // 31.07.2015 Golovkin C-40714 перенос части функционала в функцию usr_getFnsOperations
+    str = "SELECT   *                                                                      "
+          "  FROM   table(usr_getFnsOperations ('"+acc+"',                                 "
+          "                                     TO_DATE ('"+date_begin+"', 'dd.mm.yyyy'),  "
+          "                                     TO_DATE ('"+date_end+"'  , 'dd.mm.yyyy'))) ";
+
+  //Должно помочь в плане быстродействия
+  rs = TRsbDataset(str, RSDVAL_SERVER);
+
+  return rs;
+end;
+
+private macro getPaymentIDLinkedWithCarry(CarryID : integer):integer
+  var arhdoc_tablename = "dacctrn_dbt";
+  var query = "select pd.t_PaymentID " +
+              "  from dpmdocs_dbt pd, " + arhdoc_tablename + " ad " +
+              " where ad.t_AccTrnID = " + CarryID +
+              "   and pd.t_AccTrnID = ad.t_AccTrnID ";
+  var rs:RsdRecordset = execSQLselect(query);
+  if (rs and rs.moveNext() )
+    return rs.value(0);
+  end;
+  return 0;
+end;
+
+/*Вставка в временную таблицу*/
+private macro InsertStrTmp(Num, Str, Flush : bool)
+
+  var ins : RsbSQLInsert;
+  var stat = true;
+
+  if (Flush == null)
+    Flush = false;
+  end;
+
+  if ((Str.Size == 10000) or ((Flush) and (Str.Size > 0)))
+
+    ins = RsbSQLInsert("Insert into USR_VIPISKA_TMP values (0, "+ Num +", ?)", 1, Str.Size);
+    ins.AddParam( V_STRING, Str, 400 );
+    stat = ins.Insert();
+    Str.Size = 0;
+    
+  end;
+  
+  if (not stat)
+    msgbox("Ошибка вставки данных в пользовательскую таблицу.");
+  end;
+
+end;
+
+private macro GetPartyName(PartyId)
+  
+  var select = RsdCommand(" Select pt.t_name from dparty_dbt pt where t_partyid = :partyid");
+      select.AddParam("PartyID", RSDBP_IN, PartyID);
+  
+  var rs = RsdRecordSet(select);
+  
+  if (rs.Movenext)
+    return rs.value(0);
+  else
+    return "Не удалось определить имя клиента";
+  end;
+  
+end;
+
+macro Service_Part(Num, mes, PersData)
+  
+  /*ИдФайл*/
+  SplitFullInn(GetFullINN({OurBank}), INN, KPP);
+  stroka = "ИдФайл:" + INN + "**" + KPP + strYYYYMMDD({curdate}) + docnumber;
+  str(str.size) = stroka;
+  len = strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ТипИнф*/
+  stroka = "ТипИнф:ОПЕРАЦИИПОСЧ";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ВерсПрог*/
+  stroka = "ВерсПрог:RS-Bank V.6";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ТелОтпр*/
+  stroka = "ТелОтпр:"+PersData.Phone;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ДолжнОтпр*/
+  stroka = "ДолжнОтпр:"+PersData.Officer;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ФамОтпр*/
+  stroka = "ФамОтпр:"+PersData.SurName;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*КолДок*/
+  stroka = "КолДок:1";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*НомЧасти*/
+  stroka = "НомЧасти:" + Num;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ВерсФорм*/
+  stroka = "ВерсФорм:2.01";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*Конец блока*/
+  stroka = "###";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*Конец фрагмента*/
+  stroka = "@@@";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+end;
+
+macro Information_Part(Num, mes, wlreq_buff)
+
+var Code, Error;
+
+  /*ИдДок*/
+  stroka = "ИдДок:" + execStoredFunc( "sys_guid", V_STRING );
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*НомВыпис*/
+  stroka = "НомВыпис:" + docnumber;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*ИННКО*/
+  stroka = "ИННКО:" + INN;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*КППКО*/
+  stroka = "КППКО:" + KPP;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*БИК*/
+  stroka = "БИК:" + {MFO_Bank};
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НаимКО*/
+  stroka = "НаимКО:" + {Name_Bank};
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НомФ*/
+  stroka = "НомФ:0";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НомЗапр*/
+  stroka = "НомЗапр:" + mes.НомЗапр;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ДатаЗапр*/
+  stroka = "ДатаЗапр:" + ДатаДДpММpГГГГ(date(mes.ДатаЗапр));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*КодНО*/
+  if (wlreq_buff.recipientID > 0)
+    Code = ПолучитьКодСубъекта( wlreq_buff.OriginatorID, PTCK_MNS, Error);
+  else
+    Code = wlreq_buff.OriginatorCode;
+  end;
+  
+  if ((Code == null) or (valtype(Code) == V_Undef) or (Code == 0) or (Code == ""))
+    msgbox("Не удалось определить Налоговую Инспекцию |Возможно она отсутствует в справочнике!");
+    return 1;
+  end;
+  
+  stroka = "КодНО:" + Code;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  SplitFullInn(GetFullINN(mes.PartyID), INNClient, KPPClient);
+    
+  /*ИНННП*/
+  stroka = "ИНННП:" + INNClient;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  if ((strLen(INNClient) == 5) or (Strlen(INNClient) == 10))
+    /*КППНП*/
+    stroka = "КППНП:" + KPPClient;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+      
+    /*НаимНП*/
+    stroka = "НаимНП:" + substr(GetPartyName(mes.PartyID), 1, 160);
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+  end;
+  
+  if (strLen(INNClient) == 12)
+    persn.rec.PersonID = mes.PartyID;
+    persn.GetEQ();
+    /*ФИОИП*/
+    stroka = "ФИОИП:" + persn.rec.Name1 + "," + persn.rec.Name2 + "," + persn.rec.Name3;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+  end;
+  
+  /*ДолжнПрБ*/
+  stroka = "ДолжнПрБ:" + ДолжнПрБ;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ФИОПрБ*/
+  stroka = "ФИОПрБ:" + РазделитьЗапятымиФИО(ФИОПрБ);
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ДатаСправ*/
+  stroka = "ДатаСправ:" + ДатаДДpММpГГГГ({CurDate});
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*ДатаСооб*/
+  stroka = "ДатаСооб:"+ДатаДДpММpГГГГ(Date());
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+  
+  /*Конец блока*/
+  stroka = "###";
+  len = len + strlen(stroka) + 2;
+  str(str.size) = stroka;
+  InsertStrTmp(Num, str);
+
+end;
+
+macro Account_Statement(Num, rs_acc, mes)
+
+  /*Обработать операции из 5.0*/
+  var ДатаНач;
+
+  if ((date(ДатаПерехода) > date(mes.ДатаНач)) and ( (fdBank.is_PRBB) or (fdBank.is_VUZ) or (fdBank.is_NBS) or (fdBank.is_SLD) ))
+    ДатаНач = date(ДатаПерехода);
+  elif( (date("01.01.2011") > date(mes.ДатаНач)) and ((fdBank.is_EXV) or (fdBank.is_GO)))//Lavrenov: Для ЭВ Саратов дата предкновения - 01.01.2011  
+    ДатаНач = date("01.01.2011");                                                         //Lavrenov: C-10647 25.04.2012 так же для Пойдем                                 
+  elif( (date("14.11.2009") > date(mes.ДатаНач)) and (fdBank.is_GEB))                     //Chesnokov: Для ГЭБ дата предкновения - 14.11.2009
+    ДатаНач = date("14.11.2009");                                                         // заявка C-12669
+  else
+    ДатаНач = date(mes.ДатаНач)
+  end;
+
+
+  /*НомСч*/
+  stroka = "НомСч:" + rs_acc.value("t_Account");
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ВалСч*/
+  stroka =  "ВалСч:" + ПолучитьКодФинИн_usr(rs_acc.value("t_FIID"));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ДатаНачала*/
+  stroka = "ДатаНачала:" + ДатаДДpММpГГГГ(date(mes.ДатаНач));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*ДатаКонца*/
+  stroka = "ДатаКонца:" + ДатаДДpММpГГГГ(date(mes.ДатаКон));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ОстатНач*/
+  if(int(rs_acc.value("t_FIID")) == 0)
+    stroka = "ОстатНач:" + string( resta( rs_acc.value("t_Account"), date(ДатаНач)-1, rs_acc.value("t_chapter")));
+  else
+    stroka = "ОстатНач:" + string( restac( rs_acc.value("t_Account"), rs_acc.value("t_FIID"), date(ДатаНач)-1, rs_acc.value("t_chapter")));
+  end;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*СуммаДеб*/
+  var sum = $0;
+  if(rs_acc.value("t_FIID") == 0)
+    sum = debeta(rs_acc.value("t_Account"), date(ДатаНач), date(mes.ДатаКон), rs_acc.value("t_chapter"));
+  else
+    sum = debetac(rs_acc.value("t_Account"), rs_acc.value("t_FIID"), date(ДатаНач), date(mes.ДатаКон), rs_acc.value("t_chapter"));
+  end;
+  stroka = "СуммаДеб:" + string(sum);
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*СуммаКред*/
+  if(rs_acc.value("t_FIID") == 0)
+    sum = kredita(rs_acc.value("t_Account"), date(ДатаНач), date(mes.ДатаКон), rs_acc.value("t_chapter"));
+  else
+    sum = kreditac(rs_acc.value("t_Account"), rs_acc.value("t_FIID"), date(ДатаНач), date(mes.ДатаКон), rs_acc.value("t_chapter"));
+  end;
+  stroka = "СуммаКред:" + string(sum);
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*ОстатКон*/
+  if(int(rs_acc.value("t_FIID")) == 0)
+    stroka = "ОстатКон:" + string( resta( rs_acc.value("t_Account"), date(mes.ДатаКон), rs_acc.value("t_chapter")));
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+  else
+    stroka = "ОстатКон:" + string( restac( rs_acc.value("t_Account"), rs_acc.value("t_FIID"), date(mes.ДатаКон), rs_acc.value("t_chapter")));
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+  end;
+    
+  /*Конец блока*/
+  stroka = "###";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+end;
+
+private macro Get_Document_50(carry_id, account)
+  var rs, str;
+   str = " WITH t AS (SELECT   *                                          "
+         "            FROM   dacctrn_dbt c                                "
+         "            WHERE  C.T_ACCTRNID = "  + carry_id + ")            "
+         "   SELECT   a.*                                                 "
+         "     FROM   darhdoc_5_dbt a, t                                  "
+         "    WHERE   (A.T_ACCOUNT_PAYER  = '" + account + "'             "
+         "             OR A.T_ACCOUNT_RECEIVER = '" + account + "')       "
+         "            AND A.T_DATE_CARRY = t.T_DATE_CARRY                 "
+         "            AND A.T_NUMB_DOCUMENT = t.T_NUMB_DOCUMENT           "
+         "            AND a.T_NUMBER_PACK = t.T_NUMBER_PACK               "
+         "            AND A.T_OPER = t.T_OPER                             "
+         "            AND A.T_SUM = t.T_SUM_NATCUR                        " ;
+                                                                   
+
+  rs = trsbdataset(str);
+  if(rs and rs.movenext)
+     return rs;
+  end;
+  return null;
+end;
+
+private macro Construct_Full_INN(INN, KPP)
+  var FullINN;
+  if ((strlen(trim(INN)) == 10) or (strlen(trim(INN)) == 5))
+     if(strlen(trim(KPP)) == 9)
+        FullINN = trim(INN)+"/"+trim(KPP);
+     else
+        FullINN = trim(INN)+"/"+substr(trim(INN),1,4)+"01001";
+     end;
+  elif (strlen(trim(INN)) == 12)
+     FullINN = trim(INN)
+  else
+     FullINN = ПолучитьКодСубъекта({OurBank}, 16); 
+  end;
+  return FullINN;
+end;
+
+private macro Get_Bank_Name_By_BIC(bic)
+  var rs, str;
+  if(strlen(trim(bic))== 9)
+    str = "SELECT t_name " +
+          "  FROM dparty_dbt t, dobjcode_dbt o " +
+          " WHERE t.t_partyid = o.t_objectid " +
+          "   AND o.t_objecttype = 3 " +
+          "   AND o.t_codekind = 3 " +
+          "   AND o.t_state = 0 " +
+          "   AND o.t_code = '"+trim(bic)+"' ";
+    rs = trsbdataset(str);
+    if(rs and rs.movenext)
+       return rs.t_name;
+    end;
+  end;
+  return {Name_Bank};
+end;
+
+// 31.07.2015 Golovkin C-40714 перенос части функционала в функцию usr_getFnsOperations
+macro Operation_part(Num, rs_doc, rs_acc, mes, wlreq_buff)
+
+  var Payment:object;
+  var arhdoc : object;
+  var doc_50 = null;
+  var PaymentID = 0;//getPaymentIDLinkedWithCarry(rs_doc.t_AccTrnID);
+  var AccountClient = 0;
+  
+  record party(party);
+  
+  var tmpstr = "", FullINN = "";
+  var FIID = ALLFININSTR, query, rs;
+
+  // zmp 29.05.2014 пробуем что-нибудь вытянуть из 5  
+  if(    (rs_doc.dateOperation < date(ДатаПерехода)) 
+     and (   (fdBank.is_EXV) 
+          or (fdBank.is_GO) 
+          or (fdBank.is_GEB))) //Lavrenov: C-9681 для ЭВ тянем данные из darhdoc_5_dbt 
+     doc_50 = Get_Document_50(rs_doc.acctrnid, rs_acc.value("t_Account"));        //Lavrenov: C-10647 25.04.2012 так же для Пойдем Chesnokov: C-12669 - для ГЭБ
+  end;
+   
+  /*ДатаОпер*/
+  stroka = "ДатаОпер:" + ДатаДДpММpГГГГ(date(rs_doc.dateOperation));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ВидДок*/
+  stroka = "ВидДок:" + rs_doc.docKind;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*НомДок*/
+  stroka = "НомДок:" + rs_doc.docNumber;
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ДатаДок*/
+  stroka = "ДатаДок:" + ДатаДДpММpГГГГ(date(rs_doc.docDate));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НомКорСч*/
+  if((rs_doc.dateOperation < date(ДатаПерехода)) and (doc_50)) //Lavrenov: C-9681
+    if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+      if(trim(doc_50.t_mfo_receiver) != "") 
+        stroka = "НомКорСч:" + strsubst(doc_50.t_CorAcc_Receiver, strfor(0), " ");
+      else
+        stroka = "НомКорСч:"+ {CORAC_Bank};
+      end;
+    else  
+      if(trim(doc_50.t_mfo_payer) != "")
+        stroka = "НомКорСч:" + strsubst(doc_50.t_CorAcc_Payer, strfor(0), " ");
+      else
+        stroka = "НомКорСч:"+ {CORAC_Bank};
+      end;
+    end;
+  else
+    if((rs_doc.corAccNumber == null) or (rs_doc.paymentid <= 0))
+      stroka = "НомКорСч: ";
+    else
+      stroka = "НомКорСч:" + rs_doc.corAccNumber;
+    end;  
+  end;
+
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НаимБП*/
+  if((rs_doc.dateOperation < date(ДатаПерехода)) and (doc_50)) //Lavrenov: C-9681
+    if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+      if(trim(doc_50.t_mfo_receiver) != "")
+        if(trim(doc_50.t_bank_Receiver) != "")
+          stroka = "НаимБП:" + doc_50.t_bank_Receiver;
+        else//Lavrenov: Если Бик есть, а наименования банка нет о_0
+          stroka = "НаимБП:" + Get_Bank_Name_By_BIC(doc_50.t_mfo_Receiver);
+        end;
+      else
+        stroka = "НаимБП:" + {Name_Bank};
+      end;
+    else  
+      if(trim(doc_50.t_mfo_payer) != "")
+        if(trim(doc_50.t_bank_Payer) != "")
+          stroka = "НаимБП:" + doc_50.t_bank_Payer;
+        else //Lavrenov: Если Бик есть, а наименования банка нет о_0
+          stroka = "НаимБП:" + Get_Bank_Name_By_BIC(doc_50.t_mfo_payer);
+        end;
+      else
+        stroka = "НаимБП:" + {Name_Bank};
+      end;
+    end;
+  else
+    if(rs_doc.paymentid > 0)
+      stroka = "НаимБП:" + rs_doc.nameBP;
+    else
+      ПолучитьСубъекта(wlreq_buff.OriginatorID, party);
+      if((fdBank.is_SLD) and (wlreq_buff.ORIGINATORCODEKIND == 28)) //zmp 16.06.2014 
+         stroka = "НаимБП:" + {Name_Bank};
+      else
+         stroka = "НаимБП:" + party.Name;
+      end;    
+    end;  
+  end;
+
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*БИКБП*/
+  if((rs_doc.dateOperation < date(ДатаПерехода)) and (doc_50)) //Lavrenov: C-9681
+    if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+      if(trim(doc_50.t_mfo_receiver) != "")
+        stroka = doc_50.t_mfo_receiver;
+      else
+        stroka = {MFO_Bank};
+      end;
+    else  
+      if(trim(doc_50.t_mfo_payer) != "")
+        stroka = doc_50.t_mfo_payer;
+      else
+        stroka = {MFO_Bank};
+      end;
+    end;
+  else
+    if(rs_doc.paymentid > 0)
+      stroka = subStr(rs_doc.bicBP, 1, 9);
+    else
+      stroka = "000000000";
+    end;
+  end;
+  
+  str(str.size) = "БИКБП:" + stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*ФИОПП*/
+  /*НаимПП*/
+  var AccountPP; // значение поля "НомСчПП"
+  var AccountPPClient; // клиент по счету из поля "НомСчПП" 
+  var СчетПолучателяКлиентский; //Lavrenov I-00138488 является ли счет получателя клиентским
+  var INNPP;
+  var LegalForm;
+  if((rs_doc.dateOperation < date(ДатаПерехода)) and (doc_50))
+    /**
+     * Golovkin. Реквизиты получателя платежа из darhdoc_5_dbt
+     */
+    if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+      tmpstr = doc_50.t_account_receiver;
+      FIID = 0;
+    else  
+      tmpstr = doc_50.t_account_payer;
+      FIID = 0;
+    end;
+    
+    AccountPP = tmpstr; // значение поля "НомСчПП"
+    AccountPPClient = -1; // клиент по счету из поля "НомСчПП" 
+    СчетПолучателяКлиентский = true; //Lavrenov I-00138488 является ли счет получателя клиентским
+
+    query = "select t_client "
+            "  from daccount_dbt  "
+            " where     t_Account = '" + AccountPP + "' " +
+            "       and t_chapter = 1 and t_Code_Currency = " + FIID;
+    rs = execSQLselect(query);
+    if (rs and rs.moveNext())
+      AccountPPClient = rs.value(0);
+    end;
+
+    if (CompareStrWithMasks (СчетаБанка, AccountPP) == 0)//дурацкая функция, все через одно место возвращает, руки бы оторвать тому кто ее написал
+      СчетПолучателяКлиентский = false;
+    end;
+
+    if (AccountPPClient == -1)
+      СчетПолучателяКлиентский = true
+    end;
+
+    if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+      FullINN = Construct_full_inn(doc_50.t_okpo_receiver,doc_50.t_kpp_receiver);
+    else  
+      FullINN = Construct_full_inn(doc_50.t_okpo_Payer,doc_50.t_kpp_Payer);
+    end;
+    
+    INNPP = RemoveKPP(FullINN);
+
+    if ( (AccountPPClient > 0) and (ПолучитьСубъекта(AccountPPClient, party) == 0) )              
+       LegalForm = party.LegalForm;
+    else
+      /*Не нашли ИНН, то будет юр.лицом*/
+      if (strlen(trim(RemoveKPP(FullINN))) == 12)
+        LegalForm = PTLEGF_PERSN;  
+      elif ((strlen(trim(RemoveKPP(FullINN))) == 10) or (strlen(trim(RemoveKPP(FullINN))) == 5))
+        LegalForm = PTLEGF_INST;
+      else
+        LegalForm = PTLEGF_INST;
+      end;
+    end;
+    
+    if (LegalForm != PTLEGF_PERSN)
+      if((substr(rs_doc.t_payeraccount,1,3) == "202") or (substr(rs_doc.t_receiveraccount,1,3) == "202")) // Lavrenov I-00143789 Кассовые, мать их так
+        stroka = "НаимПП:Касса Банка";
+      else  
+        if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+          if(trim(doc_50.t_receiver) == "")
+             stroka = "НаимПП:" + {Name_Bank}; 
+          else
+             stroka = "НаимПП:" + doc_50.t_receiver; 
+          end;
+        else  
+          if(trim(doc_50.t_Payer) == "")
+             stroka = "НаимПП:" + {Name_Bank}; 
+          else
+             stroka = "НаимПП:" + doc_50.t_Payer; 
+          end;
+        end;
+      end;
+    else
+      if (doc_50.t_real_payer == rs_acc.value("t_Account"))
+        stroka = "ФИОПП:" + РазделитьЗапятымиФИО(CutFIO(doc_50.t_receiver)); 
+      else  
+        stroka = "ФИОПП:" + РазделитьЗапятымиФИО(CutFIO(doc_50.t_Payer)); 
+      end;        
+    end;
+
+    str(str.size) = Substr(stroka, 1, 167);//09.04.2013 Chesnokov D.S. I-00353655 привел длинну строки в соответствие с форматом
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+
+    /*ИННПП*/
+    INNPP = RemoveKPP(FullINN);
+    if (INNPP == "")
+      INNPP = " ";
+    end;
+
+    stroka = "ИННПП:" + INNPP;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+
+    /*КПППП*/
+    if ( (strlen(INNPP) == 5) or (strlen(INNPP) == 10) )
+      var KPPPP = RemoveINN(FullINN);
+      if (strlen(KPPPP) == 9)
+        stroka = "КПППП:" + KPPPP; 
+      else 
+        //Lavrenov I-00143649 Избавляемся от неправильных КПП
+        stroka = "КПППП:" + substr(INNPP,1,4) + "01001";
+      end;
+      
+      str(str.size) = stroka;
+      len = len + strlen(stroka) + 2;
+      InsertStrTmp(Num, str);
+    end;
+
+    /*НомСчПП*/
+    stroka = "НомСчПП:" + AccountPP;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);    
+  else
+    if (rs_doc.legalFormPP == PTLEGF_INST)
+      stroka = "НаимПП:" + rs_doc.namePP;
+    else 
+      stroka = "ФИОПП:" + РазделитьЗапятымиФИО(CutFIO(rs_doc.namePP));
+    end;    
+    str(str.size) = Substr(stroka, 1, 167);//09.04.2013 Chesnokov D.S. I-00353655 привел длинну строки в соответствие с форматом
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+
+    /*ИННПП*/
+    if(rs_doc.innPP == null)
+      stroka = "ИННПП: ";
+    else
+      stroka = "ИННПП:" + rs_doc.innPP;
+    end;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+
+    /*КПППП*/
+    if ( (strlen(rs_doc.innPP) == 5) or (strlen(rs_doc.innPP) == 10) )
+      stroka = "КПППП:" + rs_doc.kppPP;
+      str(str.size) = stroka;
+      len = len + strlen(stroka) + 2;
+      InsertStrTmp(Num, str);
+    end;
+
+    /*НомСчПП*/
+    stroka = "НомСчПП:" + rs_doc.accNumberPP;
+    str(str.size) = stroka;
+    len = len + strlen(stroka) + 2;
+    InsertStrTmp(Num, str);
+  end;
+
+  /*Дебет*/
+  stroka = "Дебет:" + string(money(rs_doc.debetSum));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*Кредит*/
+  stroka = "Кредит:" + string(money(rs_doc.kreditSum));
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+
+  /*НазнПл*/
+  stroka = "НазнПл:" + substr(trim(rs_doc.ground),1,210);
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+  /*Конец блока*/
+  stroka = "###";
+  str(str.size) = stroka;
+  len = len + strlen(stroka) + 2;
+  InsertStrTmp(Num, str);
+    
+end;
+
+macro CreateFile(NamePart, Num, AllNum)
+    
+  var sql, rs;
+    
+  sql = "select t_str from USR_VIPISKA_TMP where t_num = " + Num;
+  rs = RsdRecordSet(sql);
+    
+  SetOutPut(TxtFileDir  + "\\" + NamePart + ".vrb", false);
+    
+  if ((Num == AllNum) and (AllNum == 1))
+    
+    while (rs.movenext)
+     if (rs.value(0) != "НомЧасти:1")
+       println(rs.value(0));
+     end;
+    end;
+    
+  else
+    while (rs.movenext)
+     if (rs.value(0) == "КолДок:1")
+       println("КолДок:" + AllNum);
+     else
+       println(rs.value(0));
+     end;
+    end;
+  end;
+
+  SetOutput(null, true);
+  if (CopyFile(NamePart + ".vrb", ExpPath + "\\" + NamePart + ".vrb"))
+    //msgbox("Создан файл ", NamePart, ".vrb в каталоге ", ExpPath);
+    return true;
+  else
+    msgbox("Не удалось скопировать файл ", NamePart + ".vrb| в каталог ", ExpPath + "\\" + NamePart + ".vrb");
+    return false;
+  end;
+    
+    
+end;
+
+/*Формирование имен файлов выписки*/
+macro PrintFile(Num, mes, mas_name)
+
+  var NumPart = "00";
+  var NamePart, i = 1;
+  var dir, name, ext, NumRevision;
+    
+  dir = SplitFile(mes.FileName, name, ext);
+    
+  if (Num == 1)
+    
+    NamePart = "BV1" + NumPart + "_" + name;
+      
+    if (CreateFile(NamePart, i, Num))
+      mas_name(mas_name.Size) = NamePart + ".vrb";
+    end;
+  elif ((Num > 1) and (Num < 100))
+    while (i <= Num)
+      if (i < 10)
+        NumPart = "0" + i;
+      else
+        NumPart = string(i);
+      end;
+
+      NamePart = "BV1" + NumPart + "_" + name;
+        
+      if (CreateFile(NamePart, i, Num))
+        mas_name(mas_name.Size) = NamePart + ".vrb";
+      end;
+      i = i + 1;
+    end;
+      
+  else
+    msgbox("Количество частей превышает 99!!!");
+  end;
+    
+  //msgbox("Создано ", Num, " файл(а), в каталоге ", ExpPath );
+
+end;
+
+
+/*Создание файла информационного сообщения*/
+macro CreateBV(wlreq_buff, mes, fl_name, PersData)
+  
+  var rs, cnum, Num = 1, mas_name = Tarray();
+    
+  if (ПрочитатьНастройки)
+
+    rs = trsbdataset("select RSBSESSIONDATA.CNUM from dual ");
+    if (rs and rs.movenext)
+       cnum = int(rs.cnum);
+    else
+       cnum = {oper};
+    end;
+    
+    generatereference(refnumber, docnumber);
+
+    //zmp 15.07.2014 R-412157 
+    if(valtype(docnumber) == v_undef)
+       msgBox("Не удалось получить значение референса " + refnumber + ". Попробуйте перезайти в RS-Bank и обработать сообщение повторно.");
+       return 1;
+    end;
+
+    /*Очистим временную таблицу*/
+    TruncateTempTable();
+
+    /*Сервисная часть*/
+    Service_Part(Num, mes, PersData);
+    
+    /*Информационная часть*/
+    Information_Part(Num, mes, wlreq_buff);
+    
+    //Lavrenov: I-00146116 теперь для всех запросов счета берутся из одного места
+    rs_acc = getRsWlacclnk(wlreq_buff.reqid, 505);
+    
+   /* if (date(ДатаПерехода) > date(mes.ДатаНач))
+      msgbox("Дата начала выписки меньше даты перехода Банка на RS-Bank v.6 | Проверьте наличие операций в RS-Bank v.5");
+//      mes.ДатаНач = date(ДатаПерехода);
+    end;*/
+    
+    while(rs_acc and rs_acc.MoveNext())
+      if ((rs_acc.value("t_State") == 0) or (rs_acc.value("t_State") == 100))
+        ПолучитьСчет( rs_acc.value("t_FIID"), rs_acc.value("t_Account"), Acc );
+        if((Acc.Close_Date == date(0,0,0)) or (Acc.Close_Date > Date(Mes.ДатаНач)))
+          /*Выписка по счету*/
+          Account_Statement(Num, rs_acc, mes);
+          
+          progress = 0;
+          initprogress(-1, "Идет обработка");
+          
+          rs_doc = get_documents(rs_acc.value("t_Account"), rs_acc.value("t_FIID"), date(mes.ДатаНач), date(mes.ДатаКон), mes);
+          
+          while (rs_doc and rs_doc.moveNext() and (not EOF) )
+            
+            progress = progress + 1;
+            useprogress(progress);
+            /*Операции по счету*/
+            Operation_part(Num, rs_doc, rs_acc, mes, wlreq_buff);
+            if (len > int(РазмерВыписки))
+              /*Конец фрагмента*/
+              stroka = "@@@";
+              str(str.size) = stroka;
+              len = len + strlen(stroka) + 2;
+              InsertStrTmp(Num, str);
+        
+              /*Конец файла*/
+              stroka = "===";
+              str(str.size) = stroka;
+              len = len + strlen(stroka) + 2;
+              InsertStrTmp(Num, str, True);
+              
+              /*Проверим что больше в блоке нет операций*/
+              if (not rs_doc.EOF)
+                Num = Num + 1;
+                Service_Part(Num, mes, PersData);
+                Account_Statement(Num, rs_acc, mes);
+                
+                //rs_doc.MovePrev; /*Если есть вернемся назад*/
+              else
+                EOF = true;//Выборка закончилась, обрабатываем флагом из-за странного поведения TRsbDataSet
+              end;
+            end;
+          end;
+          remprogress();
+        end;
+      end;
+    end;
+    
+    if (not EOF)
+      /*Конец фрагмента*/
+      stroka = "@@@";
+      str(str.size) = stroka;
+      len = len + strlen(stroka) + 2;
+      InsertStrTmp(Num, str);
+        
+      /*Конец файла*/
+      stroka = "===";
+      str(str.size) = stroka;
+      len = len + strlen(stroka) + 2;
+      InsertStrTmp(Num, str, True);
+    end;
+    
+    PrintFile(Num, mes, @mas_name);
+    SetParm(2, mas_name);
+  else
+  
+    msgbox("Проверьте наличие настроек.");
+    return 1;
+  end;
+
+  return 0;
+end;
+
+

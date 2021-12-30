@@ -1,0 +1,373 @@
+/**************************************************************************************************/
+/*                                                                                                */
+/*            Отчет : Контроль ФМ начальных и ответных платежей                                   */
+/*           Заявка : C-41755                                                                     */
+/**************************************************************************************************/
+
+import RsbFormsInter, RSD, "KeyCodes.mac", "globals.mac", "Календарь", lib_sqltools, activeX, RCW, Rsexts;
+
+private const FT_INT32 = 1, FT_STRING = 7, FT_DATE = 9,
+              FT_NUMSTR = 18, FT_NUMERIC = 25;
+
+var p_BeginDate, p_EndDate, ExcelReport, is_Exit = false; 
+ 
+private Class Report (beginDate, endDate)
+    var beginDateReport = beginDate;
+    var endDateReport   = endDate  ; 
+
+    private var myWorkBook;
+    private var myWorkExcel;
+    private var myWorkSheet;
+    var numSheet = 1;
+
+    private var myRecord = null;
+
+    private var myFileName = "RepOperAcc" + Date();
+    private var cntRecord = 0;
+
+    /*Определение рабочей директории временных файлов*/
+    private macro GetWorkDirName() : string
+      var DirName:string = "", 
+          StrErr :string = "";
+
+      GetRegistryValue( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", V_STRING, DirName, StrErr );        
+      if( DirName )     
+        if( SubStr(DirName, 1, 1) == "." ) DirName = "$" + GetCurDir(TRUE) + replace (DirName, "..",""); end;     
+        if (existFile(DirName))  return DirName;  end;
+      end;
+
+      DirName = "$" + GetEnv("TEMP");
+
+      if( NOT DirName ) DirName = "$" + GetEnv("TMP"); end;
+      if (existFile(DirName)) return DirName; end;
+
+      msgbox("Ошибка поиска папки для временных файлов на терминале");
+
+      return "";
+    end;
+
+    /*Копирование файла на терминал*/
+    private macro myCopyFile (Name_file)
+      var Templs_Dir_Term = GetWorkDirName();
+
+      var TermFileName = toAnsi(Name_file);
+      var SPFileName;
+
+      if ( Templs_Dir_Term == "" )  return "";  end;
+      SPFileName = "..\\txtfile\\" + Name_file;
+
+      if (not existFile(SPFileName)) MsgBox(string("Транспортный временный файл не найден: |", SPFileName)); return ""; end;
+      if( not CopyFile(SPFileName, Templs_Dir_Term + "\\" + TermFileName) ) RunError("Ошибка при передаче файла на терминал\n" + Templs_Dir_Term + "\\" + TermFileName); end;
+
+      return subStr(Templs_Dir_Term + "\\" + TermFileName, 2);      
+    end;
+
+    /*Определение формата загружаемых данных*/
+    private macro SetTypeColumns();
+      var result_arr = TArray(true), i;
+ 
+      for(i, 1, 16)
+        var templs_arr = TArray(true);         
+        templs_arr(0) = i;
+        templs_arr(1) = 2;
+
+        result_arr(i - 1) = templs_arr;
+      end; 
+
+      return result_arr;
+    end;
+
+    /*Поиск "плохих" символов*/
+    private macro ClearSymble(str, split_char)
+      str = StrSubst(str, strfor(13), "" );
+      str = StrSubst(str, strfor(10), "" );
+      str = StrSubst(str, strfor(1 ), " ");
+      str = StrSubst(str, split_char, " ");
+      return string(str);   
+    end;
+
+    private macro ReplaceSpesial ( str )
+      if (valType(str) == 26) return " "; end;
+      return str;
+    end;
+
+    /*Формирвоание выборки данных*/
+    private macro FullRecord() 
+       initprogress(-1, "", "Ожидайте, формируется выборка");
+       
+       var sql =  " SELECT TO_CHAR(pm.t_valuedate, 'dd.mm.yyyy'),                        " +
+           "        prop.t_number,                                                       " +
+           "        debet.t_bankcode AS payer_bankcode,                                  " +
+           "        prop.t_payerinn,                                                     " +
+           "        NVL(CASE                                                             " +
+           "           WHEN pm.t_payer > 0                                               " +
+           "           THEN                                                              " +
+           "              TO_CHAR((SELECT t_docdate                                      " +
+           "                         FROM dobjrgdoc_dbt                                  " +
+           "                        WHERE t_codekind = 27                                " +
+           "                          AND t_objecttype = 3                               " +
+           "                          AND t_objectid = pm.t_payer                        " +
+           "                          AND ROWNUM = 1), 'dd.mm.yyyy')                     " +
+           "           ELSE                                                              " +
+           "              NULL                                                           " +
+           "        END, CHR(1)) AS payer_reg_date,                                      " +
+           "        prop.t_payername,                                                    " +
+           "        pm.t_payeraccount,                                                   " +
+           "        TO_CHAR((SELECT t_open_date                                          " +
+           "                  FROM daccount_dbt                                          " +
+           "                 WHERE t_account = pm.t_payeraccount),                       " +
+           "                'dd.mm.yyyy') AS payer_openacc,                              " +
+           "        credit.t_bankcode AS receiver_bankcode,                              " +
+           "        prop.t_receiverinn,                                                  " +
+           "        NVL(CASE                                                             " +
+           "           WHEN pm.t_payer > 0                                               " +
+           "           THEN                                                              " +
+           "              TO_CHAR((SELECT t_docdate                                      " +
+           "               FROM dobjrgdoc_dbt                                            " +
+           "               WHERE t_codekind = 27                                         " +
+           "                 AND t_objecttype = 3                                        " +
+           "                 AND t_objectid = pm.t_receiver                              " +
+           "                 AND ROWNUM = 1), 'dd.mm.yyyy')                              " +
+           "           ELSE                                                              " +
+           "              NULL                                                           " +
+           "        END, CHR(1)) AS receiver_reg_date,                                   " +
+           "        prop.t_receivername,                                                 " +
+           "        pm.t_receiveraccount,                                                " +
+           "        TO_CHAR((SELECT t_open_date                                          " +
+           "           FROM daccount_dbt                                                 " +
+           "          WHERE t_account = pm.t_receiveraccount), 'dd.mm.yyyy') AS receiver_openacc,       " +
+           "        PM.T_AMOUNT,                                                         " +
+           "        prop.t_ground                                                        " +
+           "   FROM dpmpaym_dbt pm                                                       " +
+           "        LEFT JOIN dpmrmprop_dbt prop ON pm.t_paymentid = prop.t_paymentid    " +
+           "        LEFT JOIN dpmprop_dbt debet ON pm.t_paymentid = debet.t_paymentid    " +
+           "              AND debet.t_debetcredit = 0                                    " +
+           "         LEFT JOIN dpmprop_dbt credit ON credit.t_paymentid = pm.t_paymentid " +
+           "              AND credit.t_debetcredit = 1                                   ";
+
+       if(beginDateReport == endDateReport)
+         sql = sql + "  WHERE pm.t_valuedate = :BeginDate";
+       else
+         sql = sql + "  WHERE pm.t_valuedate between :BeginDate and :EndDate ";
+       end;
+       sql = sql + "    AND pm.t_paymstatus = 32000 AND pm.t_chapter = 1 order by pm.t_valuedate ";
+          
+       var cmd = RsdCommand (sql);
+       if(p_BeginDate == endDateReport)
+         cmd.AddParam(":BeginDate", RSDBP_IN, beginDateReport);
+       else
+         cmd.AddParam(":BeginDate", RSDBP_IN, beginDateReport);
+         cmd.AddParam(":EndDate",   RSDBP_IN, endDateReport);
+       end;
+        
+       myRecord = RsdRecordSet(cmd);
+       remprogress;
+
+     OnError(er)
+       msgBox(er.Message);
+     end;
+      
+    /*Формирование и открытие файла Excel*/
+    private macro OpenExcel()
+      private var objectXls, WorkExcel;
+
+      objectXls = CreateObject ("rsax", "TRsAxServer", string("RsAxServer", UserNumber()), IsStandAlone());
+      WorkExcel = objectXls.CreateComObject ("Excel.Application"); 
+
+      myWorkExcel = WorkExcel;
+
+      return true;
+
+    OnError(er)
+      msgbox(er.Message); 
+      return false;
+    end;
+
+    /*Заполнение заголовков столбцов, формирование сетки таблицы*/
+    private macro SetHeaderExcelTable()
+      var i; 
+      myWorkBook.Sheets(numSheet);
+      myWorkSheet = myWorkBook.ActiveSheet();
+ 
+      myWorkSheet.range("A4:P4").borders.lineStyle = 1;
+      myWorkSheet.range("A4:P4").Font.Bold         = True;
+      myWorkSheet.range("A4:P4").interior.color    = #B5B5B5;
+      myWorkSheet.range("A4:P4").WrapText = true;
+      myWorkSheet.range("A4:P4").horizontalAlignment = -4108;  
+      myWorkSheet.range("A4:P4").VerticalAlignment = -4108;
+
+      myWorkSheet.Cells(4, 1).Value  = "Дата операции";
+      myWorkSheet.Cells(4, 2).Value  = "Номер п/п";
+      myWorkSheet.Cells(4, 3).Value  = "БИК банка плательщика";
+      myWorkSheet.Cells(4, 4).Value  = "ИНН плательщика";
+      myWorkSheet.Cells(4, 5).Value  = "Дата гос. регистрации плательщика";
+      myWorkSheet.Cells(4, 6).Value  = "Наименование плательщика";
+      myWorkSheet.Cells(4, 7).Value  = "Счет плательщика";
+      myWorkSheet.Cells(4, 8).Value  = "Дата открытия счета";
+      myWorkSheet.Cells(4, 9).Value  = "БИК банка получателя";
+      myWorkSheet.Cells(4, 10).Value = "ИНН получателя";
+      myWorkSheet.Cells(4, 11).Value = "Дата гос. регистрации получателя";
+      myWorkSheet.Cells(4, 12).Value = "Наименование получателя";
+      myWorkSheet.Cells(4, 13).Value = "Счет получателя";
+      myWorkSheet.Cells(4, 14).Value = "Дата открытия счета";
+      myWorkSheet.Cells(4, 15).Value = "Сумма платежа";
+      myWorkSheet.Cells(4, 16).Value = "Назначение платежа";    
+ 
+      myWorkSheet.columns("A:A").columnWidth = 10;//Дата операции
+      myWorkSheet.columns("B:B").columnWidth = 10;//Номер п/п
+  
+      myWorkSheet.columns("C:C").columnWidth = 10;//БИК банка плательщика
+      myWorkSheet.columns("D:D").columnWidth = 20;//ИНН плательщика
+      myWorkSheet.columns("E:E").columnWidth = 10;//Дата гос. регистрации плательщика
+      myWorkSheet.columns("F:F").columnWidth = 40;//Наименование плательщика
+      myWorkSheet.columns("G:G").columnWidth = 25;//Счет плательщика
+      myWorkSheet.columns("H:H").columnWidth = 10;//Дата открытия счета
+  
+      myWorkSheet.columns("I:I").columnWidth = 10;//БИК банка получателя
+      myWorkSheet.columns("J:J").columnWidth = 20;//ИНН получателя
+      myWorkSheet.columns("K:K").columnWidth = 10;//Дата гос. регистрации получателя
+      myWorkSheet.columns("L:L").columnWidth = 40;//Наименование получателя
+      myWorkSheet.columns("M:M").columnWidth = 25;//Счет получателя
+      myWorkSheet.columns("N:N").columnWidth = 10;//Дата открытия счета
+                                   
+      myWorkSheet.columns("O:O").columnWidth = 15;
+      myWorkSheet.columns("P:P").columnWidth = 50;
+
+      var listObj = myWorkSheet.rows(1);
+          listObj = myWorkSheet.Range("A2:P2");
+          listObj.Merge;
+      if (beginDateReport == endDateReport)
+        myWorkSheet.cells(2, 1).Value = "Контроль ФМ начальных и ответных платежей за " + beginDateReport; 
+      else
+        myWorkSheet.cells(2, 1).Value = "Контроль ФМ начальных и ответных платежей с " + beginDateReport + " по " + endDateReport; 
+      end;
+
+      myWorkSheet.range("A1:P" + (cntRecord + 4)).horizontalAlignment = 3;
+      
+      myWorkSheet.range("A4:P" + (cntRecord + 4)).borders.lineStyle   = 1;
+      myWorkSheet.range("A4:P" + (cntRecord + 4)).WrapText = true;                                                                
+                                                                                           	
+      return true;
+
+     OnError
+       return false;
+     end;     
+
+     /*Запись данных в временный файл*/
+     macro SetToFile()
+       FullRecord();
+       initprogress(-1, "", "Ожидайте, идет запись данных");
+       setoutput("..\\txtfile\\" + myFileName); 
+
+       var separator = ";";
+       println(separator);
+       println(separator);
+       println(separator);
+       println(separator);
+ 
+       while (myRecord.MoveNext())
+         var text = "", i;
+
+         for (i, 1, 16) text = text + ClearSymble(string(ReplaceSpesial(myRecord.value(i - 1))), ";") + separator; end;
+         println(text);
+
+         cntRecord = cntRecord + 1;
+         useprogress(cntRecord);
+       end;
+
+       setoutput(null, true);       
+       remprogress;
+     end;
+
+     /*Копирование данных в файл Excel*/
+     macro CopyValueToExcel()
+       initprogress(-1, "", "Подготовка файла Excel");
+       myFileName = myCopyFile(myFileName); 
+
+       if ( OpenExcel() and  myFileName != "")      
+ 	
+         myWorkExcel.Workbooks.OpenText (myFileName, 866, 1, 1, 2, false, false, false, false, false, true, ";", SetTypeColumns(), 1, "."," ", true, false);
+         myWorkBook = myWorkExcel.Workbooks.Application;
+
+         SetHeaderExcelTable();
+         
+         MsgBox("Файл успешно записан");
+         myWorkExcel.Visible = true;
+       end;         
+       remprogress;
+     OnError(er)
+       msgBox(er.Message);
+     end;     
+  end;
+
+ 
+class(TRsbPanel) Date_Panel();
+  InitTRsbPanel();
+  setCaption("Укажите период");
+  SetStatus("~F2, F9~ сохранить, ~F3~ Календарь, ~ESC~ Выход");
+  
+  setPosition(21,8);//определим положение на экране
+  setSize(33,6);//определяем размеры
+  
+  var StartDate:TRsbLabel = TRsbLabel(3, 2, "Начало периода:");
+  var EndDate:TRsbLabel = TRsbLabel(3, 4, "Конец  периода:");
+  
+  var val_StartDate:date = {curdate};
+  var val_EndDate:date = {curdate};
+
+  var f_StartDate:TRsbEditField = TRsbEditField(FT_DATE);
+  var f_EndDate:TRsbEditField = TRsbEditField(FT_DATE);
+
+  addLabel(StartDate);
+  addLabel(EndDate);
+  
+  f_StartDate.bindValue(this, "val_StartDate");
+  f_StartDate.SetPosition(21, 2);
+  f_StartDate.setSize(10,1);
+  f_StartDate.Editable = true;
+  f_StartDate.Focusable = true;
+  f_StartDate.Name = "StartDate";
+  AddControl(f_StartDate);
+  
+  f_EndDate.bindValue(this, "val_EndDate");
+  f_EndDate.SetPosition(21, 4);
+  f_EndDate.setSize(10,1);
+  f_EndDate.Editable = true;
+  f_EndDate.Focusable = true;
+  f_EndDate.Name = "EndDate";
+  AddControl(f_EndDate);
+  
+  addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "PressKey_Date_Panel"));
+  
+  macro PressKey_Date_Panel(RsbEvent:object)
+    if ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "StartDate"))
+      f_StartDate.Value = GetDateByCalendar(f_StartDate.Value);
+    elif ((RsbEvent.KeyCode == KEY_F3) and (FocusedControl.Name == "EndDate"))
+      f_EndDate.Value = GetDateByCalendar(f_EndDate.Value);
+    elif ((RsbEvent.KeyCode == KEY_F2) or (RsbEvent.KeyCode == KEY_F9))
+      if(f_StartDate.Value > f_EndDate.Value)
+        msgbox("Дата конца периода больше даты начала");
+      else
+        p_BeginDate = f_StartDate.Value;
+        p_EndDate = f_EndDate.Value;
+        this.hide();
+      end;
+    elif(RsbEvent.KeyCode == KEY_ESC)
+      is_Exit = true;
+    end;
+  end;
+  
+end;
+
+var dt_pan:TRsbPanel = Date_Panel;
+    dt_pan.run;
+
+var cmd, rs;
+
+if(is_Exit) exit(1); end; 
+
+var myReport = Report(p_BeginDate, p_EndDate);               
+    myReport.SetToFile();
+    myReport.CopyValueToExcel();                   
+
+

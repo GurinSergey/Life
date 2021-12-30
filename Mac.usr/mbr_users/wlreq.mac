@@ -1,0 +1,786 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank v6.0                     */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*  Макрофункции для работы с запросами (входящие)                          */
+/*                                                                          */
+/*  Имя файла: wlreq.mac                                                    */
+/*  Создан   :  11.02.2004                                    Панов А.Б.    */
+/*  Изменен  :  01.12.2011                     Чесноков Д.С./Лавренов А.А.  */
+/*              С-7026                                                      */
+/*              12.01.2012 На основании письма Климахиной от 11.01.2012     */
+/*                         I-00142931 Лавренов: сильно переработал          */
+/*                         Chesnokov D. Исправлены коды для подтверждения 1 */
+/*              09.04.2012 Chesnokov D.S. C-10076, C-10077                  */
+/*              06.07.2012 Chesnokov D.S. C-11468 отложенная обработка ROO  */
+/*              25.07.2012 Chesnokov D.S. I-00226703 всегда регистрируем    */
+/*              26.07.2012 Chesnokov D.S. добавлена массовая обработка      */
+/*                         отложенных сообщений ROO                         */
+/*              18.09.2012 Chesnokov D.S. I-00220578 обрабатываем ESC       */
+/*              05.08.2013 Gurin S. C-17880                                 */
+/*              06.09.2013 Chesnokov D.S. По запросу R-243504 делаем хитрый */
+/*                         финт ушами. Запрещаем повторною обработку по     */
+/*                         Ctrl+Z без выхода из запроса. Теперь претензии   */
+/*                         вручную задвоить нельзя.                         */
+/*              16.09.2013 zmp C-22551-6                                    */
+/*              13.11.13   Gurin S.    R-283396-2 Перенес C-17880 на ГЕБ    */ 
+/*              14.07.14   Gurin S.    R-409824-2 Перенес C-17880 на        */
+/*                                                          Солидарность    */ 
+/****************************************************************************/
+
+import "wldoc.mac", rsd, "fns_gmBOS.mac", "fns_gmPB.mac", "fns_gmBNS.mac", "fns_gmBV.mac" ;
+import "mnsZNOusr.mac", "mnsRPOusr.mac", "mnsROOusr.mac", "mnsPBusr.mac", "mnspnousr.mac", "fns_const.mac", "fns_lib.mac", "fnsReplib.mac";
+import "autoKOR.mac", "fg_Life_parm.mac";
+
+private var fgBank = fg_life_subject({OurBank});
+
+record wlreqOtv(wlreq);
+file wlr(wlreq);//Для обработки нескольких запросов
+file wlr_new(wlreq);//Контроль буфера для повторной обработки Ctrl+Z
+file wlrequpd(wlreq) write;
+file wlhistins(wlhistor) write;
+var TPShemID, cnt_ZNO, cnt_ERR, cnt_RPO, cnt_ROO, cnt_PNO;
+cnt_ZNO = cnt_ERR = cnt_RPO = cnt_ROO = cnt_PNO = 0;
+
+/* Обращаемся к полям структур, используемых в макросах выполнения шагов
+   операций, для ускорения работы макросов */
+
+var field_finit;
+
+field_finit = route.ObjID;
+field_finit = wlfininstr.FIID;
+field_finit = wlpm.PaymentID;
+field_finit = wlpmpaym.PaymentID;
+field_finit = wlpmpropdeb.PaymentID;
+field_finit = wlpmpropcred.PaymentID;
+field_finit = wlpmrmprop.PaymentID;
+field_finit = wlhead.HeadID;
+field_finit = wlconf.ConfID;
+field_finit = wlreq.ReqID;
+field_finit = wlmes.MesID;
+field_finit = wlinfo.InfoID;
+field_finit = wldlmm.DlMMID;
+field_finit = wldeal.DealID;
+field_finit = wlsess.SessionID;
+
+field_finit = f_wltransp.TpID;  
+field_finit = f_wlfininstr.FIID;
+field_finit = f_wlmes.MesID;
+
+class PersData
+  var SurName = "";
+  var Officer = ""; 
+  var Phone = "";
+end;
+
+//zmp 02.12.2014 R-492279-2
+private macro isNotReqOpenDate(id)
+   var sql = " SELECT   1                               "+
+             " FROM   dwlreq_dbt r, dcurdate_dbt c      "+
+             " WHERE  r.T_REQID                       = "+id+
+             "        AND r.T_BANKDATE = c.T_CURDATE    "+
+             "        AND c.T_ISCLOSED = CHR (88)       ";
+   return RsdRecordset(sql).moveNext();
+end;
+
+class errors
+  var errs = tarray();
+
+  class err
+     var id;
+     var filename;
+     var errortext;
+  end;
+
+  macro init()
+     errs.size = 0;
+  end;
+
+  macro add(id, filename, mes)
+    var errmes:err;
+    errmes.id = id;
+    errmes.filename = filename;
+    errmes.errortext = mes;
+    errs[errs.size] = errmes;    
+  end;
+
+  macro print
+    var i = 0;
+[ Протокол необработанных запросов
+ ┌────────────┬────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ ИД запроса │          Наименование входящего файла          │                                                Описание ошибки                                                   │
+ ├────────────┼────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤];
+    
+ 
+    while (i < errs.size)
+[│ ########## │ ############################################## │ ################################################################################################################ │]
+ (errs(i).id, errs(i).filename:c, errs(i).errortext:w);
+      i=i+1;
+    end;
+[└────────────┴────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  Итого запросов #
+
+](errs.size:l);
+   
+  end
+end;
+
+
+macro insert_MES365_LOG(reqid, InsideMes, DATE_IN, OutsideMes, DATE_OUT, RecipientID, DATE_KWT, CHECK, KWT_MES, KWT_OPER )
+  var cmd, str;
+  str = "insert into DMES365_LOG_DBT " +
+        "(t_reqid, T_InsideMes, T_DATE_IN, T_OutsideMes, T_DATE_OUT, " +
+        "  T_TIME, T_RecipientID, T_OPER, T_KWT_DATE, T_CHECK, T_KWT_MES, T_KWT_OPER) " +
+        "values (:reqid, :insideMes, :DATE_IN, :OutsideMes, :DATE_OUT, " +
+        "  TO_DATE ('01.01.0001 '||TO_CHAR (SYSDATE,'hh24:mi:ss'), 'dd.mm.yyyy hh24:mi:ss'), :RecipientID, rsbsessiondata.oper, " +
+        "  TO_DATE('01.01.0001','dd.mm.yyyy'), CHR(0), CHR(0), null) "; 
+        
+  cmd = RsdCommand(str);
+  cmd.AddParam("reqid", RSDBP_IN, reqid);
+  cmd.AddParam("insideMes", RSDBP_IN, insideMes);
+  cmd.AddParam("DATE_IN", RSDBP_IN, DATE_IN);
+  cmd.AddParam("OutsideMes", RSDBP_IN, OutsideMes);
+  cmd.AddParam("DATE_OUT", RSDBP_IN, DATE_OUT);
+  cmd.AddParam("RecipientID", RSDBP_IN, RecipientID);
+  cmd.execute;
+  
+end;
+
+macro ОбработатьЗапрос_mas(req, mes, PersData, mode)
+
+    var РелизID, ПодверждениеID;
+    var stat=0, Narrative, Description; 
+    var str, cmd;
+    var in_filename, out_filename, name, ext;
+    var mas_filename = tarray(), i;
+    
+    if (ПолучитьИмяФормы(req.ReqID) == ФормаZNO)
+
+      mes = null;
+      mes = MnsMessageFormZNO(req.ReqID);
+      mes.GetClientId();
+      mes.check(1);
+      
+      if(mes.DoNotProcess != 1)
+      
+        stat = CreatePB(req, "10", "1", out_filename);
+        if( stat != 0 )
+          msgbox("Ошибка при обработке запроса "+req.ReqID);
+          return FALSE;
+        end;
+        
+        in_FileName = ОтрезатьПутьОтИмениФайла(mes.FileName);
+        insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+
+        if(mes.error != 0)
+          stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+          if( stat != 0 )
+            msgbox("Ошибка при обработке запроса "+req.ReqID);
+            return FALSE;
+          end;
+
+          insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+        end;
+        
+        if (mes.DoNotSend == 0)
+          if (mes.ВидЗапр == 1)
+            stat = CreateBNS(req, mes, mas_filename, PersData);
+          elif (mes.ВидЗапр == 2)
+            stat = CreateBOS(req, mes, mas_filename, PersData);
+          elif (mes.ВидЗапр == 3)
+            stat = CreateBV(req, mes, mas_filename, PersData);
+          end;
+
+          if( stat != 0 )
+            msgbox("Ошибка при обработке запроса "+req.ReqID);
+            return FALSE;
+          end;
+
+          i = 0;
+          while (i < mas_filename.size)
+            insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(mas_FileName[i]), {curdate}, req.OriginatorID);
+            i = i + 1;
+          end;
+        end;
+        cnt_ZNO = cnt_ZNO + 1; 
+      end;
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаRPO)
+
+      mes = null;
+      mes = MnsMessageFormRPO(req.ReqID);
+      mes.GetClientId();
+
+      if(mode == 1)
+          mes.check(1);
+      elif(mode == 2)
+          mes.check_for_BOS;
+      end;
+      
+      in_FileName = ОтрезатьПутьОтИмениФайла(mes.filename);
+      if(mes.DoNotProcess != 1)
+        
+          if (mode == 1)
+            /*Вставить подверждение 1*/
+            stat = CreatePB(req, "10", "1", out_filename);
+
+            if( stat != 0 )
+              msgbox(stat); 
+              std.msg("Ошибка при вводе запроса");
+              return FALSE;
+            end;
+          
+          
+            insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+          end;
+
+          if(mes.error != 0)
+            stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+            if( stat != 0 )
+              msgbox("Ошибка при обработке запроса "+req.ReqID);
+              return FALSE;
+            end;
+            insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+          end;
+
+          if (mes.DoNotSend == 0)
+            if (mode == 1)
+              mes.CreateAcClaims();
+              mes.RegisterClaims();
+            end;
+            if (mode == 2)
+              stat = CreateBOS(req, mes, mas_filename, PersData);
+            if( stat != 0 )
+              msgbox("Ошибка при обработке запроса "+req.ReqID);
+              return FALSE;
+            end;
+              
+            i = 0;
+            while (i < mas_filename.size)
+              insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(mas_FileName[i]), {curdate}, req.OriginatorID);
+              i = i + 1;
+            end;
+          end;  
+        else 
+          mode = 2;
+        end;  
+         
+        cnt_RPO = cnt_RPO + 1; 
+      end;
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаROO)
+
+      mes = null;
+      mes = MnsMessageFormROO(req.ReqID);
+      mes.GetClientId();
+      if (mode == 1)
+        mes.check(1);
+      end;
+
+      in_FileName = ОтрезатьПутьОтИмениФайла(mes.filename);
+      if (mes.DoNotProcess != 1)
+        if (mode == 1)
+          /*Вставить подверждение 1*/
+          stat = CreatePB(req, "10", "1", out_filename);
+
+          if( stat != 0 )
+            msgbox(stat); 
+            std.msg("Ошибка при вводе запроса");
+            return FALSE;
+          end;
+          
+          insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+
+          if(mes.error != 0)
+              stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+              if( stat != 0 )
+                msgbox("Ошибка при обработке запроса "+req.ReqID);
+                return FALSE;
+              end;
+              insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+          end;
+        end;
+
+        if (mes.DoNotSend == 0)
+          mes.CancelAcClaims(1);
+          mes.RegisterClaims();
+        end;  
+          
+        cnt_ROO = cnt_ROO + 1; 
+      end;
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаERR)
+    
+      mes = null;
+      mes = MnsMessageFormPB(req.ReqID);
+      
+      /*Вставить подверждение 1*/
+      stat = CreatePB(req, "10", "1", out_filename);
+      if( stat != 0 )
+        msgbox("Ошибка при обработке запроса "+req.ReqID);
+        return FALSE;
+      end;
+      in_FileName = ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайла( req.reqid ));
+      insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      
+      cnt_ERR = cnt_ERR + 1; 
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаPNO)
+      msgbox("Платеж загружается автоматически");
+      return;
+    end; 
+    if(mes.DoNotProcess != 1)
+        clearrecord(wlhistins);
+        wlhistins.OBJID = req.ReqID;
+        wlhistins.OBJKIND = 505;
+        if ((mode == 1) and (ПолучитьИмяФормы(req.ReqID) == ФормаRPO))
+          wlhistins.STATE   = 65;
+        elif ((ПолучитьИмяФормы(req.ReqID) == ФормаROO) and ((mes.error == 1) or (mes.isRPOExists))) /* zmp 16.09.2013 C-22551-6 добавлено or (mes.isRPOExists) */
+          wlhistins.STATE = 66;
+        else
+        wlhistins.STATE   = 70;
+        end;
+        wlhistins.BANKDATE  = {curdate};
+        wlhistins.SYSDATE   = date(); 
+        wlhistins.SYSTIME   = time(); 
+        wlhistins.USERID    = {oper};
+        wlhistins.WLHISTORID = 0;   
+
+        if(not insert(wlhistins))
+          std.msg("Ошибка при вводе статуса запроса");
+          return FALSE;
+        else
+          writefisclog(olinsert,wlhistins,wlhistins);
+        end;
+
+        if ((mode == 1) and  (ПолучитьИмяФормы(req.ReqID) == ФормаRPO))
+          str = " update dwlreq_dbt SET T_STATE = 65, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+        elif ((ПолучитьИмяФормы(req.ReqID) == ФормаROO) and ((mes.error == 1) or (mes.isRPOExists)))  /* zmp 16.09.2013 C-22551-6 добавлено or (mes.isRPOExists) */
+          str = " update dwlreq_dbt SET T_STATE = 66, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+        else
+        str = " update dwlreq_dbt SET T_STATE = 70, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+        end;
+        
+        cmd = RSDCommand(str);
+        cmd.execute;
+    end;
+    
+    setparm(1,mes);      
+end;
+
+
+macro ОбработатьЗапрос(req, mes, PersData, mode)
+
+    var РелизID, ПодверждениеID;
+    var stat=0, Narrative, Description; 
+    var str, cmd;
+    var in_filename, out_filename, name, ext;
+    var mas_filename = tarray(), i;
+    if (ПолучитьИмяФормы(req.ReqID) == ФормаZNO)
+        if (not OperInGroup_Блин({oper},195))
+            msgBox("Вы не включены в группу \"195 - Обработка информационных сообщений\"");
+            return false;
+        end;
+
+      mes = MnsMessageFormZNO(req.ReqID);
+
+      in_FileName = ОтрезатьПутьОтИмениФайла(mes.FileName);
+      
+      stat = CreatePB(req, "10", "1", out_filename);
+      if( stat != 0 )
+        msgbox("Ошибка при обработке запроса "+req.ReqID);
+        return FALSE;
+      end;
+      insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+
+      mes.GetClientId();
+      mes.check();
+      debugbreak;
+      if(mes.error != 0)
+          stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+          if( stat != 0 )
+            msgbox("Ошибка при обработке запроса "+req.ReqID);
+            return FALSE;
+          end;
+          insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      end;
+      if (mes.DoNotSend == 0)
+        debugbreak;
+        if (mes.ВидЗапр == 1)
+           stat = CreateBNS(req, mes, mas_filename, PersData);
+        elif (mes.ВидЗапр == 2)
+           stat = CreateBOS(req, mes, mas_filename, PersData);
+        elif (mes.ВидЗапр == 3)
+           stat = CreateBV(req, mes, mas_filename, PersData);
+        end;
+
+        if( stat != 0 )
+           msgbox("Ошибка при обработке запроса "+req.ReqID);
+           return FALSE;
+        end;
+        i = 0;
+        while (i < mas_filename.size)
+          insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(mas_filename[i]), {curdate}, req.OriginatorID);
+          i = i + 1;
+        end;
+      end;
+
+      cnt_ZNO = cnt_ZNO + 1; 
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаERR)
+     
+      /*Вставить подверждение 1*/
+      stat = CreatePB(req, "10", "1", out_filename);
+      
+      if( stat != 0 )
+         msgbox("Ошибка при обработке запроса "+req.ReqID);
+         return FALSE;
+      end;
+      in_FileName = ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайла( req.reqid ));
+      insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+
+      cnt_ERR = cnt_ERR + 1; 
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаRPO)
+    
+      if (not OperInGroup_Блин({oper},197))
+          msgBox("Вы не включены в группу \"197 - Обработка приостановлений по счетам\"");
+          return false;
+      end;
+
+      mes = MnsMessageFormRPO(req.ReqID);
+      in_FileName = ОтрезатьПутьОтИмениФайла(mes.filename);
+      if (mode == 1)
+      /*Вставить подверждение 1*/
+      stat = CreatePB(req, "10", "1", out_filename);
+
+      if( stat != 0 )
+        msgbox(stat); 
+        std.msg("Ошибка при вводе запроса");
+        return FALSE;
+      end;
+        
+      insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      end;
+
+      mes.GetClientId();
+
+      if (mode == 1)
+        mes.check();
+      elif(mode == 2)
+        mes.check_for_BOS;
+      end;
+
+      if(mes.error != 0)
+        stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+        if( stat != 0 )
+          msgbox("Ошибка при обработке запроса "+req.ReqID);
+          return FALSE;
+        end;
+        insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      end;
+
+      if(mes.DoNotSend == 0)
+
+          mes.CreateAcClaims();
+          mes.RegisterClaims();
+          
+          if (mode == 2)
+            stat = CreateBOS(req, mes, mas_filename, PersData);
+          
+            if( stat != 0 )
+              msgbox("Ошибка при обработке запроса "+req.ReqID);
+              return FALSE;
+            end;
+          
+            i = 0;
+            while (i < mas_filename.size)
+              insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(mas_filename[i]), {curdate}, req.OriginatorID);
+              i = i + 1;
+            end;
+          end;
+      else
+          mode = 2;
+      end;  
+     
+      cnt_RPO = cnt_RPO + 1; 
+      
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаROO)
+    
+      if (not OperInGroup_Блин({oper},197))
+          msgBox("Вы не включены в группу \"197 - Обработка приостановлений по счетам\"");
+          return false;
+      end;
+
+      mes = MnsMessageFormROO(req.ReqID);
+      in_FileName = ОтрезатьПутьОтИмениФайла(mes.filename);
+
+      if (mode == 1)
+      /*Вставить подверждение 1*/
+      stat = CreatePB(req, "10", "1", out_filename);
+
+      if( stat != 0 )
+        msgbox(stat); 
+        std.msg("Ошибка при вводе запроса");
+        return FALSE;
+      end;
+      insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      end;
+
+      mes.GetClientId();
+      if (mode == 1)
+      mes.check();
+      end;
+      if(mes.error != 0)
+        stat = CreatePB(req, mes.error +";"+ mes.errormes, "2", out_filename);
+        if( stat != 0 )
+          msgbox("Ошибка при обработке запроса "+req.ReqID);
+          return FALSE;
+        end;
+        insert_MES365_LOG(req.reqid, in_FileName, req.bankDATE, ОтрезатьПутьОтИмениФайла(out_FileName), {curdate}, req.OriginatorID);
+      end;
+
+      if (mes.DoNotSend == 0)
+          mes.CancelAcClaims();
+          //25.07.2012 Chesnokov D.S. I-00226703 отмены регистрируем всегда.
+          mes.RegisterClaims();
+      end;  
+      
+      cnt_ROO = cnt_ROO + 1; 
+    elif (ПолучитьИмяФормы(req.ReqID) == ФормаPNO)
+      msgbox("Платеж загружается автоматически");
+      return;
+    end; 
+    
+    if(mes.DoNotProcess != 1)
+      clearrecord(wlhistins);
+      wlhistins.OBJID = req.ReqID;
+      wlhistins.OBJKIND = 505;
+      if ((mode == 1) and (ПолучитьИмяФормы(req.ReqID) == ФормаRPO))
+        wlhistins.STATE   = 65;
+    elif ((ПолучитьИмяФормы(req.ReqID) == ФормаROO) and ((mes.error == 1) or (mes.isRPOExists))) /* zmp 16.09.2013 C-22551-6 добавлено or (mes.isRPOExists) */
+      wlhistins.STATE = 66;
+      else
+        wlhistins.STATE   = 70;
+      end;
+      wlhistins.BANKDATE  = {curdate};
+      wlhistins.SYSDATE   = date(); 
+      wlhistins.SYSTIME   = time(); 
+      wlhistins.USERID    = {oper};
+      wlhistins.WLHISTORID = 0;   
+
+      if(not insert(wlhistins))
+        std.msg("Ошибка при вводе статуса запроса");
+        return FALSE;
+      else
+        writefisclog(olinsert,wlhistins,wlhistins);
+      end;
+
+      if ((mode == 1) and  (ПолучитьИмяФормы(req.ReqID) == ФормаRPO))
+        str = " update dwlreq_dbt SET T_STATE = 65, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+    elif ((ПолучитьИмяФормы(req.ReqID) == ФормаROO) and ((mes.error == 1) or (mes.isRPOExists))) /* zmp 16.09.2013 C-22551-6 добавлено or (mes.isRPOExists) */
+      str = " update dwlreq_dbt SET T_STATE = 66, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+      else
+        str = " update dwlreq_dbt SET T_STATE = 70, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+req.ReqID;
+      end;
+      cmd = RSDCommand(str);
+      cmd.execute;
+    end;
+end;
+
+macro Функция_Пользователя()
+    
+    array mn;
+    var m, rs, str, reqs, exclude_reqs, i, cnt, stat;
+    var usr_mes, repfilename, ExpPath, error;
+    var startd = {curdate}, endd={curdate};
+    var pd = PersData();
+    var Ошибки:errors;
+    
+    cnt_ZNO = cnt_ERR = cnt_RPO = cnt_ROO = cnt_PNO = 0;
+    
+    mn(asize(mn)) = "Обработать входящий запрос";
+    mn(asize(mn)) = "Обработать несколько запросов";
+    mn(asize(mn)) = "Откатить обработку запроса";
+
+    GetRegistryValue("PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ", V_STRING, ExpPath, error);
+    if ( error > 0 )
+      msgbox("Проверьте наличие настройки: PS\\REQOPENACC\\OPERATION\\СОЗДАНИЕ ИНФ СООБЩЕНИЙ\\ДИРЕКТОРИЯ ВЫГРУЗКИ");
+      return 1;
+    end;
+
+    m=menu(mn,null,"Выберите действие");
+
+    stat = PutPersData(pd.SurName, null, null, pd.Officer, pd.Phone );
+    
+    //18.09.2012 Chesnokov D.S. I-00220578 обрабатываем ESC
+    if((pd.SurName=="") and (pd.Officer=="") and (pd.Phone==""))
+      msgbox("Вы не выбрали Должностное лицо банка!!! || Перезайдите в RS-Bank и больше ни когда не жмите ESC в панели выбора Должностного лица.|| Файл сформирован не будет. ");
+      exit(1);
+    end;
+
+    debugbreak;
+    if (m < 0) 
+       return 0; // Обработка ESC
+    elif(mn(m) == "Обработать входящий запрос")
+      /*06.09.2013 Chesnokov D.S. R-243504 закрыл повторную обработку без выхода в скроллинг*/
+      wlr_new.reqid = wlreq.reqid;
+      if(not geteq(wlr_new))
+         msgbox("Ошибочка");
+      end;
+      
+      if((wlreq.state == 60) and (wlreq.state == wlr_new.state))
+          Clear_wlacclnk(wlreq.reqid);
+          
+          ОбработатьЗапрос(wlreq, usr_mes, pd, 1);
+          
+          repfilename = GetOutputFileName();
+          setoutput(repfilename,true);
+          
+          if(cnt_ZNO > 0)
+             print_body_ZNO(null,null, wlreq.reqid);
+          elif(cnt_ERR > 0)
+             //msgbox(cnt_ERR);
+             print_body_ERR(null,null, wlreq.reqid);
+          elif(cnt_RPO > 0)
+             print_body_RPO(null,null, wlreq.reqid);
+          elif(cnt_ROO > 0)
+             print_body_ROO(null,null, wlreq.reqid);
+          elif(cnt_PNO > 0)
+             msgbox("Обработка завершена");
+          end;
+          
+          println("Дирректория выгрузки: "+ ExpPath);
+          setoutput(null,true);
+          viewfile(repfilename);
+          if ((fgBank.is_EXV) or (fgBank.is_VUZ) or (fgBank.is_GEB) or (fgBank.is_SLD))
+              if((cnt_RPO > 0) or (cnt_ROO > 0))
+                  //Gurin S. 21.06.2013 C-17880-6
+                  execmacrofile("autoKOR.mac", "ProtocolTransferProcedure");
+              end;
+          end;
+      elif(wlreq.state == 65) 
+          msgbox("Запрос обрабатывается из отдельного списка!");
+      else
+          msgbox("Запрос уже обработан!");
+      end;
+   elif(mn(m) == "Обработать несколько запросов")
+      if((not OperInGroup_Блин({oper},195)) and (not OperInGroup_Блин({oper},196)) and (not OperInGroup_Блин({oper},197)))
+          msgBox("Вы не включены не в одну из групп:|| \"195 - Обработка информационных сообщений\" ||\"196 - Обработка Инкассовых сообщений\" || \"197 - Oбработка приостановлений по счетам\" ");
+          exit(); 
+      end;
+
+      if(wlreq.state == 60) 
+        Ошибки.init();
+
+        getdate(startd, "Дата начала");
+        getdate(endd, "Дата конца");
+        if(startd == date("00.00.0000")) 
+           startd = "01.01.0001";
+        end;
+
+        if(endd == date("00.00.0000")) 
+           endd = "01.01.0001";
+        end;
+
+        reqs = get_reqs(startd,endd);
+        exclude_reqs = "";
+        str = "select count(*) cnt from dwlreq_dbt where t_reqid in ("+reqs+") ";
+        rs = trsbdataset(str);
+        if(rs and rs.movenext)
+           cnt = int(rs.cnt);  
+        else
+           cnt = 0; 
+        end;
+        str = "select * from dwlreq_dbt where t_reqid in ("+reqs+") ";
+        rs = trsbdataset(str);
+        i = 0;
+        initprogress(cnt,"","Обрабока входящих запросов");
+        while( rs and rs.movenext)
+            i = i + 1;
+            useprogress(i);
+            wlr.reqid = rs.t_reqid;
+            if(not geteq(wlr))
+               msgbox("Ошибочка");
+            end;
+            if(wlr.state == 60) 
+                Clear_wlacclnk(rs.t_reqid);
+                ОбработатьЗапрос_mas(wlr, @usr_mes, pd, 1);
+                debugbreak;
+                if(usr_mes.DoNotProcess == 1)
+                   Ошибки.Add(rs.t_reqid, ОтрезатьПутьОтИмениФайла(usr_mes.filename), usr_mes.errormes);
+                   exclude_reqs = exclude_reqs + rs.t_reqid +", ";
+                end;
+            elif(wlr.state == 65) 
+              msgbox("Запрос обрабатывается из отдельного списка!");
+            else
+                msgbox("Запрос уже обработан!");
+            end;
+        end;
+        remprogress();
+            repfilename = GetOutputFileName();
+            setoutput(repfilename,true);
+            
+            if(Ошибки.errs.size > 0)
+               Ошибки.print;
+               exclude_reqs = substr(exclude_reqs, 1, strlen(exclude_reqs)-2);
+            end;
+            if(cnt_ZNO > 0)
+               print_body_ZNO(null,null, reqs, exclude_reqs);
+            end;   
+            if(cnt_ERR > 0)
+               print_body_ERR(null,null, reqs, exclude_reqs);
+            end;   
+            if(cnt_RPO > 0)
+               print_body_RPO(null,null, reqs, exclude_reqs);
+            end;   
+            if(cnt_ROO > 0)
+               print_body_ROO(null,null, reqs, exclude_reqs);
+            end;   
+            if(cnt_PNO > 0)
+               msgbox("Обработка завершена");
+            end;
+            println(" Дирректория выгрузки: "+ ExpPath);
+            setoutput(null,true);
+            viewfile(repfilename);
+        
+
+      else
+          msgbox("Запрос уже обработан!");
+      end;
+   elif(mn(m) == "Откатить обработку запроса")
+      if(wlreq.state == 70) 
+          if (ПолучитьИмяФормы(wlreq.ReqID) == ФормаZNO)
+              if( ОткатитьОбработкуЗапроса(wlreq.reqid))
+                 msgbox("Откат обработки выполнен.");
+              end;
+          elif (ПолучитьИмяФормы(wlreq.ReqID) == ФормаERR)
+              if( ОткатитьОбработкуЗапроса(wlreq.reqid))
+                 msgbox("Откат обработки выполнен.");
+              end;
+          elif (ПолучитьИмяФормы(wlreq.ReqID) == ФормаRPO)
+              if(isNotReqOpenDate(wlreq.ReqID))
+                 msgBox("Невозможно выполнить откат запроса. Операционный день " + wlreq.bankdate + " закрыт.");
+                 return 1;
+              end;
+              usr_mes = MnsMessageFormRPO(wlreq.ReqID);
+              if(usr_mes.rollback == 0)
+                  if( ОткатитьОбработкуЗапроса(wlreq.reqid))
+                     msgbox("Откат обработки выполнен.");
+                  end;
+              end;
+          elif (ПолучитьИмяФормы(wlreq.ReqID) == ФормаROO)
+              if(isNotReqOpenDate(wlreq.ReqID))
+                 msgBox("Невозможно выполнить откат запроса. Операционный день " + wlreq.bankdate + " закрыт.");
+                 return 1;
+              end;
+              usr_mes = MnsMessageFormROO(wlreq.ReqID);
+              if(usr_mes.rollback == 0)
+                  if( ОткатитьОбработкуЗапроса(wlreq.reqid))
+                     msgbox("Откат обработки выполнен.");
+                  end;
+              end;
+          elif (ПолучитьИмяФормы(wlreq.ReqID) == ФормаPNO)
+              msgbox("Откат обработки запроса PNO не реализован. Платеж откатывается вручную ");
+          end;
+      else
+          msgbox("Запрос еще не обработан!");
+      end;   
+   end;
+   return 0;
+end;
+    

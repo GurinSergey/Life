@@ -1,0 +1,299 @@
+//---------------------------------------------------------------------------------
+// @filename: exec_transfer_rest_mass.mac
+// @desc    : Процедура массового переноса остатков с 60312810К23* на 47423810К3*
+// @author  : Гурин С. 12.05.2016 R-646256-2
+// @changes : none
+//---------------------------------------------------------------------------------
+
+import RsbFormsInter, PaymInter, RSD, globals, OprInter, oralib, rsexts, treport, LikePy, BankInter;
+import KeyCodes, GENNUMBER, "lib_compare.mac", "lib_fg.mac", "lib_account.mac";
+
+var ground, client;
+var panel, tabbed;
+
+var rec_success: TArray = TArray();
+var rec_err:     TArray = TArray();
+
+var rec_success_acc: TArray = TArray();
+var rec_err_acc:     TArray = TArray();
+
+private class ForProtocol(_PaymentID, _Client, _NumDoc, _Amount, _Description, _PayerAcc, _ReceiverAcc)
+    var m_PaymentID    = _PaymentID;
+    var m_Client       = _Client;
+    var m_NumDoc       = _NumDoc;
+    var m_Amount       = _Amount;
+    var m_Description  = _Description;
+    var m_PayerAcc     = _PayerAcc;
+    var m_ReceiverAcc  = _ReceiverAcc;
+end;
+
+private class ForProtocolAcc(_Account, _Description)
+    var m_Account      = _Account;
+    var m_Description  = _Description;
+end;
+
+private class StartProcedure ()
+    
+    macro Get47423(p_clnt)
+        var sql = " SELECT T_ACCOUNT acc"+
+                  "   FROM daccount_dbt "+
+                  "  WHERE t_client = ? AND REGEXP_LIKE (t_account, '^47423810.3*')";
+        sql = execSQLselect(sql, makeArray (SqlParam ("1", p_clnt)));
+        if (sql.moveNext())
+            return sql.value("acc");
+        end;
+        return "";
+    end;
+
+    macro CreatePayment(p_acc, p_clnt, p_rest)
+        var p_payer_account, p_receiver_account;
+        p_payer_account    = Get47423(p_clnt);
+        p_receiver_account = p_acc;
+
+        var Memorial                = RsbMemorialOrder ( );
+        var Payment                 = Memorial.Payment ( );
+
+        Memorial.State          = 0;
+        Memorial.Oper           = 2005;
+        Memorial.Chapter        = 1;
+        Memorial.Code_Currency  = 0;
+        Memorial.Kind_Oper      = "6";
+        Memorial.Origin         = 1;
+        Memorial.LaunchOper     = false;
+
+        Payment.DocKind         = 70;
+        Payment.Purpose         = PM_PURP_MEMORDER;
+        Payment.ShifrOper       = "09";
+
+        Payment.BaseFIID            = 0;
+        Payment.Number              = GenNumberDocument();
+        Payment.Ground              = "перевод остатка";
+        Payment.PayerAmount         = 
+        Payment.ReceiverAmount      = 
+        Payment.BaseAmount          = p_rest;                                           
+        Payment.ValueDate           = 
+        Payment.Date                = 
+        Payment.ClientDate          = {CurDate};
+        Payment.PayerBankEnterDate  = {CurDate};
+
+        Payment.IsPlanPaym          = "X";
+        Payment.PaymentKind         = "Н";
+        Payment.Priority            = 5;
+        Payment.NumberPack          = 1;
+
+        Payment.SetPayerPI ( PAYMENTS_GROUP_INTERNAL,          
+                            {OurBank},                        
+                            3,                                
+                            {MFO_BANK},                       
+                            {NAME_BANK},                      
+                            {CORAC_BANK},                     
+                            0,                                
+                            1,                                
+                            p_payer_account);                 
+
+        Payment.SetReceiverPI ( PAYMENTS_GROUP_INTERNAL,       
+                               {OurBank},                     
+                               3,                             
+                               {MFO_BANK},                    
+                               {NAME_BANK},                   
+                               {CORAC_BANK},                  
+                               0,                             
+                               1,                             
+                               p_receiver_account);           
+        
+        if (p_payer_account != "")
+            if (Payment.BaseAmount > 0) 
+                Memorial.Update();
+                rec_success(rec_success.size()) = ForProtocol (Memorial.DocumentID, p_clnt, Payment.Number, Payment.OrderAmount, "", p_payer_account, p_receiver_account);
+            else
+                rec_err(rec_err.size()) = ForProtocol ("", p_clnt, "", "", "Остаток на счете "+p_payer_account+ " равен "+Payment.BaseAmount, "", "");
+            end;
+        else
+            rec_err(rec_err.size()) = ForProtocol ("", p_clnt, "", "", "Не найден счет 47423810К3*");
+        end;
+    end;
+
+    macro ExecuteOperation()
+        var i = 0;
+        InitProgress( rec_success.size (), "", "Ждите... Выполняется проведение документов.." );
+        while (i < rec_success.size ())
+
+            SetDialogFlag(0);
+            PM_ExecuteOperation(rec_success[i].m_PaymentID, DLDOC_MEMORIALORDER);
+            SetDialogFlag(1);
+
+            i = i + 1;
+            UseProgress(i);
+        end;
+        RemProgress();
+    end;
+
+    macro SetArest60312(p_acc)
+        var sql = "UPDATE   daccount_dbt "
+                  "   SET   T_TYPE_ACCOUNT = CONCAT (REPLACE(T_TYPE_ACCOUNT, CHR(1), ''), 'Т') "
+                  " WHERE   t_account = :acc "
+                  "         AND INSTR (T_TYPE_ACCOUNT, 'Т') = 0";
+        sql = RsdCommand(sql);
+        sql.AddParam("acc", RSDBP_IN, string(p_acc));
+        sql.execute();
+    end;
+
+    macro CloseAccount()
+        var i = 0,  errm;
+        InitProgress( rec_success.size (), "", "Ждите... Выполняется закрытие счетов 60312810К23*" );
+        while (i < rec_success.size ())
+            if ((rec_success[i].m_ReceiverAcc) == "") 
+                i = i + 1;
+                continue;
+            else
+                if(CB_CloseAccount (1, Acc_GetFiidByAccount (rec_success[i].m_ReceiverAcc), rec_success[i].m_ReceiverAcc, {Curdate}, errm)==0) 
+                    rec_success_acc(rec_success_acc.size()) = ForProtocolAcc (rec_success[i].m_ReceiverAcc, "Счет закрыт");
+                else
+                    rec_err_acc(rec_err_acc.size()) = ForProtocolAcc (rec_success[i].m_ReceiverAcc, errm);
+                end;
+            end;
+            i = i + 1;
+            UseProgress(i);
+        end;
+        RemProgress();
+    end;
+
+    macro Protocol()
+        var reportName = getTxtFileName ("exec_transfer_rest_mass");
+        var table_success = CTableReport();
+        var table_err     = CTableReport();
+        var table_success_acc = CTableReport();
+        var table_err_acc     = CTableReport();
+        var i;
+
+        setoutput(reportName,false);
+        println (string ("Отчет о выполнении процедуры массового переноса остатков с 60312810К23* на 47423810К3*"):c:100);
+        println (string ("                           Дата - ", date, ", время - ", time):c:70);
+
+        if (rec_success.size ())
+            table_success.addColumn ("ИД платежа",      25, AL_LEFT);                      0
+            table_success.addColumn ("Клиент",          22, AL_LEFT);
+            table_success.addColumn ("№ документа",     15, AL_LEFT);
+            table_success.addColumn ("Сумма",           20, AL_LEFT);
+            table_success.addColumn ("Сч. плательщика", 20, AL_LEFT);
+            table_success.addColumn ("Сч. получателя",  20, AL_LEFT);
+            table_success.printHead (string ("Успешно созданы и проведены платежи:":c:40));
+
+            i = 0;
+            while (i < rec_success.size ())
+                table_success.printStringTransferByWord(rec_success[i].m_PaymentID, rec_success[i].m_Client, rec_success[i].m_NumDoc, rec_success[i].m_Amount, rec_success[i].m_PayerAcc, rec_success[i].m_ReceiverAcc);
+                i = i + 1;
+            end;
+
+            table_success.printSeparator ();
+            table_success.printStringTransferByWord ("Всего документов:", i);
+            table_success.printBottom ();
+        end;
+ 
+        if (rec_err.size ())
+            table_err.addColumn ("Клиент",      22, AL_LEFT);
+            table_err.addColumn ("Описание",    50, AL_LEFT);
+            table_err.printHead (string ("Ошибки при создании платежей:":c:40));
+
+            i = 0;
+            while (i < rec_err.size ())
+                table_err.printStringTransferByWord(rec_err[i].m_Client, rec_err[i].m_Description);
+                i = i + 1;
+            end;
+
+            table_err.printSeparator ();
+            table_err.printStringTransferByWord ("Всего документов:", i);
+            table_err.printBottom ();
+        end;
+
+        if (rec_success_acc.size ())
+            table_success_acc.addColumn ("Номер счета", 25, AL_LEFT);
+            table_success_acc.addColumn ("Описание",    50, AL_LEFT);
+            table_success_acc.printHead (string ("Успешно закрытые счета:":c:40));
+
+            i = 0;
+            while (i < rec_success_acc.size ())
+                table_success_acc.printStringTransferByWord(rec_success_acc[i].m_Account, rec_success_acc[i].m_Description);
+                i = i + 1;
+            end;
+
+            table_success_acc.printSeparator ();
+            table_success_acc.printStringTransferByWord ("Всего документов:", i);
+            table_success_acc.printBottom ();
+        end;
+
+        if (rec_err_acc.size ())
+            table_err_acc.addColumn ("Номер счета", 25, AL_LEFT);
+            table_err_acc.addColumn ("Описание",    50, AL_LEFT);
+            table_err_acc.printHead (string ("Ошибки при закрытии счета:":c:40));
+
+            i = 0;
+            while (i < rec_err_acc.size ())
+                table_err_acc.printStringTransferByWord(rec_err_acc[i].m_Account, rec_err_acc[i].m_Description);
+                i = i + 1;
+            end;
+
+            table_err_acc.printSeparator ();
+            table_err_acc.printStringTransferByWord ("Всего документов:", i);
+            table_err_acc.printBottom ();
+        end;
+
+        SetOutput (NULL, true);
+        viewfile(reportName);
+    end;
+
+    macro init()
+       var i = 0, rs;
+
+       var sql_count = "SELECT  COUNT ( * ) cnt, ?";
+       var sql_main = " SELECT  acc.t_account acc, acc.t_client clnt, abs(RSI_RSB_Account.RestAll (acc.t_account, acc.t_chapter, acc.t_code_currency, ?)) rest ";
+       var sql = "   FROM  daccount_dbt acc "+
+                 "  WHERE      REGEXP_LIKE (acc.t_account, '^60312810.23*') AND acc.t_open_close != 'З' "+
+                 "        AND RSI_RSB_Account.RestAll (acc.t_account, acc.t_chapter, acc.t_code_currency, ?) != 0 ";
+       var parm = makeArray (SQLParam ("1", {Curdate}), SQLParam ("2", {Curdate}));
+
+       rs = execSQLSelect(sql_count + sql, parm);
+       rs.movenext();
+
+       InitProgress(int(rs.value("cnt")), "", "Ждите... Выполненяется формирования документов");
+
+       rs = execSQLSelect(sql_main + sql, parm);
+
+       while (rs and rs.movenext())
+
+          //Установим арест на ДТ по 60312810К23*
+          SetArest60312(rs.value("acc"));
+          //Создание мемордера
+          CreatePayment(rs.value("acc"), rs.value("clnt"), rs.value("rest"));
+
+          i = i + 1;
+          UseProgress( i );
+       end;
+       RemProgress();
+    end;
+end;
+
+Macro Runnable()
+    var obj = StartProcedure();
+
+    //Формирование мемордеров
+    obj.init();
+    //Массовое проведение документов
+    obj.ExecuteOperation();
+    //Закрываем счета 60312810К23* 
+    obj.CloseAccount();
+    //Протокол 
+    obj.Protocol();
+end;
+
+if (not _bank.is_VUZ ())
+    msgbox ("Функционал реализован только для ВУЗ банка");
+    exit (1);
+end;
+
+if ( gettrue(true,"Это процедура массового переноса остатков с 60312810К23* на 47423810К3*. | Вы действительно хотите ее запустить?"))
+    Runnable();
+end;
+
+
+

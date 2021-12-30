@@ -1,0 +1,195 @@
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 6.0                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*                        Экспорт сообщений "ОФК для ГИС ГМП"               */
+/*                                                                          */
+/*  Имя файла: wlgisgmpproc.mac                                             */
+/*  Создан:    17.12.12                                                     */
+/*  Изменен:   TAM 06.09.2013 C-23137                                       */
+/*             TAM 07.10.2013 C-24082                                       */
+/*             VDN 02.02.2016 R-637300                                      */
+/****************************************************************************/
+
+import WldInter, MesInter, "wlexport.mac", "ofkgminp.mac", oralib, likepy, PTInter, "rmtools.mac",
+        "genofkrep.mac", "GGProcParmPanel.mac";
+
+//Gurin S. 29.03.2016 проверка налоговых платежей на 148Н
+//LAO добавляем проверку # 	233966 ГИС ГМП
+private macro PM_CheckTaxPropUsr( PaymentID:integer, msg:string):integer
+  
+  execSQL("DELETE FROM dpmtax_tmp");
+
+  execSQL( "INSERT INTO dpmtax_tmp ( t_PaymentID ) values ( :PaymentID ) ",
+           makeArray( SQLParam( "", PaymentID ) ) 
+         );
+
+  var retval = execStoredFunc( "RSI_PM_TAXPROP.MassCheckTaxProp", V_INTEGER );  
+  if( retval > 0 )
+    return retval;
+  end;
+
+  var rs = execSQLselect( "select t_Message from dpmtax_tmp where t_PaymentID = :PaymentID", makeArray( SQLParam( "", PaymentID )), FALSE );
+
+  if( rs.moveNext() )
+
+    if( strlen(rs.value("t_Message")) != 0 )
+       if ( not (index(rs.value("t_Message"), "В наименовании получателя не указано наименование администратора доходов, выделенное скобками") > 0))
+          SetParm(1, rs.value("t_Message"));
+       end;
+    end;
+
+  else
+    msgbox("Ошибка при проверке налоговых реквизитов по 148Н");
+    return 1;
+  end;
+  
+  return 0;
+
+end;
+
+
+macro GGMesForm( )                                                  
+  debugbreak;
+  record Wlinfo (wlinfo);
+  var procParm:GGProcParm;
+  var goProc:bool = false;
+  var stat:integer = 0;
+
+  goProc = GGProcParmPanel( @procParm );
+  if( goProc == true )      
+    PrintHeaderTable( procParm.Department, procParm.Node );
+  
+    var select_count = "select count(*) ";
+    var select_info = "select pm.t_PaymentID, pm.t_PayerBankID, debet.t_CodeKind, " +
+                      " debet.t_BankCode, nvl(rm.t_PayerBankName, ' ')  ";
+    var query = "  from dpmpaym_dbt pm, dpmprop_dbt debet,                                  " +
+                "       dpmprop_dbt credit, dpmrmprop_dbt rm                                " +
+                " where pm.t_PaymentID = rm.t_PaymentID                                     " +
+                "   and pm.t_PaymentID = debet.t_PaymentID                                  " +
+                "   and debet.t_DebetCredit = 0                                             " +
+                "   and pm.t_PaymentID = credit.t_PaymentID                                 " +
+                "   and credit.t_DebetCredit = 1                                            " +
+                "   and pm.t_BaseFIID = :NATCUR                                             " + 
+                "   and pm.t_PaymStatus = 32000                                              "  + //PM_CLOSED 
+                "   and pm.t_DocKind IN ( select oprd.t_DocKind from doprkdoc_dbt oprd      " +
+                "                         start with oprd.t_DocKind = 29                    " + //DLDOC_PAYMENT
+                "              connect by prior oprd.t_DocKind = oprd.t_ParentDockind )     " +
+                "  and pm.t_DocKind NOT IN ( 400, 288, 311, 320, 322 )                      " +
+                "  and NOT EXISTS ( select 1 from dnotetext_dbt note                        " +
+                "                   where note.t_ObjectType = 501                           " +
+                "                 and note.t_DocumentID = Lpad( pm.t_PaymentID, 10, 0 )     " + 
+                "                 and note.t_NoteKind = 52 )                                "; 
+
+    query = query + " and pm.t_StartDepartment = ( select t_code from ddp_dep_dbt where t_Code = " + procParm.Department + " ) ";
+    // TAM 07.10.2013 C-24082
+    query = query + " and credit.T_TRANSFERDATE = to_date('" + procParm.ValueDate + "') ";
+    //TAM 20.02.2013 C-17858
+    //счет плательщика
+    query = query + " AND REGEXP_LIKE (pm.t_PayerAccount, '^42301|^42601|^40911|^40817|^40820|^40821|^30223|^30232|^40701|^40702|^40703|^40802|^40807|^60301|^60312|^47422|^40602') "; //TAM 06.09.2013 C-23137 //Gurin S. 26.11.2015 R-629522-2 добавил 47422
+    // TAM 25.03.13 C-18634" AND NOT REGEXP_LIKE ( pm.t_PayerAccount, '^40701........2|^40701........3|^40703........4' ) ";
+    //шифр операции
+    query = query + " AND REGEXP_LIKE (RM.T_SHIFROPER, '^01|^06|^16') ";
+    //счет получателя
+    query = query + " AND REGEXP_LIKE (PM.T_RECEIVERACCOUNT,   '^40101|^40501........2|^40503........4|^40601........[1|3]|^40603........4|^40701........[1|3]|^40703........4|^40302' ) "; //Gurin S. 30.10.2015 R-625851-2 добавил 40302 
+    query = query + " order by pm.t_PaymentID ";
+    var params = MakeArray( SQLParam( "NATCUR", NATCUR ) );
+    var rs_count:RsdRecordset = execSQLselect( (select_count + query), params, false);
+    var rs:RsdRecordset = execSQLselect( (select_info + query), params, false );
+    if( rs_count and rs_count.moveNext())
+      //TAM 20.02.2013 C-17858
+      InitProgress (int(rs_count.Value(0)),"Формирование сообщение ГИС ГМП","Формирование сообщение ГИС ГМП... Ждите...");
+      var i = 0;
+      while ( rs and rs.moveNext() )
+
+        var check148 = ""; 
+        PM_CheckTaxPropUsr(rs.value(0), check148);
+        if (check148 == "")
+        //Создать информационное сообщение
+        //Заполняем отправителя
+            Wlinfo.OriginatorCodeKind = rs.Value(2);
+            Wlinfo.OriginatorCode = rs.Value(3);
+            Wlinfo.OriginatorID = rs.Value(1);
+            Wlinfo.OriginatorName = rs.Value(4);
+
+        //Заполняем получателя
+            Wlinfo.RecipientCodeKind = procParm.CodeKind;
+            Wlinfo.RecipientCode = procParm.PartCode;
+            Wlinfo.RecipientName = procParm.PartyName;
+
+            var query_part = " select t_PartyID from dpartcode_dbt " +
+                            " where t_CodeKind = :CodeKind " +
+                            "   and t_Code = '" + procParm.PartCode + "'";
+
+            var parm_part = MakeArray( SQLParam( "CodeKind", procParm.CodeKind ) );
+            var rs_part:RsdRecordset = execSQLselect( query_part, parm_part, false );
+            if( rs_part and rs_part.moveNext() )
+                Wlinfo.RecipientID = rs_part.Value(0);
+            end;
+    
+        //Заполняем подразделение
+            var query_code = " select dep.t_PartyID, code.t_Code, code.t_CodeKind "
+                            " from ddp_dep_dbt dep, dpartcode_dbt code" +
+                            " where dep.t_Name = '" + procParm.Department + "'" +
+                            "   and code.t_PartyID = dep.t_PartyID ";
+
+            var rs_code:RsdRecordset = execSQLselect( query_code );
+            if( rs_code and rs_code.moveNext() )
+                Wlinfo.OfficeID = rs_code.Value(0);  
+                Wlinfo.OfficeCode = rs_code.Value(1);           
+                Wlinfo.OfficeCodeKind = rs_code.Value(2);                   
+            end; 
+
+            var StrInfo = "TypeCode:" + procParm.TypeCode + 
+                        "\nStatus:" + procParm.Status +
+                        "\nExchangeType:" + procParm.ExchangeType + 
+                        "\nSenderIdentifier:" + procParm.SenderIdentifier +
+                        "\nID платежа:" + string(rs.Value(0)) + "\n";
+      
+            var TpID:integer = 0, TpSchemID:integer = 0, RlsFormID:integer = 0;
+            WldDefineRlsForm( 507, //OBJTYPE_WLD_FORM 
+                            Wlinfo.RecipientID, 
+                            7, //WLD_MES_KIND_INFO 
+                            @TpID, @TpSchemID, @RlsFormID, 
+                            3 /* WLD_SUBKIND_INFO_PMINFO*/ );
+        
+            RsdCommand("Truncate table usr_lastinfid_tmp").Execute;
+        
+            stat = CreateInfo( Wlinfo, StrInfo, RlsFormID, TpSchemID );
+        
+            if( stat == 0 )
+                var MesID:integer = 0, InfoID:integer = 0;  
+                var query_info = " SELECT inf.t_last_infid, lnk.t_MesID, mes.t_Trn                 " +
+                                "   FROM usr_lastinfid_tmp inf, dwlmeslnk_dbt lnk, dwlmes_dbt mes " +
+                                "  WHERE lnk.t_ObjID = inf.t_last_infid                           " +
+                                "    AND lnk.t_ObjKind = 506                                      " +
+                                "    AND mes.t_MesID = lnk.t_MesID ";
+
+                var rs_info:RsdRecordset = execSQLselect( query_info );
+                if( rs_info and rs_info.moveNext() )
+        
+                    var pmpaym = Tbfile ("pmpaym.dbt");
+                    ClearRecord( pmpaym.rec );
+                    pmpaym.rec.PaymentID = rs.Value(0);
+                    pmpaym.getEQ ();
+                    addNoteForObject(OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, null, pmpaym), 52, rs_info.Value(2) );
+                    MesID = rs_info.Value(1);
+                    InfoID = rs_info.Value(0);
+                end;
+            
+                PrintLine( rs.Value(0), MesID, InfoID, stat );
+            end;
+        //TAM 20.02.2013 C-17858
+        else 
+            PrintLine( rs.Value(0), "", "", -111,check148 );
+        end;
+        i = i + 1;
+        UseProgress (i);
+
+      end;
+      RemProgress (i);   
+    end;
+  end;
+end;
+
+GGMesForm();

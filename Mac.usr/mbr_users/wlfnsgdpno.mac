@@ -1,0 +1,278 @@
+/*******************************************************************************/
+/*  RS-Bank 6.0                                          R-Style Software Lab  */
+/*                                                                             */
+/*  File name   : fwlfnsgdpno.mac                                              */
+/*  Created     : 15.01.2011                                                   */
+/*  Programmer  : Tikhomirov A.                                                */
+/*  Description : Генерация сообщения PNO                                      */
+/*  Request     : C-7027                                                       */
+/*  Modify      : 21.05.2012 Chesnokov D.S. Добавлено генерация и логгирование */
+/*                созданных ответных сообщений I-00194611                      */
+/*              : 29.05.2012 Golovkin C-11421                                  */
+/*              : 04.06.2012 Golovkin C-11288, I-00203031                      */
+/*              : 05.06.2012 Golovkin I-00203947                               */
+/*              : 09.06.2012 Golovkin C-11835                                  */
+/*                Lavrenov: 13.06.2012 По просьбе Николаевой                   */
+/*              : 23.07.2012 Chesnokov D.S. I-00225239 добавлена обработка     */
+/*               поля dpmpaym_dbt.t_paytype что бы платеж мог платиться в      */
+/*               обход претензий налоговых органов                             */
+/*              : 23.07.2012 Chesnokov D.S. переписал под дистрибутивную       */
+/*               функцию ВставитьЗапрос                                        */
+/*              : 26.07.2012 Chesnokov D.S. заявка I-00227218 подчистил хвосты */
+/*               за Головкиным                                                 */
+/*              : 29.08.2012 Golovkin I-00241028                               */
+/*              : 17.01.2013 LAO Добавлена проверка  соответствие ИНН  C-16386 */
+/*              : 22.01.2013 LAO Вывод отчета одиночная ген. C-16386           */
+/*              : 10.09.2013 zmp R-245659-2                                    */
+/*              : 16.12.2013 Chesnokov D.S. Адаптация под 2031, в таблице      */
+/*               добавилось поле T_REASON NUMBER(5)                            */
+/*******************************************************************************/
+
+Import MesInter, PtInter, globals, WldInter, CtInter, "wllog.mac", RSD, "likepy.mac", OprInter;
+import  "oralib.mac", "fns_const.mac", "mnspnousr.mac", "diver.mac", "fns_gmPB.mac", "wlreq.mac"; 
+
+private record wlmes(wlmes);
+file wlr_PNO(wlreq);
+
+private var РелизID, cmd, str;
+
+private macro GetAccountFIID( Account:string ):integer
+
+  var select:string = "SELECT t_fiid"+
+                     " FROM dfininstr_dbt " +
+                     " WHERE t_fi_code = :Code";
+                      
+  var params:TArray = makeArray( SQLParam( "Code", substr( Account, 6, 3 ) ) );
+  var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    return rset.value(0);
+  end;
+  return -1;
+end;
+
+/*LAO: 04.01.2013  Отчет для инкассовых C-16386-6*/
+
+private macro usr_report_pno(usr_messid,usr_errortext,usr_NAME_CLIENT_EXT,usr_NAME_CLIENT,usr_PayerAccount,usr_inn_ext,usr_inn_rs)
+  var cmd_u; 
+  /*  T_MESID           NUMBER(10),
+  T_PAYMENTID       NUMBER(10),
+  T_WLPMID          NUMBER(10),
+  T_ERRORMESSAGE    VARCHAR2(255 BYTE),
+  T_NAMEFILE_EXT    VARCHAR2(255 BYTE),
+  T_NAME_CLIENT_RS  VARCHAR2(255 BYTE),
+  T_NAME_CLIENT_EXT VARCHAR2(255 BYTE), 
+  T_RS_ACC          VARCHAR2(25 BYTE),
+  T_EXT_ACC         VARCHAR2(25 BYTE),
+  T_INN_RS          VARCHAR2(30 BYTE),
+  T_INN_EXT         VARCHAR2(30 BYTE)*/
+  
+  cmd_u = RsdCommand(" insert into USR_REPORT_PNO_TMP (T_MESID,T_ERRORMESSAGE,T_NAMEFILE_EXT,"+
+                     " T_NAME_CLIENT_EXT,T_NAME_CLIENT_RS,T_RS_ACC ,T_INN_EXT,T_INN_RS )"+
+                     " values (?,?,?,?,?,?,?,?)");
+  cmd_u.AddParam("mesid", RSDBP_IN, usr_messid);
+  cmd_u.AddParam("errtext", RSDBP_IN, usr_errortext);
+  cmd_u.AddParam("ext_file", RSDBP_IN, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(usr_messid)));
+  cmd_u.AddParam("usr_name_ext", RSDBP_IN, usr_NAME_CLIENT_EXT);
+  cmd_u.AddParam("usr_name_rs", RSDBP_IN, usr_NAME_CLIENT);
+  cmd_u.AddParam("usr_acc", RSDBP_IN, usr_PayerAccount);
+  cmd_u.AddParam("usr_inn_e", RSDBP_IN, usr_inn_ext);
+  cmd_u.AddParam("usr_inn_r", RSDBP_IN, usr_inn_rs);
+  cmd_u.Execute();   
+  
+end;
+
+macro GenDoc (AddrMes)
+  
+  record paym (pspayord); //09.06.2012 Golovkin C-11835
+  var  РелизID , ПодверждениеID, CloseDate;
+  
+  if (not ВходитВГруппу({oper},196))
+    msgBox("Вы не включены в группу \"196 - Обработка Инкассовых сообщений\"");
+    return false;
+  end;
+
+  SetBuff( wlmes, addrMes );
+  var error = 0, ReqID = -1, i = 0;
+  var Message:MnsMessageFormPNO;
+  var stat = 0, ClientId, rs;
+  var out_filename;
+  var PayerAccount, AccountEx; //29.05.2012 Golovkin C-11421
+  var INN_CMD;
+  printlog(2, "Генерация формы PNO");
+  
+  /* Заполнение учетных буферов */
+  wlreq.Kind                     = MESKIND_REQUEST;
+  wlreq.SubKind                  = 0;
+  wlreq.Trn                      = Message.НомПоруч;
+  wlreq.PmDateValue              = date(Message.ДатаПоруч);
+  wlreq.RelatedRef               = wlmes.Trn;
+  wlreq.OriginatorID             = ПолучитьКодСубъекта( substr(Message.ИдФайл,1,4), PTCK_MNS, error );
+  wlreq.OriginatorCodeKind       = PTCK_MNS;
+  wlreq.OriginatorCode           = substr(Message.ИдФайл,1,4);
+  wlreq.OriginatorName           = substr(Message.ИдФайл,1,4); 
+  wlreq.RecipientID              = {OurBank};
+  wlreq.RecipientCodeKind        = PTCK_BIC;
+  wlreq.RecipientCode            = {MFO_Bank};
+  wlreq.RecipientName            = {Name_Bank};
+  wlreq.Corschem                 = -1;
+  wlreq.FIID                     = -1;
+  wlreq.Queries                  = "Запрос";
+
+  if( not ВставитьЗапрос( wlreq, string("ИП №"+message.НомПоруч), " ", NULL, ReqID ) )
+    std.msg("Ошибка при вводе запроса");
+    return FALSE;
+  end;
+  
+  /* входящий запрос */
+
+  if (ReqID > 0)
+
+    wlr_PNO.reqid = ReqID;
+    if(not geteq(wlr_PNO))
+      msgbox("Ошибка обращения к ID запроса");
+    end;
+
+    stat = CreatePB(wlr_PNO, "10", "1", out_filename, wlmes.MesID);
+    if( stat != 0 )
+      msgbox("Ошибка при обработке запроса "+ReqID);
+      return FALSE;
+    else
+      insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+    end;
+  end;
+  
+  /*29.05.2012 Golovkin C-11421*/ 	
+  if(Message.НомСчПл == "")
+    PayerAccount = Message.НомСчБПл;
+  else
+    PayerAccount = Message.НомСчПл;
+  end;
+  var isNotIdenticalINN = False; //zmp 10.09.2013 R-245659
+  
+  /*Проверим наличие счета и то что он не закрыт*/
+  AccountEx = RsdRecordSet("select * from daccounts_view where t_account = '" + PayerAccount + "' and instr(t_type_account, 'П') = 0 ");
+  if (AccountEx.movenext())//Счет присутствует
+    
+    /*LAO 09.01.2012 проверяем на соответствие ИНН*/
+    INN_CMD = RsdRecordSet("SELECT   party.t_name, REGEXP_SUBSTR (code.T_CODE, '[0-9]{1,}') cods "+
+                               "  FROM   dparty_dbt party, dobjcode_dbt code"+
+                               " WHERE       PARTY.T_PARTYID ="+AccountEx.value("t_client")+
+                               "  AND t_objectid = PARTY.T_PARTYID"+
+                               "  AND t_codekind = 16"+
+                               "  AND t_state = 0");
+    if (INN_CMD.movenext())
+         if  (INN_CMD.value("cods") != message.ИНННП)
+            isNotIdenticalINN = true;
+            if(not IsOprMultiExec())  /*LAO 22.01.2013 если это не массовая генерация, тогда*/
+               cmd = RsdCommand("truncate table USR_REPORT_PNO_TMP");/*Чистим таблицу что бы не было дублей*/
+               cmd.Execute();  
+               cmd = RsdCommand("truncate table dwlgpmmes_tmp");/*Чистим временную*/
+               cmd.Execute();  
+               cmd = RsdCommand("insert into  dwlgpmmes_tmp (t_MesID) Values (?)");/*Вставляем запись по сообщению, что бы можно было сделать отчет*/
+               cmd.AddParam("messid", RSDBP_IN, wlmes.MesID);
+               cmd.Execute();
+               usr_report_pno(wlmes.MesID,"Несоответствие ИНН",message.Плательщ,INN_CMD.value("t_name"),PayerAccount,message.ИНННП,INN_CMD.value("cods")); 
+            else
+               usr_report_pno(wlmes.MesID,"Несоответствие ИНН",message.Плательщ,INN_CMD.value("t_name"),PayerAccount,message.ИНННП,INN_CMD.value("cods"));
+            end;          
+         end; 
+    end;                        
+     /*КОНЕЦ LAO*/                          
+    if (AccountEx.value("t_open_close") != "З")//счет открыт
+      if( (Message.НомПорВал == "") and (Message.ДатаПорВал == "") and (Message.НомВалСч == "") and ( Get_Fiid(PayerAccount) != 0 ))
+         stat = CreatePB(wlr_PNO, "35;В поручении указан валютный счет клиента. Нет распоряжения на продажу валюты", "2", out_filename, wlmes.MesID);
+         if (stat == 0)
+           insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+         end;
+      elif(isNotIdenticalINN) // zmp 10.09.2013 R-245659
+          stat = CreatePB(wlr_PNO, "35;Расчетный счет не соответствует ИНН и наименованию клиента", "2", out_filename, wlmes.MesID); 
+          if (stat == 0)
+             insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+          end;
+      else
+         if( (Message.НомПорВал != "") and (Message.ДатаПорВал != "") and (Message.НомВалСч != "") and ( Get_Fiid(PayerAccount) != 0 ))
+            msgboxex("Внимание!Сообщение " + ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)) +" Инкассовое поручение к валютному счету!");
+         end;     
+    
+         if(Message.CreatePayment != 0)  /*Создаем платеж в отложенных*/
+
+           /*Вставить подверждение 2*/
+           if (not CompareStrWithMasks("*счет*не?найден*",message.errormes,1))
+              stat = CreatePB(wlr_PNO, "32;Отсутствует номер счета", "2", out_filename, wlmes.MesID);
+              if (stat == 0)
+                insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+              end;
+              msgboxex(message.errormes);
+           elif (not CompareStrWithMasks("*наименование*наименованием?в?БД*",message.errormes,1))
+              stat = CreatePB(wlr_PNO, "33;Наименование не соответствует номеру счета", "2", out_filename, wlmes.MesID);
+              if (stat == 0)
+                insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+              end;
+              msgboxex(message.errormes);
+           elif (not CompareStrWithMasks("*банк*не?найден*",message.errormes,1))
+              stat = CreatePB(wlr_PNO, "31;Документ отправлен ошибочно не в тот банк", "2", out_filename, wlmes.MesID);
+              if (stat == 0)
+                insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+              end;
+              msgboxex(message.errormes);
+           else
+              stat = CreatePB(wlr_PNO, string("35;",message.errormes), "2", out_filename, wlmes.MesID);
+              if (stat == 0)
+                insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+              end;
+              msgboxex(message.errormes);
+           end;
+         /*Lavrenov: 13.06.2012 По просьбе Николаевой убрал сообщение.*/
+         else
+           /*23.07.2012 Chesnokov D.S. I-00225239*/
+           cmd = RsdCommand("update dpmpaym_dbt set t_paytype = 1 where t_paymentid = ?");
+           cmd.AddParam("paymentid", RSDBP_IN, message.PaymentID);
+           cmd.Execute();
+       
+           /*09.06.2012 Golovkin C-11835*/
+           paym.orderid = message.PaymentID;
+           AddNoteForObject(OBJTYPE_PSPAYORD, UniID(paym, OBJTYPE_PSPAYORD, PS_PAYORDER), 101, string(ReqID));
+         end;
+        
+      end;
+    else//счет закрыт
+       DtTmSplit(AccountEx.value("t_close_date"), CloseDate);
+       stat = CreatePB(wlr_PNO, String("35;Счет ",PayerAccount," ",message.Плательщ,", указанный в электронном документе, закрыт " + CloseDate), "2", out_filename, wlmes.MesID);
+       if (stat == 0)
+          insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+       end;
+    end;
+  else//Счет отстутствует
+     stat = CreatePB(wlr_PNO, String("32;В банке (филиале банка) отсутствует номер счета ",PayerAccount," ",message.Плательщ,", указанный в электронном документе, сформированном налоговым органом"), "2", out_filename, wlmes.MesID);
+     if (stat == 0)
+       insert_MES365_LOG(wlr_PNO.ReqID, ОтрезатьПутьОтИмениФайла(ПолучитьИмяВходФайлаПоСообщ(wlmes.MesID)), wlr_PNO.bankDATE, (out_FileName), {curdate}, wlr_PNO.OriginatorID);
+     end;
+  end;
+  
+  if( stat != 0 )
+     std.msg("Ошибка при вводе запроса PB2");
+     return FALSE;
+  end;
+  
+  cmd =  RsdCommand("INSERT INTO dwlhistor_dbt values (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  cmd.AddParam("OBJID",                 RSDBP_IN,   ReqID);
+  cmd.AddParam("OBJKIND",               RSDBP_IN,   505);
+  cmd.AddParam("STATE",                 RSDBP_IN,   70);
+  cmd.AddParam("BANKDATE",              RSDBP_IN,   {curdate});
+  cmd.AddParam("SYSDATE",               RSDBP_IN,   date());
+  cmd.AddParam("SYSTIME",               RSDBP_IN,   time());
+  cmd.AddParam("USERID",                RSDBP_IN,   {oper});
+  cmd.AddParam("WLHISTORID",            RSDBP_IN,   0);
+  cmd.AddParam("REASON",                RSDBP_IN,   0);
+  cmd.execute;
+
+  cmd = RSDCommand(" update dwlreq_dbt SET T_STATE = 70, T_SYSTIME = TO_DATE ('01.01.0001 01:00:00', 'dd.mm.yyyy hh:mi:ss') where T_REQID = "+ReqID);
+  cmd.execute;
+
+  return TRUE;
+
+  OnError(er) /* обработка ошибок времени выполнения */
+    return FALSE;
+
+end;

@@ -1,0 +1,951 @@
+/**************************************************************************************************/
+/*  RS-Bank 6.2030                                                          R-Style Software Lab  */
+/*                                                                                                */
+/*  File Name   : rminpm.mac                                                                      */
+/*  Created     : 25.07.00                                                                        */
+/*  Programmer  : Alex V. Mishin                                                                  */
+/*  Description : Проверки ответного платежа                                                      */
+/*                Функция пользователя                                                            */
+/*                Новый_Документ                                                                  */
+/*                Разноска принятых закрытых платежей по бэкам-получателям                        */
+/* -----------------------------------------------------------------------------------------------*/
+/* ИСТОРИЯ ИЗМЕНЕНИЙ:                                                                             */
+/* -----------------------------------------------------------------------------------------------*/
+/* 13.06.2012 KS R-50392 15 Дней                                                                  */
+/* 16.06.2012 SDA - открываем внешние свойства кредитовой части платежа                           */
+/* 20.09.2012 LAO - Для ПрББ добавлен каркасный план при открытие скроллинга Валютный контроль    */
+/* 01.10.2012 KS Отчет по платежу C-14283                                                         */
+/* 02.11.2012 Chesnokov D.S. Переписан на ExecMacroFile вызов процедуры ChangeReason(изменение    */
+/*             происхождения привязки старых платежей)                                            */
+/* 02.11.2012 Chesnokov D.S. Переписан на ExecMacroFile вызов процедуры show_orders_list(список   */
+/*             распоряжений по транзитному счету)                                                 */
+/* 07.11.2012 Chesnokov D.S. Переписана функция GetNewAccount, унифицирован код функции и места   */
+/*             вызовов, внесены изменения в количество параметров, по запросам ИК добавлена       */
+/*             возможность обновления получателя средств, при указании счета для зачисления.      */
+/* 08.11.2012 Chesnokov D.S. По заявкам I-00281581, I-00281510 исправлено зачисление на           */
+/*             несуществующий в Rs-Bank v.6 счет                                                  */
+/* -----------------------------------------------------------------------------------------------*/
+/* 28.01.2012 zip_z. рефакторинг. Расставлены мать их отступы, исправлена бизнес-логика проверок  */
+/*             при вводе, редактировании, сохранении (устранены дубли проверок, когда функция     */
+/*             проверки вызывалась два и более раз для одного и того же платежа). Переписана      */
+/*             Проверить_Документ и наведён условный порядок в этом космохаосе с меню по Ctrl+Z   */
+/* 14.08.2013 Gurin S. C-21844 Добавлено "Формирование запроса ЕD243" по Ctr+Z                    */
+/* 20.08.2013 Жаворонкова Н. (joy) I-00416406 Добавлена возможность изменения вида хранения и в   */
+/*             этом скроллинге                                                                    */
+/* 28.11.2013 Teleshova A. C-22504 Формирование swift-сообщения по CTRL+Z                         */
+/* 10.12.2013 Teleshova A. C-22504 Возможность редактирования кода банка отправителя для          */
+/*             валютных платежей                                                                  */
+/* 23.06.2014 Гуцу Е. Добавил обработку для банка Солидарность в ShowChosenCCCom()                */
+/* 28.11.2014 joy R-502394-2 в ПечатьИзвещений добавлена передача параметра - дата, иначе получали*/
+/*             ошибку и ничего не печаталось                                                      */
+/* 01.04.2015 Chesnokov D.S. По заявке C-31920 добавил обработку массового выделения              */
+/* -----------------------------------------------------------------------------------------------*/
+import PaymInter, globals, PTInter, OprInter, CTInter, FIInter, WldInter,
+"rmtools.mac", lnpaym, "likepy.mac", "rmtplstr.mac", "cbdefbo.mac", "rmcmptl.mac","pm_tools.mac","pm_chksave.mac", pm_note, "uf_request.mac";
+import "cb_FillFactura.mac";
+
+import lib_const, lib_pm_check;
+
+import "sw_notes.mac"; 
+import "edit_pmnote.mac";
+import "repforms.mac","Print_vk.mac", "Send_vk.mac";
+
+import cb_sql;
+import "diver.mac"; 
+import "Print_Soob.mac";
+import "UnkDocum.mac", "fg_Life_parm.mac";
+import "Temp_Un.mac";
+import op_lib;
+import RSD;
+debugbreak;
+var scroll;
+var note136,note137,note139;
+
+private const fgBank = fg_life_subject({OurBank}); // KS 24.12.2010 Запрос в другой банк
+private var OldKey = 0, oldPanel = "";
+
+record Curpmpaym   ( pmpaym   );
+record Curpmdebet  ( pmprop   );
+record Curpmcredit ( pmprop   );
+record Curpmrmprop ( pmrmprop );
+record Curpmakkr   ( pmakkr   );
+record CurCurTr    ( pmcurtr  );
+record CurPmkz     ( pmkz     );
+
+record Oldpmpaym   ( pmpaym   );
+record Oldpmdebet  ( pmprop   );
+record Oldpmcredit ( pmprop   );
+record Oldpmrmprop ( pmrmprop );
+record Oldpmakkr   ( pmakkr   );
+record OldCurTr    ( pmcurtr  );
+record OldPmkz     ( pmkz     );
+
+/* EVG Определения глобальных переменных для мультивалютных документов */
+record Multydoc   ( multydoc );
+record OldMultydoc( multydoc );
+record Paymdoc    ( pmpaym   );  
+record OldPaymdoc ( pmpaym   );
+record Rmdoc      ( pmrmprop );  
+record OldRmdoc   ( pmrmprop );
+record CurTr      ( pmcurtr  );
+
+
+record b2(rminprop);
+
+record ЗаголовокПлатежа(wlpm);
+
+
+var СимволШага;
+
+file rm_account(account);
+
+const СимволШагаРазрешениеРедактирования = "З";
+
+/*номера полей в панели*/
+const fld_akkr_Number = 1,          /*Номер аккредитива*/
+      fld_akkr_PayerBankCode = 13,  /*Код банка плательщика*/
+      fld_akkr_Date = 3,            /*Срок действия аккредитива*/
+      fld_akkr_Type = 1,            /*Вид аккредитива*/
+      fld_akkr_PayCondition = 2;    /*Условие оплаты аккредитива*/
+
+/* Хинты */
+// а) списки по шагу
+private const Hint_ByStep:string = "/*+FIRST_ROWS LEADING(t oproper pmpaym pmprop pmrmprop prop2 pk rk) INDEX(t doprstep_dbt_idx10) INDEX(pmprop dpmprop_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t oproper pmpaym pmprop pmrmprop prop2 pk rk)*/";
+// а1) списки по шагу для невыясненных
+private const Hint_ByStepUnk:string = "/*+FIRST_ROWS LEADING(t oproper pmpaym pmprop prop2 pmrmprop rminprop wlpm ) INDEX(t doprstep_dbt_idx10) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(pmprop dpmprop_dbt_idx0)  USE_NL(t oproper pmpaym pmprop prop2 pmrmprop rminprop wlpm )*/";
+// б) списки по статусу платежа
+private const Hint_ByPaymStatus:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep pk rk) INDEX(pmpaym dpmpaym_dbt_idx16) INDEX(t dpmprop_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep wlpm wlmeslnk wlmes pk rk)*/";
+// в) списки по статусу свойств, где документов слишком много, и необходима фильтрация по дате
+// в1) Если фильтрация по дате значения
+private const Hint_ByValueDate:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep pk rk) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dpmprop_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep pk rk)*/";
+// в2) Если фильтрация по ДПП
+private const Hint_ByTransferDate:string = "/*+FIRST_ROWS LEADING(t pmpaym pmrmprop prop2 oproper oprstep pk rk) INDEX(t dpmprop_dbt_idx1) INDEX(pmpaym dpmpaym_dbt_idx0) INDEX(oprstep doprstep_dbt_idx0) USE_NL(t pmpaym pmrmprop prop2 oproper oprstep wlpm wlmeslnk wlmes pk rk)*/";
+// в3) Если фильтрация по дате закрытия
+private const Hint_ByCloseDate:string = "/*+FIRST_ROWS LEADING(pmpaym t pmrmprop prop2 oproper oprstep pk rk) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dpmprop_dbt_idx0) INDEX(oprstep doprstep_dbt_idx0) USE_NL(pmpaym t pmrmprop prop2 oproper oprstep wlpm wlmeslnk wlmes pk rk)*/";
+// г) списки по статусу (несквитованныеб отвергнутые)
+private const Hint_ByOprStatus:string = "/*+FIRST_ROWS LEADING(t oproper oprstep pmpaym pmprop prop2 pmrmprop wlpm pk rk) INDEX(t doprcurst_dbt_idx1) INDEX(wlpm dwlpm_dbt_idx1) USE_NL(t oproper oprstep pmpaym pmprop prop2 pmrmprop wlpm pk rk)*/";
+/* Установка подсказки для скролингов из макроса */
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+  // Пример формируемой подсказки
+  //    "/*+FIRST_ROWS LEADING(t)*/"
+
+  if( ( ScrolStates == PM_READY_TO_RECEIVE_SCR ) or   /* отложенные   */
+      ( ScrolStates == PM_INPROCESSING_SCR ) )    /* открытые */
+
+    return Hint_ByPaymStatus;
+
+  elif ( ScrolStates == PM_UNKNOWN_SCR )  /* На счетах невыясненных сумм */
+    return Hint_ByStepUnk;
+  elif ( ( ScrolStates == PM_PREPROC_SCR ) or /* На предобработке  */
+         ( ScrolStates == PM_READY_TO_CONTROL_SCR ) or /* Контроль */         
+         ( ScrolStates == PM_WAITEDIT_SCR ) or /* ожидающие ручной обработки */
+         ( ScrolStates == PM_WAITEDITFILIAL_SCR ) or /* На обработке в других филиалах */
+         ( ScrolStates == PM_IN_CARDFILE_SCR ) or /* Документы на картотеках к корсчетам */
+         ( ScrolStates == PM_IN_QUEUE_SCR ) or /* В очереди */
+         ( ScrolStates == PM_TOBACKOFFICE_SCR ) or /* Переданные в БО */
+         ( ScrolStates == PM_STEP_SCR ) )  /* на шаге */
+    
+    return Hint_ByStep;
+
+  elif( ( ScrolStates == PM_INCLOSED_SCR ) or /* закрытые */
+        ( ScrolStates == PM_INALL_SCR ) or /* все ответные */
+        ( ScrolStates == PM_TRANSIT_SRC )) 
+
+    var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+
+    if( dtflt.IsSet( DTFL_TRANSFERDATE ) )
+      return Hint_ByTransferDate;
+    elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+      return Hint_ByValueDate;
+    elif( dtflt.IsSet( DTFL_CLOSEDATE ) )
+      return Hint_ByCloseDate;
+    end;
+  elif( ScrolStates == PM_STATUS_IN_SRC )
+    return Hint_ByOprStatus;
+  end;
+
+  return DefaultHint;
+END;
+
+/* проверка наличия изменений в реквизитах налогового платежа */
+/*zmp 22.04.2013 I-00359770 Добавлены проверки на пустые состояния составителя документа*/
+private macro PmTaxPropChanged(Rm, OldRm):bool
+  return ((OldRm.TaxAuthorState != "00") and 
+          (Rm.TaxAuthorState  != OldRm.TaxAuthorState))   or
+         (Rm.BttTICode        != OldRm.BttTICode)         or
+         (Rm.OKATOCode        != OldRm.OKATOCode)         or
+         (trim(Rm.TaxPmGround)!= trim(OldRm.TaxPmGround)) or
+         (Rm.TaxPmPeriod      != OldRm.TaxPmPeriod)       or
+         (Rm.TaxPmNumber      != OldRm.TaxPmNumber)       or
+         (Rm.TaxPmDate        != OldRm.TaxPmDate)         or
+         (trim(Rm.TaxPmType)  != trim(OldRm.TaxPmType));
+end;
+
+private Macro GetNewAccount(old_acc, new_acc, new_fiid, new_client)
+    record newaccount(account);
+    var rs, cmd, str, Col = TArray;
+  
+    private macro GetFIID(old_acc)
+        var str, rs;
+        old_acc = Substr(old_acc, 6, 3);
+        //Gurin S. 15.05.2014 --2031
+        str = " SELECT t_fiid  FROM dfininstr_dbt WHERE t_fi_kind = 1 AND t_fi_code = '" + old_acc + "'";
+        rs = RsdRecordSet(str);
+        if (rs.MoveNext())
+            return rs.value("t_fiid");
+        else
+            return 0;
+        end;
+    end;
+  
+    private macro AddCol( ar,ind, fld, head, wdth, edit )
+        ar.value( ind * 6 + 0 ) = fld;  // fieldName            
+        ar.value( ind * 6 + 1 ) = head; // header               
+        ar.value( ind * 6 + 2 ) = wdth; // width                
+        ar.value( ind * 6 + 3 ) = edit; // fldType (2 = FBT)    
+        ar.value( ind * 6 + 4 ) = null; // decPoint             
+        ar.value( ind * 6 + 5 ) = 0;    // reserv               
+    end;
+  
+
+    macro EvProcAcc(rs, cmd, id, key )
+        if (cmd == DLG_KEY) 
+            if ((key == 13) or (key == 316))
+                return CM_SELECT;
+            elif (key == 27)
+                msgbox("Вы отказались от выбора счета.");
+                return CM_CANCEL;
+            end;
+        end;
+    end;
+  
+  
+    str = " SELECT ac.t_account AS t_account, "+
+          "        ac.t_balance AS balance, "+
+          "        ac.t_kind_account AS AP, "+
+          "        (SELECT dp.t_name "+
+          "           FROM ddp_dep_dbt dp "+
+          "          WHERE dp.t_code = ac.t_department) AS filial, "+
+          "        (SELECT dp.t_name "+
+          "           FROM ddp_dep_dbt dp "+
+          "          WHERE dp.t_code = ac.t_branch) AS podrazdelen, "+
+          "        ac.t_oper AS oper, "+
+          "        ac.t_nameaccount AS name_acc, "+
+          "        (SELECT pt.t_name "+
+          "           FROM dparty_dbt pt "+
+          "          WHERE t_partyid = ac.t_client) AS name_client, "+
+          "        ac.t_client, " +
+          "        ac.t_code_currency, rownum " +
+          "   FROM daccounts_view ac " +
+          "  WHERE ac.t_chapter = 1 " +
+          "    AND instr(ac.t_type_account, 'П') = 0  " +
+          "    AND ac.t_open_close = chr(0) " +
+          "    AND ac.t_account LIKE ? " +
+          "  ORDER BY ROWNUM DESC ";
+    cmd = RsdCommand(str);
+  
+    if (GetString(old_acc, "Укажите счет для зачисления", 20)) /* 1 */
+        if (index(old_acc,"*") or index(old_acc,"?"))          /* 2 */
+            old_acc = strsubst(old_acc, "*","%");
+            old_acc = strsubst(old_acc, "?","_");
+            cmd.AddParam("old_acc", RSDBP_IN, old_acc);
+            rs = RsdRecordSet(cmd);
+            
+            if ((rs.MoveNext()) and (rs.value("rownum") == 1)) /* 3 */
+                SetParm(1, rs.value("t_account"));
+                SetParm(2, rs.value("t_code_currency"));
+                SetParm(3, rs.value("t_client"));
+                return true;
+            else /* 3 */
+                cmd = RsdCommand(str);
+                cmd.AddParam("old_acc", RSDBP_IN, old_acc);
+                rs = RSDRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+        
+                AddCol (col, 0, "t_account",    "Лицевой",            25, true);
+                AddCol (col, 1, "balance",     "Балансовый",          5, true);
+                AddCol (col, 2, "AP",          "АП",                  3, true);
+                AddCol (col, 3, "filial",      "Филиал",              4, true);
+                AddCol (col, 4, "podrazdelen", "Подразделение",       4, true);
+                AddCol (col, 5, "oper",        "Операционист",        5, true);
+                AddCol (col, 6, "name_acc",    "Наименование счета", 40, true);
+                AddCol (col, 7, "name_client", "Клиент",             40, true);
+        
+                if (RunScroll (rs, 8, col, "Account_List", "EvProcAcc", "Список лицевых счетов", "~Enter~ Выбрать", true, -1, -1, 80, 20))
+                    SetParm(1, rs.value("t_account"));
+                    SetParm(2, rs.value("t_code_currency"));
+                    SetParm(3, rs.value("t_client"));
+                    return true;
+                else
+                    return false;
+                end;
+            end; /* 3 */
+            
+        elif (strlen(old_acc) != 20) /* 2 */
+            msgbox("Счет должен содержать 20 символов или маску!");
+            return false;
+        
+        elif (strlen(old_acc) == 20) /* 2 */
+            cmd.AddParam("old_acc", RSDBP_IN, old_acc);
+            rs = RsdRecordSet(cmd);
+            if (rs.MoveNext())
+                SetParm(1, rs.value("t_account"));
+                SetParm(2, rs.value("t_code_currency"));
+                SetParm(3, rs.value("t_client"));
+                return true;
+            else
+                SetParm(1, old_acc);
+                SetParm(2, GetFIID(old_acc));
+                SetParm(3, -1);
+                return true;
+            end;
+        end; /* 2 */
+    
+    else /* 1 */
+        return false;
+    end;
+
+end; /* private Macro GetNewAccount(old_acc, new_acc, new_fiid, new_client) */
+
+/* EVG 9/08/2012 Функция выводит на экран выбранные на этапе ВК комиссии */
+// zip_z. хм... от делать нефиг переписал
+macro ShowChosenCCCom( pmPaym )
+    var sql, rs, params;
+    
+    macro makeMessage( rset )
+        var ret = "";
+        while( rs.moveNext() )
+            ret = ret + rs.value( 0, null, V_STRING ) + "  -->  " + string(rs.value( 1, null, V_MONEY ):a) + "|";
+        end;
+        if (ret != "") ret = "Для платежа выбраны следующие комиссии за ВК:|" + ret; 
+        else           ret = "По данному платежу не установлены комиссии за ВК";
+        end;
+        return ret;
+    end;
+
+    
+    // Для рублёвых платежей во всех банках, а также для всех платежей в банках Проба, ВУЗ, НБС и 
+    // Подъём в ust_trnsf_comiss.notify_num хранится PaymentID 
+    // EVG 24/06/2014 Добавил Солидарность
+    if( (pmPaym.FIID == NATCUR) or fgBank.is_PRBB or fgBank.is_VUZ or fgBank.is_NBS or fgBank.is_GO or fgBank.is_SLD )
+        sql = "Select com.t_code, vkCom.sum From USR_TRNSF_COMISS vkCom, DSFCOMISS_DBT com " +
+              " Where vkCom.notify_num = :ntfyNum " +
+              "   and com.t_feetype    = 1 " +
+              "   and com.t_number     = vkCom.comid ";
+    
+    // Для валютных платежей в банках ГЭБ и ЭВ в ust_trnsf_comiss.notify_num хранится ссылка 
+    // на ust_trnsf_notify.notify_num
+    else
+        sql = "Select com.t_code, vkCom.sum From USR_TRNSF_COMISS vkCom, DSFCOMISS_DBT com " +
+             " Where vkCom.notify_num = ( Select notify_num From usr_trnsf_notify Where payment_Id = :ntfyNum and to_char(notify_date, 'YYYY') = to_char(vkCom.comdate, 'YYYY') ) " +
+             "   and com.t_feetype    = 1 " +
+             "   and com.t_number     = vkCom.comid ";
+    end;
+    
+    params = makeArray( SQLParam( "ntfyNum", pmPaym.PaymentID ) );
+    if( rs = execSQLselect( sql, params ) ) 
+        msgbox(makeMessage( rs ));
+    end;
+end;
+
+
+
+macro Новый_Документ( )
+    // SDA - так и не смог понять почему при ручном вводе по - умолчанию тянется первый вид кода : АРМ ПОЗИЦИОНЕРА\ПЕРЕМЕННЫЕ\DEFSCROLLCODEKIND = 3 
+    Curpmdebet.CodeKind = 3;
+    Curpmdebet.BankCode = {MFO_Bank};
+    Curpmcredit.CodeKind = 3;
+    Curpmcredit.BankCode = {MFO_Bank};
+    return 0;
+end;
+
+
+/*проверка на то, что входит в ТС*/
+private macro Входит_в_ТС():bool
+    var rs : RsdRecordset,
+    Query: string = " SELECT * "+
+                    " FROM ddp_dep_dbt dp "+
+                   " WHERE dp.t_PartyID = :ReceiverBankID "+
+                    "  AND dp.t_AccessMode = 1 ",
+    params: TArray = makeArray( SQLParam( "ReceiverBankID", Curpmpaym.ReceiverBankID  ) );
+    rs = execSQLselect( Query, params , true  );
+    return  rs.MoveNext();
+end;
+
+macro Проверить_Документ( Режим )
+    
+    var PropStatus, stat, cmd;  
+
+    //SDA 15.06.2012 - Если исходящая схема =-1 закрываем внешние свойства платежа по кредиту
+    if (Curpmcredit.Corschem == -1) Curpmcredit.Group = 2; end;
+
+    if ( (Режим == SCR_SAVE) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT) )
+        /*** проверки для аккредитивов ***/
+        if ( Curpmrmprop.ShifrOper == "08" )
+            if ( Curpmpaym.PayerBankID == Curpmpaym.ReceiverBankID )
+                msgbox("Банк плательщика не должен совпадать с банком получателя");
+                stat = fld_akkr_PayerBankCode;        
+                return stat;
+            end;             
+      
+            if ( NOT Входит_в_ТС() )
+                msgbox("Банк получателя не входит в ТС (on-line)");
+                stat = fld_akkr_PayerBankCode;        
+                return stat;
+            end;
+      
+            if ( (Curpmpaym.FIID != Curpmpaym.PayFIID) or (Curpmpaym.BaseFIID != Curpmpaym.PayFIID) or (Curpmpaym.BaseFIID != NATCUR) )
+                msgbox("Аккредитив может быть только в рублях");
+                return 1;
+            end;
+      
+            if ( (Curpmcredit.DebetCredit == 0) ) 
+                msgbox("Аккредитив может быть только кредитовым");
+                return 1;
+            end;
+         
+            if ( Curpmakkr.Date < {curdate} )
+                msgbox("Срок действия аккредитива должен быть больше|либо равен дате операционного дня"); 
+                stat = fld_akkr_Date;
+                return stat;
+            end;
+
+            if ( Curpmakkr.Type == "" )
+                msgbox("Не задан вид аккредитива");
+                stat = fld_akkr_Type; 
+                return stat;
+            end;                    
+
+            if ( StrLen( Curpmrmprop.Ground ) == 0 )
+                MsgBox("Не заполнено поле 'Наименование товаров (работ, услуг), № и дата договора, срок отгрузки товаров (выполнения работ, оказания услуг), грузополучатель и место назначения'");
+                return 1;
+            end;
+
+            if ( StrLen( Curpmrmprop.Number ) == 0 )
+                MsgBox("Не задан номер аккредитива");
+                return fld_akkr_Number;
+            end;
+        
+        end; // if ( Curpmrmprop.ShifrOper == "08" )
+        
+        /*проверка реквизитов валютной операции*/
+        if( PM_CheckCO(Curpmpaym,Curpmrmprop,Curpmdebet,Curpmcredit,CurCurTr) )
+            return 1;
+        end;
+        
+        /* Общие проверки по списку */
+        stat = RMIN_ScrolMacroCommonChecks( TPanelFields(), Curpmpaym, Curpmdebet, Curpmcredit, Curpmrmprop );
+        if( stat != NOTERROR )
+          return stat;
+        end;
+    
+    end;
+  
+    if((Режим == SCR_SAVE) or (Режим == SCR_EDIT)) // Проверки при вводе и редактировании
+        //Gurin S. 16.02.2015 I-00551560-2
+        if (Режим == SCR_EDIT)
+           if ((Curpmcredit.tpid == 9) and (strlen(Curpmrmprop.Ground) > 210))
+              MsgBox("Назначение платежа превышает 210 символов");
+              return 1;
+           end;
+        end;
+
+        if( PM_CheckPayments( Curpmpaym, Curpmdebet, Curpmcredit, Curpmrmprop, 1 ) )
+            return 1;
+        end;
+
+    end; 
+
+    if( Режим == SCR_EDIT )  /* РЕДАКТИРОВАНИЕ ДОКУМЕНТА */
+       /*При редактировании производим проверку важности внесенных изменений */
+       /* Константы важности внесенных изменений:           */
+       /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+       /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+       /* CHANG_NOTKEEP        - не сохранять изменения */
+       /* Если возвращаемое значение  > 0, то это оно интерпретируется как номер поля с ошибочным параметром*/
+       /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+          и сохранение изменений можно производить без отката операции      */
+
+       if( Curpmdebet.IsSender == "X" )
+           PropStatus = Curpmdebet.PropStatus;
+       elif( Curpmcredit.IsSender == "X" )
+           PropStatus = Curpmcredit.PropStatus;
+       else
+           MsgBox( "Не указаны свойства ни банка-плательщика, ни банка-получателя!" );
+           return 1;
+       end;
+
+       if( PropStatus == PM_PROP_LOADED )   /* Редактируем принятые платежи  без операции */
+          if(Curpmpaym.DocKind == WL_INDOC)
+            if( not ( ПроверкаИдентичности(Curpmpaym  , Oldpmpaym  ) and
+                      ПроверкаИдентичности(Curpmdebet , Oldpmdebet ) and
+                      ПроверкаИдентичности(Curpmcredit, Oldpmcredit) and
+                      ПроверкаИдентичности(Curpmrmprop, Oldpmrmprop) and
+                      ПроверкаИдентичности(Curpmakkr  , Oldpmakkr  ) and
+                      ПроверкаИдентичности(CurPmkz    , OldPmkz    ) 
+                    )                      
+              )
+//              return CHANG_NOTKEEP;
+            end;
+          elif(Curpmpaym.DocKind == WL_WIPM)
+            return 0;
+          end;
+       elif( (PropStatus == PM_PROP_RECEIVED) or (PropStatus == PM_PROP_CLOSED) )   /* Редактируем принятые платежи с операцией */
+            if( (СимволШага == СимволШагаРазрешениеРедактирования)  or (Curpmpaym.PaymStatus == PM_REJECTED)) /*Платежи на ручной обработке*/
+                if( (Curpmpaym.PayAmount       != Oldpmpaym.PayAmount) or
+                    (Curpmpaym.NumberPack      != Oldpmpaym.NumberPack) or
+                    (Curpmpaym.Netting         != Oldpmpaym.Netting) or
+                    (Curpmpaym.DeliveryKind    != Oldpmpaym.DeliveryKind ) or
+                    (Curpmpaym.Department      != Oldpmpaym.Department) or
+                    (Curpmpaym.SubPurpose      != Oldpmpaym.SubPurpose) or
+                    (Curpmpaym.Purpose         != Oldpmpaym.Purpose) or
+                    (Curpmpaym.ValueDate       != Oldpmpaym.ValueDate) or
+                    (Curpmdebet.CodeKind       != Oldpmdebet.CodeKind) or
+                    (Curpmdebet.BankCode       != Oldpmdebet.BankCode) or
+                    (Curpmcredit.CodeKind      != Oldpmcredit.CodeKind) or
+                    (Curpmcredit.BankCode      != Oldpmcredit.BankCode) or
+                    (Curpmdebet.Corschem       != Oldpmdebet.Corschem) or
+                    (Curpmcredit.Corschem      != Oldpmcredit.Corschem) or
+                    (Curpmpaym.PayFIID         != Oldpmpaym.PayFIID    ) or
+                    (Curpmrmprop.Instancy      != Oldpmrmprop.Instancy ) or
+                    (Curpmrmprop.ReceiverBankName  != Oldpmrmprop.ReceiverBankName ) or
+                    (Curpmrmprop.PayerBankName     != Oldpmrmprop.PayerBankName ) or
+                    (Curpmrmprop.Number        != Oldpmrmprop.Number     ) or
+                    (Curpmrmprop.Date          != Oldpmrmprop.Date       ) or
+                    (Curpmrmprop.PayDate       != Oldpmrmprop.PayDate    ) or
+                    (Curpmrmprop.ClientDate    != Oldpmrmprop.ClientDate ) or
+                    (Curpmrmprop.Priority      != Oldpmrmprop.Priority   ) or
+                    (Curpmrmprop.ShifrOper     != Oldpmrmprop.ShifrOper  ) or
+                    (Curpmrmprop.ReceiverCorrAccNostro != Oldpmrmprop.ReceiverCorrAccNostro ) or
+                    (Curpmrmprop.ReceiverINN           != Oldpmrmprop.ReceiverINN ) or
+                    (Curpmrmprop.PayerCorrAccNostro != Oldpmrmprop.PayerCorrAccNostro ) or
+                    (Curpmrmprop.PayerINN           != Oldpmrmprop.PayerINN ) or
+                    (Curpmdebet.PayFIID        != Oldpmdebet.PayFIID)   or
+                    (Curpmcredit.PayFIID       != Oldpmcredit.PayFIID)  or
+                    PmTaxPropChanged(Curpmrmprop, Oldpmrmprop)
+                  )
+                  return CHANG_NOTKEEP;
+                end;
+         
+                if(Curpmrmprop.IsShortFormat != SET_CHAR)
+                    if( (Curpmrmprop.ReceiverName  != Oldpmrmprop.ReceiverName ) or
+                        (Curpmrmprop.PayerName     != Oldpmrmprop.PayerName ) )
+                        return CHANG_NOTKEEP;
+                    end;
+                end;
+
+                if( ( Curpmpaym.ReceiverAccount != Oldpmpaym.ReceiverAccount  ) )
+                    return CHANG_NOTKEEP;
+                end;
+
+                if( ( Curpmpaym.PayerAccount != Oldpmpaym.PayerAccount ) )
+                    return CHANG_NOTKEEP;
+                end;
+            else
+                //TAM 29.01.2013 - разрешено менять дату значения и корсхему - это приводит к значительным изменения в 
+                // pmrmprop и pmprop - поэтому проверяем только pmpaym - ранее эти проверки платежами не проходились
+                // отмним пока эту проверку - они всё подряд меняют. позже проверю.
+                /*if( not ( ПроверкаИдентичности(Curpmpaym,   Oldpmpaym,  "ValueDate") And 
+                          ПроверкаИдентичности(Curpmdebet,  Oldpmdebet,  "CorSchem") And 
+                          ПроверкаИдентичности(Curpmcredit, Oldpmcredit, "CorSchem") And //- меняют исх. корсхему
+                          ПроверкаИдентичности(Curpmrmprop, Oldpmrmprop) )) //- это меняется соответсвенно
+                    return CHANG_NOTKEEP;
+                end;*/
+            end;
+            
+            //TAM 29.01.2013 - разрешено менять дату значения и корсхему
+            if( (Curpmpaym.PayAmount       != Oldpmpaym.PayAmount) or
+                // (Curpmpaym.ValueDate       != Oldpmpaym.ValueDate) or
+                ((Curpmdebet.CodeKind      != Oldpmdebet.CodeKind) and (Curpmpaym.PayFIID == 0)) or //TAM 09.12.2013 C-22504
+                ((Curpmdebet.BankCode      != Oldpmdebet.BankCode) and (Curpmpaym.PayFIID == 0)) or //TAM 09.12.2013 C-22504
+                (Curpmcredit.CodeKind      != Oldpmcredit.CodeKind) or
+                (Curpmcredit.BankCode      != Oldpmcredit.BankCode) or
+                // (Curpmdebet.Corschem       != Oldpmdebet.Corschem) or
+                // (Curpmcredit.Corschem      != Oldpmcredit.Corschem) or
+                (Curpmpaym.PayFIID         != Oldpmpaym.PayFIID    ) or
+                PmTaxPropChanged(Curpmrmprop, Oldpmrmprop)
+              )
+                return CHANG_IMPORTANT;
+            end;
+
+       elif( PropStatus == PM_PROP_UNKNOWN )  /* Редактируем невыясненные платежи */
+            if(
+                // (Curpmpaym.PayAmount       != Oldpmpaym.PayAmount    ) or TAM 01.02.13 редактирование курса -> смена суммы (для мультивалютных)
+                (Curpmpaym.NumberPack      != Oldpmpaym.NumberPack   ) or
+                (Curpmpaym.Netting         != Oldpmpaym.Netting      ) or
+                (Curpmpaym.DeliveryKind    != Oldpmpaym.DeliveryKind ) or
+                (Curpmpaym.Purpose         != Oldpmpaym.Purpose      ) or
+                (Curpmpaym.SubPurpose      != Oldpmpaym.SubPurpose   ) or
+                (Curpmpaym.Department      != Oldpmpaym.Department   ) or
+                //TAM 28.01.2013 - дата значения может меняться
+                //(Curpmpaym.ValueDate       != Oldpmpaym.ValueDate    ) or
+                // Редактируем эти параметры!!! TAM 10.02.2014                
+                /*(Curpmdebet.CodeKind          != Oldpmdebet.CodeKind          ) or
+                (Curpmdebet.BankCode          != Oldpmdebet.BankCode          ) or
+                (Curpmcredit.CodeKind         != Oldpmcredit.CodeKind         ) or
+                (Curpmcredit.BankCode         != Oldpmcredit.BankCode         ) or
+                (Curpmdebet.Corschem          != Oldpmdebet.Corschem          ) or
+                (Curpmcredit.Corschem         != Oldpmcredit.Corschem         ) or*/
+                (Curpmpaym.PayFIID         != Oldpmpaym.PayFIID    ) or
+                /*(Curpmrmprop.Instancy         != Oldpmrmprop.Instancy         ) or
+                (Curpmrmprop.ReceiverBankName != Oldpmrmprop.ReceiverBankName ) or
+                (Curpmrmprop.PayerBankName    != Oldpmrmprop.PayerBankName    ) or
+                (Curpmrmprop.Number           != Oldpmrmprop.Number           ) or
+                (Curpmrmprop.Date             != Oldpmrmprop.Date             ) or
+                (Curpmrmprop.PayDate          != Oldpmrmprop.PayDate          ) or
+                (Curpmrmprop.ClientDate       != Oldpmrmprop.ClientDate       ) or
+                (Curpmrmprop.Priority         != Oldpmrmprop.Priority         ) or
+                (Curpmrmprop.ShifrOper        != Oldpmrmprop.ShifrOper        ) or
+                (Curpmdebet.PayFIID           != Oldpmdebet.PayFIID           ) or
+                (Curpmcredit.PayFIID          != Oldpmcredit.PayFIID          ) or*/
+                 PmTaxPropChanged(Curpmrmprop, Oldpmrmprop)                     or
+                (Curpmpaym.PayerAccount       != Oldpmpaym.PayerAccount       ) or
+                (Curpmpaym.ReceiverAccount    != Oldpmpaym.ReceiverAccount    )
+                   )
+                   return CHANG_NOTKEEP;
+            end;
+
+            if( not( (Curpmdebet.Group == 1 ) and 
+                     (Curpmcredit.Group == 1)
+                   )
+              )
+             
+               if( Curpmcredit.IsSender == "X")
+                 
+                 if (  ( Curpmrmprop.ReceiverCorrAccNostro != Oldpmrmprop.ReceiverCorrAccNostro ) or
+                         ( Curpmrmprop.ReceiverName          != Oldpmrmprop.ReceiverName ) or
+                         ( Curpmrmprop.ReceiverINN           != Oldpmrmprop.ReceiverINN )
+                      )
+                       return CHANG_NOTKEEP;
+                   end;
+
+               else
+
+                 if (  ( Curpmrmprop.PayerCorrAccNostro != Oldpmrmprop.PayerCorrAccNostro ) or
+                         ( Curpmrmprop.PayerName          != Oldpmrmprop.PayerName ) or
+                         ( Curpmrmprop.PayerINN           != Oldpmrmprop.PayerINN )
+                      )                               
+                      return CHANG_NOTKEEP;
+                   end;
+
+               end;
+
+            end;
+
+       end;
+    
+
+    elif( Режим == SCR_SAVE ) /* Ввод ответного платежа  */
+
+    end;
+
+
+    return 0;
+end;
+
+/*
+ return 0;        // никаких действий после работы макросы не делать
+ return UPDTREC   // обновить в скролле текущюю запись
+ return UPDTPAGE  // обновить страницу скроллла         
+*/
+macro Функция_Пользователя(Режим)
+
+  var cmd, rs, m, rub, kop,CURtext;
+  var new_acc:string,  new_fid:integer, new_client:integer;
+  array mn;
+
+  record fi(fininstr);
+
+  var PaymentObj = Rsbpayment (Curpmpaym.paymentId);
+  var obj = GetPrimObj(paymentObj);
+   
+  macro GetArhDocDate(pm_id)
+      var SQL, cmd, rs;
+      //TAM 10.12.2014 I-00538156-2
+      cmd = RsdCommand( " SELECT   ad.t_date_carry                                   " +
+                        " FROM   dacctrn_dbt ad, dpmdocs_dbt pm, daccount_dbt acnt   " +
+                        " WHERE       pm.t_paymentid = ?                             " +
+                        "         AND AD.T_ACCTRNID = PM.T_ACCTRNID                  " +
+                        "         AND ad.t_account_receiver = acnt.t_account         " +
+                        "         AND acnt.t_chapter = 1                             " +
+                        "         AND INSTR (UPPER (acnt.t_type_account), 'Y') != 0  "
+                      );
+      cmd.AddParam("pm", RSDBP_IN, pm_id);
+      rs = RsdRecordSet(cmd);
+      if(rs.MoveNext())
+          return sqlDate2date(rs.Value(0));
+      end;
+  end;
+
+  /*** заполняем меню ***/
+  /*01.04.2015 Chesnokov D.S. По заявке C-31920 добавил обработку массового выделения*/
+  if (Режим == UFN_SCROL_FMASS)
+    mn(asize(mn)) = "Массовая установка кода ФМ и заполнение descr";
+    /*** отрисовываем меню ***/
+    m=menu(mn, null, "Выберите массовое действие");
+  
+    if (m < 0)
+      return 1;
+    elif (mn(m)=="Массовая установка кода ФМ и заполнение descr")
+      return execMacroFile ("fm_inscode_mass.mac", "Dialog_mass");
+    end;
+  
+    return 0;
+  elif (Режим == UFN_SCROL_NMASS) // Обработка массового режима
+    return execMacroFile ("fm_inscode_mass.mac", "SetCodeAndDescr", Curpmpaym);
+  elif (Режим == UFN_SCROL_LMASS) // Постобработка массового режима
+    return 0;
+  else//обрабатываем остальные режимы
+   
+    // 1. зачисление состоялось
+    If (IsCarry(Curpmpaym.paymentid)) 
+        // 1.1. (зачисление состоялось) поступили рубли от нерезидента 
+        If ((curpmpaym.basefiid == 0) and ISPayerNerezAcc(Curpmpaym.PayerAccount)) 
+            mn(asize (mn)) = "Печать извещения о поступлении выручки от нерезидента";
+            mn(asize (mn)) = "Кредитовое авизо";
+            mn(asize (mn)) = "Указать счет для зачисления"; //TAM 26.04.2013 R-185099-2
+            mn(asize (mn)) = "Паспорта, коды валютного контроля";
+            mn(asize (mn)) = "Изменение платежа ФМ";
+            mn(asize (mn)) = "Редактировать примечания платежа";
+            mn(asize (mn)) = "Показать выбранные комиссии за ВК"; 
+            mn(asize (mn)) = "Статистика по прохождению ответного платежа"; 
+            if (fgBank.is_PRBB) 
+                mn(asize (mn)) = "Редактировать примечания платежа";
+                mn(asize (mn)) = "Кредитовое авизо SWIFT"; 
+                mn(asize (mn)) = "Кредитовое авизо SWIFT (лоро)"; // zip_z.  C-16285
+            end;
+            mn(asize (mn)) = "Изменить вид хранения"; // 20.08.2013 I-00416406 (joy) 
+            mn(asize (mn)) = "Формирование запроса ЕD243";
+            mn(asize (mn)) = "Информация о рейсе"; 
+            
+        // 1.2. (зачисление состоялось) поступила валюта резиденту на транзитный счет *** 
+        elif ((curpmpaym.basefiid != 0) and (not(ISPayerNerezPtID(Curpmpaym.receiver))) and (ISTransitAcc(curpmpaym.futurereceiveraccount, curpmpaym.payfiid))) 
+            var rec_account = ТранзитныйСчетЗачисленияИзПроводки(Curpmpaym.paymentid, "");
+            if( rec_account != "")
+                mn(asize (mn)) = "Печать уведомления о поступлении валюты резиденту";
+            end;
+
+            mn(asize (mn)) = "Список распоряжений по транзитному счету";
+            mn(asize (mn)) = "Кредитовое авизо";
+            mn(asize (mn)) = "Указать счет для зачисления"; //TAM 26.04.2013 R-185099-2
+            mn(asize (mn)) = "Паспорта, коды валютного контроля";
+            mn(asize (mn)) = "Изменение платежа ФМ";
+            mn(asize (mn)) = "Кредитовое авизо SWIFT"; // zip_z.
+            mn(asize (mn)) = "Кредитовое авизо SWIFT (лоро)"; // zip_z.  C-16285
+            mn(asize (mn)) = "Редактировать примечания платежа"; //TAM 25.07.2012 C-11947
+            mn(asize (mn)) = "Показать выбранные комиссии за ВК"; // EVG 9/08/2012 Показ выбранных комиссий за ВК
+            mn(asize (mn)) = "Изменить вид хранения"; // 20.08.2013 I-00416406 (joy) 
+            mn(asize (mn)) = "Формирование запроса ЕD243";
+            mn(asize (mn)) = "Информация о рейсе";  
+   
+        // 1.3. (зачисление состоялось) прочее
+        else
+            mn(asize (mn)) = "Кредитовое авизо";
+            mn(asize (mn)) = "Указать счет для зачисления";
+            mn(asize (mn)) = "Паспорта, коды валютного контроля";
+            mn(asize (mn)) = "Редактировать примечания платежа";
+            mn(asize (mn)) = "Сообщение клиенту \"Сумма на невыясненных\""; 
+            mn(asize (mn)) = "Изменение платежа ФМ";
+            mn(asize (mn)) = "Статистика по прохождению ответного платежа";
+            if (fgBank.is_PRBB) 
+                mn(asize (mn)) = "Кредитовое авизо SWIFT";
+                mn(asize (mn)) = "Кредитовое авизо SWIFT (лоро)"; // zip_z.  C-16285
+                mn(asize (mn)) = "Показать выбранные комиссии за ВК"; 
+            elif (fgBank.is_VUZ) // KS 24.12.2010 Запрос в другой банк
+                mn(asize (mn)) = "Запрос в банк";
+                mn(asize (mn)) = "Показать выбранные комиссии за ВК"; 
+            elif ( (fgBank.is_EXV) or (fgBank.is_GEB) )
+                mn(asize (mn)) = "Запрос по суммам";
+                mn(asize (mn)) = "Печать извещения о поступлении валюты резиденту";
+                mn(asize (mn)) = "Показать выбранные комиссии за ВК"; 
+            elif   (fgBank.is_SLD) //Gurin S. 09.10.2014 R-466027-2
+                mn(asize (mn)) = "Кредитовое авизо SWIFT";
+            end;
+            mn(asize (mn)) = "Изменить вид хранения"; // 20.08.2013 I-00416406 (joy) 
+            mn(asize (mn)) = "Формирование запроса ЕD243"; 
+            mn(asize (mn)) = "Информация о рейсе";
+            //Gurin S. 15.05.2015 R-580876-2 Только для невыясненных
+            if ( PaymentObj.IsPlacedToUnknown )
+                mn(asize (mn)) = "Сменить валюту счета плательщика";
+                mn(asize (mn)) = "Удалить шаг Редактирование";  //Gurin S. 16.07.2015 Чтобы была возможность возврата документов с невыясненных
+            end;
+        end;
+
+    // 2. зачисления пока нет, платёж на приёме
+    elif (curpmpaym.paymstatus == PM_IS_RECEIVING) 
+        mn(asize (mn)) = "Отметка - в невыясненные";
+        mn(asize (mn)) = "Указать счет для зачисления";
+        mn(asize (mn)) = "Кредитовое авизо SWIFT"; 
+        mn(asize (mn)) = "Кредитовое авизо SWIFT (лоро)";  // zip_z.  C-16285
+        mn(asize (mn)) = "Редактировать примечания платежа"; 
+        mn(asize (mn)) = "Статистика по прохождению ответного платежа"; 
+        mn(asize (mn)) = "Изменить вид хранения"; // 20.08.2013 I-00416406 (joy) 
+        mn(asize (mn)) = "Информация о рейсе";
+    end;
+    //TAM 15.11.2013 C-22504
+    if (fgBank.is_EXV)
+        mn(asize (mn)) = "Сформировать сообщение SWIFT по данным Payments";
+    end;
+
+    /*** отрисовываем меню ***/
+    m = menu(mn,null,"Выберите действие над платежом");
+    if (m < 0) return 0; end;
+
+    if   (mn (m) == "Печать извещения о поступлении выручки от нерезидента") 
+        CURtext    = CurToStrAlt(Curpmpaym.amount, rub, kop, GetIsoByID(Curpmpaym.basefiid, false)); 
+        //Gurin S. 02.02.2015 I-00548780-2 добавил 8-й параметр
+        ПечатьИзвещения(Curpmpaym.receiveraccount,Curpmrmprop.receivername,Curpmpaym.amount, SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext, Curpmpaym.paymentid, false, PaymentObj.PayerChargeOffDate);
+        if (isborw(Curpmpaym.receiveraccount))
+            if ( gettrue (TRUE, "Данный клиент является клиентом Боурм. Отправить извещение?"))
+                CURtext    = CurToStrAlt(Curpmpaym.amount, rub, kop, GetIsoByID(Curpmpaym.basefiid, false)); 
+                ОтправкаИзвещения(Curpmpaym.receiveraccount,Curpmrmprop.receivername,Curpmpaym.amount, SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext, Curpmpaym.paymentid, false, Curpmpaym.receiver);
+            end;
+        end;
+
+    elif (mn (m) == "Паспорта, коды валютного контроля")
+        edit_paymnote(Curpmpaym.paymentid,111);
+            
+    elif (mn (m) == "Редактировать примечания платежа")
+        if (ВходитВГруппу({oper},170)) //170 - "Правка примечаний платежа"
+            ВывестиПримечанияНаРедактирование(Curpmpaym.paymentID); 
+        else
+            msgbox("Вы не включены в группу \"Правка примечаний платежа\" ");
+        end;
+         
+    elif ( mn (m) == "Печать уведомления о поступлении валюты резиденту")
+        CURtext    = CurToStrAlt(Curpmpaym.payamount, rub, kop, int(GetIsoByID(Curpmpaym.payfiid, false))); 
+        ПечатьУведомления(GetArhDocDate(Curpmpaym.paymentid), rec_account,GetClientNameByAcc(rec_account), Curpmpaym.payamount, SubStr(CURtext, StrLen(rub)+1, Index(CURtext, kop)-Strlen(rub)-1), CURtext, DateAfterWorkDays(date(Curpmpaym.valuedate),15), Curpmrmprop.receiverBankname, Curpmpaym.paymentid, false);
+        if (isborws(Curpmpaym.receiveraccount))
+            if ( gettrue (TRUE, "Данный клиент является клиентом Боурм. Отправить уведомление?"))
+                CURtext    = CurToStrAlt(Curpmpaym.amount, rub, kop, GetIsoByID(Curpmpaym.basefiid, false)); 
+                ОтправкаУведомления(date(Curpmpaym.valuedate),Curpmpaym.receiveraccount,Curpmrmprop.receivername,Curpmpaym.amount, SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext, DateAfterWorkDays(date(Curpmpaym.valuedate),15), Curpmrmprop.receiverBankname, Curpmpaym.paymentid, false, Curpmpaym.receiver);
+            end;
+        end;
+            
+    elif (mn (m) == "Список распоряжений по транзитному счету")            //показ списка распоряжений по тр. счету на просмотр
+        ExecMacroFile("trn_order_list.mac", "show_orders_list", Curpmpaym.paymentid, Curpmpaym.futurereceiveraccount);
+         
+    elif (mn (m) == "Кредитовое авизо")
+        ExecMacroFile ("makeMT103.mac", "makeMT103", Curpmpaym.paymentid);
+            
+    elif (mn (m) == "Сообщение клиенту \"Сумма на невыясненных\"")
+        CURtext    = CurToStrAlt(Curpmpaym.amount, rub, kop, int(GetIsoByID(Curpmpaym.basefiid, false)));
+        ПоказатьСообщение(Curpmpaym.PaymentId, string(Curpmpaym.amount+SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1)), Curpmrmprop.number, date(Curpmrmprop.date), Curpmrmprop.payername, false, Curpmpaym.receiver, 1);
+            
+    elif (mn (m) == "Изменение платежа ФМ")
+        ExecMacroFile("ChangeReason.mac", "ChangeReason", PaymentObj);
+            
+    elif (mn (m) == "Кредитовое авизо SWIFT")  
+        PM_FillNote (Curpmpaym.paymentid);
+    
+    elif (mn (m) == "Кредитовое авизо SWIFT (лоро)")  
+        ExecMacroFile  ("sw_notes.mac", "PM_FillLoroFile", Curpmpaym.paymentid);
+                
+    elif (mn (m) == "Запрос в банк") // KS 24.12.2010 Запрос в другой банк
+        PrintUnkDocum(PaymentObj);
+                
+    elif (mn (m) == "Запрос по суммам")
+        PrintBlankBack(PaymentObj);
+                
+    elif (mn (m) == "Печать извещения о поступлении валюты резиденту")
+        ПечатьИзвещения(Curpmpaym.receiveraccount,Curpmrmprop.receivername,Curpmpaym.amount, SubStr(CURtext, StrLen(rub)+1, Index(CURtext,kop)-Strlen(rub)-1), CURtext, Curpmpaym.paymentid, false, {curdate}); // 28.11.2014 joy R-502394-2 Добавлен параметр - дата, иначе получали ошибку и ничего не печаталось
+
+    elif (mn(m) == "Показать выбранные комиссии за ВК" )
+        ShowChosenCCCom( Curpmpaym );
+
+    //Gurin S. 14.08.2013 C-21844
+    elif (mn(m) == "Формирование запроса ЕD243" )
+        UF_Request.CreateRequest(PaymentObj.PaymentID);
+
+    //Gurin S. 14.05.2014 
+    elif (mn(m) == "Информация о рейсе" )
+        ExecMacroFile ("lib_menu_common.mac", "GetRaceInfo", PaymentObj.PaymentID); 
+                    
+    //Gurin S. 15.05.2015 R-580876-2
+    elif (mn(m) == "Сменить валюту счета плательщика" )
+        if (ListFI(FIKIND_CURRENCY, 0, fi))
+           cmd = RSDCommand("update dpmpaym_dbt set T_PAYFIID = " + fi.fiid + " where t_paymentid = " + Curpmpaym.paymentid);
+           cmd.execute();
+           msgbox("Выполнено");
+        end;
+    //Gurin S. 16.07.2015 
+    elif (mn(m) == "Удалить шаг Редактирование" )
+       execSql("delete from doprstep_dbt where t_id_operation = :id and t_blockid = 10000159", makeArray( SQLParam( "id", PM_Opr_GetIdOperation (Curpmpaym.PaymentId, Curpmpaym.DocKind))));
+       msgbox("Выполнено");
+            
+    elif (mn(m) == "Статистика по прохождению ответного платежа" )
+        ExecMacroFile ("rep_paym_other_bank.mac", "GetPayments", PaymentObj.PaymentID, 0);
+
+    elif   (mn (m) == "Отметка - в невыясненные")
+        cmd = RSDCommand("update dwlpm_dbt set t_isunknown = 'X' where t_paymentid = " + Curpmpaym.paymentid);
+        cmd.execute();
+            
+    elif (mn (m) == "Указать счет для зачисления")
+        if (GetNewAccount(Curpmpaym.futurereceiveraccount, new_acc, new_fid, new_client))
+            // почему не в транзакции !?
+            cmd = RSDCommand("update dpmpaym_dbt set t_FIID_FutureRecAcc = ?, t_futurereceiveraccount = ?, t_receiver = ? where t_paymentid = ?");
+            cmd.addparam("fiid",          RSDBP_IN, new_fid);
+            cmd.addparam("new_acc",       RSDBP_IN, new_acc);
+            cmd.addparam("new_receiver",  RSDBP_IN, new_client);
+            cmd.addparam("paymentid",     RSDBP_IN, Curpmpaym.paymentid);
+            cmd.execute();
+            //Gurin S. R-444539-2 04.09.2014 перенес проверку по C-25153
+            /*10.07.2014 Chesnokov D.S. По запросу C-25153, обновляем поле валюты кредита. Сделано для платежей из Payments */
+            /*                          где в дебете валютный счет, в кредите рублевый, при попытке указать валютный счет   */
+            /*                          обновляет не только валюты будущей проводки кредита, но и текущую валюту кредита    */
+            /*                          для исключения конверсии.*/
+            //Gurin S. 21.01.2015 R-530658-2
+            if(/*(Curpmpaym.payfiid == 0) and */(new_fid == Curpmpaym.fiid))
+              cmd = RSDCommand("update dpmpaym_dbt set t_PayFIID = ? where t_paymentid = ?");
+              cmd.addparam("payfiid",       RSDBP_IN, new_fid);
+              cmd.addparam("paymentid",     RSDBP_IN, Curpmpaym.paymentid);
+              cmd.execute();
+            end;
+                    
+            cmd = RSDCommand("delete from dnotetext_dbt where T_DOCUMENTID = lpad (?, 10, '0') and T_NOTEKIND = 133");
+            cmd.addparam("pmid",  RSDBP_IN, Curpmpaym.paymentid);
+            cmd.execute();
+           
+            cmd = RSDCommand("update dwlpm_dbt set t_isunknown =  chr (0) where t_paymentid = :p");
+            cmd.addparam("p",  RSDBP_IN, Curpmpaym.paymentid);
+            cmd.execute();
+           
+            /*SDA и устанавливаем, если необходимо признак выгрузки во фронт */
+            PaymentObj.futurereceiveraccount = Curpmpaym.futurereceiveraccount = new_acc;
+            SetFrontRoute(PaymentObj,string(paymentObj.dockind), obj.origin, new_acc); 
+        end;
+        
+    elif  (mn (m) == "Изменить вид хранения"); // 20.08.2013 I-00416406 (joy)
+        if (PaymentObj.PaymStatus == PM_FINISHED) // Проверки только для закрытых, если открыт\отложен менять можно без проблем
+            execMacroFile ("ea_checks.mac", "CheckEAGroup", Curpmpaym); 
+        else
+            execMacroFile ("ea_checks.mac","SetEAStoreKind", Curpmpaym);
+        end;
+    //TAM C-22504 28.11.2013
+    elif  (mn (m) == "Сформировать сообщение SWIFT по данным Payments")
+        execMacroFile ("CreateSWIFTMes.mac", "GenerateSwiftMessage", Curpmpaym.ReceiverBankId, Curpmcredit.BankCode, Curpmpaym.PaymentId);
+    end; 
+
+  end;
+  return 0;
+end;
+
+Macro ProcessPanel(mode, key, field, panel)
+    /*SDA 16.06.2012 - открываем внешние свойства кредитовой части платежа */
+    var i = 0;  
+    If ((panel.ResourceName == "P_PMCPTC") and (Curpmcredit.Group != 1))
+        Curpmcredit.Group = 1;
+        while (i < panel.Fields.count)
+            panel.Fields.Item(i).Enabled = true;
+            i = i + 1;
+        end;
+    end;
+    
+    /*If ((panel.ResourceName == "EDPAYMRM") and (panel.Fields.Item(24).value))
+      debugbreak;
+      msgbox("sdf");
+    end;*/
+    return key;
+end;
+  
+/* Активация каркасного плана  LAO */
+//rsdcommand("ALTER  session SET USE_STORED_OUTLINES = ARMSQ").execute;

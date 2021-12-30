@@ -1,0 +1,356 @@
+	/*Тихомиров Доработка для массовой проводки в течении дня*/
+/*21.05.2012 Поставил ограничение на временную таблицу (за раз максимум 25 строк LAO)*/
+ 
+/*zmp 35.03.2013 C-1751
+С целью увеличения производительности при обработке документов сотрудниками группы картотеки ЕРЦ необходимо настроить процедуру автоматического проведения документов следующего происхлждения:
+1. 2100 (АВВУУ) пачки 5002,7005,8002;
+2. 3300 (электронные по 365-П) пачка 1002;
+3. 19( выставлены банком получателем) пачка 1003.
+ При обработке документов необходимо соблюдать следующие условия:
+1. До шага "Выгрузка в МБР" проводятся документы, если сумма по счету клиента больше или равна сумме платежного документа;
+2. Документ ставим на Картотеку 2 (шаг "Ожидание в картотеке 2"), если сумма по счету клиента меньше суммы документа или по счету имеются активные претензии (аресты), очередность которых меньше очередности документа.
+3. До шага "Доп. контроль (соглсование)" проводятся документы клиентов, по которым доступны только средства овердрафта, или по счету есть какие-либо признаки согласования.
+4. До шага "Доп. контроль (соглсование)" проводятся документы клиентов, по которым есть признаки конкурсного производства (банкроты) либо в примечаниях поле 153 по ALT+N, либо в претензиях по F11.
+*/
+
+import rsd, globals, "opr_engine.mac", "gstname.mac", "pmreport_mass.mac", "timestat.mac", lib_pm_check, KeyCodes, ExecERCDocs_Report;
+import календарь, lib_registry, lib_const, lib_access;
+import commonint, ptinter;
+import "acs_func.mac";
+
+var sql, NextDate, rsd, time1, flag = true, mes, fl = true, time2, intM, intMax, num = 0, countP, count_start, Min_Time, flag_a;
+
+VAR forTest:bool = false;// для отладки
+var rs, cmd, cmd1, code, clientstr="";
+var opr = opr_engine;
+
+
+opr.oper = {OPER};
+opr.kindoperation = 24001;
+opr.dockind = 201;
+
+                       
+PRIVATE MACRO countPM()
+var rs = rsdrecordset ("  select   count(1) as cnt " +
+                       "     from   dpmpaym_dbt pm, dpspayord_dbt ps, doproper_dbt op, dpmrmprop_dbt pr " +
+                       "    where       pm.t_dockind = 201 " +
+                       "            and pm.t_documentid = ps.t_orderid " +
+                       "            and ps.t_currentstate = 0 " +
+                       "            AND ((ps.t_origin = 2100 and pm.t_numberpack in (5002,7005,8002)) or "+ // KS 11.07.2012
+                       "                 (ps.t_origin = 3300 and pm.t_numberpack in (1002)) or "+
+                       "                 (ps.t_origin = 19 and pm.t_numberpack in (1003)))  "             // KS Условие из ТЗ  
+                       "            and pr.t_date <= to_date ('"+{curdate}+"', 'DD.MM.YYYY') " +
+                       "            and op.t_documentid = lpad (to_char (pm.t_paymentid), 34, '0') " +
+                       "            and op.t_dockind = pm.t_dockind " +
+                       "            and pr.t_paymentid = pm.t_paymentid "+
+                       "        AND NOT EXISTS ( SELECT 1 "+
+                       "  FROM dobjatcor_dbt "+
+                       " WHERE t_objecttype = 501 "+
+                       "   AND t_groupid = 1003 "+
+                       "   AND t_attrid = 1 "+
+                       "   AND t_object = LPAD (pm.t_paymentid, 10, '0'))  "+
+ 
+                       "        AND NOT EXISTS ( SELECT 1 "+
+                       "  FROM dobjatcor_dbt "+
+                       " WHERE t_objecttype = 4 "+
+                       "   AND t_groupid = 107 "+
+                       "   AND t_attrid = 1 "+
+                       "   AND t_object = '010000000'||pm.t_payeraccount)  ");
+                       
+if (rs and rs.movenext())  return rs.value(0); end;
+return 0;
+
+END;
+
+PRIVATE MACRO catch(x)
+var err_count = 0;
+var lasterror = "oшибка:"+x.module + "[" + x.line + "]:" + x.message;
+
+    while( err_count < RSLDefEnv.ErrorCount )
+        lasterror = lasterror + "|"+RSLDefEnv.error(err_count).descr;
+        err_count = err_count + 1;
+    end;
+
+    if (RSLDefCon.IsinTrans)
+        RSLDefCon.RollbackTrans;
+    end;
+msgBox(lasterror);
+END;
+
+set_pipe_server(pipe_server_erc);
+//set_pipe_server("zmp_test");
+PRIVATE MACRO StartPM()
+    macro SortPM()
+        cmd = RSDCommand("declare " +
+                         "   v_cnt   number; " +
+                         "   v_rng   number; " +
+                         "begin " +
+                         "   select   count (1) into v_cnt from doprtemp_tmp; " +
+                         "   update   doprtemp_tmp " +
+                         "      set   t_sort = null; " +
+                         "   for i " +
+                         "   in (  select   pmp.t_payeraccount, count (1) acc_cnt, rownum ac_num " +
+                         "           from   doprtemp_tmp op, dpmrmprop_dbt pm, dpmpaym_dbt pmp " +
+                         "          where       op.t_orderid = pmp.t_paymentid " +
+                         "                  and op.t_dockind = pmp.t_dockind                   " +
+                         "                  and pm.t_paymentid = pmp.t_paymentid                   " +
+                         "       group by   pmp.t_payeraccount, rownum " +
+                         "       order by   count (1) desc) " +
+                         "   loop " +
+                         "      for j in (  select   pmp.t_documentid, rownum n " +
+                         "                    from   doprtemp_tmp op, dpmpaym_dbt pmp " +
+                         "                   where   op.t_documentid = pmp.t_paymentid and pmp.t_payeraccount = i.t_payeraccount " +
+                         "                order by   t_paymentid) " +
+                         "      loop " +
+                         "         v_rng := round (v_cnt / i.acc_cnt); " +
+                         "         update   doprtemp_tmp " +
+                         "            set   t_sort = v_rng * j.n + i.ac_num " +
+                         "          where   t_orderid = j.t_documentid; " +
+                         "      end loop; " +
+                         "   end loop; " +
+                         "end; "
+                        );
+       
+        cmd.Execute();
+    end;
+
+
+    macro TruncateTableTMP(tmp_table)
+        cmd = RSDCommand("truncate table " + tmp_table);
+        cmd.execute;
+    end;
+
+    initprogress(-1,"обработка платежей ERC");
+    TruncateTableTMP(" doprtemp_tmp ");
+    TruncateTableTMP(" usr_doprtempERC_tmp " );
+
+    rsldefcon.BeginTrans;
+    SaveBeginTime (); //Старт
+    cmd = RSDCommand(
+                     "insert into doprtemp_tmp (t_id_operation, " +
+                     "                          t_sort, " +
+                     "                          t_dockind, " +
+                     "                          t_documentid, " +
+                     "                          t_orderid, " +
+                     "                          t_kind_operation, " +
+                     "                          t_start_date, " +
+                     "                          t_isnew, " +
+                     "                          t_id_step) " +
+                     "   select   op.t_id_operation, " +
+                     "            null, " +
+                     "            pm.t_dockind, " +
+                     "            lpad (to_char (pm.t_paymentid), 34, '0'), " +
+                     "            pm.t_paymentid, " +
+                     "            decode (op.t_kind_operation, " +
+                     "                    0, (select   min (t_kind_operation) " +
+                     "                          from   doprkoper_dbt " +
+                     "                         where   t_dockind = 29 and t_notinuse = chr (0) and t_kind_operation > 0), " +
+                     "                    op.t_kind_operation) /*если операция не определена то определяется*/, " +
+                     "            rsbsessiondata.curdate, " +
+                     "            chr (88), " +
+                     "            null " +
+                     "     from   dpmpaym_dbt pm, dpspayord_dbt ps, doproper_dbt op, dpmrmprop_dbt pr " +
+                     "    where       pm.t_dockind = 201 " +
+                     "            and pm.t_documentid = ps.t_orderid " +
+                     "            and ps.t_currentstate = 0 " +
+                     "            AND ((ps.t_origin = 2100 and pm.t_numberpack in (5002,7005,8002)) or "+ // KS 11.07.2012
+                     "                 (ps.t_origin = 3300 and pm.t_numberpack in (1002)) or "+
+                     "                 (ps.t_origin = 19 and pm.t_numberpack in (1003)))  "             // KS Условие из ТЗ  
+                     "            and  pr.t_date <= to_date ('"+{curdate}+"', 'DD.MM.YYYY') " +
+                     "            and op.t_documentid = lpad (to_char (pm.t_paymentid), 34, '0') " +
+                     "            and op.t_dockind = pm.t_dockind " +
+                     "            and pr.t_paymentid = pm.t_paymentid "+
+                     "        AND NOT EXISTS ( SELECT 1 "+
+                     "  FROM dobjatcor_dbt "+
+                     " WHERE t_objecttype = 501 "+
+                     "   AND t_groupid = 1003 "+
+                     "   AND t_attrid = 1 "+
+                     "   AND t_object = LPAD (pm.t_paymentid, 10, '0'))  "+
+ 
+                     "        AND NOT EXISTS ( SELECT 1 "+
+                     "  FROM dobjatcor_dbt "+
+                     " WHERE t_objecttype = 4 "+
+                     "   AND t_groupid = 107 "+
+                     "   AND t_attrid = 1 "+
+                     "   AND t_object = '010000000'||pm.t_payeraccount)  ");
+    cmd.execute;
+    cmd = RSDCommand("delete from doprtemp_tmp op where exists (select 1 from doprstep_dbt where t_id_operation = op.t_id_operation)");
+    cmd.execute; 
+    cmd = RSDCommand("insert into usr_doprtempERC_tmp ( select * from doprtemp_tmp);");
+    cmd.Execute();
+    cmd = RSDCommand("delete from usr_ReportERC /*where to_char(t_date,'dd.mm.yyyy') < to_char(sysdate ,'dd.mm.yyyy')*/;");
+    cmd.Execute();
+    cmd = RSDCommand("insert into usr_ReportERC (select T_ORDERID, t_id_operation, sysdate from usr_doprtempERC_tmp );");
+    cmd.Execute();
+    cmd = RSDCommand("select * from dpmpaym_dbt where t_paymentid in (select t_documentid from doprtemp_tmp) for update nowait");
+    cmd.execute;    
+    
+    cmd=RSDCommand("begin ? := wld_common.definemessagereleaseforpmmass (false); end;");
+    cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+    cmd.Execute();
+
+    SortPM();
+    if (opr.change_opr_stat(291,2/*состояние=открыт*/) and opr.change_opr_stat(292, 6/*ДО=предобработка*/) and opr.start_operation)
+        rsldefcon.CommitTrans;
+
+        cmd=RSDCommand("begin usr_operations.exec_steps_for_temp; end;");
+        cmd.Execute();
+    else
+        println("Ошибка запуска операции: "+opr.lasterror+"\nдокументы находятся в списке отложенных");
+        rsldefcon.RollbackTrans;
+    end;
+    TruncateTableTMP(" doprtemp_tmp ");
+    rsldefcon.BeginTrans;
+    /* Посылаем еще раз сообщение в пайп для документов на к2, чтобы списать частичку*/
+    cmd = RSDCommand("  INSERT INTO doprtemp_tmp (t_id_operation,                               "+
+                     "                           t_sort,                                        "+
+                     "                           t_dockind,                                     "+
+                     "                           t_documentid,                                  "+
+                     "                           t_orderid,                                     "+
+                     "                           t_kind_operation,                              "+
+                     "                           t_start_date,                                  "+
+                     "                           t_isnew,                                       "+
+                     "                           t_id_step)                                     "+
+                     " SELECT   op.t_id_operation,                                              "+
+                     "          null,                                                           "+
+                     "          pm.t_dockind,                                                   "+
+                     "          LPAD (TO_CHAR (pm.t_paymentid), 34, '0'),                       "+
+                     "          pm.t_paymentid,                                                 "+
+                     "          DECODE (                                                        "+
+                     "             op.t_kind_operation,                                         "+
+                     "             0,                                                           "+
+                     "             (SELECT   MIN (t_kind_operation)                             "+
+                     "                FROM   doprkoper_dbt                                      "+
+                     "               WHERE       t_dockind = 29                                 "+
+                     "                       AND t_notinuse = CHR (0)                           "+
+                     "                       AND t_kind_operation > 0),                         "+
+                     "             op.t_kind_operation                                          "+
+                     "          )                                                               "+
+                     "           ,                                                              "+
+                     "          rsbsessiondata.curdate,                                         "+
+                     "          CHR (0),                                                        "+
+                     "  (SELECT   MIN(t_id_step)                                                " +
+                     "            FROM   doprstep_dbt                                           " +
+                     "            WHERE   t_id_operation = op.t_id_operation AND t_isexecute = 'R') " +
+                     "   FROM   dpmpaym_dbt pm,                                                 "+
+                     "          doproper_dbt op,                                                "+
+                     "          dpmrmprop_dbt rm,                                               "+
+                     "          usr_doprtempERC_tmp tmp                                         "+
+                     "  WHERE   usr_get_rest (pm.t_payeraccount,                                "+
+                     "                       TO_DATE ('"+ {curdate} +"', 'dd.mm.yyyy')) > 0     "+
+                     "          AND pm.t_paymstatus = 2000                                      "+
+                     "          AND op.t_documentid = LPAD (TO_CHAR (pm.t_paymentid), 34, '0')  "+
+                     "          AND op.t_dockind = pm.t_dockind                                 "+
+                     "          AND tmp.T_ORDERID = PM.T_PAYMENTID                              "+
+                     "          AND rm.t_paymentid = pm.t_paymentid                                      "+ /*Проверка на то, что частичка списываться будет не за счет овера*/                    
+                     "          and not exists (                                                         "+
+                     "          select 1 from daccount_dbt acc                                           "+
+                     "          where acc.t_account = pm.t_payeraccount                                  "+
+                     "          and acc.t_code_currency = 0                                              "+
+                     "          and acc.t_chapter = 1                                                    "+
+                     "          and instr(acc.t_type_account,'О') != 0                                   "+
+                     "          and usr_get_rest_current(acc.t_ACCOUNT, '"+{CURDATE}+"', rm.t_priority ) "+
+                     "          != usr_get_rest_claims(acc.t_ACCOUNT, '"+{CURDATE}+"', rm.t_priority )   "+	
+                     "          ) "                                                              
+     ); 
+    cmd.execute;            
+    SortPM();
+    cmd=RSDCommand("begin ? := wld_common.definemessagereleaseforpmmass (false); end;");
+    cmd.addParam("stat", RSDBP_RETVAL, V_INTEGER);
+    cmd.Execute();
+
+    rsldefcon.CommitTrans;
+    cmd=RSDCommand("begin usr_operations.exec_steps_for_temp; end;");
+    cmd.Execute();
+    
+    remprogress;
+    num = num + 1;
+    rep_file_succ = GetTxtFileName("report_succ");
+    rep_file_err = GetTxtFileName("report_err");
+    //debugbreak;
+    PrintReport("ERC",num);
+    setoutput(null,true);
+
+    TruncateTableTMP(" usr_doprtempERC_tmp "); 
+    TruncateTableTMP(" doprtemp_tmp ");
+
+    SaveEndTime (14); //Закончили
+
+onError(er)
+    catch(er); 
+END;
+
+    if( not (ACS_CheckGroupOper(ACS_GRP_PIPE_START, {OPER}, false)))
+        msgBox("Вы не входите в группу 99 ");
+        exit();
+    end;
+
+    if(not (Min_Time = intM = RSL_GetRegistryValue("PRBB/MASS_EXEC/PAUSE_MIN", false)));
+        intM = 1;
+    end;
+
+
+    if(not (IntMax = RSL_GetRegistryValue("PRBB/MASS_EXEC/PAUSE_MAX", false)));
+        intMax = 5;
+    end;
+
+
+    if(not (count_start = RSL_GetRegistryValue("PRBB/MASS_EXEC/COUNT_START", false)));
+        count_start = 5;
+    end;
+
+    while (1)
+        time1 = time;
+        IntM = Min_time;
+        mes = "F2 - Запуск, F7 - Отчет, F8 - Стоп, Ожидание: ";
+        flag = true;
+        fl = true;
+        BegAction(0,"Ожидаются платежи", false);
+        countP = 0;
+
+        while (flag)
+            time2 = time;
+            message(string(mes,(time(0,intMax,0,0) - (time2 - time1))));
+
+            if( (time2 - time1) > time(0,intM,0,0)) 
+                countP = countPM();
+                if  (countP >= count_start)
+                    flag = false;
+                else
+                mes = "F2 - Запуск, Платежей в очереди < "+count_start+" ("+countp+"), Ожидание: ";
+                intM = intM + 1;
+            end;
+
+        end;
+
+
+       If (TestEvent == KEY_F2 )
+          flag = false;   
+       elif (TestEvent == KEY_F7)
+           ViewReportERC();      
+       elIf (TestEvent == KEY_F8)
+          Return 0;
+       End;
+
+       if ((time2 - time1) > time(0,IntMax,0,0))
+           flag = false;
+       end;
+    end;
+
+    EndAction(0);
+
+    flag_a = true;
+
+    if (date() > {CURDATE})
+      usr_SetOperDay(); //устанавливаем последний открытый ОД
+       /*Установила или нет, пока не проводим, если все ок, проведем через 5 минут или придем повторно*/
+    flag_a = false; // На время теста - уберу
+    end;
+
+    if (flag_a)
+        if (countPM() > 0)
+            StartPM();             
+        end;
+    end;
+
+END

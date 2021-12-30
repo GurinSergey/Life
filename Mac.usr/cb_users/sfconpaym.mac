@@ -1,0 +1,434 @@
+/*
+А.Киселев 13.04.2011
+
+Скроллинг выбора входящих внешних платежей
+Наряд №I-00012707
+Технология Экспресс-Волга, контактное лицо М.Журавлев
+
+
+*/
+import rsd, rcw, BilFacturaInter, "KeyCodes.mac", adress;
+import globals, adress, SfInter, payminter, cb_sql, oprinter ; //RR 24.05.2012 эхяюэ Єэю ъЄю ¤Єю чръюьхэЄшы ш чрўхь
+
+
+private const SFTYPE_DISTRIBUTED = 1;
+
+
+
+private macro EventHandler (DataSet, cmd, id, key )
+ if ((cmd == DLG_KEY) and (key == KEY_ENTER)) //Выбор внешнего входящего платежа для привязке к комиссии и СФ
+  return CM_SELECT;
+ end;
+end;                                 
+
+ /* атрибуты полей */
+private macro AddColumn( ar:@TArray,ind, fld, head, width )
+   ar.value( ind * 6 + 0 ) = fld;  // fieldName
+   ar.value( ind * 6 + 1 ) = head; // header 
+   ar.value( ind * 6 + 2 ) = width;//null; // width
+   ar.value( ind * 6 + 3 ) = 2;    // fldType (2 = FBT)
+   ar.value( ind * 6 + 4 ) = null; // decPoint
+   ar.value( ind * 6 + 5 ) = 0;    // reserv
+end;
+
+
+macro SelAndJoinPaymforPay(RecAcc, RecBankID, PayDate, FeeId, FeeType):integer
+var cmd;
+var Column = TArray();
+var DataSet;
+
+ cmd = RsdCommand (" SELECT B.T_NUMBER,A.T_PAYERACCOUNT,A.T_RECEIVERACCOUNT,A.T_AMOUNT,A.T_PAYMENTID FROM dpmpaym_dbt A, dpmrmprop_dbt B " +
+                                  " WHERE T_RECEIVERACCOUNT = ? " +
+                                  "  AND T_RECEIVERBANKID = ? " +
+                                  "  AND T_VALUEDATE = ? " +
+                                  "  AND A.T_PAYMSTATUS = 32000 AND A.T_DEFCOMID = 0 " +
+                                  "  AND B.T_PAYMENTID = A.T_PAYMENTID "
+                                 );
+ cmd.addParam("RecAcc", RSDBP_IN, RecAcc);
+ cmd.addParam("RecBankID", RSDBP_IN, RecBankID);
+ cmd.addParam("PayDate", RSDBP_IN, PayDate);
+ DataSet = RSDRecordset( cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+
+ AddColumn( @Column, 0, "T_NUMBER", "Номер",10 );
+ AddColumn( @Column, 1, "T_PAYERACCOUNT", "Счет пл-ка",25 );
+ AddColumn( @Column, 2, "T_RECEIVERACCOUNT", "Счет пол-ля",25 );
+ AddColumn( @Column, 3, "T_AMOUNT", "Сумма",25 );
+ AddColumn( @Column, 4, "T_PAYMENTID", "ID Документа",10 );
+
+
+ if (RunScroll (DataSet, 5, Column, "test", @EventHandler, "Выбрать документ оплаты комиссии", "~Esc~ Отмена, ~F3~ Просмотр, ~Enter~ Выбор", true))
+//  Выполнить привязку разовой комиссии и платежа
+
+// Привязка платежа T_DEFCOMID,T_FEETYPE
+  cmd = RSDCommand(" UPDATE dpmpaym_dbt " +
+                   " SET T_DEFCOMID = ?, T_FEETYPE = ? " +
+                   " WHERE T_PAYMENTID = ? "
+                   );
+
+  cmd.addParam("DefComId", RSDBP_IN, FeeId);
+  cmd.addParam("FeeType", RSDBP_IN, FeeType);
+  cmd.addParam("PaymentId", RSDBP_IN, DataSet.value(4));
+  cmd.execute();
+// Привязка платежа T_DEFCOMID,T_FEETYPE
+
+
+//  Выполнить привязку разовой комиссии и платежа
+  return DataSet.value(4);
+ end;
+ return 0;
+end;
+
+
+
+
+private macro sfBFCreateBilBookEntry( FacturaID, Paym, CarryDate )
+  
+  var bilbeID = 0;
+  var bilfDocArray = TArray;
+  var rs,DataSet,cmd;
+  
+  const DocIdSize = 34;
+  var DocID = string( Paym.PaymentID() );
+  DocID = mkstr( "0", DocIdSize - strlen(DocID) ) + DocID;
+  
+  bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+
+  bilfDocArray[0].Clear();
+  bilfDocArray[0].rec.DocID = string( Paym.PaymentID() );
+  bilfDocArray[0].rec.DocKind = Paym.DocKind;
+  bilfDocArray[0].rec.FIID  =  Paym.PayerFIID;                   
+  bilfDocArray[0].rec.Amount = Paym.PayerAmount;
+
+//Kozina делаем запись книги продаж, только если её еще нет 
+  rs = RSDRecordset("select 1 from DBILRECONCILE_DBT where t_docid = "+Paym.PaymentID());
+  if(not rs.MoveNext())
+//А Киселев 04.03.2011 заплата для ошибки при выполнении последней частичной оплаты
+    cmd = RSDCommand(" SELECT B.T_BOOKENTRYID FROM dbilbookentry_dbt A, DBKENTSUM_DBT B WHERE A.T_FACTURAID = ? AND B.T_BOOKENTRYID = A.T_BOOKENTRYID " ); 
+    cmd.addparam("BEENTID",RSDBP_IN,FacturaID);
+    DataSet = RSDRecordset(cmd);
+    if(DataSet.MoveNext())
+     SQL_Execute (" DELETE DBKENTSUM_DBT WHERE  T_BOOKENTRYID = " + string(DataSet.value(0)), false );
+    end;
+//А Киселев 04.03.2011 заплата для ошибки при выполнении последней частичной оплаты
+    Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind, DocID, bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+    if( not BFCreateBilBookEntry(FacturaID, bilfDocArray, CarryDate, bilbeID) )
+      MsgBox("Не удалось связать оплату комиссии с СФ.");        
+    end;
+  end;
+
+end;
+
+
+
+macro CreateBilBookEntryforPaym( PaymentID, CarryDate )
+var Paym = RsbPayment( PaymentID );
+
+file SfSingDf( "sfdef.dbt" );
+
+ SfSingDf.ID = Paym.DefComID;
+ SfSingDf.FeeType = 6;  // EVG 14/02/2012
+ if( not getEQ( SfSingDf ) )
+   MsgBox("Не найдена разовая комиссия с ID = ", Paym.DefComID);
+   return 0;
+ end;
+  
+ if( SfSingDf.FacturaID > 0 )
+  sfBFCreateBilBookEntry( SfSingDf.FacturaID, Paym, CarryDate );
+ end;
+
+ return 1;
+end;
+
+
+macro readNoteForObject_SQL( ObjId, SfDocID, NumOfNote ) :string //Получить примечание объекта - почему то readNoteForObject не сработало
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT UTL_RAW.cast_to_varchar2 (t_text) as NOTE FROM dnotetext_dbt " +
+                   " WHERE T_OBJECTTYPE = ? AND T_NOTEKIND = ? " +
+                   "  AND TO_NUMBER(T_DOCUMENTID) = ? " );
+ cmd.addParam( "ObjId", RSDBP_IN, ObjId );
+ cmd.addParam( "NumOfNote", RSDBP_IN, NumOfNote );
+ cmd.addParam( "SfDocID", RSDBP_IN, SfDocID );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return "";
+ end;
+end;
+
+
+macro GetAccPartyLinked(PartyCodeOne, AccMask, NumOfLink ) :string
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT SUBSTR(A.T_OBJECTID,-20) as ACC FROM dobjlink_dbt A, dobjcode_dbt B " +
+                   " WHERE B.T_CODEKIND = 1 AND B.T_CODE = ? AND B.T_STATE = 0 " +
+                   "  AND A.T_ATTRTYPE = 3 AND TO_NUMBER(A.T_ATTRID) = B.T_OBJECTID " +
+                   "  AND A.T_OBJECTTYPE = 4 AND A.T_GROUPID = ? " +
+                   "  AND SUBSTR(A.T_OBJECTID,-20) LIKE ?||'%' ");
+ cmd.addParam( "PartyCodeOne", RSDBP_IN, PartyCodeOne );
+ cmd.addParam( "NumOfLink", RSDBP_IN, NumOfLink );
+ cmd.addParam( "AccMask", RSDBP_IN, AccMask );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return "";
+ end;
+end;
+
+macro GetClientId( PartyCodeOne ) :integer
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT B.T_OBJECTID FROM dobjcode_dbt B " +
+                   " WHERE B.T_CODEKIND = 1 AND B.T_CODE = ? AND B.T_STATE = 0 ");
+ cmd.addParam( "PartyCodeOne", RSDBP_IN, PartyCodeOne );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return 0;
+ end;
+end;
+
+
+macro GetClientName_( PartyId ) :string
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT T_NAME from dparty_dbt WHERE T_PARTYID = ? ");
+ cmd.addParam( "PartyId", RSDBP_IN, PartyId );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return "";
+ end;
+end;
+
+
+macro GetPairAcc(Chapter, Acc) :string
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT T_PAIRACCOUNT FROM daccount_dbt WHERE T_CHAPTER = ? AND T_ACCOUNT = ? ");
+ cmd.addParam( "Chapter", RSDBP_IN, Chapter );
+ cmd.addParam( "Acc", RSDBP_IN, Acc );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return "";
+ end;
+
+end;
+
+
+//-----------------для генерации СФ-------------------
+macro SfOnce_GetFacturaId(SfId) :integer
+var cmd, DataSet;
+
+ cmd = RsdCommand( " SELECT T_FACTURAID FROM dsfdef_dbt " +
+                   " WHERE T_ID = ? " +
+                   "   AND T_FEETYPE = 6 ");  // EVG 14/02/2012
+ cmd.addParam( "SfId", RSDBP_IN, SfId );
+    
+ DataSet = RsdRecordset( cmd );
+ if( DataSet.moveNext() )
+  return DataSet.value(0);
+ else
+  return 0;
+ end;
+end;
+
+private macro FillPartyInfo( PartyID, PartyName:@string, PartyINN:@string, bBothName )
+  
+  record party(party);
+  if( ПолучитьСубъекта( PartyID, party ) == 0 )
+    PartyName = party.Name;
+    if( bBothName == true )
+      PartyName = PartyName + " (" + party.ShortName + ")";
+    end;
+    PartyINN = GetPartyINN( PartyID, 1 );
+  end;
+
+  /* EVG Проверка ИНН */
+  if ( strlen(PartyINN) == 0 )
+     msgbox ("Внимание! У субъекта " + PartyName + " не определён ИНН. |Счёт-фактура не будет сформирован.");
+  end;
+
+end;
+
+private macro SetPartyAddress( PartyID, Adress:@string )
+  
+  record RecordAdress ( adress  );  
+  ClearRecord( RecordAdress );
+
+  Adress = "";
+
+  var bFounded = НайтиАдресСубъекта( PartyID, PTADDR_LEGAL, RecordAdress );
+  if( bFounded )
+    Adress = RecordAdress.Adress;
+  end;
+
+  if( (bFounded == false) OR (Adress == "") )
+    if( НайтиАдресСубъекта(PartyID, PTADDR_REAL, RecordAdress) )
+    Adress = RecordAdress.Adress;
+  end;
+  end;
+
+end;
+
+
+macro SFOnce_FillBilFactura( feeType, SfID, BillDate, Dprt, DprtNode, PayerID, payFIID, facturaBuff )
+
+  var stat = 0;
+
+  const BILTYPE_BILFAC = 1;
+
+  var FacturaNumber = "";
+
+  record factura("bilfactura.dbt");
+  ClearRecord(factura);  
+
+  setBuff( factura, facturaBuff );
+
+  factura.Direction = 1;
+  FacturaNumber = string( SfID );
+
+  if( stat == 0 )
+    factura.FacturaID  = 0;
+    factura.SfTypeID   = BILTYPE_BILFAC;
+    factura.Department = Dprt;
+    if( DprtNode > 0 )
+      factura.Branch = DprtNode;
+    else
+      factura.Branch = Dprt;
+    end;
+
+    factura.BankDate = BillDate;
+    factura.SysDate  = date();
+    factura.SysTime  = time();
+    factura.Oper     = {oper};
+    
+    factura.CreationDate  = BillDate;
+    factura.AcquisitionDate = BillDate;
+    factura.RegDate       = BillDate;
+    factura.FIID          = PayFIID;
+    factura.Status        = 1;    
+    factura.Assignment    = 1;
+
+    if( factura.Direction == SFTYPE_DISTRIBUTED )
+      factura.SupplierID = {HeadBankID};
+      factura.ReceiverID = PayerID;
+    else
+      factura.SupplierID = PayerID;
+      factura.ReceiverID = {HeadBankID};
+      
+      factura.FacturaNumber = FacturaNumber;
+
+      factura.IsHanded = "X";  
+      factura.AcquisitionDate = factura.CreationDate;
+    end;
+
+    FillPartyInfo( factura.SupplierID, @factura.SupplierName, @factura.SupplierINN, true );
+    SetPartyAddress( factura.SupplierID, @factura.SupplierAddress );
+
+    FillPartyInfo( factura.ReceiverID, @factura.ReceiverName, @factura.ReceiverINN, false );
+    SetPartyAddress( factura.ReceiverID, @factura.ReceiverAddress );
+  end;
+
+  if( stat == 0 )
+    copy( facturaBuff, factura );  
+  end;
+
+  return stat;
+end;
+
+private macro DelEndOfStr(Str,FSym,LSym) :string
+var pos = 0,
+    posEnd = 0,
+    flFSym = 0,
+    StrBuf = "";
+
+ StrBuf = Str;   
+ while ((pos = index(StrBuf,FSym)) > 0) //ищем последний открывающий символ
+  flFSym = 1;
+  StrBuf = SubStr(StrBuf,pos + 1);
+  posEnd = posEnd + pos;
+ end;
+ if ( (flFSym) and ((pos = index(StrBuf,LSym)) > 0))
+  Str = SubStr(Str, 1, posEnd - 1);
+ end;
+ return Str;
+end;
+
+
+
+macro FillFacturaLines_( feeType, SfID, BillDate, ground )
+  var Query, DataSet, cmd;
+  var facturaLineAr = TArray;  
+
+  Query = " SELECT A.T_NUMBER, A.T_NAME, A.T_PRODUCTID, " +
+              "  (SELECT C.T_TAXSCHEMA FROM dbilproduct_dbt C WHERE C.T_PRODUCTID = A.T_PRODUCTID) as TAXSCHEMA, " +
+              "  B.T_SUM, B.T_SUMNDS, B.T_NDSRATEVALUE " +
+              " FROM dsfcomiss_dbt A, dsfdef_dbt B " +
+              " WHERE B.T_ID = ?  " +
+              "  AND  B.T_FEETYPE = 6 " + // EVG 14/02/2012
+              "  AND A.T_FEETYPE = B.T_FEETYPE AND A.T_NUMBER = B.T_COMMNUMBER ";
+  cmd = RSDCommand( Query );
+  cmd.addParam( "SfID", RSDBP_IN, SfID );
+
+  DataSet = RsdRecordset( cmd );
+  if ( DataSet.moveNext() )
+        
+    /*Заполняем спецификацию СФ*/
+    facturaLineAr[0] = TRecHandler("bilfacturaline.dbt");
+    facturaLineAr[0].Clear();    
+    
+    facturaLineAr[0].rec.LineNo = 1;    
+    facturaLineAr[0].rec.ProductID = DataSet.value(2);    
+    facturaLineAr[0].rec.ProductName = DelEndOfStr(ground,"(",")");//DataSet.value(1) + ", " + string(BillDate); нужно тащить из назначения платежа
+    
+    if( DataSet.value(3) != NULLVAL )
+      facturaLineAr[0].rec.TaxSchema = DataSet.value(3);
+    end;   
+    
+    facturaLineAr[0].rec.Amount = DataSet.value(4);         
+    facturaLineAr[0].rec.AmountWithNDS = DataSet.value(4) + DataSet.value(5);    
+    facturaLineAr[0].rec.NDSAmount = DataSet.value(5);
+    
+    if( DataSet.value(6) != 0 )
+      facturaLineAr[0].rec.NDSRate = DataSet.value(6);
+    else
+      if( (DataSet.value(5) != $0) AND (DataSet.value(4) != $0) )
+        facturaLineAr[0].rec.NDSRate = double( round(DataSet.value(5)/DataSet.value(4)) ) * 100.0;
+      end;
+    end;
+        
+    facturaLineAr[0].rec.ComisID      = SfID;
+    facturaLineAr[0].rec.ComisType    = feeType;
+
+  end;
+
+  return facturaLineAr;
+
+end;
+
+macro SF_UpdateOnce( SfID, facturaID )
+
+  var Query, cmd;
+
+  Query = " UPDATE dsfdef_dbt SET T_FACTURAID = ? WHERE T_ID = ? " +
+          "                                         AND T_FEETYPE = 6 ";  // EVG 14/02/2012
+  
+  cmd = RSDCommand( Query );
+  cmd.addParam( "facturaID", RSDBP_IN, facturaID );
+  cmd.addParam( "SfID", RSDBP_IN, SfID );
+  cmd.Execute();
+end;
+
+//-----------------для генерации СФ-------------------

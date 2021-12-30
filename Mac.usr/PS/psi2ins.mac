@@ -1,0 +1,481 @@
+/*
+$Name:           psi2ins.mac
+$Module:         РКО
+$Description:    Макрос шага
+*/
+/*
+ Блок     : 29020 - "Картотека 2"
+ Шаг      : 10    - "Помещение в картотеку 2"
+*/
+
+//-----------------------------------------------------------------------------
+// Блок     : 29020 - "Картотека 2"
+// Шаг      : 10    - "Помещение в картотеку 2"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+// KS 03.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку2
+// Gurin S. 15.07.2013 C-21521 Дополнил Narrative в PostStepAction
+// Gurin S. 05.08.13 C-17880
+// LAO      08.08.2013 C-22144 отправка в лотус: к2 по инкассовым и плат. требованиям
+// KS 22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov 2014-02-21 C-19151 Логгирование массово выполненных шагов
+// EVG 21/03/2014 Для БО добавлена корректировка суммы, оставшейся к оплате, при переносе КОР/К2 -> К2
+// TAM 02.06.2015 C-38458 - отправка в OW сумм заблокированных средств
+//-----------------------------------------------------------------------------
+
+
+import pm_common, pm_setst, payinter, oralib, likepy, catfdoc, cbsttls, "sf_lib.mac", "pm_answerret.mac", WldInter, MesInter, "wltools.mac";
+
+// KS 03.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку2
+import "interbankmes_lib.mac","op_lib.mac","send_claim.mac", lib_account;
+import OprInter; //Jushmanov 2014-02-21 C-19151
+
+var PaymentObj:RsbPayment;
+
+private const PM_OPR_KA_ACCEPTI1    = 205;
+private const PM_OPR_KA_OUTPLACEIWP = 235;
+private const PM_OPR_KA_PLACEIWP    = 234; 
+
+//zmp 13.10.2014 C-30537-7
+private macro getNote40inTable(pid)
+   var rs = RsdRecordset("select 1 from usr_paym_note40 where PAYMENTID = " + pid);
+   return rs and rs.moveNext();
+onError
+   return false;
+end;
+
+PRIVATE MACRO ПлатежИзКартотеки1илиКОР( Payment:RsbPayment, ID_Operation:@integer, ID_Step:@integer, Kind_Action:@integer ):bool
+
+//Gurin S. 24.06.2015 Этого раньше не было
+// LVV 19/05/15 Адаптация клиентской ветки. Перенес нижележащее условие из дистрибутива.
+//  if( Payment.DocKind != PS_PAYORDER )
+//    return false;
+//  end;
+
+  var sDocumentID:string = PM_MakeDocumentID( Payment.DocKind, Payment.DocumentID );
+
+  var query:string = "SELECT STEP.T_ID_OPERATION, STEP.T_ID_STEP, STEP.T_KIND_ACTION    " +
+                     "  FROM DOPROPER_DBT OPR,                        " +
+                     "       DOPRSTEP_DBT STEP                        " +
+                     " WHERE OPR.T_DOCKIND       = :DOCKIND           " +
+                     "   AND OPR.T_DOCUMENTID    = :DOCUMENTID        " +
+                     "   AND STEP.T_ID_OPERATION = OPR.T_ID_OPERATION " +
+                     "   AND STEP.T_ISEXECUTE    = 'X'                " +
+                     "   AND STEP.T_KIND_ACTION  IN(:KIND_ACTION_K1, :KIND_ACTION_IWP, :KIND_ACTION_IWP2)  "+
+                     "ORDER BY STEP.T_ID_STEP DESC" ;
+
+  var params:TArray = makeArray( SQLParam( "DOCKIND"    , Payment.DocKind           ), 
+                                 SQLParam( "DOCUMENTID" , sDocumentID               ),
+                                 SQLParam( "KIND_ACTION_K1" , PM_OPR_KA_ACCEPTI1        ),
+                                 SQLParam( "KIND_ACTION_IWP", PM_OPR_KA_OUTPLACEIWP     ),
+                                 SQLParam( "KIND_ACTION_IWP2", PM_OPR_KA_PLACEIWP       ));
+
+  var rs:RsdRecordset = execSQLselect( query, params, true );
+  if( rs and rs.moveNext() )
+    ID_Operation = rs.value(0);
+    ID_Step      = rs.value(1);
+    Kind_Action  = rs.value(2);
+    return TRUE;
+  else
+    return FALSE;
+  end;
+
+ONERROR(x)
+  
+  MsgBox( "Ошибка получения шага операции|" + x.Message );
+  return FALSE;
+
+END;
+
+PRIVATE MACRO DeleteCarryPrevStep( Payment:RsbPayment, ID_Operation:integer, ID_Step:integer ):integer
+
+  // Получить проводку
+  MACRO getCarry( AccTrnID:integer ):TBFile
+    var fdocument:TBFile = TBFile("acctrn.dbt",  "R", 0, "acctrn.dbt", "bank.def");
+      
+    if( fdocument and AccTrnID )
+      fdocument.rec.AccTrnID = AccTrnID;
+      if( fdocument.GetEQ() )
+        return fdocument;
+      end;
+    end;
+    return fdocument;
+   
+  END;
+
+  var carrydocument:TBFile;
+  // привязка проводки к найденному шагу
+  var query:string = "SELECT OPRDOCS.T_ACCTRNID " +
+                     "  FROM DOPRDOCS_DBT OPRDOCS " +
+                     " WHERE OPRDOCS.T_DOCKIND      = :DOCKIND " + 
+                     "   AND OPRDOCS.T_ID_OPERATION = :ID_OPERATION " +
+                     "   AND OPRDOCS.T_ID_STEP      = :ID_STEP; ";
+   
+  var params:TArray = makeArray( SQLParam( "DOCKIND"     , DLDOC_CARRY  ),
+                                 SQLParam( "ID_OPERATION", ID_Operation ),
+                                 SQLParam( "ID_STEP"     , ID_Step      ) );
+     
+  var rs:RsdRecordset = execSQLselect( query, params, true );
+  while( rs and rs.moveNext() )
+
+    carrydocument = getCarry( rs.value(0) );
+
+    // Удалить внебалансовую проводку, выполненную на шаге "Изъятие из картотеки №1" или "Списание из КОР"
+    if( ( carrydocument.rec.Result_Carry == OBI1CARRY ) or ( carrydocument.rec.Result_Carry == OBIWPOUTCARRY ) )
+      if( not Opr_DeleteCarry( carrydocument.rec.AccTrnID ) )
+        MsgBox("Ошибка при удалении проводки");
+        return 1;
+      else
+        return 0;
+      end; 
+    end;
+  end; 
+
+ONERROR(x)
+  
+  MsgBox( "Ошибка получения привязки проводки к шагу операции|" + x.Message );
+  return 1;
+
+END;
+
+MACRO ExecuteStep( doc, payorder, Kind, ID_Operation )
+
+  var ВнебалСчетКартотеки2:string = "";
+  var paymtr:RsbAccTransaction = NULL;
+
+  var IDOperation:integer = 0;
+  var IDStep:integer = 0;
+  var Kind_Action:integer = 0;
+    private var Theme;
+
+
+  var ПлатежПришелИзКартотеки1:bool = ПлатежИзКартотеки1илиКОР( PaymentObj, @IDOperation, @IDStep, @Kind_Action ) and 
+                                      ( Kind_Action == PM_OPR_KA_ACCEPTI1    );
+  var ПлатежПришелИзКОР       :bool = ( Kind_Action == PM_OPR_KA_OUTPLACEIWP ) or (Kind_Action == PM_OPR_KA_PLACEIWP);
+    private var stat;
+    //SDA 19.04.2012
+    private var IsSfdoc = false;
+    //zmp 13.10.2014 C-30537-7
+    if(getNote40inTable(PaymentObj.PaymentID))
+       PaymentObj.notes.delnote(40); 
+    end;
+
+  //Gurin S. 27.07.2015 R-608350-2
+  if ((PaymentObj.FeeType != 0) and (PaymentObj.Purpose == 0))
+     execSql("update dpmpaym_dbt set t_purpose = 68 where t_paymentid = :id and t_dockind = 286 and t_fiid = 0", makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+  end;
+ 
+  if( PaymentObj.PaymStatus != PM_I2PLACED )
+  
+    // Для документов ПЗО вызовем функцию начисления комиссий
+        // KS 08.11.2010 I-068571 Процедура массовой проводки комиссий из внешних систем    
+        //    if( ( IsSfCommPayment( PaymentObj ) ) or ( ( PaymentObj.feeType == 1 ) and ( PaymentObj.defcomid == 0 ) ) ) 
+
+        //SDA 19.04.2012 ... а так же банковские ордера со счетом получателя 70601 если вдруг пошли на картотеку 2
+        if (( PaymentObj.DocKind == 286) and ( substr( PaymentObj.ReceiverAccount ,1,5) == "70601")) 
+            IsSfdoc = true;
+        end;
+
+        if ( ( IsSfCommPayment( PaymentObj ) ) or  (IsSfdoc) or
+            (( PaymentObj.feeType == 1 ) and ( PaymentObj.defcomid == 0 ) )  
+           ) 
+      if( not chargeComission( PaymentObj.PaymentID ) )
+        MsgBox("Ошибка при начислении комиссии");
+        return 1;
+      end;
+    end;
+
+    //Gurin S. 16.06.2015 R-592536-2 Этого не было раньше
+    /*
+    if( GetAccount90902( PaymentObj.PayerAccount,
+                         PaymentObj.PayerFIID,
+                         PaymentObj.BaseFIID,
+                         ВнебалСчетКартотеки2,  /* В случае успеха, сюда вернется номер "привязанного" счета */
+                         PaymentObj.ValueDate ) )
+      return 1;
+    end;
+    */    
+    if( ПлатежПришелИзКартотеки1 or ПлатежПришелИзКОР ) 
+
+       // Удалить внебалансовую проводку, выполненную на шаге "Изъятие из картотеки №1"/"Списание платежа с карт.ОР"
+       if( DeleteCarryPrevStep( PaymentObj, IDOperation, IDStep ) )
+         return 1;
+       end;
+            //TAM 14.05.2014 I-00486760-2
+            if (ПлатежПришелИзКОР)
+                /* EVG 27/1/2014 Фикс ошибки переноса КОР -> К2 из списка документов КОР по Ctrl-F2 (не из списка шагов).
+                   Запрос в трекер #206256. */
+                if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_2 ) )
+                    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+                    return 1;
+                end;
+
+                /* EVG 21/03/2014 Корректировка суммы, оставшейся к оплате, при переносе КОР/К2 -> К2, только для БО */
+                if( PaymentObj.DocKind == DLDOC_BANKORDER )
+                   RSDCommand("update dpmpaym_dbt  set t_futurepayeramount=round(t_futurebaseamount,2), t_futurereceiveramount=round(t_futurebaseamount,2) where t_paymentid = "+PaymentObj.PaymentID).Execute;
+                end;
+            end;
+        /*SDA см.комментарий к формированию суммы проводки ниже */
+        else
+            RSDCommand("update dpmpaym_dbt  set t_futurepayeramount=round(t_payamount,2), t_futurereceiveramount=round(t_payamount,2) where t_paymentid = "+PaymentObj.PaymentID).Execute;
+        /*SDA end*/
+    end;
+
+    // Выполнить проводку по внебалансу
+
+    paymtr = PaymentObj.MakeTransaction();
+    if( PaymentObj.I2PlaceDate == date(0,0,0) )
+      PaymentObj.I2PlaceDate = {curdate};
+    end;
+
+    if( paymtr == NULL )
+      MsgBox("Ошибка при создании проводки по платежу");
+      return 1;
+    end;
+
+    paymtr.Chapter         = 3;                                            
+            paymtr.Date_Carry    = {curdate};
+    paymtr.Number_Pack     = PaymentObj.NumberPack;
+    paymtr.Numb_Document   = PaymentObj.Number;
+    paymtr.ResultCarry     = 50;
+            paymtr.Kind_Oper     = " 6";
+    paymtr.Shifr_Oper      = "09";
+    paymtr.Department      = PaymentObj.Department;
+            paymtr.AccountPayer  = PaymIndex2_FirstDoc( PaymentObj.PaymentID ).FindAndOpenAccount( "Картотека 2", 0, {curdate} );
+    paymtr.FIIDPayer       = PaymentObj.BaseFIID;
+
+    if( ПлатежПришелИзКартотеки1 ) 
+                /*SDA 12.03.2012 фикс ошибки актуализации существующего счета
+      paymtr.AccountReceiver = PaymIndex1_FirstDoc( PaymentObj.PaymentID ).FindAndOpenAccount( "Картотека 1", 0, {curdate} );
+                */
+                paymtr.AccountReceiver = PaymIndex1_FirstDoc( PaymentObj.PaymentID ).FindAndOpenSysAccount( "Картотека 1", 0, {curdate} );
+    elif( ПлатежПришелИзКОР ) 
+      paymtr.AccountReceiver = TIndexWPPrimDoc( PM_GetSfContrID(PaymentObj), PaymentObj.PaymentID ).FindAndOpenSysAccount( "Карт ОР", IsOprMultiExec() );
+    else
+      paymtr.AccountReceiver = NotBalCorrAcc_FirstDoc( "П" ).FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+    end;
+    
+    paymtr.FIIDReceiver = NATCUR;
+
+            /*SDA сумму проводки выбираем по будущему плательщику только по платежам пришедшим
+              из других картотек. Почему, то при ручном вводе PaymentObj.FuturePayerAmount часто сожержит какой то мусор
+              как воспроизвести - не знаю пока.
+
+                    paymtr.SumPayer = PaymentObj.FutureBaseAmount;
+                    if( ConvSum( paymtr.SumReceiver, PaymentObj.FutureBaseAmount, PaymentObj.ValueDate, PaymentObj.BaseFIID, NATCUR ) )
+                      msgbox("Ошибка конвертации суммы");
+                      return 1;
+                    end;
+            */
+            if( ПлатежПришелИзКартотеки1 or ПлатежПришелИзКОР ) 
+                paymtr.SumPayer = PaymentObj.FutureBaseAmount;
+    if( ConvSum( paymtr.SumReceiver, PaymentObj.FutureBaseAmount, PaymentObj.ValueDate, PaymentObj.BaseFIID, NATCUR ) )
+      msgbox("Ошибка конвертации суммы");
+      return 1;
+    end;
+            else
+                paymtr.SumPayer = PaymentObj.BaseAmount;
+                if( ConvSum( paymtr.SumReceiver, PaymentObj.BaseAmount, PaymentObj.ValueDate, PaymentObj.BaseFIID, NATCUR ) )
+                    msgbox("Ошибка конвертации суммы");
+                    return 1;
+                end;
+            end;
+            /*SDA end*/
+
+            //Gurin S. 17.06.2013 C-17880-6
+            var rs1 = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and t_fromKOR = 'X' and t_flag = 'X'", makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+            var rs2 = ExecSqlSelect ("select 1 from usr_auto_k2_kor where t_id = :id and t_fromKOR = 'X' and t_flag is null", makeArray (SQLParam ("id", PaymentObj.PaymentID)));
+
+            if (rs1 and rs1.moveNext ())
+                paymtr.Ground = "Документ № "                            + string(PaymentObj.Number) + 
+                                " от "                                   + string(PaymentObj.Date)   + 
+                                " к счету "                              + string(PaymentObj.PayerAccount)+","+
+                                " получено  разрешение на проведение операции."
+            elif (rs2 and rs2.moveNext ())
+                paymtr.Ground = "Постановка в картотеку 2 документа  № " + string(PaymentObj.Number) + 
+                                " от "                                   + string(PaymentObj.Date)   + 
+                                " к счету "                              + string(PaymentObj.PayerAccount);
+            else
+    paymtr.Ground          = "Постановка в Картотеку 2 документа № " + string(PaymentObj.Number) + 
+                             " от "                                  + string(PaymentObj.Date)   + 
+                             " к счету "                             + string(PaymentObj.PayerAccount);
+            end;
+
+            /* EVG 14/12/2011 Для документа оплаты единовременной комиссии выполним поиск
+               операциониста, вводившего родительский ПД (т.к. шаг оплаты комиссии может выполнять
+               автомат Фронта). Функция из sf_lib.mac */
+            if ( ( PaymentObj.FeeType == 3 ) and ( PaymentObj.DefComID > 0 ) )
+                Paymtr.Oper = FindParentDocOper( PaymentObj.DefComID, Paymtr.oper );
+            end;
+
+    if( not paymtr.Carry )
+      MsgBox("Ошибка при актуализации платежа");
+      return 1;
+    end;  
+
+    // Установить статус платежа
+    PaymentObj.PaymStatus = PM_I2PLACED;
+
+    // Установить статус первички
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_I2 );
+
+    if ( IsDocKindChild(PaymentObj.DocKind, 283/*PMDOC_CLIENTPAYMENT*/) // платеж клиентский
+        and (PaymentObj.Notes.ReadNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, {curdate}) == "") )//примечание не заполнено
+      if (PaymentObj.Notes.AddNote(PM_NOTEKIND_PAYM_ACCEPTUATEDATE, GetCurrentDateTimeUTC({curdate})))
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+    end;
+
+        // KS 19.09.2012 C-13246 В данном случае дата значения документа равна дате постановки на картотеку
+        PaymentObj.ValueDate = PaymentObj.I2PlaceDate;
+        // KS 03.07.2012 C-13246 ИнтерБанк Извещение о помещении в Картотеку2
+        InternetBankMessPaym(PaymentObj.PaymentID,
+                             PaymentObj.PayerAccount,
+                             PaymentObj.ReceiverAccount,
+                             PaymentObj.PayerAmount,
+                             PaymentObj.ValueDate,
+                             PaymentObj.FuturePayerFIID,
+                             "",
+                             12,
+                             PaymentObj.Payer,
+                             PaymentObj.Receiver);
+        InternetBankMessPaym(PaymentObj.PaymentID,
+                             PaymentObj.PayerAccount,
+                             PaymentObj.ReceiverAccount,
+                             PaymentObj.PayerAmount,
+                             PaymentObj.ValueDate,
+                             PaymentObj.FuturePayerFIID,
+                             "",
+                             22,
+                             PaymentObj.Payer,
+                             PaymentObj.Receiver);
+
+    // Здесь можно вставлять дополнительные проводки для шага
+
+        if ((PaymentObj.PayerBankID == {OurBank}) and ((PaymentObj.ShifrOper == "06") or (PaymentObj.ShifrOper == "02")))
+            if (PaymentObj.ShifrOper == "06")
+                Theme = "Уведомление о помещение в Картотеку 2: инкассовое поручение";
+            else
+                Theme = "Уведомление о помещение в Картотеку 2: платежное требование";
+            end;
+            send_use_MailFront(Paymentobj.PayerAccount,Theme,GetINKLetter(Paymentobj, paymtr,"K2"));
+        end;
+  end;
+
+    //Gurin S. 30.06.2015 R-598200-2
+    var _acc = RSL_Account(PaymentObj.PayerAccount,PaymentObj.PayerFIID);
+    if ((_acc.check_claims) and (GetOprStatus(306) == 1))
+       УстановитьСтатусыПлатежа(306, 2);
+    end; 
+
+  return 0;
+
+END;
+
+MACRO getInitialPaymentID( PurposePaymentID:integer, LinkKind:integer ):integer
+
+  var InitialPaymentID:integer = 0;
+  var select       :string  = "";
+  var params       :TArray  = TArray();
+  var rset         :object;
+
+  select = "select pmlink.t_InitialPayment " +
+           "from   dpmlink_dbt pmlink      " +
+           "where  pmlink.t_PurposePayment  = :PurposePaymID " +
+           "  and  pmlink.t_InitialPayment != pmlink.t_PurposePayment " +
+           "  and  pmlink.t_LinkKind        = :LinkKind ";
+
+  params = makeArray( SQLParam( "PurposePaymID" , PurposePaymentID  ),
+                      SQLParam( "LinkKind", LinkKind));
+
+  rset = execSQLselect( select, params, false );
+
+  if( rset AND rset.moveNext() )
+    InitialPaymentID = rset.Value( 0 );
+  end;
+  
+  return InitialPaymentID;
+END;
+
+macro PostStepAction( message,     /* данный параметр может принимать следующие       */
+                                   /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                      errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                                   /* произошла ошибка                                */
+                      FirstDoc,    /* указатель на первичный документ                 */
+                      ID_Oper,     /* внутренний идентификатор операции               */
+                      Num_Step,    /* Номер шага операции (из настроек)               */
+                      KindOper,    /* номер вида операции                             */
+                      KindDoc,     /* номер вида первичного документа                 */
+                      KindStep,    /* вид шага операции                               */
+                      ID_Step )    /* внутренний идентификатор шага операции          */
+
+    //Jushmanov 2014-02-21 C-19151
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        var logquery, idOper = ID_Oper, idStep = ID_Step;
+
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+
+    // TAM 28.04.2015 C-38458 - отправка в OW сумм заблокированных средств
+    var rsdcom:RSDCommand;
+    if(message == OP_EXECUTE_STEP) 
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (1," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    elif (message == OP_BACKOUT_STEP)
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (2," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    end;
+
+  if (message != OP_EXECUTE_STEP)
+    return 0;
+  end;                                   
+
+    if (PaymentObj.DocKind == PS_PAYORDER)
+        var PsOrder : RsbPsPayOrder = RsbPsPayOrder(PaymentObj.PaymentID);
+        //Gurin S. 26.03.2015 HF2031_19_25_148
+        var Doc : string = IfThenElse( PsOrder.DocKind == PSPOKIND_REQUEST, 
+                                   "инкассового поручения", "платежного требования" );
+        //var Narrative : string = "Недостаточно денежных средств на счете плательщика " + PaymentObj.PayerAccount + ". Документ помещен в К2"; 
+        var Narrative : string = 
+          "Недостаточность денежных средств на счете плательщика " + PaymentObj.PayerAccount +
+          ", уведомляем о помещении " + Doc + " в очередь не исполненных в срок распоряжений " + 
+          "(в соответствии с нормативными актами Банка России) и о приеме " + Doc + 
+          " к исполнению. ";
+        var Queries : string = "InfoCode:6";
+        CreateED274(PsOrder, Queries, Narrative, ID_Oper, ID_Step);
+    end;                                 
+
+  /* Связанное входящее сообщение платежа */
+  record wlmes( wlmes );
+  if (ДокументПорожденВходящимЭСИД(PaymentObj.PaymentID))
+    var ErrList = RsbWlError(0);
+
+    var wlerr_buf = TRecHandler("wlerror.dbt");
+    wlerr_buf.rec.Code         = 35;
+    wlerr_buf.rec.Description  = string("поручение налогового органа № ",
+        PaymentObj.GetPMRMPROP().rec.Number, " от ", PaymentObj.GetPMRMPROP().rec.Date,
+        " на сумму ", PaymentObj.BaseAmount, " не может быть исполнено в установленный срок в  связи с отсутствием ",
+        "(недостаточностью) денежных средств на счете ", PaymentObj.PayerAccount,
+        " клиента ", PaymentObj.GetPMRMPROP().rec.PayerName, " банка (филиала банка)");
+
+    ErrList.Insert( wlerr_buf );
+    if( not ПолучитьСообщение( getInitialPaymentID(PaymentObj.PaymentID, PMLINK_KIND_EXECORDER), OBJTYPE_PAYMENT, 1/*WLD_MES_IN*/, wlmes, NULL ) )
+      ClearRecord( wlmes );
+    end;
+    /* Параметры создаваемого подтверждения банка */
+    var ErrCode = 9; /*Электронный документ налогового органа не может быть исполнен банком*/
+    var ErrDescription; GetElementAndNoteLLVALUES( OBJTYPE_WLRESCODE_MNS, ErrCode, NULL, ErrDescription );
+
+    if( not ВставитьПодтверждениеБанкаФНС( wlmes, ErrCode, ErrDescription, ErrList ) )
+      msgbox( "Ошибка при вставке подтверждения банка" );
+    end;
+  end;
+
+  return 0;
+end;

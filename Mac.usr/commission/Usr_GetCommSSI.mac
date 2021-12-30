@@ -1,0 +1,196 @@
+/****************************************************************************
+ * Пользовательский алгоритм выбора СПИ комиссии                            *
+ * Имя макрофайла выбора СПИ для комиссии задаётся в настройке              *
+ * BANK_INI \ ОБЩИЕ ПАРАМЕТРЫ \ СПИ \ АЛГОРИТМЫ ВЫБОРА \ КОМИССИИ ПЗО       *
+ ****************************************************************************/
+import cb_sql, CTInter;
+
+
+// EVG 4/1/2016 Дата начала действия новых счетов доходов
+CONST DATE_446P = date( 1, 1, 2016 );
+
+
+/* EVG 2/12/2015 Доп проверка для счетов нерезидентов: если счёт является счётом нерезидента (балансовый 40807),
+   то к строке для проверки масок слева добавляется константа EMPL_STR. Это нужно для того, чтобы разделить СПИ
+   для нерезидентных ЮЛ и ИП, т.к. в лицевом счёте у них различительных особенностей не предусмотрено. */
+// EVG 11/1/2016 Теперь также для 40821
+macro CheckNotRez( pAccount, pPartyId )
+
+  CONST EMPL_STR = "ИП";
+
+  var vIsEmployer = "";
+  var RetVal = pAccount;
+
+  if( ( subStr( pAccount, 1, 5 ) == "40807" )
+      or ( subStr( pAccount, 1, 5 ) == "40821" ) )      // EVG 11/1/2016 Добавил
+
+     var cmd, rs;
+
+     // Является ли клиент ИП
+     cmd = rsdCommand( " select nvl( t_isemployer, chr(0) ) from dpersn_dbt where t_personid = ? " );
+     cmd.addParam( "", RSDBP_IN, pPartyId );
+     rs = rsdRecordSet( cmd );
+     if( rs and rs.moveNext() )
+        vIsEmployer = rs.value( 0, null, V_STRING );
+     end;
+
+     if( vIsEmployer == "X" )
+        RetVal = string( EMPL_STR + pAccount );
+     end;
+
+  end;
+
+  return RetVal;
+end;
+
+
+/* EVG 2/12/2015 Функция подбора СПИ для комиссии с учётом особенностей 446-П с 1/1/2016.
+   Для доходов  по комиссиям, уплачиваемым  клиентами с различными формами собственности,
+   используются соответствующие им счета доходов банка. */
+macro SelectIncAccountForCommission( pCommId, pContractId, retSettaccRecord )
+
+  var sql, cmd, rs;
+  var vObjAccount, vObjParty, 
+      vSpiDescription, vSpiShortName;
+  var recSettacc = TRecHandler( "settacc.dbt" );
+
+  // Находим объект по договору обслуживания
+  sql = " select t_object, t_partyid from dsfcontr_dbt where t_id = ? ";
+  cmd = rsdCommand( sql );
+  cmd.addParam( "", RSDBP_IN, pContractId );
+  rs = rsdRecordSet( cmd );
+  if( rs and rs.moveNext() )
+     vObjAccount = rs.value( 0, null, V_STRING );
+     vObjParty   = rs.value( 1, null, V_INTEGER );
+  else
+     //vObjAccount = "40817810";
+     return false;
+  end;
+
+  /* Дополнительная проверка для нерезидентов */
+  vObjAccount = CheckNotRez( vObjAccount, vObjParty );
+
+  /* Находим СПИ по комиссии */
+  sql = " select sa.*                          "+
+        "   from dsfssi_dbt t, dsettacc_dbt sa "+
+        " where sa.t_settaccid = t.t_setaccid  "+
+        "   and t.t_ObjectType = ?             "+
+        "   and t.t_objectid   = ?             ";
+  cmd = rsdCommand( sql );
+  cmd.AddParam("t_ObjectType", RSDBP_IN, OBJTYPE_SFCOMISS );
+  cmd.AddParam("t_objectid",   RSDBP_IN, pCommId          );
+  rs = rsdRecordSet( cmd );
+  while( rs and rs.moveNext() )
+     
+     // В описании каждой СПИ по комиссиям должна быть маска счетов,
+     // для оплаты комиссии по которым эта СПИ используется.
+     vSpiDescription = rs.value( "t_description", null, V_STRING );
+
+     // Если счёт из ДО подходит под маску, СПИ можно использовать.
+     // Плюс доп. проверка для нерезиков
+     if( not CompareStrWithMasks( vSpiDescription, vObjAccount ) )
+
+        CopyRSetToFBuff( retSettaccRecord, rs );
+        //Copy( recSettacc, retSettaccRecord );   // Если при отладке нужно посмотреть найденную СПИ
+
+        return true;
+     end;
+
+  end;
+
+  return false;
+end;
+
+
+/* EVG 2/12/2015 Выбор СПИ для единовременных и разовых комиссий */
+macro GetSPI_SfComiss( pFIID, pSfComiss, pSettacc, pResult, pFeeType, pDefBuf, pBranch )
+
+    record sfComiss (sfComiss);
+    record settacc (settacc);
+    record sfssi (sfssi);
+    record sfdef (sfdef);
+
+    debugbreak;
+    SetBuff( sfComiss, pSfComiss );
+    SetBuff( settacc, pSettacc );
+    SetBuff( sfdef, pDefBuf );
+
+    var vCommissId = UniId( sfComiss, OBJTYPE_SFCOMISS );
+
+    /* EVG 4/1/2016 Добавлена проверка на дату 1/1/2016, чтобы макрос выбора СПИ можно было использовать после НГ
+       для взимания комиссий за дату до НГ.
+    if( SelectIncAccountForCommission( vCommissId, sfdef.SfContrId, settacc ) )*/
+    if( ( sfdef.DateFee >= DATE_446P ) and SelectIncAccountForCommission( vCommissId, sfdef.SfContrId, settacc ) )
+       pResult = 1;
+    else
+       pResult = 0;
+    end;
+
+    SetParm( 3, pResult );
+    return 0;
+
+end;
+
+
+/* EVG 2/12/2015 Выбор СПИ для периодических комиссий */
+macro GetSPI_SfComissBatch()
+
+    var sfSettAccCache = RsbSQLinsert("sfSettAcc.tmp");
+    var sfSettAcc      = TRecHandler ("sfSettAcc.tmp");
+
+    var vObjectId, vContractId, vSsiKind, vSfdefId, vSfDepartment, vCommDate;
+    var recSettAcc = TRecHandler( "settacc.dbt" );
+
+    var sql, cmd, rs;
+
+    record sfComiss (sfComiss); // EVG 2/12/2015
+
+    sql = string(" select si.*, sf.t_conid, sf.t_department, "
+                 "        sf.t_datefee                       " // EVG 4/1/2016 Добавил
+                 "   from dsfssi_tmp si, dsfdeftmp_tmp sf    "
+                 "  where si.t_sfdefid = sf.t_sfdefid        ");
+    cmd = rsdCommand( sql );
+    rs  = TRsbDataSet( cmd );
+    while( rs.moveNext() )
+
+        vObjectId     = rs.value("t_objectId");
+        vContractId   = rs.value("t_conid");
+        vSsiKind      = rs.value("t_ssikind");
+        vSfdefId      = rs.value("t_sfdefid");
+        vSfDepartment = rs.value("t_department");
+        vCommDate     = rs.value("t_datefee");          // EVG 4/1/2016 Добавил
+
+
+
+        /* EVG 4/1/2016 Добавлена проверка на дату 1/1/2016, чтобы макрос выбора СПИ можно было использовать после НГ
+           для взимания комиссий за дату до НГ.
+        if( SelectIncAccountForCommission( vObjectId, vContractId, recSettAcc ) )*/
+        if( ( vCommDate >= DATE_446P ) and SelectIncAccountForCommission( vObjectId, vContractId, recSettAcc ) )
+
+           // Структуры немного различаются, поэтому Copy() заполняет одинаковые поля,
+           // а недостающие заполняем отдельно.
+           Copy( sfSettAcc, recSettAcc );
+
+           sfSettAcc.rec.result     = 1; //RESULT_SPI_FIND;
+           sfSettAcc.rec.ssikind    = vSsiKind;
+           sfSettAcc.rec.sfdefId    = vSfdefId;
+
+           /* EVG 3/12/2015 !!!!! Филиал получателя должен быть -1, иначе СПИ не подхватывается !!!!!
+              В макросе sfcrpaybatch.mac -> SFCreateDocPayBatch() значение филиала необходимо вернуть
+              (приравнять филиалу плательщика), иначе вместо БО формируется клиентский платёж.
+           sfSettAcc.rec.department = vSfDepartment;*/
+           sfSettAcc.rec.department = -1;
+
+           sfSettAccCache.addRecord( sfSettAcc );
+
+        else
+            sfSettAcc.rec.settAccId = 0; // -1?
+            sfSettAcc.rec.result    = 0; //RESULT_SPI_SYS;
+
+        end;
+
+    end;
+    sfSettAccCache.insert();
+
+    return 0;
+end;

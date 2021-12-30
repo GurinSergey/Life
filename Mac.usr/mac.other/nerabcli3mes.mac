@@ -1,0 +1,451 @@
+/************************************************************************/
+/*          Автоматизированная банковская система RS-Bank v6.0          */
+/*                                                                      */
+/*               Copyright (c) R-Style Ukraine                          */
+/*                                                                      */
+/*  Имя файла        :                                                  */
+/*                                                                      */
+/*  Описание         : макрос отчета "неработающие клиенты 3 месяца     */
+/*                                                                      */
+/*  Программист      : Вихров Д.В.                                      */
+/*                                                                      */
+/*  Создан           : 27.11.2009                                       */
+//  исправлено         вихров 02.11.2011 I-00115093-2
+/*  исправлено         вихров 22.11.2011 I-00122472-2                   */
+/*  исправлено         DPN 14.10.2013 R-259496-2                        */
+/*
+шаг 1 - выборка клиентов
+1. отбираются клиенты а) юрлица, б) физлица с признаком ИП
+2. из этих клиентов отбираются те, кто  обслуживаются на тарфиных планах, заданных настройкой  TARIF_PLAN
+3. клиенты должны быть открыты
+4. у данных клиентов в рассмотрение идут счета, которые открыты ранее, чем (текущая дата минус кол-во месяцев, введенное в форме)
+5. счета должны быть на балансовых 401-407 или 40802 или 40807
+
+шаг 2 - 
+1. по каждому клиенту из шага 1 выбираются все счета на балансовых 401-407 или 40802 или 40807, дата открытия которых ранее, чем (текущая дата минус кол-во месяцев, введенное в форме)
+2. для каждого счета проверяем наличие проводок за кол-во месяцев, введенное в форме. получатель НЕ равен 70601хххххххх2101ххх, 70601хххххххх2102ххх, 47423хххх3ххххххххх
+3. если есть хоть одна проводка переходим к следующему клиенту
+4. берется тариф по комиссии, заданной настройкой KOMISS_MAIN. Если на каком либо из счетов клиента есть пользовательский тип "Ё", то значит прибавляем еще к тарифу по комиссии KOMISS_MAIN тариф по комиссии KOMISS_INET.
+5. Если у клиента по всем счетам (шаг2, п.1) нет проводок (шаг2, п.2) и при этом сумма остатков на счетах клиента меньше, чем сумма комиссий, то вывести клиента в отчет.
+
+*/
+/************************************************************************/
+
+import globals, oralib,  FIInter,rsbdataset,OprInter;//,Календарь;
+
+var dlg; 
+var KEY_F2=316;
+var KEY_F3=317;
+var KEY_F9=323;
+var KEY_ESC=27;
+var KEY_ENTER=13;
+var ds_main, sql_main;
+record uz(DP_DEP);
+var ds_kl,ds_c4;
+var sql;
+var temp;
+var client:string;
+var kl_idet=true;
+var ob,ex,obBook,obSheet;
+var out, output = "nerab3mes.xls", fulloutput;                            
+var est_provodki:bool=false,est_komiss_inet:bool=false;
+var exelstroka:integer=1;
+var c4et_cl;
+var temp_s:string;
+var cl_output:integer=0;
+var temp_summ:double=0;
+var data_posled_provodki:string="";
+var sql1:string="";
+var est_c4eta:bool=false;
+var tarif_plan:string;
+var komiss_main:integer;
+var komiss_inet:integer;
+var var_uz = -1;
+
+//var  tarif_plan_filtr:string;
+
+var  tarif_plan_path="PRBB\\REPORT\\NERABCLI3MES\\TARIF_PLAN";
+var komiss_main_path="PRBB\\REPORT\\NERABCLI3MES\\KOMISS_MAIN";
+var komiss_inet_path="PRBB\\REPORT\\NERABCLI3MES\\KOMISS_INET"; // если комиссия за инет-обслуживание не взимается, нужно ставить несуществующую комиссию. например, -1 (ноль нельзя ставить. это признак ненастроенного отчета)
+
+private macro day_reestr(pt:string,zn:@variant)
+        private var errcode:integer = NULL;
+        if ((GetRegistryValue(pt,0,zn, errcode) == V_UNDEF)  or (zn == "") or (zn == 0)) //02.11.2011 что-то errcode возвращает ненулевое значение даже при успешном считывании
+                msgbox("ошибка чтения настройки реестра "+pt +"\n вначале необходимо настроить отчет. "); 
+                exit(); 
+        else 
+                ;//msgbox("ok "+pt+" = "+zn); 
+        end;
+end; //macro day reestr
+
+
+
+
+
+private MACRO day_name_klienta(cl)
+        private var s:string="select t_shortname from dparty_dbt where t_partyid ="+cl+" ";
+        var  DS=TRsbDataSet(s);
+//      getstring(s);
+        if (ds.movenext())
+                return ds.value("t_shortname");
+        else 
+                return "нет такого клиента в dparty_dbt";
+        end;
+END;
+
+
+
+private MACRO day_c4eta_klienta(cl)
+        private var s:string="select t_account,t_usertypeaccount,t_final_date from daccount_dbt "+
+                                                                                         "where t_client ="+cl+" and (substr ( t_account, 1, 3 ) between '401' and '407' or t_account like '40802%' or t_account like '40807%' ) "+
+//                                                                                       " and t_branch="+dlg.rec.uzel+" "+
+                                                                                         "and  t_open_date < add_months ( to_date ( '"+{curdate}+"', 'DD.MM.YYYY' ), -"+dlg.rec.kolwomes+" )   and t_open_close<>'З' and t_chapter=1 "; //vihrov 29.11.2011
+        //getstring("day_c4eta    "+s);
+        return s;
+END;
+
+
+
+
+private MACRO day_provodki_c4eta_klienta(c4)  //vihrov 29.11.2011 изменил запрос, убыстрил
+//      msgbox("c4="+c4);
+        private var first_provodka:bool=true;
+        /* EVG 5/2/2014 Переход на 2031
+        private var s=" select 1 from (select 1 "+
+                       "        from darhdoc_dbt        "+                                                                                      
+                       "        where ( t_account_payer = '"+c4+"' or t_account_receiver = '"+c4+"' ) and t_chapter=1   "+  
+                       "              and t_date_carry > add_months ( to_date ( '"+{curdate}+"', 'DD.MM.YYYY' ), -"+dlg.rec.kolwomes+" )        "+              
+                       "              and not (   t_account_receiver like '70601________2101%'  "+                                        
+                       "                       or t_account_receiver like '70601________2102%'  "+                                        
+                       "                       or t_account_receiver like '47423____3%' )       "+
+                       "        union select 1  "+                                                                                                  
+                        "       from darhdoc$_dbt       "+                                                                                        
+                        "       where ( t_account_payer = '"+c4+"' or t_account_receiver = '"+c4+"' )   and t_chapter=1 "+                                    
+                        "             and t_date_carry > add_months ( to_date ( '"+{curdate}+"', 'DD.MM.YYYY' ), -"+dlg.rec.kolwomes+" )        "+
+                        "             and not (   t_account_receiver like '70601________2101%'  "+                                          
+                        "                      or t_account_receiver like '70601________2102%'  "+                                          
+                        "                      or t_account_receiver like '47423____3%' )       ) ";//order by t_date_carry desc";
+        */
+        private var s= " select 1 from (select 1 "+
+                       "        from dacctrn_dbt        "+                                                                                      
+                       "        where ( t_account_payer = '"+c4+"' or t_account_receiver = '"+c4+"' ) and t_chapter=1   "+  
+                       "              and t_date_carry > add_months ( to_date ( '"+{curdate}+"', 'DD.MM.YYYY' ), -"+dlg.rec.kolwomes+" )        "+              
+                       "              and not (   t_account_receiver like '70601________2101%'  "+                                        
+                       "                       or t_account_receiver like '70601________2102%'  "+                                        
+                       "                       or t_account_receiver like '47423____3%' )     ) ";
+        var  DS=TRsbDataSet(s);
+//      getstring(s);
+        if (ds.movenext())
+                est_provodki=true;
+        end;
+END;
+
+private MACRO day_cod_clienta(qqq)
+//      private var s:string="select t_code from dobjcode_dbt where t_objectid="+qqq+" and t_codekind=101 and t_objecttype=3";
+        private var s:string="select t_code from dobjcode_dbt where t_objectid="+qqq+" and t_codekind=1 and t_objecttype=3"; //11.07.2012 vihrov C-12122 смена диапазонов кодов
+        var  DS=TRsbDataSet(s);
+
+        if (ds.movenext())
+                return ds.value("t_code"); 
+        else
+                return "???";
+        end;
+
+END;
+
+
+private MACRO summa_komissii(id_cl,nomer_komiss)
+        /* EVG 5/2/2014 Переход на 2031
+        private var s:string="select distinct "+
+                     "       ( party.t_partyid ) id_cli, "+                                                                           
+                     "       setka.t_commnumber n_comiss, "+                                                                              
+                     "       setka.t_objectid id_tp, "+                                                                                   
+                     "       tarif.t_tarsclid tarifn_setka, "+                                                                            
+                     "       t_tarifsum stavka, "+                                                                                               
+                     "       party.t_name, t_datebegin "+ 
+                     "from dsfcontr_dbt dog, dsfcontrplan_dbt pl_dog, dsftarscl_dbt setka, dsftarif_dbt tarif, dparty_dbt party "+        
+                     "where     dog.t_partyid = "+id_cl+" "+ 
+                     "      and pl_dog.t_sfcontrid = dog.t_id "+                                                                          
+                     "      and setka.t_commnumber = "+nomer_komiss+" "+ 
+                     "      and setka.t_objectid = pl_dog.t_sfplanid "+                                                                   
+                     "      and setka.t_feetype = 1   "+                                                                                  
+                     "      and tarif.t_tarsclid = setka.t_id "+                                                                          
+                     "      and dog.t_partyid = party.t_partyid order by t_datebegin desc, stavka desc "; //vihrov 29.11.2011 должен взять самую высокую ставку в том случае, когда у одного клиента у разных счетов есть разные ТП
+                     */
+        private var s:string="select distinct( party.t_partyid ) id_cli,                                                                                        "+
+                     "               setka.t_commnumber          n_comiss,                                                                                      "+
+                     "               pl_dog.t_sfplanid           id_tp,                                                                                         "+
+                     "               tarif.t_tarsclid            tarifn_setka,                                                                                  "+ 
+                     "               t_tarifsum                  stavka,                                                                                        "+
+                     "               party.t_name,                                                                                                              "+
+                     "               dog.t_datebegin                                                                                                            "+ 
+                     "          from dsfcontr_dbt dog, dsfcontrplan_dbt pl_dog, dsftarscl_dbt setka, dsftarif_dbt tarif, dparty_dbt party, dsfconcom_dbt con    "+        
+                     "         where dog.t_partyid      = "+id_cl                                                                                                +
+                     "           and pl_dog.t_sfcontrid = dog.t_id                                                                                              "+
+                     "           and con.t_objecttype   = 57                                                                                                    "+
+                     "           and con.t_objectid     = pl_dog.t_sfplanid                                                                                     "+
+                     "           and con.t_feetype      = 1                                                                                                     "+
+                     "           and con.t_commnumber   = "+nomer_komiss                                                                                         +
+                     "           and setka.t_concomid   = con.t_id                                                                                              "+
+                     "           and setka.t_feetype    = con.t_feetype                                                                                         "+
+                     "           and setka.t_commnumber = con.t_commnumber                                                                                      "+
+                     "           and tarif.t_tarsclid   = setka.t_id                                                                                            "+
+                     "           and dog.t_partyid      = party.t_partyid                                                                                       "+
+                     //vihrov 29.11.2011 должен взять самую высокую ставку в том случае, когда у одного клиента у разных счетов есть разные ТП
+                     "      order by t_datebegin desc, stavka desc                                                                                              ";
+
+        var  DS=TRsbDataSet(s);
+        if (ds.movenext())
+                return ds.value("stavka");
+        else
+                return 0;
+        end;
+END;
+
+MACRO   sobrat_daty(c1);
+        var sql1;
+//      sql1="select acc.t_account, count ( * ), max (to_date ( prov.t_date_carry ,'DD.MM.RR' )) dd  "+
+            sql1="select acc.t_account, count ( 1 ), max ( prov.t_date_carry)  dd  "+
+                 /* EVG 5/2/2014 Переход на 2031
+                 "from dobjcode_dbt cod, dparty_dbt party, daccount_dbt acc, darhdoc_dbt prov  "+*/
+                 "from dobjcode_dbt cod, dparty_dbt party, daccount_dbt acc, dacctrn_dbt prov  "+
+                 "where     party.t_partyid = cod.t_objectid "+
+                 "      and cod.t_code = '"+c1+"'  "+
+//               "      and cod.t_codekind = 101    "+
+                 "      and cod.t_codekind = 1    "+ //11.07.2012 vihrov C-12122 смена диапазонов кодов
+                 "      and cod.t_objecttype = 3    "+  //vihrov 29.11.2011 изменил запрос, убыстрил
+                 "      and acc.t_client = party.t_partyid   "+
+                 "      and prov.t_chapter = acc.t_chapter   and acc.t_chapter=1 "+
+                 "      and (prov.t_account_payer = acc.t_account or prov.t_account_receiver=acc.t_account) "+
+                 "      and not (   prov.t_account_receiver like '70601________2101%'  "+
+                 "               or prov.t_account_receiver like '70601________2102%'  "+
+                 "               or prov.t_account_receiver like '47423____3%' )    "+
+                 "      and prov.t_result_carry <> 23   "+
+                 "      and (   substr ( acc.t_account, 1, 3 ) between '401' and '407'  "+
+                 "           or acc.t_account like '40802%'   "+
+                 "           or acc.t_account like '40807%' )   "+
+                 "      and acc.t_open_close <> 'З'  "+
+                 "group by acc.t_account ";
+//      getstring(sql1);
+        var ds1;
+        ds1=trsbdataset(sql1);
+        //msgbox(" клиент "+c1+" прошел."); getstring(sql1);
+        data_posled_provodki="";
+        while (ds1.movenext)
+        debugbreak;
+                data_posled_provodki=data_posled_provodki+" "+substr(string(ds1.value("dd")),1,10);
+        end;
+END;
+
+private MACRO outputinexel(c);
+        sobrat_daty(day_cod_clienta(c));
+//  obSheet.Range("A"+exelstroka).Value=day_cod_clienta(c);
+  obSheet.Range("A"+exelstroka).Value=substr(day_cod_clienta(c),7); //11.07.2012 vihrov C-12122 смена диапазонов кодов
+  obSheet.Range("B"+exelstroka).Value="|"+day_name_klienta(c);
+  obSheet.Range("C"+exelstroka).Value="|";
+  obSheet.Range("D"+exelstroka).Value="|"+(temp_summ/10000);
+  obSheet.Range("e"+exelstroka).Value="|"+ds_kl.value("rest");
+  obSheet.Range("f"+exelstroka).Value="|"+data_posled_provodki;
+  exelstroka=exelstroka+1;
+  cl_output=cl_output+1;
+END; //macro outputinexel
+
+
+
+
+
+macro EvMacro (dlg, cmd, id, key)
+
+private MACRO GetClientName(id)
+var  sl=" select part.t_name from dparty_dbt part where part.t_partyid="+id;
+
+var  DataS=TRsbDataSet(sl);
+  if( DataS.moveNext())
+    return DataS.name;
+  else
+    msgbox("Субъект не найден в party.dbt");
+    return 0;
+  end;
+END;
+
+
+
+
+
+  if (cmd==DLG_INIT)
+    message("~F2~ выполнить, ~F3~ cправочник, ~ESC~ выход");
+//    dlg.rec.date_name_field={curdate};
+//          dlg.rec.uzel_n ="ffffffff";
+  end;
+
+
+  if (cmd==DLG_KEY)
+    if (KEY==KEY_F9)
+        return CM_ignore;
+    end; //if F9
+
+    if (KEY==KEY_ENTER)
+        return CM_ignore;
+    end; //if F9
+
+    if (KEY==KEY_F3)
+      if (FldName(dlg,id) == "uzel")                            
+        if (ListDepartment (uz))
+          dlg.rec.uzel = uz.name; // DPN 14.10.2013 R-259496-2 После выбора подразделения в поле отображался неправильный номер(t_code вместо t_name). 
+                         var_uz = uz.code; 
+//          debugbreak;
+          dlg.rec.uzel_n = GetClientName(uz.PartyID);    
+//          dlg.rec.uzel_n ="ffffffff";
+//          message(" ~F3~ Список подразделений "+const_mess);        
+          UpdateFields(dlg);                                        
+        end;                                                        
+      end;                                                          
+//      dlg.rec.date_name_field=GetDatebyCalendar({Curdate});
+      return CM_Ignore;
+    end; //if F3
+
+    if (KEY==KEY_F2)
+/*      if (dlg.rec.date_name_field >{curdate})
+        msgbox("Дата больше даты текущего операционного дня");
+        return cm_ignore;
+      end;*/
+      return CM_save;
+    end; //if F2
+
+    if (KEY==KEY_ESC)
+      exit(1);
+      return CM_CANCEL;
+    end; //if esc
+
+  end; //if DLG_KEY
+end; //evmacro
+
+
+
+// KS 27.12.2010 Переписал под папку
+var path;
+GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,path);
+var pathfile = FindPath("nerab3mescli.lbr",path);
+        if (not pathfile)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+day_reestr(tarif_plan_path,  @tarif_plan);
+day_reestr(komiss_main_path, @komiss_main);
+day_reestr(komiss_inet_path, @komiss_inet);
+
+//tarif_plan_filtr=convertmasktosqlformat(tarif_plan,"plan.t_num");
+//if (tarif_plan_filtr=="") msgbox(" Ошибка формирования SQL фильтра для тарифных планов. Проверьте настройку реестра "+tarif_plan_path); exit(); end;
+
+debugbreak;
+dlg = TRecHandler("panel",pathfile,True);
+
+if(rundialog(dlg,"evmacro")) 
+  if (IsStandAlone()) // Двухзвенка
+    if ((ValType(ex)!=V_UNDEF) and (ex.Visible==False))
+      ex = ActiveX("Excel.Application",NULL,false); 
+    else
+      ex = ActiveX("Excel.Application",NULL,true);
+    end;
+  else // Трехзвенка
+    ob = CreateObject ("rsax","TRsAxServer","RsAxServer",false);
+    ex = ob.CreateComObject ("Excel.Application");
+  end; 
+        GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\USERTEMPLSDIR",2,out);
+        Fulloutput = FindPath(output, out);                    
+        if (not Fulloutput)
+                msgbox("Не найдена LBR");
+                exit();
+        end;
+
+//      msgbox("out="+out+"   output="+output+"     fulloutput="+fulloutput);
+        obBook = ex.Workbooks.add(fulloutput); 
+  obSheet = obBook.ActiveSheet(); 
+  obSheet.Range("A"+exelstroka).Value="Отчет на "+{curdate}+"    ("+dlg.rec.kolwomes+" мес)";
+  exelstroka=exelstroka+2;
+  obSheet.Range("A"+exelstroka).Value="ОТДЕЛЕНИЕ БАНКА: "+dlg.rec.uzel_n;
+  exelstroka=7;
+        if (var_uz ==1) // DPN 14.10.2013 R-259496-2 
+            sql1=" "; 
+        else 
+            sql1="   and acc.t_branch="+var_uz+" "; 
+        end;
+sql=" "+
+"         SELECT   t_partyid, t_code, SUM (rrr) rest    "+
+"           FROM   (SELECT   pt.t_partyid, cod.t_code,  "+
+"                            ABS (rsb_account.resta (acc.t_account, TO_DATE ('"+{curdate}+"', 'DD.MM.YYYY'), acc.t_chapter, NULL)) rrr, dog_tp.t_begin, "+
+"                            dog_tp.t_end, dog_tp.t_sfplanid q  "+
+"                     FROM   dparty_dbt pt LEFT JOIN dpersn_dbt pers ON (pt.t_partyid = pers.t_personid), daccount_dbt acc, dobjcode_dbt cod,   "+
+"                            dsfcontr_dbt dog, dsfcontrplan_dbt dog_tp, dsfplan_dbt plan        "+
+"                    WHERE   (t_legalform = 1 OR (t_legalform = 2 AND t_isemployer = 'X'))      "+
+"                        AND acc.t_client = pt.t_partyid        "+
+"                        AND acc.t_client = cod.t_objectid      "+
+"                        and cod.t_objecttype=3 "+
+//"                      AND cod.t_codekind = 101       "+
+"                        AND cod.t_codekind = 1 "+ //11.07.2012 vihrov C-12122 смена диапазонов кодов
+"                        AND cod.t_state = 0    "+
+"                        AND (SUBSTR (acc.t_account, 1, 3) BETWEEN '401' AND '407' OR t_account LIKE '40802%' OR t_account LIKE '40807%')       "+
+"                        AND acc.t_chapter = 1  "+
+"                        AND acc.t_open_date < ADD_MONTHS (TO_DATE ('"+{curdate}+"', 'DD.MM.YYYY'), -"+dlg.rec.kolwomes+")      "+sql1+
+"                        AND pt.t_locked <> 'X' "+
+"                        AND pt.t_partyid = dog.t_partyid       "+
+"                        AND dog.t_id = dog_tp.t_sfcontrid      "+
+"                        AND dog_tp.t_begin < TO_DATE ('"+{curdate}+"', 'DD.MM.YYYY')   "+
+"                        AND (dog_tp.t_end >= TO_DATE ('"+{curdate}+"', 'DD.MM.YYYY') OR dog_tp.t_end = TO_DATE ('01.01.0001', 'DD.MM.YYYY'))   "+
+"                        AND plan.t_num IN ("+tarif_plan+")     "+
+"                        and dog_tp.t_sfplanid=plan.t_sfplanid) "+
+"       GROUP BY   t_partyid, t_code    "+
+"       order by t_code ";
+  // взяли всех клиентов, которые юрики или физики с признаком ИП, которые обслуживаются на тарфиных планах, перечисленных в реестре,
+  //  дата открытия которых меньше чем (текущая дата - кол-во месяцев, введеное в форме)
+  // и у которых есть счета на балансовых 401-408, счета не закрыты и клиенты не закрыты
+  //getstring(sql);
+  ds_kl=TRsbDataSet(sql);
+  temp=0;
+//  debugbreak;
+  while (ds_kl.movenext())
+        temp_summ=0.0;
+        client=ds_kl.value("t_partyid");
+        ds_c4=TRsbDataSet(day_c4eta_klienta(client));
+        est_provodki=false;
+        est_komiss_inet=false;
+        est_c4eta=false;
+        data_posled_provodki="";
+        while(ds_c4.movenext())
+//              data_posled_provodki=data_posled_provodki+substr(ds_c4.value("t_final_date"),1,10);
+                        est_c4eta=true;
+      //data_posled_provodki=data_posled_provodki+substr(string(" "+ds_c4.value("t_final_date")),1,11);
+                c4et_cl=ds_c4.value("t_account");
+                if (index(ds_c4.value("t_usertypeaccount"),"Ё")!=0)  est_komiss_inet=true; end;
+                    day_provodki_c4eta_klienta(c4et_cl);
+           end;// закончили обход счетов одного клиента
+
+          temp_summ=summa_komissii(client,komiss_main); if (est_komiss_inet) temp_summ=temp_summ+summa_komissii(client,komiss_inet); end;
+
+          if ( not(est_provodki) and (ds_kl.value("rest")<(temp_summ/10000)) and est_c4eta)
+              outputinexel(client); 
+                        temp=temp+1;
+          end;
+     
+     message ("обработано клиентов: "+temp);
+  end; // конец всех клиентов
+  //msgbox("всего обработал - "+temp+", в отчет вошли "+cl_output);(cl_output >0) and 
+  //obSheet.rows("6:"+(exelstroka-1)).select;
+  //ex.Selection.Sort Key1:=Range("A7"), Order1:=xlAscending, Header:=xlGuess, OrderCustom:=1, MatchCase:=False, Orientation:=xlTopToBottom, DataOption1:=xlSortNormal ;
+  obSheet.Range("A"+(exelstroka+1)).Value="Выбрано клиентов: "+cl_output;
+  // DPN 14.10.2013 R-259496-2 Если ни один клиент не попал в отчёт, то шаблон Excel не вызывается
+         if (temp==0) 
+             println("                          ни один клиент в отчет не попал.");
+         else
+            ex.visible=true;
+                 println();
+       println("                                ОТЧЕТ СФОРМИРОВАН В EXCEL");
+       println("                Для продолжения работы нажмите ESC");
+       println();
+         end;
+
+
+ 
+
+end; 

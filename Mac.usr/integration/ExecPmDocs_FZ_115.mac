@@ -1,0 +1,186 @@
+// ------------------------------------------------------------------------------------------------
+// @filename: ExecPmDocs_FZ_115.mac
+// @author  : Gurin S. N
+// @desc    : Скроллинг документов (24*7) не прошедших проверку по 115-ФЗ
+// @request : C-36593-7
+// -------------------------------------------------------------------------------------------------
+import BankInter, PaymInter, SbCrdInter, RCW, OraLib, LikePy, Globals;
+import lib_agents, lib_const; //, OperationsProc;
+
+private var sql_add, cmd_add, rs_add, col_add, msg_add = "", sql_global, isMultiDel = False, isMultiPrint = False, i;
+
+//set_pipe_server(pipe_server_roboplan);
+
+private macro FastUpdateCheckScroll(rs : RsdRecordset)
+   rs.refreshcommand = RSDCommand(sql_global + " AND usr.paymid = " + rs.value("paymid") + " AND usr.reason = '" + rs.value("reason") + "' AND usr.stopfrase = '" + rs.value("stop") + "'");
+   rs.refreshrecord;
+   UpdateScroll(rs);
+end;                     
+
+private macro FastDeleteScroll(rs:RsdRecordset)
+
+    if (not setCtgVal(rs.value("paymid"), PT_USR_CAT_CHECK_BEFORE_UNLOAD, 6/*Контроль пройден*/, {curdate})) end;
+    //addNoteForObject (OBJTYPE_PAYMENT, RSL_LPAD(rs.value("paymid"), 10, "0"), PM_USR_NOTEKIND_FM_CHECKED, "X");
+    if (not setNote(rs.value("paymid"), PM_USR_NOTEKIND_FM_CHECKED)); end;
+    
+    //RsbExecuteStep(rs.value("paymid"), rs.value("dockind"));
+    rs.deletecommand = RSDCommand("begin delete from USR_PLAN_24_7_FZ_115 where paymid = " + rs.value("paymid") + "; end;");
+    rs.refreshrecord;
+    UpdateScroll(rs); 
+end;
+
+class  TScroll_24_7_FZ_115 ()
+    var rs            :RsdRecordSet = null;        // источник данных для построения скроллинга
+    var isRunning     :bool         = true;        // флаг "скроллинг запущен"
+    var cr            :TCheckCurrentRecord;        // параметры текущей записи скроллинга
+
+    const SET_CHAR   = strFor (88),  
+          UNSET_CHAR = strFor (0);
+
+    // @desc: обработчик скроллинга
+    macro handleScrollEvents ( rs, cmd, id, key )
+        file fp  () txt;
+        private var ret = CM_DEFAULT;
+
+        if (cmd == DLG_INIT)
+            if (not cr.IsNull ())
+                var flag = false;
+                if (rs.movenext () and (flag == false))
+                    flag = cr.Compare (rs);
+                    GoTOScroll();
+                end;  
+            end;
+            if ((not AddMultiAction (rs, 321)) or (not AddMultiAction (rs, 322)))
+                msgbox ("Ошибка инициализации массового выделения сообщений");
+            end;
+
+        elif (cmd == DLG_KEY) 
+            if (key == 27) // Esc - выход из скроллинга
+                isRunning = false;
+                ret = CM_SELECT;
+            elif ((key == 13) or (key == 323))//Enter или F9
+                ret = CM_IGNORE;
+            elif (key == 281) //Alt + P - просмотреть платёж
+                PM_ProcessPanel (RSBPayment (rs.value ("paymid")));
+            elif (key == 322) //F8 - снять признак ручная обработка
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                FastDeleteScroll(rs);
+            elif (key == 321) //F7 - печать
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.value ("reason"), rs, rs.bookmark);
+                PrintReportCheck4(rs);
+                isPrint_24_7(rs.value ("paymid"), rs.value ("stop"), rs.value ("reason"));
+                FastUpdateCheckScroll(rs);
+                CheckArr = TArray();
+            elif (isMultiPrint)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                PrintReportCheck4(rs);
+                CheckArr = TArray();
+                isMultiPrint = False;
+            elif (isMultiDel)        
+                cr.Save (rs); // сохраняем параметры текущей записи скроллинга, чтобы потом переброситься на неё
+                for (i, 0, CheckArr.Size - 1 )
+                   if (rs.move(CheckArr[i][1], BOOKMARK))
+                      FastDeleteScroll(rs);
+                   end;
+                end;
+                CheckArr = TArray();
+                isMultiDel = False;
+            end;
+
+        elif (cmd == DLG_MSEL)
+            if (key == 321) //F7 - печать
+               CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.value ("reason"), rs, rs.bookmark);
+               isPrint_24_7(rs.value ("paymid"), rs.value ("stop"), rs.value ("reason"));
+               FastUpdateCheckScroll(rs);
+               ret = CM_MSEL_CONT_CLEAR;
+            elif (key == 322) //F8 - снять признак ручная обработка
+               CheckArr[CheckArr.Size] = makeArray(rs.value ("paymid"), rs.bookmark);
+               ret = CM_MSEL_CONT_CLEAR;
+            end;
+
+        elif (cmd == DLG_MSELEND)
+            if (key == 321) //F7 - печать
+               isMultiPrint = true;
+               ret = CM_CANCEL;
+            elif (key == 322) //F8 - снять признак ручная обработка
+               isMultiDel = true;
+               ret = CM_CANCEL;
+            end;
+        end;
+        
+        return ret;
+    
+    onError (e)
+      debugbreak ();       
+    end;
+    
+    macro init (_title)
+         var scrollCaption = string (_title);
+         var msg = "(Alt + P) - платеж | (Ecs) - выйти | (F8) - Снять признак ручной обработки | (F7) - печать";
+        
+         var scrollResult = false;
+         var cmd;
+                                     
+         var sql = " SELECT   usr.isprint p, rownum n, dpm.t_paymentid paymid,"+
+                   "          DECODE (dpm.t_payer, -1, ' ', dpm.t_payer) payer,"+
+                   "          DECODE (dpm.t_receiver, -1, ' ', dpm.t_receiver) receiver, "+
+                   "          rm.t_number numdoc, rm.t_date dat, dpm.t_amount amount, usr.stopfrase stop, "+
+                   "          usr.koef_sovp koef, usr.reason reason, dpm.t_dockind dockind, "+
+                   "          rm.t_payername payname, rm.t_receivername recname, rm.t_ground ground"+
+                   "   FROM   USR_PLAN_24_7_FZ_115 usr, dpmpaym_dbt dpm, dpmrmprop_dbt rm "+
+                   "  WHERE   usr.paymid = dpm.t_paymentid AND dpm.t_paymentid = rm.t_paymentid AND dpm.t_paymstatus not in (32000) ";
+        sql_global = sql;
+                                                                                                                                                   
+         // вот так мы формируем массив колонок для скроллинга
+         var col;
+             col = makeArray ("P"              ,"Печать"                            , 2,  0, -1, 0,
+                              "Payer"          ,"Код клиента плат-ка"               ,15,  0, -1, 0,
+                              "Receiver"       ,"Код клиента плат-ка"               ,15,  0, -1, 0,
+                              "NumDoc"         ,"№ док."                            ,15,  0, -1, 0,
+                              "Dat"            ,"Дата"                              ,15,  0, -1, 0,
+                              "Amount"         ,"Сумма"                             ,15,  0, -1, 0,
+                              "Stop"           ,"Стоп фаза"                         ,20,  0, -1, 0,
+                              "Koef"           ,"Коэф."                             ,20,  0, -1, 0,
+                              "Reason"         ,"Имя поля документа"                ,20,  0, -1, 0,
+                              "DocKind"        ,"Вид документа"                     ,15,  0, -1, 0
+                              );                   
+
+        while (isRunning)
+            cmd = RsdCommand (sql);
+            rs = RsdRecordSet (cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+            scrollResult = runScroll (rs, col.size/6, col, null, r2m (this, "handleScrollEvents"), scrollCaption, msg, false);
+        end;
+        return scrollResult;
+    
+    onError (e)
+         
+    end;
+end;
+
+TScroll_24_7_FZ_115.init ("Список документов 24*7 не прошедших контроль по \"115-ФЗ\"");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

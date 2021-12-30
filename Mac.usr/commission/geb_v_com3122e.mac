@@ -1,0 +1,224 @@
+/*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+   EVG Банк "Газэнергобанк" (ГЭБ)
+   
+       Макрос пользовательского алгоритма расчёта базовых сумм комиссии 3.12.1v
+       "Комиссия за платежи сверх лимита по пакету платежей "Импортер":
+         - за платежи сверх лимита по пакетам 3.11.1v - 3.11.5v, за каждый платеж 
+           после 13-00 часов".
+
+       Тип комиссии - единовременная.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+
+import sfinter, ctinter, fiinter, cb_sql;
+import lib_packetCommission;
+
+/*
+    Если при расчете произошла ошибка, поместить в эту переменную ненулевое значение
+*/
+var MacroError :integer = 0;
+private var FICode_calc:string = "";
+
+  /* Тип величины
+enum SfBaseTypes{*/
+private const   SF_BASETYPE_SUM     = 1;      /* Сумма*/
+private const   SF_BASETYPE_QUONT   = 2;      /* Количество*/
+
+private const NATCUR = 0;
+record sfbassum( "sfbassum.str" );
+record cpord(pscpord);
+
+const CommissionBrakeTime     = "13:00",
+      CommissionBrakeTime_cat = "< 13 часов";
+
+
+/*
+    Расчет для единовременных комиссий
+*/
+macro CalcCommissionSum( docKind/*Тип первички*/, Doc/*Буфер первички*/, sfcalcalusr_addr/*Алгоритм расчета*/, sfcontr_addr /*Договор обслуживания*/, beginDate, endDate  )
+    record sfclusr( "sfclusr.str" );
+    record sfcontr( sfcontr );
+    record sfcalcal(sfcalcal);
+    record payord(pscpord);
+
+    var query, cmd, rs, stat;
+    var CommQuont   = 0,
+        CommSum     = $0;
+    var DefaultPmCount = 0, n = 0;
+
+    debugbreak;
+
+    SetBuff( sfcalcal, sfcalcalusr_addr );
+    SetBuff( sfcontr, sfcontr_addr );
+    SetBuff( payord, Doc );
+
+    query = " Select paym.t_valuedate " +
+            "   From dpscpord_dbt ord, dpmpaym_dbt paym  " +
+            "  Where ord.t_orderid    = ? " +
+            "    and paym.t_paymentid = ord.t_orderid " +
+            "    and ( to_date( nvl( regexp_substr( ord.t_userfield1, '\\d{2}:\\d{2}:\\d{2}' ), '00:00:00' ), 'hh24:mi:ss' ) " +
+            "                                                                                       > to_date (?, 'hh24:mi') " +
+
+            /* EVG 01/10/2012 Посмотрим также категорию "Время поступления платежа в Банк (для комиссий 3.4 / 3.5)" */
+            "          or ( SELECT attr.t_Name FROM dobjattr_dbt attr, dobjatcor_dbt cor  " +
+            "                WHERE attr.t_objectType = 643 "    // Валютный клиентский платеж
+            "                  AND attr.t_groupId    = 1 "
+            "                  AND attr.t_parentId   = 0 "
+            "                  AND attr.t_AttrID     = cor.t_attrId "
+            "                  AND cor.t_object      = lpad (?, 34, '0') "
+            "                  AND cor.t_objectType  = attr.t_objectType "
+            "                  AND cor.t_groupId     = attr.t_groupId "
+            "                  AND cor.t_validfromdate = (SELECT MAX( t_validfromdate )"
+            "                                               FROM dobjatcor_dbt "
+            "                                              WHERE t_object     = cor.t_object "
+            "                                                AND t_objectType = cor.t_objectType "
+            "                                                AND t_groupId    = cor.t_groupId) )"
+            "             <> ? )";
+
+    //getstring(query);
+    cmd = rsdCommand( query );
+    cmd.AddParam( "", RSDBP_IN, payord.OrderID );
+    cmd.AddParam( "", RSDBP_IN, CommissionBrakeTime );
+    cmd.AddParam( "", RSDBP_IN, payord.OrderID );
+    cmd.AddParam( "", RSDBP_IN, CommissionBrakeTime_cat );
+    rs = rsdRecordSet( cmd );
+    if( rs and rs.movenext() )
+
+       var PaymentDate = rs.value( 0, null, V_DATE );
+       
+       /* Получим количество платежей в пакете, привязанном клиенту */
+       query = "SELECT NVL( UTL_RAW.cast_to_binary_integer( nt.t_text, 2 ), 0 ) "
+               "    FROM dsfcomiss_dbt com LEFT JOIN dnotetext_dbt nt"
+               "         ON (nt.t_objectType = 650 AND nt.t_noteKind = 200 AND nt.t_documentID = CONCAT (LPAD (com.t_feeType, 5, '0'), LPAD (com.t_number, 5, '0')))"
+               "   WHERE com.t_code IN (SELECT REGEXP_SUBSTR (REGEXP_SUBSTR (attr.t_fullName, '<objattr:id>\\d+.\\d+.\\d+[[:alnum:]]{0,1}</objattr:id>'), '\\d+.\\d+.\\d+[[:alnum:]]{0,1}')"
+               "                          FROM dobjattr_dbt attr, dobjatcor_dbt cor "
+               "                         WHERE attr.t_objectType = 3 "
+               "                           AND attr.t_groupId    = 200 "
+               "                           AND attr.t_parentId   = 0 "
+               "                           AND attr.t_codeList   = 'v' "
+               "                           AND attr.t_AttrID     = cor.t_attrId "
+               "                           AND cor.t_object      = lpad (?, 10, '0') "
+               "                           AND cor.t_objectType  = 3 "
+               "                           AND cor.t_groupId     = 200 "
+               "                           AND cor.t_validfromdate = (SELECT MAX( t_validfromdate )"
+               "                                                        FROM dobjatcor_dbt "
+               "                                                       WHERE t_object     = cor.t_object "
+               "                                                         AND t_objectType = cor.t_objectType "
+               "                                                         AND t_groupId    = cor.t_groupId) )"
+               "ORDER BY t_code";
+       
+       cmd = rsdCommand( query );
+       cmd.AddParam( "", RSDBP_IN, sfcontr.partyid );
+       rs = rsdRecordSet( cmd );
+       if( rs and rs.movenext() )
+
+          DefaultPmCount = rs.value( 0, null, V_INTEGER );
+          if( DefaultPmCount > 0)
+
+             /* Определим дату начала месяца */
+             var mm, yy;
+             DateSplit( PaymentDate, null, mm, yy );
+             
+             /* Количество платежей, проведённых в течение месяца */
+             n = PaymentsCount( sfcontr, date(1,mm,yy), PaymentDate, true );
+
+             /* Если количество платежей в пакете превышено, берём комиссию */
+             if( n >= DefaultPmCount )
+                CommQuont = 1;
+             end;
+          end;
+       end;
+    end;
+
+    
+    ClearRecord(sfbassum);
+
+    sfbassum.baseType    = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont   = CommQuont;
+
+    sfbassum.baseType2   = SF_BASETYPE_QUONT;
+    sfbassum.baseQuont2  = CommQuont;
+
+    stat = InsertSumList(sfbassum);
+
+    if( stat )
+      MsgBox("Ошибка при вставке базовой суммы");
+    end;
+
+    
+end;/*CalcServiceSum*/
+
+
+
+
+
+
+
+
+/*
+    Печать заголовка подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintHeader( sfrepdet )
+    FICode_calc = "";
+[----------------------------------------------------------------------------------------------------------------------];
+[|             Сумма                    |             Ставка                   |              Итого                   |];
+[|                                      |                                      |                                      |];
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintHeader*/
+
+/*
+    Печать строчки отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintLine( sfrepdet )
+    var FICode_base, FICOde_tariff:string;
+    file fininstr( fininstr )key 0;
+    
+    if(sfrepdet.baseType == SF_BASETYPE_SUM )
+        fininstr.FIID = sfrepdet.FIID_baseSum;
+        if( not GetEQ(fininstr))
+            MsgBox("Не найдена валюта ", sfrepdet.FIID_baseSum );
+            return 1;
+        end;
+        FICode_base = fininstr.FI_code;
+    else
+        FICode_base = "";
+    end;
+
+    fininstr.FIID = sfrepdet.FIID_tariff;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_tariff );
+        return 1;
+    end;
+    FICOde_tariff = fininstr.FI_code;
+
+    fininstr.FIID = sfrepdet.FIID_CalcSum;
+    if( not GetEQ(fininstr))
+        MsgBox("Не найдена валюта ", sfrepdet.FIID_CalcSum );
+        return 1;
+    end;
+    FICode_calc = fininstr.FI_code;
+
+
+[| ################### ################ | ################### ################ | ################### ################ |]
+
+    ( sfrepdet.BaseSum, FICode_base,
+        sfrepdet.tariff, FICOde_tariff,
+        sfrepdet.CalcSum, FICode_calc );
+
+    return 0;
+end;/*CalcReportPrintLine*/
+
+/*
+    Печать окончания отчета подробного отчета о расчете периодической комиссии
+*/
+macro CalcReportPrintFooter( sfrepdet, TotalSum )
+
+[----------------------------------------------------------------------------------------------------------------------];
+[Итого за период                                                               | ################### ################ |]
+(TotalSum, FICode_calc);
+[----------------------------------------------------------------------------------------------------------------------];
+    return 0;
+end;/*CalcReportPrintFooter*/
+

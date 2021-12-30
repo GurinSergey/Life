@@ -1,0 +1,1029 @@
+//-----------------------------------------------------------------------------
+// Блок      : Вне блока
+// Шаг       : Вне шага
+// Назначение: Макрос скроллинга
+// Описание  : Макрос скроллинга платежей и требований банка
+// TAM            9.11.11     I-00101757-1 - Исправление номеров пачек для пользовтаелей группы 107
+// Гурин С. Н.                C-6133  проверка ДПП для платежей со счетом Дт 40911*43
+// Gurin S. N.    11.06.2012  I-00178227-2 
+// Жаворонкова Н. 20.05.2013  R-188983-1 Добавлено изменения вида хранения в ЭА по ctrl+z 
+// Gurin S.       17.07.2013  R-218524-2 Вид платежа не "Э" при ручном вводе
+// TAM            12.02.2015  C-34990 - контроль УИН на 40822*
+// Gurin S. 21.12.2015 HotFix 2031.19.25 (Life_1 1.3)_11
+// VDN            02.02.2016  R-637300
+//-----------------------------------------------------------------------------
+import globals, CTInter, OprInter, check117, "pmchoper.mac", "pm_tools.mac", PaymInter, "pm_opr.mac", pm_common, pbs, pm_chksave, "pm_syscont.mac";
+import "cb_FillFactura.mac";
+import "GenNumber.mac";
+import "ASVKB.mac",Rsbdataset,"pm_note.mac";
+import "diver.mac"; //Diver
+import "outsidecarry.mac";
+import "SetVOStaff.mac";
+/*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+import "ChangeReason.mac";
+import "fg_Life_parm.mac"; //Lavrenov 01.11.11
+// KS 27.11.2013 Адаптация под 31ю сборку
+//TAM 9.11.11 I-00101757-1
+import "NUMBERPACK.mac";
+// joy 20.05.2013 
+import "lib_const.mac", "lib_pm_check.mac";
+
+FILE   fmo_party      ("party.dbt");
+FILE   fmo_account  ("account.dbt");
+FILE   fmo_partcode   ("partcode.dbt");
+
+record Order     ( memorder );
+record Payment   ( pmpaym   );
+record DbProp    ( pmprop   );
+record CrProp    ( pmprop   );
+record RmProp    ( pmrmprop );
+record Demand    ( pmdemand );
+record CurTr     ( pmcurtr  );
+record Pmkz      ( pmkz     );
+
+record OldOrder  ( memorder );
+record OldPayment( pmpaym   );
+record OldDbProp ( pmprop   );
+record OldCrProp ( pmprop   );
+record OldRmProp ( pmrmprop );
+record OldDemand ( pmdemand );
+record OldCurtr  ( pmcurtr  );
+record OldPmkz   ( pmkz     );
+
+//record          b1(arhdoc);
+private record          Acc(account) key 0;
+
+var ind;
+/*номера полей в панели*/
+const fld_Number:TArray = makeArray( 1, 1 ),
+      fld_baseFIID:TArray = makeArray( 7, 0 ),
+      fld_bankaccr:TArray = makeArray( 23, 17 ),
+      fld_bankaccp:TArray = makeArray( 18, 12 ),
+      fld_Ground:TArray = makeArray( 30, 22 ),
+      fld_PayerINN:TArray = makeArray( 10, 5 ),  /*инн получателя*/
+      fld_ReceiverINN:TArray = makeArray( 25, 19 ); /*инн плательщика*/
+const fld_paym_kind      = 3,  /*Вид платежа*/
+      fld_kzPayerCode    = 7,
+      fld_kzReceiverCode = 18;
+
+private const MEMORDER_STATUS_POST = 1; /* Отложенный документ */
+private var fgBank = fg_life_subject({OurBank});
+
+/* Установка подсказки для скролингов из макроса */
+
+private const Hint_ByStatus   :string = 
+"/*+FIRST_ROWS LEADING(t pmpaym pmrmprop debet credit oproper oprcurst) INDEX(t dmemorder_dbt_idx1) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t pmpaym pmrmprop debet credit oproper oprcurst)*/";
+
+private const Hint_ByValueDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop debet credit oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx11) INDEX(t dmemorder_dbt_idx0) USE_NL(pmpaym t pmrmprop debet credit oproper oprcurst)*/";
+
+private const Hint_ByCloseDate:string = 
+"/*+FIRST_ROWS LEADING(pmpaym t pmrmprop debet credit oproper oprcurst) INDEX(pmpaym dpmpaym_dbt_idx15) INDEX(t dmemorder_dbt_idx0) USE_NL(pmpaym t pmrmprop debet credit oproper oprcurst)*/";
+
+private const Hint_ByStep     :string = 
+"/*+FIRST_ROWS LEADING(t oproper memorder pmpaym pmrmprop debet credit oprcurst) INDEX(t doprstep_dbt_idx10) INDEX(memorder dmemorder_dbt_idx0) INDEX(pmpaym dpmpaym_dbt_idx0) USE_NL(t oproper memorder pmpaym pmrmprop debet credit oprcurst)*/";
+
+MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStates:integer ):string
+   /*  Возможные значения ScrolStates:
+       0 - Все
+       1 - Отложенные
+       2 - Открытые
+       3 - Закрытые
+       4 - Отвергнутые
+       5 - Для контроля
+      10 - Картотека требований
+      11 - Оплаченные требования
+      12 - Отказанные требования
+      13 - Все поступившие требования */
+  
+   /* Все, Закрытые */
+   if( ( ScrolStates == 0 ) or
+       ( ScrolStates == 3 ) )
+
+      var dtflt:PMScrolDateFltr = PMScrolDateFltr();
+      if( dtflt.IsSet( DTFL_CLOSEDATE ) )
+         return Hint_ByCloseDate;
+      elif( dtflt.IsSet( DTFL_VALUEDATE ) )
+         return Hint_ByValueDate;
+      else
+         return Hint_ByCloseDate;
+      end;
+
+   /* Подготовленные к шагу */ 
+   elif ( ScrolStates == 5 )
+      return Hint_ByStep;
+   /* Остальные */
+   else 
+      return Hint_ByStatus;
+   end;
+   return DefaultHint;
+END;
+
+/*  Проверка запрещения редактирования мемориального ордера, являющегося платой за обслуживание.
+    Разрешается изменение только основания у отложенного документа,
+    если он попадает под действие инструкции 93-И
+    Если редактирование запрещено, возвращается true */
+MACRO ЗапретРедактирванияПЗО()
+   var GroundNameFld = "";
+   if(Order.Origin != MEMORDER_FDOC_SF) return false; end;     /* Не является ПЗО*/
+   if(Order.Status != MEMORDER_STATUS_POST) return true; end;  /* Разрешаем редактировать только отложенный документ */
+
+   if(not ПроверкаИдентичности(Order,  OldOrder))   return true; end;
+   if(not ПроверкаИдентичности(Payment,OldPayment)) return true; end;
+   if(not ПроверкаИдентичности(DbProp, OldDbProp))  return true; end;
+   if(not ПроверкаИдентичности(CrProp, OldCrProp))  return true; end;
+
+    /*if(GetKNFbyBalanceAccount(Substr(Payment.PayerAccount,1,5)) or
+      GetKNFbyBalanceAccount(Substr(Payment.ReceiverAccount,1,5))
+      ) GroundNameFld = "Ground";
+    end;*/
+
+    /* Разрешаем менять основание */
+   if(not ПроверкаИдентичности(RmProp,OldRmProp,GroundNameFld)) return true; end;
+
+   return false;
+END;
+
+// Просто ищем Party по PartyId
+macro FindPartyByPartyID( PartyID )
+   var retval, OldKey;
+   OldKey = KeyNum (0, fmo_party);
+
+   fmo_party.PartyId = PartyId;
+   retval = getEQ(fmo_party);
+
+   keyNum (OldKey, fmo_party);
+   return retval;
+end;
+
+/* Ищем имеем ли мы БИК*/
+macro FindBIC ( PartyID )
+   var retval, OldKey;
+   OldKey = KeyNum (0, fmo_partcode);
+
+   fmo_partcode.PartyId = PartyId;
+   fmo_partcode.CodeKind = 3; //PTCK_BIC
+
+   retval = getEQ(fmo_partcode);
+
+   keyNum (OldKey, fmo_partcode);
+   return retval;
+end;
+
+/* Возвращает код головного банка, если таковой есть, для банка заданного ID*/
+macro GetHeadBankCode (BankID)
+   if( not FindBIC( BankID ) )
+      FindPartyByPartyID(BankID);
+      if(fmo_party.Superior != -1 )
+         if( FindPartyByPartyID( fmo_party.Superior ) )
+            return fmo_party.PartyId;
+         else return -1;
+         end;
+      else return -1;
+      end;
+   else return -1;
+   end;
+end;
+
+//------------------------------------------------------------------------------
+//   Функция проверяет наличие лиц. счета
+//------------------------------------------------------------------------------
+private MACRO ЛСчетСуществует( Chapter:integer, FIID:integer, Account:string ):bool
+   VAR select:string = " select acc.T_ACCOUNT " +
+                       " from daccount_dbt acc " +
+                       " where acc.T_CHAPTER = :chapter " +
+                       "   and acc.T_CODE_CURRENCY = :fiid " +
+                       "   and acc.T_ACCOUNT = :account "+
+                       "   and acc.T_Open_Close = chr(0)";
+   VAR params:TArray = makeArray(SQLParam( "chapter", Chapter ),     
+                                 SQLParam( "fiid", FIID ),     
+                                 SQLParam( "account", Account ));
+  
+   VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+   return ( rset and rset.moveNext() );
+END;
+
+macro CheckBankID( BankID, FIID, Account )
+   return 0;
+   if( (BankID == {OurBank}) or (BankID == GetHeadBankCode({OurBank})) )
+      /* ищем среди наших счетов */
+      if( ЛСчетСуществует( 1, FIID, Account ) )
+         if( Order.DocKind == DLDOC_BANKPAYMENT ) //DLDOC_BANKPAYMENT = 16
+            if ( RsbGetTrue (false, true, "Проверьте реквизиты получателя. | Указанный счет есть в \"нашем банке\". | Отправить \"внешний\" платеж? ") == false)
+               return fld_bankaccr[(17-Order.DocKind)];
+            end;
+         else
+            if ( RsbGetTrue (false, true, "Проверьте реквизиты плательщика. | Указанный счет есть в \"нашем банке\". | Отправить \"внешний\" платеж? ") == false)
+               return fld_bankaccp[(17-Order.DocKind)];
+            end;
+         end;
+      end;
+   end;
+   return 0;
+end;
+
+/* Проверка на числовой номер */
+macro IsDigitNumber( Number )
+   var stat = 0, i = 1, ch, DigitString = "0123456789";
+   while( (not stat) and (i <= strlen(Number)) )
+      ch = SubStr( Number, i, 1 );
+      if( not Index( DigitString, ch ))
+         stat = 1;
+      end;
+      i = i + 1;
+   end;
+   return stat;
+end;
+
+macro    НовыйДокумент()
+   /* EVG Ввод документа: автоматическое формирование номера по референсу */
+   if( StrLen( Rmprop.Number ) == 0 )
+      Rmprop.Number = GenNumberDocument();
+      Rmprop.clientDate = {curdate}; // zmp 21.11.2014 фиксим R-498094-2
+   end;
+   if (Payment.DocKind == DLDOC_BANKPAYMENT)
+       Rmprop.taxpmtype = "0";
+   end;
+   return 0;
+end;
+
+private macro getOperationIDbyPaymentID(PID :integer)
+   var sql  = " SELECT OPR.T_ID_OPERATION                               "
+              " FROM DOPROPER_DBT OPR, DPMPAYM_DBT PM                   "
+              " WHERE OPR.T_DOCUMENTID = LPAD (PM.T_PAYMENTID, 34, 0)   "
+              " AND PM.T_DOCKIND = OPR.T_DOCKIND                        "
+              " AND PM.T_PAYMENTID = :pid                               ";
+   sql = execSQLselect(sql, makeArray(SQLParam(":pid", PID)));
+   if (sql and sql.moveNext())  
+      return int(sql.value(0));
+   end;                                                               
+   return 0;
+end;
+
+
+macro    ПроверитьДокумент( Режим )
+   var stat = 0, BankID, FIID, Account, NeedCheckBankID = 0,
+       CHANG_IMPORTANT = -11,
+       CHANG_NOTIMPORTANT = -10,
+       res, obj, cmd,
+       Sh_Oper,
+       OldDoc = 0;
+   var ErrStr:string = "";
+   debugbreak;
+
+   if((Режим == SCR_SAVE ) or (Режим == SCR_EDIT))
+      //zmp 12.03.2014 I-00471566-1
+      var OperationID = getOperationIDbyPaymentID(payment.paymentid) ;   
+      if ((OperationID != 0) and (Payment.PaymStatus == 0))       
+         execSQL("update doprcurst_dbt  set T_NUMVALUE = 1  where T_ID_OPERATION =  :OID  and T_STATUSKINDID = 291", makeArray(SQLParam("OID", OperationID)));
+      end;    
+   end;
+
+   //Gurin S. 26.03.2014 I-00475314-2	
+   if ((Режим == SCR_SAVE ) and (Payment.PayerBankEnterDate == date(0,0,0)))
+      if (Payment.Origin == 0)
+         Payment.PayerBankEnterDate = {Curdate};
+      end;
+   end;
+   
+   // TAM 13.02.2015  C-34990 - контроль УИН на 40822*
+   if ((Режим == SCR_SAVE) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT)) // Проверка актуальна для ввода
+      if(substr(Payment.ReceiverAccount, 1, 5) == "40822")
+         //проверка на длину в 25 знаков
+         if(StrLen(trim(rmprop.UIN)) != 25)
+            msgbox("Заполните поле <КОД> значением в 25 знаков");
+            return 1;
+         //проверку прошёл, проверяем ключ
+         else
+            if(not Check_UIN_Control_Key("40822", substr(trim(rmprop.UIN), 1, 16)))
+               msgbox("Контрольный ключ УИН не верен");
+               return 1;
+            end;
+         end;
+      end;
+ 
+      //Gurin S. 13.11.2015 R-627695-2
+      //VDN      02.02.2016 R-637300
+      if ( (Payment.DocKind == DLDOC_BANKPAYMENT) and
+           (inList(substr(Payment.PayerAccount,1,5), "40911", "47422")) and 
+           (inList(substr(Payment.ReceiverAccount,1,5), "40101", "40302")) and 
+           ( not(((trim(rmprop.UIN) == "0") or (StrLen(trim(rmprop.UIN)) == 20)) and (IsDigitNumber(trim(rmprop.UIN)) == 0)) ) and 
+           ( not IsOprMultiExec())
+         )
+         msgbox("Поле <КОД> в платеже банка (Дт: 40911*, 47422* Кт: 40101*, 40302*) должен быть заполнен корректно | (0 или 20-ти значное числовое значение)");
+         return 1;
+      end;
+
+   end;
+
+   /*Проверяем номер для всех документов, в том числе и отложенных.*/
+   if( (Режим == SCR_SAVE ) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT) )
+      if( needUseKZpm() )
+         if( CompareStrWithMasks("10-29&??", Pmkz.PayerCode) )
+            MsgBox("Некорректное значение КОд");
+            return fld_kzPayerCode;
+         end;
+         if( CompareStrWithMasks("10-29&??", Pmkz.ReceiverCode) )
+            MsgBox("Некорректное значение Кбе");
+            return fld_kzReceiverCode;
+         end;
+      end;
+
+      if ( fgBank.is_EXV ) 
+      /*SDA */
+         if ( Payment.numberpack == 0 )
+            MsgBox("Не задан номер пачки");
+            return 1;
+         end;
+      end;
+      
+      if( not stat )
+         res = CheckINN(rmprop.PayerINN);
+         if (res)
+            msgBox ("Ошибка в ИНН плательщика");
+            return 1;
+         end;
+
+         res = CheckINN(rmprop.ReceiverINN);
+         if (res)
+            msgBox ("Ошибка в ИНН получателя");
+            return 1;
+         end;
+
+         if(stat==2)    
+            return stat = fld_PayerINN[(17-Order.DocKind)];
+         end;
+         if(stat==3)    
+            return stat = fld_ReceiverINN[(17-Order.DocKind)];
+         end;
+      end;
+
+      if( Order.DocKind == DLDOC_BANKCLAIM ) //DLDOC_BANKCLAIM = 17
+         if( Payment.PayerBankID == Payment.ReceiverBankID  )
+            MsgBox("Банк плательщика не должен совпадать с|банком получателя" );
+            return fld_bankaccp[(17-Order.DocKind)];
+         end;
+      
+         if( PM_CheckPayments( Payment, DbProp, CrProp, RmProp, 1 ) )
+            return 1;
+         end;
+      end;
+
+      /* Общие проверки по списку */
+      if( payment.Dockind == DLDOC_BANKPAYMENT )
+         stat = BBBP_ScrolMacroCommonChecks( TPanelFields(), payment, DbProp, CrProp, rmprop );
+         /* Проверка длин атрибутов*/
+         if( stat == NOTERROR )
+            stat = CheckSave383PLength( payment, DbProp, CrProp, rmprop );
+         end;
+      elif( payment.Dockind == DLDOC_BANKCLAIM )
+         stat = BBBC_ScrolMacroCommonChecks( TPanelFields(), payment, DbProp, CrProp, rmprop );
+      end;
+      
+      if( stat != NOTERROR )
+         return stat;
+      end;
+
+      if( StrLen( Rmprop.Number ) == 0 )
+         MsgBox("Не задан номер документа");
+         return fld_Number[(17-Order.DocKind)];
+      end;
+
+      if( IsDigitNumber(Rmprop.Number) )
+         MsgBox("Номер документа нечисловой");
+         return fld_Number[(17-Order.DocKind)];
+      else
+         if( int(Rmprop.Number) == 0 )
+            MsgBox("Номер документа не может быть нулевым");
+            return fld_Number[(17-Order.DocKind)];
+         end;
+      end;
+      /* Gurin S. 21.12.2015 HotFix 2031.19.25 (Life_1 1.3)_11
+      Sh_Oper = Rmprop.ShifrOper;
+      if( ( (Sh_Oper == "01") or (Sh_Oper == "02") or (Sh_Oper == "05") or (Sh_Oper == "06") or (Sh_Oper == "08") or (Sh_Oper == "16")) and
+          ( SubStr( Rmprop.Number, StrLen(Rmprop.Number)-2 ) == "000" ) )
+         MsgBox("Три последних разряда номера должны быть отличны от '000'");
+         return fld_Number[(17-Order.DocKind)];
+      end;
+      */
+      if( OldDoc = GetRegValueOldDoc( payment.DocKind ) )
+         if((Payment.ValueDate - Rmprop.Date) > OldDoc ) // Документ не устарел?
+         MsgBox("Документ устарел и не может быть сохранён");
+            return fld_Number[(17-Order.DocKind)];
+         end;
+      end;
+
+      if( StrLen( Rmprop.Ground ) == 0 )
+         MsgBox("Введите Назначение платежа");
+         return fld_Ground[(17-Order.DocKind)];
+      end;
+    
+      if( StrLen( Rmprop.Ground )>210 )                
+         if ( RsbGetTrue( False,True,"Основание платежа превышает 210 символов.|Продолжить?")==False )                   
+            return fld_Ground[(17-Order.DocKind)];
+         end;
+      end;
+
+      if( StrLen( Rmprop.PartyInfo)>210-33 )
+         if ( RsbGetTrue( False,True,"Информация участнику превышает 177 символов.|Продолжить?")==False )
+            return 1;
+         end;
+      end;
+
+      if( StrLen( Rmprop.ReceiverBankName)>140 )
+         if ( RsbGetTrue( False,True,"Наименование банка получателя превышает 140 символов.|Продолжить?")==False )
+            return 1;
+         end;
+      end;
+
+      if( StrLen( Rmprop.PayerBankName)>140 )
+         if ( RsbGetTrue( False,True,"Наименование банка плательщика превышает 140 символов.|Продолжить?")==False )
+            return 1;
+         end;
+      end;
+
+      if( StrLen( Rmprop.ReceiverName)>160 )
+         if ( RsbGetTrue( False,True,"Наименование получателя превышает 160 символов.|Продолжить?")==False )
+            return 1;
+         end;
+      end;
+
+      if( StrLen( Rmprop.PayerName)>160 )
+         if ( RsbGetTrue( False,True,"Наименование плательщика превышает 160 символов.|Продолжить?")==False )
+            return 1;
+         end;
+      end;
+
+      if ( GetDialogFlag() )
+         if(PM_CheckCO(Payment,RmProp,DbProp,CrProp))
+            return 1;
+         end;
+      end;
+  
+      /*  Если код банка равен нашему банку или код банка равен коду нашего головного банка */
+      if( Order.DocKind == DLDOC_BANKPAYMENT ) //DLDOC_BANKPAYMENT = 16
+         if( strlen(CrProp.BankCode) and
+            ((Режим != SCR_EDIT) or ((Режим == SCR_EDIT) and
+             ((CrProp.BankCode != OldCrProp.BankCode) or
+             (Payment.ReceiverAccount != OldPayment.ReceiverAccount))
+            )))
+            NeedCheckBankID = 1;
+            BankID  = Payment.ReceiverBankID;
+            FIID    = Payment.FIID;
+            Account = Payment.ReceiverAccount;
+         end;
+      else
+         if( strlen(DbProp.BankCode) and
+             (Режим != SCR_EDIT) or ((Режим == SCR_EDIT) and
+             ((DbProp.BankCode != OldDbProp.BankCode) or
+             (Payment.PayerAccount != OldPayment.PayerAccount))
+            ))
+            NeedCheckBankID = 1;
+            BankID  = Payment.PayerBankID;
+            FIID    = Payment.FIID;
+            Account = Payment.payerAccount;
+         end;
+      end;
+      /*платеж внешний*/
+      if( NeedCheckBankID and (Режим != SCR_EDIT) and (OldOrder.OrderID == 0) ) 
+         stat = CheckBankID( BankID, FIID, Account );
+         if( stat ) return stat; 
+         end;
+      end;
+
+      if( Order.DocKind == DLDOC_BANKPAYMENT ) //DLDOC_BANKPAYMENT = 16
+         ErrStr = PM_CheckPaymAccounts( Payment, NULL, CrProp, Rmprop, 1 );
+      else
+         ErrStr = PM_CheckPaymAccounts( Payment, DbProp, NULL, Rmprop, 1 );
+      end;
+
+      if( strlen(ErrStr) > 0 )
+         msgbox( ErrStr );
+         return 1;
+      end;
+
+      //Gurin S. 27.04.2015 R-576226-2
+      if (Payment.PayerBankEnterDate != {curdate})
+         Payment.PayerBankEnterDate = {curdate};
+      end;
+   end;
+    
+   /* Вид платежа "Срочно" разрешен только для рублевых платежей банка */
+   if( (RmProp.PaymentKind == "С"              ) and
+       (Payment.DocKind    != DLDOC_BANKPAYMENT))
+      MsgBox("Недопустимый вид платежа");
+      return fld_paym_kind;
+   end;
+
+   if(Режим == SCR_DELETE ) /*УДАЛЕНИЕ ДОКУМЕНТА*/
+      if(not isDLMRuning())
+         if(Order.Origin == MEMORDER_FDOC_ZP)
+            msgbox("Документ порожден п/с \"Заработная плата\".|Удаление запрещено.");
+            stat = 1;
+         elif(Order.Origin == MEMORDER_FDOC_SF)
+         elif(Order.Origin == MEMORDER_FDOC_CONTRACT)
+            msgbox("Документ порожден п/с \"Учет договоров\".|Удаление запрещено.");
+            stat = 1;
+         elif(Order.Origin == MEMORDER_FDOC_DP)
+            if(not Index( "Д", StrFor(GetIdentProgram())))
+               msgbox("Документ порожден п/с \"Депозиты\".|Удаление запрещено.");
+               stat = 1;
+            end;
+         elif(Order.Origin == MEMORDER_FDOC_LOANS)
+            if(not Index( "Ц", StrFor(GetIdentProgram())))
+               msgbox("Документ порожден п/с \"Кредитование\".|Удаление запрещено.");
+               stat = 1;
+            end;
+         elif(Order.Origin == MEMORDER_FDOC_RETAIL)
+            if(not Index( "ВБD", StrFor(GetIdentProgram())))
+               msgbox("Документ порожден п/с \"Обслуж.физ.лиц\".|Удаление запрещено.");
+               stat = 1;
+            end;
+         elif( Order.Origin == MEMORDER_FDOC_RETURN )
+            msgbox("Документ порожден п/с \"АРМ позиционера\".|Удаление запрещено.");
+            stat = 1;
+         elif( Order.Origin == MEMORDER_FDOC_PROCUNKNOWNPM )
+            msgbox("Документ порожден при обработке невыясненной суммы.|Удаление запрещено.");
+            stat = 1;
+         end;
+      end;
+
+      if(CheckDeletePayment(Payment.PaymentID))
+         return 1;
+      end;
+   end;
+
+   if(Режим == SCR_SAVE)  /* ВВОД ДОКУМЕНТА */
+      if(Order.Kind_Operation and (Order.Status == MEMORDER_STATUS_POST)) /* начало операции */
+      end;
+   end;
+
+   if(Режим == SCR_EDIT)  /* РЕДАКТИРОВАНИЕ ДОКУМЕНТА */
+      if(Order.Origin == MEMORDER_FDOC_ZP)
+         msgbox("Документ порождён п/с \"Заработная плата\".|Корректировка запрещена.");
+         stat = 1;
+      elif( (Order.DocKind == 17) and (Order.Origin == MEMORDER_FDOC_AUTO) and (Payment.PaymStatus == PM_REJECTED) )
+         Acc.Account       = Payment.PayerAccount;
+         Acc.Code_Currency = Payment.FIID;
+         Acc.Chapter       = 1/*CHAPT1*/;
+         GetEQ(Acc);
+         if( ПроверкаИдентичности(Order,OldOrder) and
+             ПроверкаИдентичности(DbProp, OldDbProp) and
+             ПроверкаИдентичности(CrProp, OldCrProp) and
+             ПроверкаИдентичности(RmProp, OldRmProp) and
+             ПроверкаИдентичности(Demand, OldDemand)
+            )
+            if( ( (Acc.Department == {OperDprt}) and
+                  ПроверкаИдентичности(Payment, OldPayment,"Amount","FuturePayerAmount","PayAmount","FutureReceiverAmount","BaseRate","BaseRateType","BasePoint","BaseScale",
+                                                           "BaseRateDate","IsBaseInverse","FutureDRate","FutureDRateType","FutureDRatePoint","FutureDRateScale","FutureDRateDate",
+                                                           "FutureDRateIsInverse","FutureCRate","FutureCRateType","FutureCRatePoint","FutureCRateScale","FutureCRateDate",
+                                                           "FutureCRateIsInverse",
+                                                           "Rate","RateType","Point","Scale","RateDate","IsInverse" )
+                ) or
+                ( (Acc.Department != {OperDprt}) and
+                  ПроверкаИдентичности(Payment, OldPayment, "Amount","FuturePayerAmount","PayAmount","FutureReceiverAmount","BaseRate","BaseRateType","BasePoint","BaseScale",
+                                                            "BaseRateDate","IsBaseInverse","FutureDRate","FutureDRateType","FutureDRatePoint","FutureDRateScale","FutureDRateDate",
+                                                            "FutureDRateIsInverse","FutureCRate","FutureCRateType","FutureCRatePoint","FutureCRateScale","FutureCRateDate",
+                                                            "FutureCRateIsInverse" )
+                )
+               )
+               stat = CHANG_NOTIMPORTANT;
+            else
+               stat = CHANG_NOTKEEP;
+            end;
+         else
+            stat = CHANG_NOTKEEP;
+         end;
+      elif(Order.Origin == MEMORDER_FDOC_SF)
+      elif(Order.Origin == MEMORDER_FDOC_CONTRACT)
+         msgbox("Документ порожден п/с \"Учет договоров\".|Корректировка запрещена.");
+         stat = 1;
+      elif(Order.Origin == MEMORDER_FDOC_DP)
+         if(not Index( "Д", StrFor(GetIdentProgram())))
+            msgbox("Документ порожден п/с \"Депозиты\".|Корректировка запрещена.");
+            stat = 1;
+         end;
+      elif(Order.Origin == MEMORDER_FDOC_LOANS)
+         if(not Index( "Ц", StrFor(GetIdentProgram())))
+            msgbox("Документ порожден п/с \"Кредитование\".|Корректировка запрещена.");
+            stat = 1;
+         end;
+      elif(Order.Origin == MEMORDER_FDOC_RETAIL)
+         if(not Index( "ВБD", StrFor(GetIdentProgram())))
+            msgbox("Документ порожден п/с \"Обслуж.физ.лиц\".|Корректировка запрещена.");
+            stat = 1;
+         end;
+      elif( (Order.Origin == MEMORDER_FDOC_REDIRECT) or (Order.Origin == MEMORDER_FDOC_TRANZIT) )
+         msgbox("Документ порожден п/с \"АРМ позиционера\".|Корректировка запрещена.");
+         stat = 1;
+      end;
+      
+      if( (not stat) and NeedCheckBankID ) /*платеж внешний*/
+         stat = CheckBankID( BankID, FIID, Account );
+         if( stat ) return stat; end;
+      end;
+    
+      var OprPaymStatus:integer = -1;
+      if(not PM_GetOprStatus( Payment.DocKind, Payment.DocumentID, OPR_PAYM_STATE, @OprPaymStatus ))
+         stat = 1;
+      end;
+    
+      if((stat == 0) and (Order.Status != 1) and ( (Order.Status != 4) or ((Order.Status == 4) and (OprPaymStatus == 3))))
+      /* документ находится в открытых или закрытых, или отвернут со статусом операции "закрыт" */
+         stat = CHANG_NOTIMPORTANT;
+      /*При редактировании производим проверку важности внесенных изменений */
+      /* Константы важности внесенных изменений:           */
+      /* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+      /* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+      /* CHANG_NOTKEEP        - не сохранять изменения */
+      /* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+      /* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+         и сохранение изменений можно производить без отката операции      */
+         If (RmProp.ground!=OldRmProp.ground) 
+            stat = CHANG_NOTIMPORTANT;
+         End;
+         if  (  (Payment.Amount          != OldPayment.Amount) or
+                (Payment.PayerAccount    != OldPayment.PayerAccount) or
+                (Payment.ReceiverAccount != OldPayment.ReceiverAccount) or
+                (Payment.PayerMesBankID    != OldPayment.PayerMesBankID    ) or
+                (Payment.ReceiverMesBankID != OldPayment.ReceiverMesBankID ) or
+                (Payment.ValueDate       != OldPayment.ValueDate) or
+                (Payment.NumberPack      != OldPayment.NumberPack) or
+                (Payment.Department      != OldPayment.Department) or
+                (RmProp.PayerINN         != OldRmProp.PayerINN) or
+                (RmProp.ReceiverINN      != OldRmProp.ReceiverINN) or
+                (RmProp.PayDate          != OldRmProp.PayDate) or
+                (Dbprop.CodeKind         != OldDbprop.CodeKind) or
+                (Dbprop.BankCode         != OldDbprop.BankCode) or
+                (Crprop.CodeKind         != OldCrprop.CodeKind) or
+                (Crprop.BankCode         != OldCrprop.BankCode) or
+                (Dbprop.Corschem         != OldDbprop.Corschem) or
+                (Crprop.Corschem         != OldCrprop.Corschem) or
+                (Dbprop.RlsFormID        != OldDbprop.RlsFormID) or
+                (Crprop.RlsFormID        != OldCrprop.RlsFormID) or
+                (RmProp.TaxAuthorState    != OldRmProp.TaxAuthorState) or
+                (RmProp.BttTICode         != OldRmProp.BttTICode) or
+                (RmProp.OKATOCode         != OldRmProp.OKATOCode) or
+                (RmProp.TaxPmGround       != OldRmProp.TaxPmGround) or
+                (RmProp.TaxPmPeriod       != OldRmProp.TaxPmPeriod) or
+                (RmProp.TaxPmNumber       != OldRmProp.TaxPmNumber) or
+                (RmProp.TaxPmDate         != OldRmProp.TaxPmDate) or
+                (RmProp.TaxPmType         != OldRmProp.TaxPmType) or
+                (RmProp.SymbNotBalDebet   != OldRmProp.SymbNotBalDebet) OR
+                (RmProp.NeedNotify   != OldRmProp.NeedNotify) OR
+                (RmProp.Instancy     != OldRmProp.Instancy) OR
+                (OldDemand.AcceptTerm != Demand.AcceptTerm) OR
+                (Payment.BaseAmount   != OldPayment.BaseAmount) OR
+                (Payment.PayAmount    != OldPayment.PayAmount)
+             )
+            stat = CHANG_IMPORTANT;
+         end;
+      end;
+           
+      if( ( Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "К" ) Or 
+            Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "А" ) Or
+            Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "Е" ) Or
+            Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "е" ) ) And
+            ( /*Order.Status != MEMORDER_STATUS_REJECTED*/
+            Payment.PaymStatus != PM_REJECTED) )
+         if ( not ( 
+                ПроверкаИдентичности(Order,       OldOrder   ) And
+                ПроверкаИдентичности(DbProp,      OldDbProp  ) And
+                ПроверкаИдентичности(CrProp,      OldCrProp  ) And
+                ПроверкаИдентичности(Payment,     OldPayment, "FUTUREPAYERACCOUNT", "payercode","RECEIVERACCOUNT","receivercode", " ") And
+                ПроверкаИдентичности(RmProp,      OldRmProp, "ground"  ) 
+                  ) )                   
+            //Gurin S. 21.01.2015 R-530728-2
+            if (not GetTrue(true,"Сохранить изменения?"))
+               stat = CHANG_NOTKEEP;
+            end;
+            //msgbox("Изменения не будут сохранены");
+         elif (       
+               (Not Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "U", "R") ) And
+               (Not Opr_IsStepExecuteSymb( Payment.DocumentID, Payment.DocKind, "З", "R", 29029) ) And 
+               (Payment.FutureReceiverAccount != OldPayment.FutureReceiverAccount )
+              )
+            stat = CHANG_NOTKEEP;
+            //msgbox("Изменения не будут сохранены");
+         end;
+      else
+         stat = CHANG_NOTIMPORTANT;
+      end;
+      
+      obj = GenObject("RsbPayment", Payment.paymentid);
+      if (IsExternalCarry(obj))
+         if (gettrue(false,"Вы редактируете документ выгруженный из внешнией системы|информация об альтернативной схеме проводок может быть утеряна|продолжить?"))
+            cmd = RSDCommand("delete usr_pmdocs where paymentid = ?");
+            cmd.addparam("pmid", RSDBP_IN, Payment.paymentid);
+            cmd.execute;
+         else
+            stat = CHANG_NOTKEEP;
+         end;
+      end;
+
+      //Gurin S. 26.11.2015 R-629440-2
+      //LAO Сергей сказал что это не решает проблемы
+     /* if ((OldCrprop.Corschem == 1) and (obj.PaymStatus != PM_PREPARING) and (obj.PaymStatus != PM_FINISHED))
+         stat = CHANG_IMPORTANT;
+         msgbox("Документ РКЦ. Для редактирования необходимо откатить платеж в отложенные");
+      end;*/
+   end;
+
+   if( Payment.DocKind == DLDOC_BANKPAYMENT )
+      if ( (Режим == SCR_SAVE) or (Режим == SCR_EDIT) or (Режим == SCR_INSERT) )
+         If(ПользовательскиеПроверкиПриСохранении(Payment, CrProp, RmProp))
+            return 1; //ОШ  
+         end;
+      end;
+   end;
+
+   if(Режим == SCR_ROLLBACK ) /*ПОМЕЩЕНИЕ ДОКУМЕНТА В ОТЛОЖЕННЫЕ, ОТКАТ ОПЕРАЦИИ*/
+   end;
+
+   if( Режим == SCR_INSERT )  /*ВВОД В ОТЛОЖЕННЫЕ*/
+   end;
+  
+   if(Режим == OBJ_AFTEREDIT) // Проверка важности изменений влияющей на необходимость смены опера документа
+                               // (изменения в буферах не сохраняются)
+      return IsImportantChangeForOperBankPaym(Payment, OldPayment, RmProp, OldRmProp, CrProp, OldCrProp, DbProp, OldDbProp, Demand, OldDemand)
+   end;
+   return stat;
+end;
+
+macro    Проверить_Счет_В_Документе( поле ) /*0-счет плательщика, 1-счет получателя*/
+   var новое_значение_счета;
+
+   if(поле) 
+      новое_значение_счета = Payment.ReceiverAccount;
+   else    
+      новое_значение_счета = Payment.PayerAccount;
+   end;
+   return новое_значение_счета;
+end;
+
+macro    ФункцияПользователя_Документ( Режим:integer )
+   debugbreak;
+   var PaymentObj:Rsbpayment=Rsbpayment(Payment.paymentId);
+   var Flv=0;//выгрузка платежа СОВСЕМ без кодов
+   var Macros:integer; 
+   Macros=3;//memorder 
+   var m;
+   array mn;
+   // mn(2)="Заполнить коды ВО";
+   mn(0)="Выгрузить в АСКВБ";
+   mn(1)="Очистить файл выгрузки oplata.d";
+   mn(2)="Посмотреть сеанс отправки";
+   mn(3)="Редактировать примечания платежа";//по заявке A50141 (с) Diver
+   /*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+   mn(asize(mn)) = "Изменение платежа ФМ";
+   //TAM 9.11.11 I-00101757-1
+   mn(asize(mn))="Сменить номер пачки";
+   // KS 22.03.2011 Установка даты на документе
+   var datedoc = {curdate};
+   if (Order.Status == MEMORDER_STATUS_POST) // Отложенные
+      mn(asize(mn)) = "Установка даты на документе";
+   end;
+   mn(asize(mn))="Редактировать примечания платежа";//TAM 25.07.2012 C-11947
+   /*20.05.2013 Жаворонкова Н. (joy) R-188983-1 (C-17206) */
+   mn(asize(mn)) = "Изменить вид хранения";
+   //Gurin S. 28.08.2015 I-00581174-2
+   if (ВходитВГруппу({oper}, ACS_GRP_CLOSE_DOC))
+      mn(asize(mn)) = "Закрыть документ без проводок";
+   end;
+   //VDN 11.11.2015 По многочисленным заявкам ГИС, сил нет   
+   mn(asize(mn)) = "Перегенерация сообщения ГИС ГМП";
+
+   mn(asize(mn)) = "Добавление статьи сметы";
+   mn(asize(mn)) = "Очистить сообщение ГИС ГМП по платежу"; 
+   m=menu(mn,null,null);
+   var qwery, rs1;
+   rs1=null;
+
+   if (m == 3)
+      if ((Режим == UFN_PANEL_INPUT) or (Режим == UFN_SCROL_FMASS))
+         msgbox("Непредназначено для правки примечаний в массовых режимах, а так же при первоначальном вводе платежа");
+         return 0;
+      end;
+      if (ВходитВГруппу({oper},170)) //170 - "Правка примечаний платежа"
+         ВывестиПримечанияНаРедактирование(paymentObj.paymentID); 
+      else
+         msgbox("Вы не включены в группу \"Правка примечаний платежа\" ");
+      end;
+      return 0;
+   end;
+
+   if (m==2)     //Заполняем примечания
+      qwery = " Select  ses.t_number , mes.t_MESID, mes.t_outsideabonentdate "+ 
+              "  From DWlPm_dbt wlp, DWlMesLnk_dbt lnk, DWlMes_dbt mes, dwlsess_dbt ses "+ 
+              "  Where wlp.t_PaymentID = " + paymentObj.paymentID +
+              "    and lnk.t_ObjKind   = '501' "+
+              "    and lnk.t_ObjID     = wlp.t_WlPmID "+ 
+              "    and mes.t_MesID     = lnk.t_MesID "+
+              "    and ses.t_SessionID = mes.t_SessionID";
+             
+      rs1 = rsdRecordSet(qwery);
+      if (rs1.MoveNext())
+         msgbox("Платёж был отправлен "+rs1.Value(2)+" сеансом №"+rs1.Value(0)+". ID платежа в сеансе  "+rs1.Value(1)); 
+      else
+         msgbox ("Платеж ещё не выгружен для отправки");
+      end;
+      return 0;
+   end;
+    
+   if (m==1)  //Очищаем, выходим  
+      clear();
+      return 0;
+   elif (m==-2) 
+      If(режим!=4)
+         return 0;
+      end;
+   end; 
+
+   /*22.09.2010 Chesnokov D. Изменение поля t_reason таблицы dpmdocs_dbt для "старых" платежей*/
+   if(mn(m) == "Изменение платежа ФМ")
+      ChangeReason(PaymentObj);
+      return 0;
+   end;
+    
+   //TAM 25.07.2012 C-11947
+   if(mn(m) == "Редактировать примечания платежа")
+      if (ВходитВГруппу({oper},ACS_GRP_NOTE407_EDIT)) //170 - "Правка примечаний платежа"
+         ВывестиПримечанияНаРедактирование(paymentObj.paymentID); 
+      else
+         msgbox("Вы не включены в группу \"Правка примечаний платежа\" ");
+      end;
+      return 0;
+   end;
+
+   //TAM 9.11.11 I-00101757-1
+   if (mn(m)=="Сменить номер пачки")
+      if (ВходитВГруппу({oper},ACS_GRP_CHANGE_NUMBERPACK)) //107
+         NUMBERPACK(paymentObj.paymentID,PaymentObj.NumberPack);
+      else
+         msgbox("Вы не включены в группу \"107 - Право исправлять номер пачки в закрытых документах\"");
+      end;
+      return 0;
+   end;
+   /*20.05.2013 Жаворонкова Н. (joy) R-188983-1 (C-17206) */
+   if(mn(m) == "Изменить вид хранения")
+      if (Payment.PaymStatus == PM_FINISHED) // Проверки только для закрытых, если открыт\отложен менять можно без проблем
+         execMacroFile ("ea_checks.mac", "CheckEAGroup", Payment); 
+      else
+         execMacroFile ("ea_checks.mac","SetEAStoreKind", Payment);
+      end;
+      return 0;
+   end;
+   //Gurin S. 28.08.2015 I-00581174-2
+   if (mn(m) == "Закрыть документ без проводок")
+      execMacroFile ("lib_menu_common.mac","UsrCloseDoc", PaymentObj);
+      return UPDTPAGE;
+   end;
+   //VDN 11.11.2015 По многочисленным заявкам ГИС, сил нет
+   if (mn(m) == "Перегенерация сообщения ГИС ГМП")
+      execMacroFile ("utilMessGIS.mac","generateMessage", PaymentObj.paymentid);
+      return 0;
+   end;
+   // KS 22.03.2011 Установка даты на документе
+   if (mn(m) == "Установка даты на документе")
+      if (GetDate(datedoc, "Введите дату"))
+         Payment.ValueDate   = datedoc;
+         Payment.PayerBankEnterDate = datedoc;
+         CrProp.TransferDate = datedoc;
+         RmProp.PayDate      = datedoc;
+         RmProp.ClientDate   = datedoc;
+         RmProp.PayerChargeOffDate = datedoc;
+         if(Режим==SCR_EDIT)
+            RSDCommand("update dpmpaym_dbt   set t_ValueDate="          + GetSQLDate(datedoc) + "," +
+                                               " t_PayerBankEnterDate="   + GetSQLDate(datedoc) + " where t_paymentid=" + Payment.PaymentId).Execute();
+            RSDCommand("update dpmrmprop_dbt set t_PayDate="            + GetSQLDate(datedoc) + "," +
+                                               " t_ClientDate="         + GetSQLDate(datedoc) + "," +
+                                               " t_PayerChargeOffDate=" + GetSQLDate(datedoc) + " where t_paymentid=" + Payment.PaymentId).Execute();
+            RSDCommand("update dpmprop_dbt   set t_TransferDate="       + GetSQLDate(datedoc) + 
+                                             " where t_debetcredit = 1 and t_paymentid=" + Payment.PaymentId).Execute();
+         end;
+      end;
+      return 0;
+   end;
+   
+   if (mn(m) == "Очистить сообщение ГИС ГМП по платежу")
+      execMacroFile ("lib_gisgmp.mac","dell_GISGMPMessage", PaymentObj.paymentid);
+      return 0;
+   end;
+   
+   if (mn(m) == "Добавление статьи сметы")
+        execMacroFile ("smeta.mac","initSmetaFields", PaymentObj.paymentid);
+        return 0;
+   end;
+
+   if((ReadNoteForPayment(paymentObj.paymentID,111)=="") and 
+      ((CurTr.VO_code==0) or (CurTr.VO_code==00000)) and //Анализируем Alt+V, если пусто уточняем
+      (not(GetTRUE (FALSE,"В платеже не указан код ВО, Выгрузить?"))))
+      flV=0;
+   else
+      flV=1;
+   End;
+
+   var ZachSpis;
+   If ((payment.payerBankId==213)and(payment.receiverBankId==213))
+      ZachSpis=2;
+      ASVKB(Payment,Rmprop,CurTr,режим,Macros,ZachSpis,payment.payeraccount,flV);
+      If (flV==1) //если
+         ZachSpis=1;
+         ASVKB(Payment,Rmprop,CurTr,режим,Macros,ZachSpis,payment.receiveraccount,flV); 
+      End;
+   Elif (payment.payerBankId==213);
+      ZachSpis=2;
+      ASVKB(Payment,Rmprop,CurTr,режим,Macros,ZachSpis,payment.payeraccount,flV);
+   Elif
+      (payment.receiverBankId==213);
+      ZachSpis=1;
+      ASVKB(Payment,Rmprop,CurTr,режим,Macros,ZachSpis,payment.receiveraccount,flV); 
+   Else
+      //ASVKB(Payment,Rmprop,pmco,режим,Macros,ZachSpis,payment.receiveraccount,flV); 
+       Msgbox("Данная операция не удовлетворяет условиям выгрузки в АСВКБ");
+   End;
+   /*
+     Возможные значения Режим:
+      UFN_PANEL_INPUT(1) - функция вызвана из панели ввода объекта;
+      UFN_PANEL_EDIT(2) - функция вызвана из панели корректировки объекта;
+      UFN_SCROL(3) - функция вызвана из панели скролинга, единичный вызов, любая корректировка объекта запрещена;
+      UFN_SCROL_FMASS(4) - функция вызвана из панели скролинга, работа по нескольким записям, вызов до начала обработки, любая корректировка объекта запрещена;
+     
+    // Пример работы: 
+     if( Режим == UFN_SCROL )
+       return UPDTPAGE;    // Обновить страницу записей и область скролинга
+       //return UPDTREC;     // Обновить текущую запись, загрузив из файла
+     end;
+   */
+   return 0;
+END;
+
+Macro user_vuz(panel):bool;      // проверка если Дт платежа 40911*43 и ДПП>дата создания платежа + 1, то не разрешать сохранять!!! 
+   if ((substr(panel.Fields.Item(7).value,1,5)=="40911") and (substr(panel.Fields.Item(7).value,19)=="43") and (CrProp.TransferDate >Payment.valueDate + 1))
+      return true;
+   else
+      return false;
+   end;
+END;
+
+Macro ProcessPanel(mode, key, field, panel)
+   var i=0;
+
+   if ( fgBank.is_EXV ) 
+      // KS 22.03.2011 Установка даты на документе
+      panel.Fields.Item(25).value = RmProp.PayDate;
+      panel.Fields.Item(26).value = Payment.ValueDate;
+   end;
+
+   //Gurin S. 17.07.2013 R-218524-2
+   if ((order.Origin == 0/*Ручной ввод*/) and (panel.ResourceName =="PBMEMORD") and (substr(panel.Fields.Item(2).value,1,1) == "Э"))
+      msgbox("В соотвествии с 384-П с 01.07.2013 \"Вид платежа\" не заполняется | для распоряжений, отправляемых в электронном виде. | Нужно оставить вид платежа \"Н\".");
+      panel.Fields.Item(2).value = "Н";
+   end;
+
+   if(mode == 1)
+      if (user_vuz(panel)==true) 
+         msgbox("Дата перечисления платежа должна быть | не позднее следующего рабочего дня от даты создания документа!");
+         CrProp.TransferDate=OldCrProp.TransferDate;
+         break;
+      end;
+
+      //Gurin 11.06.2012 I-00178227-2 
+      if ((order.Origin == 0/*Ручной ввод*/) and (panel.ResourceName =="PBMEMORD") and (panel.Fields.Item(22).value == "02"))
+         msgbox("Платеж банка не может быть с шифром 02");
+         panel.Fields.Item(22).value = "01";
+      end;
+
+      if (panel.ResourceName != "P_PMCPTC")
+         if ((panel.Fields.Item(5).value == "ОАО АКБ "+strfor(34)+"ПРОБИЗНЕСБАНК"+strfor(34)) and (strlen(panel.Fields.Item(4).value) == 0))
+            panel.Fields.Item(4).value = "7729086087/775001001";
+         end;
+         if (panel.Fields.Item(panel.Fields.current).name == "PNRMPM_INN")
+            panel.Fields.Item(panel.Fields.current).Enabled = false;
+         else
+            panel.Fields.Item(panel.Fields.current).Enabled = true;
+         end;
+
+         if ((panel.Fields.Item(panel.Fields.current).name == "PNRMPM_DEPARTMENT") and ({oper} != 10000))
+            panel.Fields.Item(panel.Fields.current).Enabled = false;
+         else
+            panel.Fields.Item(panel.Fields.current).Enabled = true;
+         end;
+         i = i + 1; 
+         
+         if(key==522)
+            if ((order.Origin == MEMORDER_FDOC_AUTO )/* or (order.Origin >= 1000)*/)//Ручной ввод и Фронт
+               while (i < panel.Fields.count)
+                  panel.Fields.Item(i).Enabled = false;
+                  i = i + 1;
+               end;
+            else
+               while (i < panel.Fields.count)
+                  panel.Fields.Item(i).Enabled = true;
+                  i = i + 1;
+               end;
+            end;
+         end;
+      end;
+   end;
+END;

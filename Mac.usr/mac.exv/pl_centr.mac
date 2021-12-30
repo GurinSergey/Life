@@ -1,0 +1,748 @@
+/* ──────────────────────────────────────────────────────────────────────────
+  RS-Bank 5.00                              (C) АКБ "Пробизнесбанк"
+  Module     : ОДБ
+  File Name  : pl_centr.mac
+  Description: Проведение денежных переводов РНКО "Платежный центр"
+  Comment    : 
+  History    : 22.03.10 Братчиков В.В.
+               17.02.11  Зубко С. - адаптация под RS-Bank 6.0
+└───────────────────────────────────────────────────────────────────────────*/
+Import BankInter, globals, rsd;
+Import PaymInter, PTInter;
+
+/*!!!Настройки!!!*/
+/*****************************************************/
+/*Директория импорта*/
+var ImportDir= "\\\\172.16.22.116\\Import\\rspar\\*.*";
+/*Загржаем ли м золотую корону?*/
+var Load_Gold_Crown:bool = false;
+/*****************************************************/
+
+file ftxt () txt ;
+private var Value_err;
+var _f_txt;
+var _FileName, selCarry, ext, dkey;
+var _ifile, str, sFiles, o_Msg = "";
+var flNext, flInst, flVersion, flCode, flCharSet, flFirstFile, flNewFormat= false;
+var stat;
+
+var Payment:RsbPayment = null;
+var Memorial:object    = null;
+
+
+var TypeCarry= TArray();
+    TypeCarry(0)= " В отложенные ";
+    TypeCarry(1)= " !!! Настройки ";
+
+var is_Gold_Crown:bool = false;
+
+/*──────────────────────────────────────────────────────────────────────────*/
+
+/*Меняем кодировку ANSI в DOS*/
+private macro Win2Dos(s)
+ private macro OEM2Char(WinChar)
+  var DosN, WinN;
+  WinN = CodeFor(WinChar);
+  if ((WinN > 175) and (WinN < 192))
+    DosN = WinN + 64;
+  elif ((WinN > 191) and (WinN < 240))
+    DosN = WinN - 64;
+  elif ((WinN > 239) and (WinN < 256))
+    DosN = WinN - 16;
+  else
+    DosN = WinN;
+  end;
+  Return StrFor(DosN);
+ end; /* OEM2Char */
+
+  var i = 1, ss = "";
+  While ( i <= StrLen(s) )
+    ss = ss + OEM2Char(SubStr(s,i,1));
+    i = i + 1;
+  end;
+  Return ss;
+end; 
+
+private macro Get_Name_Account(p_acc)
+  
+  var cmd:object,rs:object,sql:string;
+
+  sql = "select acc.T_NAMEACCOUNT from daccount_dbt acc where acc.T_ACCOUNT = ? ";
+
+  cmd = RsdCommand(SQL);
+  cmd.AddParam("account", RSDBP_IN, p_acc);
+  cmd.execute();
+
+  rs = RsdRecordSet(cmd);
+  if (rs.MoveNext and ( Valtype(rs.Value(0)) != 26))
+     return rs.Value(0);
+  end;
+  return "";
+END;
+
+/*Получить ID валюты по его ISO-коду*/
+/*Если передается 0, томеняем на 810*/
+MACRO GetFIIDCurrency(cur)
+  var cmd:object,rs:object,str:string;
+
+
+  if(cur == 0)
+    cur = "810";
+  end;
+
+  str= " select t_fiid"+
+       " from dfininstr_dbt"+
+       " where t_fi_code='"+cur+"'";
+
+  cmd = RsdCommand(str);
+  rs  = RsdRecordSet(cmd);
+
+  if(rs.movenext)
+     return rs.Value("t_fiid");
+  else
+     msgbox("Нет такой валюты: "+cur);
+     return NULL;
+  end;
+END;
+
+/*Получить по ISO-коду валюты ID валюты*/
+/*Если получаем 810, то возвращается 0*/
+MACRO GetISONumberCur(curid)
+  var cmd:object,rs:object,str:string;
+
+  str= " select t_iso_number"+
+       " from dfininstr_dbt"+
+       " where t_fiid='"+curid+"'";
+
+  cmd = RsdCommand(str);
+  rs  = RsdRecordSet(cmd);
+
+  if(rs.movenext)
+     if(rs.Value("t_iso_number") == 810)
+       return 0;
+     else
+       return rs.Value("t_iso_number");
+     end;
+  else
+     msgbox("Нет такой валюты: "+curid);
+     return NULL;
+  end;
+END;
+
+
+/*Разбивается строка на тэг и его значение (Сумма=0.15 --> Сумма и 0.15)*/
+macro DelimStrDoc(str, _tag, _val)
+  if(index(str,"="))
+    _tag= StrUpr(Trim(SubStr(str,1,index(str,"=")-1)));
+    _val= Trim(SubStr(str,index(str,"=")+1));
+  else
+    _tag= "";
+    _val= "";
+  end;
+
+  SetParm(1, _tag);
+  SetParm(2, _val);
+end; // DelimStr()
+/*──────────────────────────────────────────────────────────────────────────*/
+/*Формирование нового назначения платежа*/
+macro NewGround( str )
+ var p, ret= str, tmp;
+
+  if( p= index(StrUpr(ret), "РЕЕСТР=") )
+    tmp= trim(SubStr(ret, p+7));
+    ret= SubStr(ret, 1, p+6);
+    if(p= index(StrUpr(tmp), " ОТ "))
+      ret= ret+ SubStr(tmp, 1, p+3);
+      tmp= trim(SubStr(tmp, p+4));
+      if(p= index(tmp, " "))
+        ret= trim(ret+ SubStr(tmp, 1, p));
+      else
+        ret= ret+ tmp;
+      end;
+    else
+      ret= ret+ tmp;
+    end;
+
+  end;
+  ret= StrSubst(ret, " . ", ". ");
+
+  return ret;
+end;
+/*──────────────────────────────────────────────────────────────────────────*/
+
+/*Получаем город агента*/
+macro PlaceAgent(id, _TypePlat, Currency)
+
+  var cmd:object,rs:object,sql:string;
+
+  if(ValType(Currency)== v_undef) 
+    Currency= 0; 
+  end;
+
+  sql = "SELECT * FROM ddoc_dprt_dbt WHERE t_agent = ? AND t_type = ? AND t_code_currency = ? ";
+
+  cmd = RsdCommand(SQL);
+  cmd.AddParam("agent", RSDBP_IN, id);
+  cmd.AddParam("type", RSDBP_IN, _TypePlat);
+  cmd.AddParam("code_currency", RSDBP_IN, Currency);
+  cmd.execute();
+
+  rs = RsdRecordSet(cmd);
+
+  if(rs.MoveNext())
+    SetParm(2, rs.Value("t_code_currency"));
+    return rs.Value("t_name");
+  end;
+
+  SetParm(2, 0);
+  return "";
+end;
+/*──────────────────────────────────────────────────────────────────────────*/
+
+/*Находим реальные счета плательщика и получателя из таблицы ddoc_dprt_dbt*/
+macro GetParamPlace(Type, Name, AccountP, NameAccP, AccountR, NameAccR, CorSch, Agent, Currency)
+
+ var cmd:object,rs:object,sql:string;
+
+ var ret= false, flFind;
+  AccountP= "";
+  NameAccP= "";
+  AccountR= "";
+  NameAccR= "";
+  CorSch  = "";
+  Agent   = "";
+
+
+
+  sql = "SELECT * FROM ddoc_dprt_dbt WHERE t_type = ? AND t_code_currency = ? AND t_name = ? ";
+
+  if(Valtype(Type)== v_undef)
+    Name= "";
+    ret= true;
+  else
+    flFind= false;
+
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("type", RSDBP_IN, Type);
+    cmd.AddParam("code_currency", RSDBP_IN, Currency);
+    cmd.AddParam("name", RSDBP_IN, StrUpr(Name));
+
+    cmd.execute();
+    rs = RsdRecordSet(cmd);
+
+    if(rs.MoveNext())
+
+      AccountP= rs.Value("t_AccountP");
+      NameAccP= rs.Value("t_NameAccP");
+      AccountR= rs.Value("t_AccountR");
+      NameAccR= rs.Value("t_NameAccR");
+      CorSch  = rs.Value("t_CorrScheme");
+      Agent   = rs.Value("t_Agent");
+      Currency= rs.Value("t_Code_Currency");
+      ret= true;
+
+    else
+
+      cmd = RsdCommand(SQL);
+      cmd.AddParam("type", RSDBP_IN, Type);
+      cmd.AddParam("code_currency", RSDBP_IN, Currency);
+      cmd.AddParam("name", RSDBP_IN, "САРАТОВ");
+
+      cmd.execute();
+      rs = RsdRecordSet(cmd);
+
+      if(rs.MoveNext())
+         Name   = "САРАТОВ";
+         AccountP= rs.Value("t_AccountP");
+         NameAccP= rs.Value("t_NameAccP");
+         AccountR= rs.Value("t_AccountR");
+         NameAccR= rs.Value("t_NameAccR");
+         CorSch  = rs.Value("t_CorrScheme");
+         Agent   = rs.Value("t_Agent");
+         Currency= rs.Value("t_Code_Currency");
+         ret= true;
+      end;
+
+    end;
+
+  end;
+
+  SetParm(1, Name);
+  SetParm(2, AccountP);
+  SetParm(3, NameAccP);
+  SetParm(4, AccountR);
+  SetParm(5, NameAccR);
+  SetParm(6, CorSch);
+  SetParm(7, Agent);
+  SetParm(8, Currency);
+
+  return ret;
+end ; 
+
+/*Находим данные о схемах расчетов*/
+macro GetAccCorSchem(num, RealAcc, CorAcc, BIK, Currency)
+ var ret= false;
+ var cmd:object,rs:object,sql:string;
+ var err;
+
+  if(num== -1)
+    RealAcc = "";
+    CorAcc  = "";
+    BIK     = "";
+    Currency= 0;
+  else
+    sql = "SELECT * FROM DCORSCHEM_DBT WHERE t_number = ? ";
+
+    cmd = RsdCommand(SQL);
+    cmd.AddParam("number", RSDBP_IN, num);
+    cmd.execute();
+
+    rs = RsdRecordSet(cmd);
+
+    if(rs.MoveNext())
+      RealAcc = rs.Value("t_account");
+      CorAcc  = rs.Value("t_coraccount");
+      BIK     = ПолучитьКодСубъекта(rs.Value("t_corrid"), PTCK_BIC, err );
+      Currency= GetISONumberCur(rs.Value("Code_Currency"));
+    else
+      return false;
+    end;
+  end;
+
+  SetParm(1, RealAcc);
+  SetParm(2, CorAcc);
+  SetParm(3, BIK);
+  SetParm(4, Currency);
+
+  return true;
+end; 
+
+/*Проверяем наименование и находим реальные счета плательщика и получателя*/
+macro CheckAccDoc(TypePlat, sPlace, Currency, p_accPayer, p_accReceiver)
+
+ var Name, BIK,
+     AccountP, NameAccP, AccountR, NameAccR,
+     CorSch, RealAcc, CorAcc, Agent;
+
+  sPlace= StrUpr(Trim(sPlace));
+  /*if(sPlace!= "")*/
+
+    Name  = sPlace;
+
+    if( /*(Name!="САРАТОВ") and */(not GetParamPlace(TypePlat, Name, AccountP, NameAccP, AccountR, NameAccR, CorSch, Agent, Currency)) )
+
+      [│#######################################################################################################################################│]
+      (("!!!  В НАСТРОЙКАХ НЕ НАЙДЕН ПУНКТ \""+ sPlace+ "\"  !!!"):w);
+      return false;
+    end;
+
+    if( (Name!="САРАТОВ") and (not GetAccCorSchem(CorSch, RealAcc, CorAcc, BIK)) )
+      [│#######################################################################################################################################│]
+      (("!!!  В НАСТРОЙКАХ ДЛЯ ПУНКТА \""+ sPlace+ "\" НЕ НАЙДЕНА КОР.СХЕМА "+ CorSch+ "  !!!"):w);
+      return false;
+    end;
+
+
+    if(TypePlat == 2)  // "Город" входящие
+
+      if((Trim(AccountP) == "") or (Trim(AccountP) == StrFor(1)))
+        AccountP = "30213810400000010511";
+      end;
+
+      if((Trim(AccountR) == "") or (Trim(AccountR) == StrFor(1)))
+        AccountR = "40911810100080910511";
+      end;
+
+      SetParm(4, AccountP);
+      SetParm(3, AccountR);
+
+    elif(TypePlat == 3)  // "Город" исходящие
+
+      if((Trim(AccountP) == "") or (Trim(AccountP) == StrFor(1)))
+        AccountP= "40911810100080910511";
+      end;
+
+      if((Trim(AccountR) == "") or (Trim(AccountR) == StrFor(1)))
+        AccountR= "30213810400000010511";
+      end;
+
+      SetParm(3, AccountP);
+      SetParm(4, AccountR);
+    end;
+
+    return true;
+/*
+  end;
+
+  return false;
+*/
+end; 
+/*──────────────────────────────────────────────────────────────────────────*/
+/*Загрузка блока документа и вставка в БД*/
+macro LoadRecDoc(td)
+  var _Tag, _Val, ln, p, tmp;
+
+  /*Переменные для запоминания счета плательщика и полчателя*/
+  var v_PayAcc:string    = "";
+  var v_Payer:string    = "";
+  var v_RecAcc:string    = "";
+  var v_Receiver:string    = "";
+
+  var v_RealPayAcc:string    = "";
+  var v_RealRecAcc:string    = "";
+
+
+  var sPlace = "";
+  var _cur;
+  var _tDoc;
+  var v_is01 = true;
+
+  Payment = null;
+  Payment = null;
+
+  Memorial               = GenObject( "RsbMemorialOrder", 0 );
+  Payment                = Memorial.Payment();
+
+  while( flNext and next(ftxt) )
+    /*str= Win2Dos(ftxt.Str);*/
+    str= ToOEM(ftxt.Str, true);
+
+    if(StrUpr(Trim(str))== "КОНЕЦДОКУМЕНТА")
+
+      /*f_ldoc.Rec.Code_Currency= -1;*/
+      Memorial.Origin        = CB_DOC_ORIGIN_MANUAL;
+      Memorial.Oper          = {oper}; 
+      Memorial.State         = 0; /*CB_DOC_STATE_DEFERRED*/;
+      Memorial.Chapter       = 1; /*CHAPT1*/;
+      Memorial.Code_Currency = 0;
+
+      Memorial.Kind_Oper     = " 1";
+      Memorial.Origin        = CB_DOC_ORIGIN_MANUAL;
+      Memorial.LaunchOper     = true;
+      Memorial.ConnectToOper = true;
+
+      Payment.DocKind        = 70;
+      Payment.Purpose        = PM_PURP_MEMORDER;
+      Payment.ShifrOper      = "09";
+      Payment.NumberPack     = 603;
+
+
+      if(StrUpr(td)== "ПЛАТЕЖНОЕ ПОРУЧЕНИЕ")
+        v_is01 = true;
+      elif(StrUpr(td)== "ПЛАТЕЖНОЕ ТРЕБОВАНИЕ")
+        v_is01 = false;
+      else
+        println("Неизвестный для программы тип документа \""+ td+ "\""
+               );
+        return false;
+      end;
+
+      sPlace = "";
+      _cur = 0;
+      /*Если золотую корону загружаем*/
+      if(Load_Gold_Crown)
+         sPlace = PlaceAgent(SubStr(Memorial.UserField2,2), 3, _cur);
+      else
+        if(not is_Gold_Crown)
+          sPlace = PlaceAgent(SubStr(Memorial.UserField2,2), 3, _cur);
+        end;
+      end;
+
+      if(trim(sPlace)== "")
+        o_Msg = o_Msg + "\n"
+                + "----------------------------------------------------------------------------------------------------------------------------" + "\n"
+                + "Не найден пункт для агента: "+ SubStr(Memorial.UserField2,2) + "; Сумма платежа: " + Payment.PayerAmount + ";" + "\n"
+                + "Назначение платежа: " + Payment.Ground + "\n"
+                + "----------------------------------------------------------------------------------------------------------------------------";
+      end;
+
+      /*Если валюта другая, то переназначим*/
+      if(_cur != 0)
+        Memorial.Code_Currency = GetFIIDCurrency(string(_cur));
+      end;
+
+      /*Определим необходимые счета*/
+      if(not is_Gold_Crown)
+
+        if(v_is01)
+          _tDoc = 2;
+        else
+          _tDoc = 3;
+        end;
+        CheckAccDoc(_tDoc, sPlace, GetISONumberCur(Memorial.Code_Currency),  v_RealPayAcc, v_RealRecAcc);
+/*          println(sPlace);
+        else
+          println("Не найден КОД АГЕНТА: ", SubStr(Memorial.UserField2,2), ";  _cur = ", _cur);*/
+      end;
+
+      /*println("v_PayAcc = ", v_PayAcc, "; v_RecAcc = ", v_RecAcc, "; v_RealPayAcc = ", v_RealPayAcc, "; v_RealRecAcc = ", v_RealRecAcc);*/
+
+      /*Может быть такое, что счета не нашлись, поэтому оставим какие есть*/
+      if(StrLen(v_RealPayAcc) == 0)
+         v_RealPayAcc = v_PayAcc;
+      end;
+
+      if(StrLen(v_RealRecAcc) == 0)
+         v_RealRecAcc = v_RecAcc;
+      end;
+
+
+      /*Вместо наминования плательщика из файла подставим наименование счета*/
+      if (Get_Name_Account (v_RealPayAcc) != "")
+         v_Payer = Get_Name_Account (v_RealPayAcc);
+      end;
+
+      Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                          {OurBank}, 
+                          0, 
+                          "", 
+                          "",
+                          "",
+                          Memorial.Code_Currency, 
+                          1/*CHAPT1*/, 
+                          v_RealPayAcc, 
+                          0, 
+                          v_Payer, 
+                          "" );
+
+      /*Вместо наминования получателя из файла подставим наименование счета*/
+      if (Get_Name_Account (v_RealRecAcc) != "")
+         v_Receiver = Get_Name_Account (v_RealRecAcc);
+      end;
+
+      Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                          {OurBank}, 
+                          0, 
+                          "", 
+                          "",
+                          "",
+                          Memorial.Code_Currency, 
+                          1/*CHAPT1*/, 
+                          v_RealRecAcc, 
+                          0, 
+                          v_Receiver, 
+                          "" );
+
+      /*Вставляем платеж*/
+      /*Вставляем только городские платежи*/
+      /*Если золотую корону загружаем*/
+      if(Load_Gold_Crown)
+        Memorial.Update();
+      else
+        if(not is_Gold_Crown)
+          Memorial.Update();
+        end;
+      end;
+
+      return true;
+    end;
+
+    DelimStrDoc(str, _Tag, _Val);
+
+    if(_Tag=="НОМЕР")
+
+      Memorial.UserField1     = string(Trim(_Val));;
+      ln                      = StrLen(Memorial.UserField1);
+
+      if(ln>3)
+        Payment.Number = SubStr(Memorial.UserField1,ln-2);
+      else
+        Payment.Number = Memorial.UserField1;
+      end;
+
+    end;
+
+    if(_Tag=="ДАТА")
+      Payment.ClientDate         =
+      Payment.Date               =
+      Payment.PayerBankEnterDate =
+      Payment.ValueDate          = date(Trim(_Val));
+    end;
+
+    if(_Tag=="ПЛАТЕЛЬЩИКСЧЕТ")
+       v_PayAcc = Trim(_Val);
+    end;
+
+    if(_Tag=="ПЛАТЕЛЬЩИК1")
+       v_Payer = Trim(_Val);
+    end;
+
+    if(_Tag=="ПОЛУЧАТЕЛЬСЧЕТ")
+      v_RecAcc = Trim(_Val);
+    end;
+
+    if(_Tag=="ПОЛУЧАТЕЛЬ1")
+       v_Receiver = Trim(_Val);
+    end;
+
+    if(_Tag=="СУММА")
+      Payment.PayerAmount        = money(_Val);
+    end;
+
+    if(_Tag=="НАЗНАЧЕНИЕПЛАТЕЖА")
+
+      Payment.Ground  = _Val;
+
+      is_Gold_Crown = false;
+ 
+      if( p= index(Payment.Ground, " ID=") ) // Платежи РНКО
+        tmp= Trim(SubStr(Payment.Ground, p+4));
+        tmp= Trim(SubStr(tmp, 1, index(tmp, " ")));
+        Memorial.UserField2 = "Р"+ Trim(tmp);
+        is_Gold_Crown = true;
+      elif( p= index(StrUpr(Payment.Ground), " РЕЕСТР=") ) // Платежи системы "Золотая корона" по новому формату с 24.09.2010
+        tmp= Trim(SubStr(Payment.Ground, p+8));
+        tmp= Trim(SubStr(tmp, 1, index(tmp, " ")));
+        Memorial.UserField2= "R"+ Trim(tmp);
+        Payment.Ground    = NewGround( Payment.Ground );
+        flNewFormat= true;
+        is_Gold_Crown = true;
+      elif(index(StrUpr(Payment.Ground), " КОД АГЕНТА:")) /* Платежи системы "Город". Агент с двоеточием. Например:
+                          ... агент - Ф. ЗАО АКБ"ЭКСПРЕСС-ВОЛГА" В Г.ВОРОНЕЖ, код агента: 50205815 Пл-к БИН:B000328*/
+        p= index(StrUpr(Payment.Ground), " КОД АГЕНТА:");
+        Payment.Ground  = _Val;
+        tmp= Trim(SubStr(Payment.Ground, p+13));
+        /*В конце может быть пробел, а может быть и точка*/
+        tmp= Trim(StrSubst(SubStr(tmp, 1, index(tmp, " ")),".", ""));
+        Memorial.UserField2= "Г"+ Trim(tmp);
+        is_Gold_Crown = false;
+
+        /* Можно, чтобы при загрузке выписки подтягивалось назначение платежа не полностью , до определенного момента,
+        т.е. заканчивалось  код. агента 50205815, Дальше "Пл-к БИН ,,," не нужно.*/
+        if(p > 0) /*Если имеется в строке код агента*/
+           Payment.Ground  = Trim(SubStr(Payment.Ground, 1, p+21));
+        end;
+      elif(index(StrUpr(Payment.Ground), " КОД АГЕНТА ")) /* Платежи системы "Город". Агент без двоеточия. Например:
+                                                     ... реестры 20050303 на сумму 2412.56. Код агента 50205815. Без НДС.*/
+        p= index(StrUpr(Payment.Ground), " КОД АГЕНТА ");
+        Payment.Ground  = _Val;
+        tmp= Trim(SubStr(Payment.Ground, p+12));
+        /*В конце может быть пробел, а может быть и точка*/
+        tmp= Trim(StrSubst(SubStr(tmp, 1, index(tmp, " ")),".", ""));
+        Memorial.UserField2= "Г"+ Trim(tmp);
+        is_Gold_Crown = false;
+
+        /* Можно, чтобы при загрузке выписки подтягивалось назначение платежа не полностью , до определенного момента,
+        т.е. заканчивалось  код. агента 50205815, Дальше "Пл-к БИН ,,," не нужно.*/
+        if(p > 0) /*Если имеется в строке код агента*/
+           Payment.Ground  = Trim(SubStr(Payment.Ground, 1, p+20));
+        end;
+
+      end;
+    end;
+  end;
+
+  flNext= false;
+  return  false;
+
+end;
+
+/*Обработка файла выписки 1С*/ 
+macro LoadLDoc()
+ var _Tag, _Val;
+
+  flFirstFile= true;
+  flInst     = false;
+  flVersion  = false;
+  flCode     = false;
+
+  while( flNext and next(ftxt) )
+    /*str= Trim(Win2Dos(ftxt.Str));*/
+    str= Trim(ToOEM(ftxt.Str, true));
+
+    if(str!= "")
+      if(flInst)
+        DelimStrDoc(str, _Tag, _Val);
+        if(_Tag=="СЕКЦИЯДОКУМЕНТ")
+          if( not LoadRecDoc(Trim(_Val)) )
+            println("Не записан документ "+ Memorial.UserField1 + /*" "+ f_ldoc.Rec.Account_Payer+ " "+ f_ldoc.Rec.Account_Receiver+ " "+ Payment.PayerAmount +*/ "- "+ "  ID=", Memorial.UserField2);
+          end;
+        end;
+      else
+        if( index(StrUpr(str),"ВЕРСИЯФОРМАТА") )
+          if(Trim(SubStr(str,index(str,"=")+1))!= "1.00")
+            flNext= false;
+            println("Версия выгруженного файла "+ trim(_FileName)+ trim(ext)+ " не 1.00.");
+          else
+            flVersion = true;
+          end;
+        end;
+
+        if( index(StrUpr(str),"КОДИРОВКА") )
+          if(Trim(SubStr(str,index(str,"=")+1))!= "Windows")
+            flNext= false;
+            println("Кодировка выгруженного файла "+ trim(_FileName)+ trim(ext)+ " не Windows.");
+          else
+            flCode = true;
+          end;
+        end;
+
+        flInst= flVersion and flCode;
+      end;
+    end;
+  end;
+
+  flNext= false;
+end;
+/*──────────────────────────────────────────────────────────────────────────*/
+
+/*Основная макропроцедура*/ 
+macro Start()
+ var fl, err, _sel = 0;
+
+  /*Выбираем пункт меню*/
+  _sel= menu(TypeCarry, "Выберите из списка меню...", "Платежи РНКО");
+
+  if(_sel==0)
+
+     stat = SelectFile(fl, ImportDir,"Выберите файл для обработки");
+
+     if (not stat)
+       msgbox("Файл не выбран!");
+       exit(0);
+     end;
+
+     stat = Open(ftxt, fl);
+     if (not stat)
+       msgbox("Файл не открыт!");
+       exit(0);
+     end;
+
+     flNext     = true;
+     flCharSet  = false;
+     flFirstFile= false;
+
+     rewind(ftxt);
+     while( flNext and next(ftxt) )
+       str= Trim(ftxt.Str);
+       err= "";
+       
+       if(str!= "")
+         if(str== "1CClientBankExchange")
+           LoadLDoc();
+         end;
+       end;
+     end; 
+
+     if(not flFirstFile)
+       println("Не знакомый для программы тип файла "+ trim(_FileName)+ trim(ext));
+       println("─────────────────────────────────────────────────────────────────────────────────────") ;
+     end;
+
+     close(ftxt);
+
+     println(o_Msg);
+
+  elif( _sel==1 )
+/*
+    msgbox("Модуль настройки еще не готов!");
+    exit(1);
+*/
+    ExecMacroFile( "edit_rnko.mac", "SetOptions");
+
+    /*SetOptions();*/
+  end;
+
+end;
+
+Start();

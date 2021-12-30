@@ -1,0 +1,311 @@
+// -------------------------------------------------------------------------------------------------
+// @filename: AcptInAdvancePanel.mac v.1
+// @author  : 22-07-2013 TeleshovaAM C-20979
+// @desc    : Обработка панели заявления на заранее данный акцепт
+// @changes : TAM 31.10.2013 I-00438646-2 - контроль наличия ИНН в поле при поиске контрагента
+// -------------------------------------------------------------------------------------------------
+
+import Календарь, globals, RSD, BankInter, "KeyCodes.mac";
+
+//Глобальные переменные
+private var g_saveCurField; //текущее поле в панели
+private var g_Contragent_Id = 0, g_ContragentBankId = 0; //идентификаторы субъектов: контрагента по ЗДА и его банка
+private var g_party_info; //информация о субъекте для заполнения полей формы
+
+// Параметры формы договора для передачи в БД
+class ZdaContrProcParm()
+   var ContrNumber:string, 
+      ContrDate:date, 
+      ZdaEnterDate:date,
+      ZdaEndDate:date,
+      PartnerID:integer,
+      PartnerAcc:string,
+      PartnerName:string,
+      PartnerInn:string,
+      PartnerKPP:string,
+      PartnerBankId:integer,
+      LimitedSum:double,
+      ContrGround:string,
+      ContrPaymentGround:string;
+end;
+
+private class (TRecHandler) ContrPanelParm(fulloutputlbr)
+   InitTRecHandler ("zda_cntr", fulloutputlbr, TRUE);
+   var exitKey  = 0;
+   var mode     = 0; // 0 - ввод 1 - редактирование
+   var contr_id = 0; // 0 - при создании нового
+end;
+
+//Поиск контрагента по перечислениям на основе кода ИНН
+macro GetZdaContragentByInn(inn_code:string)
+    var sqlstring, cmd, data;
+    sqlstring = " SELECT   PT.T_PARTYID pt_id, PT.T_NAME pt_name, USR_UF_GETINN (COD.T_CODE) pt_inn, USR_UF_GETKPP (cod.t_code) pt_kpp" +
+                " FROM   dobjcode_dbt cod, dparty_dbt pt, dpartyown_dbt ow " +
+                " WHERE       COD.T_OBJECTTYPE = 3 " +
+                        " AND COD.T_CODEKIND = 16 " +
+                        " AND COD.T_CODE like '%" + inn_code + "%' " +
+                        " AND COD.T_OBJECTID = PT.T_PARTYID " +
+                        " and COD.T_OBJECTID = OW.T_PARTYID " +
+                        " and OW.T_PARTYKIND = 117 ";
+    cmd = RsdCommand(sqlstring);
+    cmd.execute();
+    data = RsdRecordset(cmd);
+    return data;
+end;
+
+//Поиск банка по БИКу
+private macro GetBankByBic(bic_code:string)
+    var sqlstring, cmd, data;
+    sqlstring = " SELECT   PT.T_PARTYID pt_id, PT.T_NAME pt_name, BNK.T_CORACC pt_acc " +
+                " FROM   dparty_dbt pt, dbankdprt_dbt bnk " +
+                   " WHERE PT.T_PARTYID = " +
+                         " (SELECT   BIC.T_OBJECTID " +
+                         " FROM   dobjcode_dbt bic " +
+                         " WHERE       BIC.T_OBJECTTYPE = 3 " +
+                                 " AND BIC.T_CODEKIND = 3 " +
+                                 " AND BIC.T_CODE = ?) " +
+                   " AND BNK.T_PARTYID = PT.T_PARTYID ";
+    cmd = RsdCommand(sqlstring);
+    cmd.AddParam("code", RSDBP_IN, bic_code);
+    cmd.execute();
+    data = RsdRecordset(cmd);
+    return data;
+end;
+
+//Получение информации о договоре по его идентификатору
+macro GetZdaContractInfo(cntr_id:integer)
+   var sqlstring, cmd, data;
+   sqlstring = " SELECT   zda.t_contr_number contr_number,                                               " +
+               "          zda.t_contr_date contr_date,                                                   " +
+               "          zda.t_zda_enter_date zda_enter_date,                                           " +
+               "          zda.t_zda_end_date zda_end_date,                                               " +
+               "          zda.t_contragent_id partner_id,                                                " +
+               "          NVL (pt_c.t_name, zda_c.t_contragent_name) partner_name,                       " +
+               "          NVL (zda.t_contragent_acc, ' ') partner_account,                               " +
+               "          NVL (zda.t_contragent_inn, ' ') partner_inn,                                   " +
+               "          NVL (zda.t_contragent_KPP, ' ') partner_kpp,                                   " +
+               "          zda_b.t_contrbank_id partner_bank_id,                                          " +
+               "          NVL (PT_B.T_NAME, ' ') partner_bank,                                           " +
+               "          NVL ((SELECT   BIC.T_CODE                                                      " +
+               "                 FROM   dobjcode_dbt bic                                                 " +
+               "                 WHERE  BIC.T_OBJECTTYPE = 3                                             " +
+               "                    AND BIC.T_OBJECTID = zda_b.t_contrbank_id                            " +
+               "                    AND BIC.T_CODEKIND = 3                                               " +
+               "                    AND BIC.T_STATE = 0), ' ') partner_bank_bic,                         " +
+               "         NVL ( (SELECT   BNK.T_CORACC                                                    " +
+               "                 FROM   dbankdprt_dbt bnk                                                " +
+               "                 WHERE   BNK.T_PARTYID = zda_b.t_contrbank_id), ' ') partner_bank_account," +
+               "         zda.t_limited_sum contr_limited_sum,                                            " +
+               "         NVL (zda.t_note, ' ') contr_note,                                               " +
+               "         NVL (zda.t_note_for_ground, ' ') contr_ground_note                              " +
+               " FROM   usr_zda_contr_dbt zda,                                                           " +
+               "        usr_zda_contr_dbt zda_c LEFT JOIN dparty_dbt pt_c                                " +
+               "                                ON (zda_c.t_contragent_id = pt_c.t_partyid),             " +
+               "        usr_zda_contr_dbt zda_b LEFT JOIN dparty_dbt pt_b                                " +
+               "                                ON (zda_b.t_contrbank_id = pt_b.t_partyid)               " +
+               " WHERE       zda.t_contr_id = ?                                                          " +
+               "         AND zda_c.t_contr_id = zda.t_contr_id                                           " +
+               "         AND zda_b.t_contr_id = ZDA.t_contr_id                                           ";
+   cmd = RsdCommand(sqlstring);
+   cmd.AddParam("id", RSDBP_IN, cntr_id);
+   cmd.execute();
+   data = RsdRecordset(cmd);
+   return data;
+end;
+
+//Инициализация панели
+private macro InitContrPanel(dlg:ContrPanelParm):bool
+   if(dlg.mode == 0)
+      dlg.rec.contr_date = {curdate}; 
+      dlg.rec.zda_enter_date = {curdate};
+      dlg.rec.zda_end_date = date(0,0,0);
+      dlg.rec.lnk_to_partner = "X"; 
+   elif (dlg.mode == 1)
+      g_party_info = GetZdaContractInfo(dlg.contr_id);
+      if(g_party_info.movenext())
+         dlg.rec.contr_number = g_party_info.value("contr_number");
+         dlg.rec.contr_date = g_party_info.value("contr_date");
+         if(g_party_info.value("partner_id") != 0)
+            dlg.rec.lnk_to_partner = "X";
+         end;
+         dlg.rec.partner_name = g_party_info.value("partner_name");
+         dlg.rec.partner_inn = ifthenelse(g_party_info.value("partner_id") == 0, g_party_info.value("partner_inn"), GetPartyINN(g_party_info.value("partner_id"),0));
+         dlg.rec.partner_kpp = g_party_info.value("partner_kpp");
+         g_Contragent_Id = g_party_info.value("partner_id");
+         dlg.rec.partner_account = trim(g_party_info.value("partner_account"));
+         dlg.rec.partner_bank = g_party_info.value("partner_bank");
+         dlg.rec.partner_bank_inn = GetPartyINN(g_party_info.value("partner_bank_id"),1);
+         g_ContragentBankId = g_party_info.value("partner_bank_id");
+         dlg.rec.partner_bank_bic = g_party_info.value("partner_bank_bic");
+         dlg.rec.partner_bank_account = g_party_info.value("partner_bank_account");
+         dlg.rec.zda_enter_date = ifthenelse( (g_party_info.value("zda_enter_date") == ORA_ZERO_DATE), date(0,0,0), g_party_info.value("zda_enter_date"));
+         dlg.rec.zda_end_date = ifthenelse( (g_party_info.value("zda_end_date") == ORA_ZERO_DATE), date(0,0,0), g_party_info.value("zda_end_date"));
+         dlg.rec.limited_sum = g_party_info.value("contr_limited_sum");
+         dlg.rec.contr_note = g_party_info.value("contr_note");
+         dlg.rec.note_for_ground = g_party_info.value("contr_ground_note");
+      end;
+   end;
+end;
+
+// Проверить параметры панели
+private macro CheckPanel( dlg:ContrPanelParm ):bool
+   // Проверяем заданность всех обязательных полей
+   var emptyField = "", gotoField = "";
+   if( dlg.rec.contr_number == "" ) 
+      gotoField = "contr_number";
+      emptyField = "Номер договора";
+   elif(dlg.rec.zda_enter_date == date(0, 0, 0)) 
+      gotoField = "contr_date";
+      emptyField = "Дата поступления ЗДА";
+   elif(dlg.rec.partner_name == "") 
+      gotoField = "partner_name";
+      emptyField = "Наименование контрагента";
+   elif(dlg.rec.partner_inn == "") 
+      gotoField = "partner_inn";
+      emptyField = "ИНН контрагента";
+   //Требования могут приходить от нескольких счетов контрагента: TAM 01.10.2013
+   /*elif(dlg.rec.partner_account == "") 
+      gotoField = "partner_account";
+      emptyField = "Счет контрагента"; */
+   //Требования могут быть из разных банков
+   /*elif(dlg.rec.partner_bank == "") 
+      gotoField = "partner_bank";
+      emptyField = "Наименование банка контрагента";
+   elif(dlg.rec.partner_bank_bic == "") 
+      gotoField = "partner_bank_bic";
+      emptyField = "БИК банка контрагента";
+   elif(dlg.rec.partner_bank_account == "") 
+      gotoField = "partner_bank_account";
+      emptyField = "Кор. счет банка контрагента";*/
+   elif(dlg.rec.zda_end_date == date(0, 0, 0))
+      dlg.rec.zda_end_date = (date(1,1,2) - 365);
+   end;
+   
+   if( emptyField != "" )
+      SetFocus(dlg, FldIndex(dlg,gotoField));
+      msgbox("Для формирования договора необходимо заполнить поле <" + emptyField + ">.");
+      return false;
+   end;
+  
+  return true;
+end;
+
+// Обработчик панели
+private macro EvenPanel(dlg, cmd, id, key)
+   var curFld = FldName (dlg, id);
+   var res;
+   var MenuChoice;
+   if(cmd == DLG_INIT)
+      InitContrPanel(dlg);
+      UpdateFields(dlg); 
+   elif( cmd == DLG_SETFOCUS )
+      g_saveCurField = dlg.item(id);
+   elif( cmd == DLG_REMFOCUS )
+      UpdateFields(dlg); 
+   elif( cmd == DLG_KEY )
+      if ( key == KEY_F3 )
+         if (curFld == "contr_date") 
+            dlg.rec.contr_date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         elif (curFld == "zda_enter_date") 
+            dlg.rec.zda_enter_date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         elif (curFld == "zda_end_date") 
+            dlg.rec.zda_end_date = GetDateByCalendar ({curDate});
+            UpdateFields(dlg);
+         end;
+      elif ( key == KEY_ENTER )
+         if( curFld == "partner_inn" )
+            // TAM 31.10.2013 I-00438646-2
+            if((dlg.rec.lnk_to_partner == "X") and (trim(dlg.rec.partner_inn) != "")) //ссылаемся на справочник контрагентов
+               g_party_info = GetZdaContragentByInn(dlg.rec.partner_inn); 
+               if(g_party_info.movenext())
+                  dlg.rec.partner_name = g_party_info.value("pt_name");
+                  dlg.rec.partner_inn = g_party_info.value("pt_inn");
+                  dlg.rec.partner_kpp = g_party_info.value("pt_kpp");
+                  g_Contragent_Id = g_party_info.value("pt_id");
+               else
+                  msgbox("Контрагент с таким ИНН в списке контрагентов отсутствует!");
+                  dlg.rec.partner_inn = "";
+               end;
+            else
+               msgbox("В заявлении отключена привязка на справочник контрагентов, или вы не указали ИНН. Заполните ИНН.");
+               dlg.rec.partner_inn = "";
+            end;
+         elif( curFld == "partner_bank_bic" )
+            g_party_info = GetBankByBic(dlg.rec.partner_bank_bic); 
+            if(g_party_info.movenext())
+               dlg.rec.partner_bank = g_party_info.value("pt_name");
+               dlg.rec.partner_bank_account = g_party_info.value("pt_acc");
+               g_ContragentBankId = g_party_info.value("pt_id");
+               dlg.rec.partner_bank_inn = GetPartyINN(g_ContragentBankId, 1);
+            else
+               msgbox("Банк с таким БИК нет среди банков!");
+               dlg.rec.partner_bank_bic = "";
+            end;
+         end;
+      elif ( key == KEY_SPACE )
+         if( curFld == "lnk_to_partner" )
+            if(dlg.rec.lnk_to_partner == "X")
+               dlg.rec.lnk_to_partner = "";
+            else
+               dlg.rec.lnk_to_partner = "X";
+            end;
+         end;
+      elif ( key == KEY_F9 )
+         if( CheckPanel( dlg ) ) //проверки перед сохранением, чтобы были заполнены обязательные поля
+            dlg.exitKey = key;
+            return CM_SAVE;
+         end;
+         return CM_IGNORE;
+      elif ( key == KEY_ESC )
+         dlg.exitKey = key;
+         return CM_SAVE;
+      end;
+      UpdateFields( dlg );
+   end;   
+end; 
+
+//заполнение параметров для передачи в БД
+private macro FillProcParm(dlg:ContrPanelParm, procParm:@ZdaContrProcParm)
+   debugbreak;
+   procParm.ContrNumber = dlg.rec.contr_number;
+   procParm.ContrDate = dlg.rec.contr_date;
+   if(dlg.rec.lnk_to_partner == "X")
+      procParm.PartnerId = g_Contragent_Id;
+   else
+      procParm.PartnerId = 0;
+   end;
+   procParm.PartnerName        = dlg.rec.partner_name;
+   procParm.PartnerAcc         = dlg.rec.partner_account;
+   procParm.PartnerKPP         = dlg.rec.partner_kpp;
+   procParm.PartnerInn         = dlg.rec.partner_inn;
+   if(dlg.rec.partner_bank_bic == "")
+      g_ContragentBankId = 0;
+   end;
+   procParm.PartnerBankId      = g_ContragentBankId;
+   procParm.ZdaEnterDate       = dlg.rec.zda_enter_date;
+   procParm.ZdaEndDate         = dlg.rec.zda_end_date;
+   procParm.LimitedSum         = dlg.rec.limited_sum;
+   procParm.ContrGround        = dlg.rec.contr_note;
+   procParm.ContrPaymentGround = dlg.rec.note_for_ground;
+end; 
+
+macro ContrParmZdaPanel( PanelParm:@ZdaContrProcParm, panel_mode, contract_id ):integer
+   debugbreak;
+   var Fulloutputlbr, outlbr, outputlbr="zda_contr.lbr";                    
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\LBRDIR",2,outlbr);
+   Fulloutputlbr = FindPath(outputlbr, outlbr);
+   if (not Fulloutputlbr)
+      msgbox("Не найдена LBR");
+      exit();
+   end;
+   var dlg:ContrPanelParm = ContrPanelParm(Fulloutputlbr);
+   dlg.mode = panel_mode;
+   dlg.contr_id = contract_id;
+   RunDialog(dlg, @EvenPanel);
+   if( dlg.exitKey == KEY_F9 )
+      FillProcParm( dlg, @PanelParm );
+   end;
+   return dlg.exitKey;
+end;

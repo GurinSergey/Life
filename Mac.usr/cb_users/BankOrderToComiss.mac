@@ -1,0 +1,204 @@
+// KS 22.10.2010 I-068571 Процедура массовой проводки комиссий из внешних систем
+// Макрос процедур, реализующих заявку
+
+import pm_chkrst, cbsttls;
+
+// Проверка банковского ордера.
+// Устанавливается подходит ли корреспонденция и пользовательский тип
+// под технологию проводки комиссий из внешних систем
+macro ПроверкаБОКомиссия( PaymentObj )
+
+  var obj:object;
+/*SDA как справедливо заметил А.Тихомиров, ни у мультивалютного 
+      ни у сводного пользовательского типа документа нет        */
+/*
+  if  (PaymentObj.Dockind==CB_MULTYDOC)
+    obj = GenObject( "RsbMultyDoc", PaymentObj.DocumentID );
+  elif(PaymentObj.Dockind==DLDOC_SUMMARY_MEMORDER)
+    obj = GenObject( "RsbSummaryMemorialOrder", PaymentObj.DocumentID );
+  else //По идее, только DLDOC_MEMORIALORDER
+*/
+
+  if(PaymentObj.Dockind==DLDOC_MEMORIALORDER)
+    obj = GenObject( "RsbMemorialOrder", PaymentObj.DocumentID );
+    if (index(obj.UserTypeDocument,"К") > 0)               // Пользовательский тип К (Кирилл и Мефодий)
+      return 1;                                            // Это наш случай
+    end;
+  end;
+
+  return 0;
+end;
+
+// Проверка средств
+private macro BO_CheckPayerAccount(Account, FIID, Amount,Payment:RsbPayment,obj:object):integer
+var RestDebet;
+  if( СчетПассивный(Account, obj.Chapter, FIID) and 
+      ( not ЕстьПарныйСчет( Account, obj.Chapter, FIID ) ) )
+
+/*    RestDebet = AccGetFreeAmount( Account, obj.Chapter,FIID, Payment.Priority, Payment.ClaimID, {curdate} );*/
+/*SDA */
+    AccGetFreeAmount( RestDebet, null, Account, obj.Chapter,FIID, {curdate}, Payment.Priority, Payment.ClaimID); 
+    if( RestDebet < Amount )
+      return 1; //Недостаточно средств для списания со счёта
+    end;
+  end;
+    
+  return 0;  //Достаточно средств для списания со счёта
+end;
+
+MACRO BO_CheckAccRest( Payment:RsbPayment ):integer
+
+  var stat = 0;//:integer = PM_CheckAccRestCommon( Payment );
+  var obj:object;
+  var pmaddpi_rs;
+  var ret;
+
+if  (Payment.Dockind==CB_MULTYDOC)
+    obj = GenObject( "RsbMultyDoc", Payment.DocumentID );
+elif(Payment.Dockind==DLDOC_SUMMARY_MEMORDER)
+    obj = GenObject( "RsbSummaryMemorialOrder", Payment.DocumentID );
+else //По идее, только DLDOC_MEMORIALORDER
+    obj = GenObject( "RsbMemorialOrder", Payment.DocumentID );
+end;
+
+  //Проверяем плательщика
+  if((Payment.Dockind==DLDOC_SUMMARY_MEMORDER) and (not Payment.IsFixPayerAmount) )
+  //Для сводных проверяем все счета разноски  
+    pmaddpi_rs = RsdRecordset("SELECT * FROM dpmaddpi_dbt pma WHERE pma.t_PaymentID="+Payment.PaymentID);
+    while(pmaddpi_rs.moveNext)
+      if((ret=BO_CheckPayerAccount(pmaddpi_rs.value("t_Account"),pmaddpi_rs.value("t_FIID"),pmaddpi_rs.value("t_Amount"),Payment,obj))!=2) 
+        return ret;
+      end;
+    end;
+  else
+    //Если не сводный или сумма плательщика не распределённая (Payment.IsFixPayerAmount==true), 
+    //то просто проверим остаток на счете плательщика
+    if((ret=BO_CheckPayerAccount(Payment.PayerAccount,Payment.PayerFIID,Payment.FuturePayerAmount,Payment,obj))!=2) 
+      return ret;
+    end;
+  end;
+  return 0;
+
+END;
+
+// Порождаем платеж
+macro ComCreatePayment(BO_Payment)
+
+  var paymtr:RsbPaymTransaction = BO_Payment.MakeTransaction();
+
+  var error, stat;
+
+  var Payment:RsbPayment = null; // платеж 
+  var BankPayment:object = null; // первичный документ
+
+    BankPayment = GenObject( "RsbPsPayOrder", 0 );
+    Payment     = BankPayment.Payment();
+
+    BankPayment.Origin     = 7; //CB_DOC_ORIGIN_MANUAL;
+    BankPayment.DocKind    = 2; // требование
+    BankPayment.Oper       = BO_Payment.Oper; 
+
+    BankPayment.AcceptTerm = 1; // Без акцепта
+
+    Payment.DocKind        = Payment.PrimDocKind = PS_PAYORDER;
+    Payment.Purpose        = PM_PURP_POPRIMARY;
+    Payment.ShifrOper      = "02";
+    
+    Payment.BaseFIID       =
+    Payment.PayerFIID      = 
+    Payment.ReceiverFIID   = BO_Payment.PayerFIID;
+  
+    Payment.BaseAmount     = 
+    Payment.ReceiverAmount = 
+    Payment.PayerAmount    = BO_Payment.PayerAmount;
+
+     //Заполняем поля документа
+   
+     paymtr.Chapter = 1;
+     paymtr.FIIDPayer = BO_Payment.PayerFIID;
+     paymtr.Sum = BO_Payment.PayerAmount;
+     paymtr.Number_Pack = BO_Payment.NumberPack;
+   
+     paymtr.ResultCarry = AVIZOCARRY;
+   
+     paymtr.Kind_Oper  = " 1";
+
+     paymtr.Shifr_Oper = "09";
+
+     paymtr.AccountPayer      = BO_Payment.FuturePayerAccount;
+     paymtr.AccountReceiver   = BO_Payment.FutureReceiverAccount;
+
+     paymtr.Date_Carry    = {curdate};
+     paymtr.Date_Value    = {curdate};
+
+     paymtr.Department    = BO_Payment.Department;
+   
+     paymtr.Ground        = BO_Payment.Ground;
+     paymtr.Numb_Document = BO_Payment.Number;     
+
+  Payment.ReceiverMesBankID = BO_Payment.PayerMesBankID;
+  Payment.PayerMesBankID    = BO_Payment.ReceiverMesBankID;
+
+  stat = Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                               {OurBank}, 
+                               PTCK_BIC,
+                               "", 
+                               "",
+                               "",
+                               BO_Payment.FuturePayerFIID, 
+                               1, //CHAPT1 
+                               BO_Payment.FuturePayerAccount,
+                               BO_Payment.Payer,
+                               BO_Payment.PayerName,
+                               BO_Payment.PayerINN,
+                               PTCK_CONTR,
+                               ПолучитьКодСубъекта({OurBank}, PTCK_CONTR, error) 
+                             );
+
+  if( stat ) return 1; end;
+
+  stat = Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                BO_Payment.ReceiverBankID, 
+                                PTCK_BIC, 
+                                "", 
+                                "",
+                                "",
+                                BO_Payment.ReceiverFIID, 
+                                1, //CHAPT1 
+                                BO_Payment.ReceiverAccount,
+                                BO_Payment.Receiver,
+                                BO_Payment.ReceiverName,
+                                BO_Payment.ReceiverINN,
+                                PTCK_CONTR,
+                                ПолучитьКодСубъекта(BO_Payment.Receiver, BO_Payment.ReceiverCodeKind, error) 
+                              );
+  if( stat ) return 1; end;
+  
+  Payment.ToBackOffice      = "";
+
+  Payment.SubPurpose        = 0;
+  Payment.ValueDate         = {CurDate};
+  Payment.Number      = BO_Payment.Number;
+  Payment.Priority    = BO_Payment.Priority;
+  Payment.PaymentKind = "Э";
+  
+  Payment.FeeType           = 1;
+  Payment.DefComID          = 0;//BO_Payment.DefComID; // Техническая комиссия
+  Payment.NumberPack        = BO_Payment.NumberPack;
+  
+  Payment.ReceiverBankMarkDate  = 
+  Payment.PayerBankEnterDate  = date(0,0,0); 
+  Payment.IsFactPaym            = "";
+
+  Payment.OutTransferDate = {CurDate};
+  
+  Payment.Ground = BO_Payment.Ground;
+
+  Payment.Date               = {CurDate};
+  Payment.PayDate            = {CurDate};
+  Payment.ClientDate         = {CurDate};
+  Payment.PayerChargeOffDate = date(0,0,0);
+
+end;
+
+end;

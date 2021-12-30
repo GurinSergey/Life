@@ -1,0 +1,1474 @@
+/************************************************************************/
+/* ОТЧЕТ "Удаленные, Отвергнутые, Введенные в Архив документы РКО"      */
+/*                                                                      */
+/* Юшманов Дмитрий                                                      */
+/* Начато 19.06.2013                                                    */
+/*                                                                      */
+/* По мотивам заявки C-22356 (C-19151-6)                                */
+/*                                                                      */
+/************************************************************************/
+
+import bankinter, RsbDataSet, rsexts, globals, RsbFormsInter, rslx, pm_common;
+import "KeyCodes.mac", "lib_const.mac";
+
+private const
+    TYPE_INTEGER = 1,
+    TYPE_STRING = 7,
+    TYPE_DATE = 9,
+    TYPE_TIME = 10,
+    RES_SIZE = 7, //размер структуры массива результатов
+                  // 0 - код вида (dockind)
+                  // 1 - наименование вида
+                  // 2 - код источника
+                  // 3 - наименование источника (source)
+                  // 4 - количество документов
+                  // 5 - операционист
+                  // 6 - paymentid, debug
+    DOCKIND_SIZE = 4,   //размер структуры массива видов документов
+    SOURCE_SIZE = 3,    //размер структуры массива источников документов
+    TYPE_SIZE = 2,      //размер структуры массива типов документов
+    DELETED = 0,    //выводить в отчёт удалённые документы
+    OUTCASTED = 1,  //выводить в отчёт отверженные документы
+    ARCHIEVED = 2;  //выводить в отчёт введённые в архиве документы
+
+private var 
+    aDockind = TArray(), 
+    aSource = TArray(),
+    aType = TArray(),
+    aResult = TArray(),
+    chosenType : integer = 0,
+    startDate : Date = {curdate} - 30, //текущий опердень минус календарный месяц
+    endDate : Date = {curdate},
+    strDayExists : string = "", //дни, за которые отсутствуют платежи
+    strFisclogExists : string = "", //дни, за которые фисклог не имеет записей. Совсем.
+    fisclogIsEmpty : bool = false, //флаг "за заданый период фискальный журнал пуст"
+    formRun : bool = false,
+    debugMode = false,
+    debugNumDocs : integer = 10;
+
+
+//диалоговая панель с параметрами фильтра
+private class (TRsbPanel) RslPanel(caption: string)
+/*----------------------------------------------------------------------------*/
+    var endOfMultiSelect : bool = false,
+        ctrlName : string = "",
+        m_combo: TRSBComboBox = TRSBComboBox();
+/*----------------------------------------------------------------------------*/
+    //добавление на панель текстовой метки
+    macro addLabelField(name: string, x: integer, y: integer)
+    var m_label: TRSBLabel;
+
+        m_label = TRSBLabel(x, y, name);
+        addLabel(m_label);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель выпадающего списка
+    macro addComboBox(name: string, posX: integer, posY: integer, sizeX: integer, sizeY: integer)
+    var i: integer;
+
+        m_combo.setPosition(posX, posY);
+        m_combo.setSize(sizeX, sizeY);
+        for (i, 0, aType.size/TYPE_SIZE-1)
+            m_combo.addChoice(i, aType[i*TYPE_SIZE+1]);
+        end;
+        m_combo.currentChoice = 0;
+        m_combo.bindValue("chosenType");
+        addControl(m_combo);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель поля ввода
+    macro addEditField(name: string, dataType: integer, val: variant, textLen: integer, editFlag: bool, 
+                       focusFlag: bool, posX: integer, posY: integer, sizeX: integer, sizeY: integer)
+    var m_edit: TRSBEditField = TRsbEditField(dataType);
+
+        m_edit.name = name;
+        m_edit.setPosition(posX, posY);
+        m_edit.setSize(sizeX, sizeY);
+        m_edit.textLength = textLen;
+        m_edit.editable = editFlag;
+        m_edit.focusable = focusFlag;
+        m_edit.value = val;
+        addControl(m_edit);
+    end;
+/*----------------------------------------------------------------------------*/
+    //добавление на панель чекбокса
+    macro addCheckBox(name: string, posX: integer, posY: integer)
+    var m_checkbox: TRSBCheckBox = TRSBCheckBox();
+
+        m_checkbox.name = name;
+        m_checkbox.setPosition(posX,posY);
+        m_checkbox.checked = false;
+        addControl(m_checkbox);
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработка выбора элемента скроллинга
+    macro scrollElement (ctrlName, rs, pArray, structSize, cmpStr)
+    var i : integer = 0;
+
+        if (ctrlName == "formSourceEdit")
+            for (i, 0, pArray.size/structSize)
+                if (pArray[structSize*i+2] == rs.value(cmpStr))
+                    pArray[structSize*i] = (pArray[structSize*i] == false); //инвертируем элемент
+                end;
+            end;
+        else
+            for (i, 0, pArray.size/structSize)
+                if (pArray[structSize*i+1] == rs.value(cmpStr))
+                    pArray[structSize*i] = (pArray[structSize*i] == false); //инвертируем элемент
+                end;
+            end;
+        end;
+
+        return pArray;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработчик событий скроллингов
+    macro scrollEvent (rs, cmd, id, key)
+    var i : integer = 0;
+
+        if (cmd == DLG_INIT)
+            endOfMultiSelect = false;
+            addMultiAction(rs, KEY_ENTER);
+
+        elif (cmd == DLG_MSEL)
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, "t_dockind");
+            elif (ctrlName == "formSourceEdit")
+                aSource = scrollElement(ctrlName, rs, aSource, SOURCE_SIZE, "srcname");
+            end;
+            return CM_MSEL_CONT_CLEAR;
+
+        elif (cmd == DLG_MSELEND)
+            endOfMultiSelect = true;
+
+        elif ((cmd == DLG_KEY) and (endOfMultiSelect))
+            return CM_CANCEL;
+
+        elif ((cmd == DLG_KEY) and (key == KEY_ENTER))
+            if   (ctrlName == "formDockindEdit")
+                aDockind = scrollElement(ctrlName, rs, aDockind, DOCKIND_SIZE, "t_dockind");
+            elif (ctrlName == "formSourceEdit")
+                aSource = scrollElement(ctrlName, rs, aSource, SOURCE_SIZE, "srcname");
+            end;
+            return CM_SELECT;
+        end;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //вспомогательное заполнение массива для построения скроллинга
+    macro addCol (ar, ind, fld, head, width, rdonly)
+        ar.value (ind * 6) = fld;
+        ar.value (ind * 6 + 1) = head;
+        ar.value (ind * 6 + 2) = width;
+        ar.value (ind * 6 + 3 ) = 2;  // fldType
+        ar.value (ind * 6 + 4 ) = -1; // decPoint
+        ar.value (ind * 6 + 5 ) = 0;  // reserv
+    end;
+/*----------------------------------------------------------------------------*/
+    //общие для скроллингов действия
+    macro quickScroll(rs, col, numCols, pArray, structSize, ctrlName)
+    var tempstr : string = "",
+        moreThanOne : bool = false,
+        i : integer = 0;
+
+        RunScroll(rs, numCols, col, Null, R2M(this, "scrollEvent"));
+
+        //пересчёт содержимого "подвала" для выбранного фильтра
+        for (i, 0, pArray.size/structSize)
+            if (pArray[structSize*i])
+                if (tempstr == "") tempstr = pArray[structSize*i+2]
+                else moreThanOne = true
+                end;
+            end;
+        end;
+        if (tempstr == "") tempstr = "ВСЕ" end;
+        if (moreThanOne) tempstr = "Несколько" end;
+
+        getControl(ctrlName).value = tempstr;
+
+    end;
+/*----------------------------------------------------------------------------*/
+    //обработчик события "нажатие клавиши" для всей экранной формы
+    macro onKeyPress (RsbEvent: object)
+    var i : integer = 0;
+
+        //сброс выбранного параметра фильтра
+        if (RsbEvent.KeyCode == KEY_F4)
+
+            ctrlName = RsbEvent.source.name;
+
+            if   (ctrlName == "formDockindEdit")
+                for (i, 0, aDockind.size/DOCKIND_SIZE) aDockind[DOCKIND_SIZE*i] = false; end;
+                getControl("formDockindEdit").value = "ВСЕ";
+            elif (ctrlName == "formSourceEdit")
+                for (i, 0, aSource.size/SOURCE_SIZE) aSource[SOURCE_SIZE*i] = false; end;
+                getControl("formSourceEdit").value = "ВСЕ";
+            end;
+
+        //запуск скроллингов для параметров фильтров
+        elif (RsbEvent.KeyCode == KEY_F3)
+        var col = TArray(),
+            tempstr : string = "",
+            rs;
+
+            ctrlName = RsbEvent.source.name;
+
+            if (ctrlName == "formDockindEdit")
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "t_dockind", "Код вида документа", 15, true);
+                addCol(col, 2, "t_name", "Вид документа", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aDockind.size/DOCKIND_SIZE-1)
+                    if (aDockind[DOCKIND_SIZE*i]) tempstr = tempstr + "," + aDockind[DOCKIND_SIZE*i+1] end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when t_dockind in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                    "select " + tempstr, 
+                    "\n     t_dockind, ",
+                    "\n     t_name, ",
+                    "\n     substr(t_strorigin, ",
+                    "\n            length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+                    "\n from ",
+                    "\n ( select t.t_dockind, ",
+                    "\n          t.t_name, ",
+                    "\n          replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+                    "\n     from doprkdoc_dbt t ",
+                    "\n    where CONNECT_BY_ISLEAF = 1 ",
+                    "\n      and t_dockind != 320 ", //заглушка до выяснения
+                    "\n    start with t.t_dockind = 29 ",
+                    "\n  connect by prior t_dockind = t_parentdockind ",
+                    "\n    UNION ",
+                    "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+                    "\n     from doprkdoc_dbt w ",
+                    "\n    where w.t_dockind = 200 ",
+                    "\n    UNION ",
+                    "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+                    "\n     from doprkdoc_dbt w ",
+                    "\n    where w.t_dockind = 320 )",
+                    "\n order by t_dockind " ),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 3, aDockind, DOCKIND_SIZE, ctrlName);
+
+            elif (ctrlName == "formSourceEdit")
+            var strDockind : string = "";
+
+                for (i, 0, aDockind.size/DOCKIND_SIZE)
+                    if (aDockind[DOCKIND_SIZE*i] == true)
+                        strDockind = strDockind + "," + aDockind[DOCKIND_SIZE*i+1];
+                    end;
+                end;
+
+                if (substr(strDockind,1,1) == ",")
+                    strDockind = substr(strDockind,2);
+                end;
+
+                if (strDockind != "")
+                    strDockind = " and t.t_dockind in (" + strDockind + ") ";
+                end;
+
+                addCol(col, 0, "chosen", "Выбор", 5, true);
+                addCol(col, 1, "srcname", "Источник документа", 30, true);
+
+                //добавляем в скроллинг колонку с индикацией записей, которые уже выбраны пользователем
+                for (i, 0, aSource.size/SOURCE_SIZE-1)
+                    if (aSource[SOURCE_SIZE*i]) tempstr = tempstr + ",'" + aSource[SOURCE_SIZE*i+2] + "'"; end;
+                end;
+
+                if (tempstr != "")
+                    tempstr = "case when big.srcname in (" + substr(tempstr,2) + ") then 'X' else '' end chosen,";
+                else
+                    tempstr = "'' chosen,";
+                end;
+
+                rs = RsdRecordSet(string(
+                  "select distinct " + tempstr,
+                  "\n       big.* ",
+                  "\n  from ( ",
+                  "\n       select lval.t_name srcname ",
+                  "\n         from ( ",
+                  "\n              select t_dockind, ",
+                  "\n                     t_name, ",
+                  "\n                     substr(t_strorigin, length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+                  "\n                from ( ",
+                  "\n                     select t.t_dockind, ",
+                  "\n                            t.t_name, ",
+                  "\n                            replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+                  "\n                       from doprkdoc_dbt t ",
+                  "\n                      where CONNECT_BY_ISLEAF = 1 ",
+                  "\n                        and t.t_dockind != 320 ", //у 320-ого документа нет справочника происхождений, исправлено ниже
+                  "\n                      start with t.t_dockind = 29 ",
+                  "\n                    connect by prior t_dockind = t_parentdockind ",
+                  "\n                     UNION ",
+                  "\n                     select w.t_dockind, ",
+                  "\n                            w.t_name, ",
+                  "\n                            '/1660' t_strorigin ",
+                  "\n                       from doprkdoc_dbt w ",
+                  "\n                      where w.t_dockind = 200 ",
+                  "\n                     UNION ",
+                  "\n                     select w.t_dockind, ",
+                  "\n                            w.t_name, ",
+                  "\n                            '/1660' t_strorigin ",
+                  "\n                       from doprkdoc_dbt w ",
+                  "\n                      where w.t_dockind = 320 ) ",
+                  "\n              ) t, ",
+                  "\n              dllvalues_dbt lval ",
+                  "\n        where t.t_origin = lval.t_list ",
+                  "\n " + strDockind,
+                  "\n       ) big "),
+                    RSDVAL_CLIENT, RSDVAL_STATIC);
+
+                quickScroll(rs, col, 2, aSource, SOURCE_SIZE, ctrlName);
+
+            end;
+
+        //запуск отчёта
+        elif (RsbEvent.KeyCode == KEY_F2)
+            startDate = getControl("formDateStart").value;
+            endDate   = getControl("formDateEnd").value;
+            chosenType = m_combo.currentChoice;
+            debugMode = getControl("formIDsCheckBox").checked;
+            debugNumDocs = int(getControl("formIDsEdit").value);
+            formRun = true;
+            close(1);
+        end;
+
+    end;
+
+
+/*----------------------------------------------------------------------------*/
+//создание экранной формы
+    macro init(caption: string)
+    var formDockindArr = TArray(),
+        formSourceArr = TArray(),
+        formTypeArr = TArray(),
+        editString = 9000,
+        editLength = 25,
+        editHeight = 1,
+        alLeft = 4, 
+        Line = 1,
+        alStartDate = alLeft + 20,
+        alFinDate = alLeft + 32,
+        alCombo = alLeft + 16;
+
+        setCaption(caption);
+        setposition(15,5);
+        setsize(48,11);
+        addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "onKeyPress"));
+        setStatus("F2: Запуск отчёта, F3: Список значений, F4: Сброс поля");
+
+        //инициализация массивов параметров фильтра:
+        //вид первичного документа
+        var rs = RsdRecordSet(string(
+        "   select t_dockind, ",
+        "\n        t_name, ",
+        "\n        substr(t_strorigin, ",
+        "\n               length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+        "\n from ",
+        "\n ( select t.t_dockind, ",
+        "\n          t.t_name, ",
+        "\n          replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+        "\n     from doprkdoc_dbt t ",
+        "\n    where CONNECT_BY_ISLEAF = 1 ",
+        "\n      and t.t_dockind != 320 ",
+        "\n    start with t.t_dockind = 29 ",
+        "\n  connect by prior t_dockind = t_parentdockind ",
+        "\n    UNION ",
+        "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+        "\n     from doprkdoc_dbt w ",
+        "\n    where w.t_dockind = 200 ",
+        "\n    UNION ",
+        "\n   select w.t_dockind, w.t_name, '/1660' t_strorigin ",
+        "\n     from doprkdoc_dbt w ",
+        "\n    where w.t_dockind = 320 )" ));
+        var i : integer = 0;
+        while (rs.moveNext)
+            aDockind[DOCKIND_SIZE*i] = false;
+            aDockind[DOCKIND_SIZE*i+1] = rs.value("t_dockind");
+            aDockind[DOCKIND_SIZE*i+2] = rs.value("t_name");
+            aDockind[DOCKIND_SIZE*i+3] = rs.value("t_origin");
+            i = i + 1;
+        end;
+
+        rs = RsdRecordSet(string(
+          " SELECT distinct lval.t_element ",
+          "\n       ,lval.t_name srcname ",
+          "\n   FROM dllvalues_dbt lval ",
+          "\n       ,doprkdoc_dbt kdoc ",
+          "\n  WHERE lval.t_list = kdoc.t_origin ",
+          "\n  ORDER BY lval.t_name, lval.t_element " ));
+        i = 0;
+        while (rs.moveNext)
+            aSource[SOURCE_SIZE*i] = false;
+            aSource[SOURCE_SIZE*i+1] = rs.value("t_element");
+            aSource[SOURCE_SIZE*i+2] = rs.value("srcname");
+            i = i + 1;
+        end;
+
+        //типы документов
+        rs = RsdRecordSet(string(
+          " SELECT rownum t_numtype, decode(rownum, 1, 'Удаленные', 2, 'Отвергнутые', 'Введённые в архив') t_type ",
+          " FROM dual CONNECT BY level <= 3 "));
+        i = 0;
+        while (rs.moveNext)
+            aType[TYPE_SIZE*i]   = rs.value("t_numtype");
+            aType[TYPE_SIZE*i+1] = rs.value("t_type");
+            i = i + 1;
+        end;
+
+        //создание элементов экранной формы
+        addLabelField("Дата окончания обработки:", alLeft, Line);
+        addLabelField("с", alStartDate-2, Line);
+        addEditField("formDateStart", TYPE_DATE, startDate, 10, true, true, alStartDate, Line, 9, 1);
+        addLabelField("по", alFinDate-2, Line);
+        addEditField("formDateEnd", TYPE_DATE, endDate, 10, true, true, alFinDate, Line, 9, 1);
+        Line = Line + 1;
+        addLabelField("Внимание! Поиск документов с типом \"Удаленные\"", alLeft, Line);
+        Line = Line + 1;
+        addLabelField("осуществляется по датам выполнения транзакции", alLeft, Line);
+        Line = Line + 1;
+        addLabelField("удаления, зафиксированным в фискальном журнале.", alLeft, Line);
+        Line = Line + 2;
+
+        addLabelField("Вид документа:", alLeft, Line);
+        addEditField("formDockindEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Источник поступления:", alLeft, Line);
+        addEditField("formSourceEdit", TYPE_STRING, "ВСЕ", editString, true, true, alCombo, Line, editLength, editHeight);
+        Line = Line + 1;
+
+        addLabelField("Тип документа:", alLeft, Line);
+        addComboBox("formTypeEdit", alCombo, Line, 25, 1);
+        m_combo.currentChoice = DELETED;
+        Line = Line + 2;
+
+        addLabelField("Со списком id документов", alLeft, Line);
+        addCheckBox("formIDsCheckBox", alStartDate - 2, Line);
+        addLabelField("Количество id:", alCombo + 10, Line);
+        addEditField("formIDsEdit", TYPE_STRING, "10", editString, true, true, alFinDate + 5, Line, 4, editHeight);
+
+    end;
+/*----------------------------------------------------------------------------*/    
+    InitTRsbPanel();
+    init(caption);
+/*----------------------------------------------------------------------------*/
+end; /*End of class RslPanel*/
+
+
+/*----------------------------------------------------------------------------*/
+//проверка массива параметра фильтра на наличие выбранных элементов
+private macro arrIsEmpty(pArr:TArray, pStr:integer)
+var isEmpty : bool = true,
+    i : integer = 0;
+    while ((i < pArr.size/pStr) and isEmpty)
+        isEmpty = (not pArr[pStr*i]);
+        i = i + 1;
+    end;
+    return isEmpty;
+end;
+/*----------------------------------------------------------------------------*/
+//простейшая сортировка для массива результатов
+private macro sortme(pArr:TArray, pStr:integer) //массив и размер его структуры
+var t, i, j, k;
+    for (j, 1, pArr.size/pStr-1)
+        for (i, 1, pArr.size/pStr-1)
+            if ( (pArr[pStr*(i)+0] < pArr[pStr*(i-1)+0])
+            or   ((pArr[pStr*(i)+0] == pArr[pStr*(i-1)+0]) and (pArr[pStr*(i)+2] < pArr[pStr*(i-1)+2])) )
+                for (k, 0, pStr-1)
+                    t = pArr[pStr*(i)+k];
+                    pArr[pStr*(i)+k] = pArr[pStr*(i-1)+k];
+                    pArr[pStr*(i-1)+k] = t;
+                end;
+            end;
+        end;
+    end;
+    return pArr;
+end;
+/*----------------------------------------------------------------------------*/
+//подготовка строки для вставки в запрос
+private macro strFill (arr, structSize, compl_table)
+var i : integer = 0,
+    str : string = "";
+
+    for (i, 0, arr.size/structSize-1)
+        if (arr[structSize*i] == true)
+            str = str + "," + arr[structSize*i+1];
+        end;
+    end;
+
+    //для фильтра доккайнда, если значение фильтра не задано (стоит "ВСЕ"), заполняем условие всеми возможными
+    //значениями этого фильтра чтобы избежать попадания документов с dockind = 320 и прочих.
+    if ((str == "") and (compl_table == "t.t_dockind"))
+        for (i, 0, arr.size/structSize-1)
+            str = str + "," + arr[structSize*i+1];
+        end;
+    end;
+
+    if (substr(str,1,1) == ",")
+        str = substr(str,2);
+    end;
+
+    if (str != "")
+        str = "\n and " + compl_table + " in (" + str + ") ";
+    end;
+
+    return str;
+
+end;
+/*----------------------------------------------------------------------------*/
+//подготовка строки для вставки в запрос (для массива источников)
+private macro strFillSource (arr, cmpStr1, cmpStr2)
+var i : integer = 0,
+    str : string = "",
+    rs;
+
+    if (arrIsEmpty(aSource,SOURCE_SIZE))
+
+        //если источники не выбраны, в запросе достаточно указать доккайнды,
+        //отрезав предварительно первый "and"
+        return substr(strFill(aDockind, DOCKIND_SIZE, "t.t_dockind"), 6);
+
+    else
+
+        rs = RsdRecordSet(string(
+            " select t.* from (",
+            "\n  select distinct t.t_dockind, ",
+            "\n       t.t_name dkndname, ",
+            "\n       lval.t_element, ",
+            "\n       lval.t_name ",
+            "\n  from (select t_dockind, ",
+            "\n               t_name, ",
+            "\n               substr(t_strorigin, length(t_strorigin) + 2 - instr(REVERSE(t_strorigin),'/')) t_origin ",
+            "\n          from ",
+            "\n            (SELECT t.t_dockind, ",
+            "\n                    t.t_name, ",
+            "\n                    replace(SYS_CONNECT_BY_PATH(t.t_origin, '/'),  '/0', null) t_strorigin ",
+            "\n               FROM doprkdoc_dbt t ",
+            "\n              WHERE CONNECT_BY_ISLEAF = 1 ",
+            "\n                AND t.t_dockind != 320 ",
+            "\n              START WITH t.t_dockind = 29 ",
+            "\n            CONNECT BY PRIOR t_dockind = t_parentdockind ",
+            "\n             UNION ",
+            "\n             select w.t_dockind, ",
+            "\n                    w.t_name, ",
+            "\n                    '/1660' t_strorigin ",
+            "\n               from doprkdoc_dbt w ",
+            "\n              where w.t_dockind = 200 ",
+            "\n             UNION ",
+            "\n             select w.t_dockind, ",
+            "\n                    w.t_name, ",
+            "\n                    '/1660' t_strorigin ",
+            "\n               from doprkdoc_dbt w ",
+            "\n              where w.t_dockind = 320 ",
+            "\n            )) t, ",
+            "\n       dllvalues_dbt lval ",
+            "\n  where t.t_origin = lval.t_list ",
+            "\n ) t ",
+            "\n where ",
+            "\n " + substr(strFill(aDockind, DOCKIND_SIZE, "t.t_dockind"),7),
+            "\n " + strFill(aSource, SOURCE_SIZE, "t.t_element"),
+            "\n order by t.t_dockind, t.t_element " ));
+
+        while (rs.moveNext)
+            str = str + "or (" + cmpStr1 + " = " + rs.value("t_dockind") + 
+                       " and " + cmpStr2 + " = " + rs.value("t_element") + ") ";
+        end;
+
+        if (substr(str,1,2) == "or")
+            str = substr(str,3);
+        end;
+
+        if (str != "")
+            str = "(" + str + ") ";
+        end;
+
+        return str;
+
+    end;
+
+end;
+/*----------------------------------------------------------------------------*/
+//введенные в архив
+private macro quickQuery(strType)
+var rs,
+    cmd,
+    query,
+    curDate : Date = startdate,
+    dayExists : bool = false,
+    strDockind : string = "",
+    strSource : string = "",
+    progressCounter : integer = 0,
+    resultSize : integer = 0,
+    i : integer = 0,
+    j : integer = 0;
+
+    //в случае неверного ввода меняем даты местами
+    if (startDate > endDate)
+        curDate = startDate;
+        startDate = endDate;
+        endDate = curDate;
+        curDate = startDate;
+    end;
+
+    //подготовка строки с параметром "происхождение документа" для вставки в запрос
+    strSource = strFillSource(aSource, "t.t_dockind", "t.origin");
+
+    //виды документов, обрабатываемые пакетной функцией user_ea.getOrigin
+    strDockind = "(" + CB_MULTYDOC + //15
+                 "," + DLDOC_BANKPAYMENT + //16
+                 "," + DLDOC_BANKCLAIM + //17
+                 "," + "18" + //не нашёл константы в pm_common
+                 "," + BBANK_CPORDER + //27
+                 "," + DLDOC_MEMORIALORDER + //70
+                 "," + PS_PAYORDER + //201
+                 "," + PS_CPORDER + //202
+                 "," + PS_INRQ + //203
+                 "," + CASH_BOF_ADDORDER + //400
+                 "," + CASH_PS_INCORDER + //410
+                 "," + CASH_PS_OUTORDER + //420
+                 "," + CASH_BOF_INCORDER + ")"; //430
+
+    //промежуточное окно для этапа подсчёта документов
+    InitProgress(1, "Идёт подсчёт документов...", "Удаленные, отвергнутые, введенные в архив документы");
+
+    //подсчитываем количество документов согласно параметрам фильтра, полученное значение используется в прогрессбаре
+    rs = RsdRecordSet(string(
+    "   select count(distinct t.t_paymentid) pid from ( ",
+    "\n select pm.t_paymentid, ",
+    "\n        pm.t_dockind, ",
+    "\n        case when (pm.t_dockind in " + strDockind + ") ",
+    "\n             then decode( user_ea.getOrigin(pm.t_docKind, pm.t_paymentID), ",
+    "\n                          9999, decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ), ",
+    "\n                          user_ea.getOrigin(pm.t_docKind, pm.t_paymentID) ) ",
+    "\n             else decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ) end origin ",
+    "\n   from dpmpaym_dbt pm ",
+    "\n  where " + strType,
+    "\n    and pm.t_valuedate between '" + startDate + "' and '" + endDate + "' ",
+    "\n ) t where ",
+        strSource ));
+
+    rs.moveNext;
+
+    j = rs.value("pid");
+
+    RemProgress();
+    InitProgress(j, "Идёт обработка документов...", "Общие показатели обработки документов в RS-Bank");
+
+    query = string(
+        "   SELECT distinct ",
+        "\n        t.t_paymentid pid ",
+        "\n       ,t.t_dockind ",
+        "\n       ,t.origin ",
+        "\n FROM ",
+        "\n (select ",
+        "\n      pm.t_paymentid, ",
+        "\n      pm.t_dockind, ",
+        "\n      case when (pm.t_dockind in " + strDockind + ") ",
+        "\n           then decode( user_ea.getOrigin(pm.t_docKind, pm.t_paymentID), ",
+        "\n                        9999, decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ), ",
+        "\n                        user_ea.getOrigin(pm.t_docKind, pm.t_paymentID) ) ",
+        "\n           else decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ) end origin ",
+        "\n   from dpmpaym_dbt pm ",
+        "\n  where " + strType,
+        "\n    and pm.t_valueDate = ? ",
+        "\n  ) t ",
+        "\n  ,doproper_dbt oper ",
+        "\n  ,doprstep_dbt step ",
+        "\n WHERE oper.t_documentid = lpad(t.t_paymentid, 34, '0') ",
+        "\n   AND oper.t_dockind = t.t_dockind ",
+        "\n   AND oper.t_id_operation = step.t_id_operation(+) ",
+        "\n   AND " + strSource,
+        "\n GROUP BY t.t_paymentid, t.t_dockind, t.origin ",
+        "\n ORDER BY t.t_dockind "
+        );
+
+    //запрос выполняется для каждого дня в отдельности, т.к. нужна статистика по дням с отсутствующими платежами
+    while (curDate != endDate + 1)
+
+        cmd = RSDCommand(query);
+        cmd.addParam("currentDate", RSDBP_IN, curDate);
+        rs = RSDRecordset(cmd);
+
+        dayExists = false;
+
+        while (rs.moveNext)
+            dayExists = true;
+            i = 0;
+            resultSize = aResult.size/RES_SIZE;
+
+            useProgress(progressCounter);
+            progressCounter = progressCounter + 1;
+
+            //ищем существующую запись с соответствующими параметрами
+            while (not (
+                ((aResult[RES_SIZE*i] == rs.value("t_dockind")) and (aResult[RES_SIZE*i+2] == rs.value("origin")))
+                or (i == resultSize) ))
+                    i = i + 1;
+            end;
+
+            //Инициализация структуры, если встретился следующий тип документа или источника
+            if (i == resultSize)
+
+                aResult[RES_SIZE*i] = rs.value("t_dockind"); //код вида документа
+
+                j = 0;
+                while (aDockind[DOCKIND_SIZE*j+1] != rs.value("t_dockind"))
+                    j = j + 1;
+                end;
+                aResult[RES_SIZE*i+1] = aDockind[DOCKIND_SIZE*j+2]; //наименование вида документа
+
+                j = 0;
+                while (aSource[SOURCE_SIZE*j+1] != rs.value("origin"))
+                    j = j + 1;
+                end;
+
+                aResult[RES_SIZE*i+2] = aSource[SOURCE_SIZE*j+1]; //код происхождения документа
+                aResult[RES_SIZE*i+3] = aSource[SOURCE_SIZE*j+2]; //наименование происхождения документа
+
+                aResult[RES_SIZE*i+4] = 0; //всего документов
+                aResult[RES_SIZE*i+5] = ""; //пользователь
+
+                aResult[RES_SIZE*i+6] = "";
+            end;
+
+            aResult[RES_SIZE*i+4] = aResult[RES_SIZE*i+4] + 1;
+            if (debugMode)
+                if (aResult[RES_SIZE*i+4] < debugNumDocs)
+                    aResult[RES_SIZE*i+6] = aResult[RES_SIZE*i+6] + "," + rs.value("pid");
+                end;
+            end;
+
+        end;
+
+        if (not dayExists)
+            strDayExists = strDayExists + ", " + curDate;
+        end;
+
+        curDate = curDate + 1;
+    end;
+
+end;
+/*----------------------------------------------------------------------------*/
+//общие для запросов действия
+private macro queryOutcast()
+var rs,
+    curDate : Date,
+    strDockind : string = "",
+    strSource : string = "",
+    progressCounter : integer = 0,
+    progressIsRunning : bool = false,
+    resultSize : integer = 0,
+    i : integer = 0,
+    j : integer = 0;
+
+    //в случае неверного ввода меняем даты местами
+    if (startDate > endDate)
+        curDate = startDate;
+        startDate = endDate;
+        endDate = curDate;
+    end;
+
+    //подготовка строки с параметром "происхождение документа" для вставки в запрос
+    strSource = strFillSource(aSource, "t.t_dockind", "t.origin");
+
+    //виды документов, обрабатываемые пакетной функцией user_ea.getOrigin
+    strDockind = "(" + CB_MULTYDOC + //15
+                 "," + DLDOC_BANKPAYMENT + //16
+                 "," + DLDOC_BANKCLAIM + //17
+                 "," + "18" + //не нашёл константы в pm_common
+                 "," + BBANK_CPORDER + //27
+                 "," + DLDOC_MEMORIALORDER + //70
+                 "," + PS_PAYORDER + //201
+                 "," + PS_CPORDER + //202
+                 "," + PS_INRQ + //203
+                 "," + CASH_BOF_ADDORDER + //400
+                 "," + CASH_PS_INCORDER + //410
+                 "," + CASH_PS_OUTORDER + //420
+                 "," + CASH_BOF_INCORDER + ")"; //430
+
+    //промежуточное окно для этапа подсчёта документов
+    InitProgress(1, "Идёт выполнение запроса...", "Удаленные, отвергнутые, введенные в архив документы");
+
+    //основной запрос, за все дни сразу
+    rs = RsdRecordSet(string(
+    "select rownum, t.* from ( ",
+    "\n SELECT distinct ",
+    "\n         t.t_paymentid pid ",
+    "\n        ,t.t_dockind ",
+    "\n        ,t.origin ",
+    "\n  FROM ",
+    "\n  (select ",
+    "\n       pm.t_paymentid, ",
+    "\n       pm.t_dockind, ",
+    "\n       case when (pm.t_dockind in " + strDockind + ") ",
+    "\n            then decode( user_ea.getOrigin(pm.t_docKind, pm.t_paymentID), ",
+    "\n                         9999, decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ), ",
+    "\n                         user_ea.getOrigin(pm.t_docKind, pm.t_paymentID) ) ",
+    "\n            else decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ) end origin ",
+    "\n    from dpmpaym_dbt pm, ",
+    "\n         doproper_dbt op, ",
+    "\n         doprstep_dbt st ",
+    "\n   where op.t_id_operation = st.t_id_operation ",
+    "\n     and op.t_documentid = lpad(pm.t_paymentid, 34, '0') ",
+    "\n     and op.t_dockind = pm.t_dockind ",
+    "\n     and st.t_plan_date between '" + startDate + "' and '" + endDate + "' ",
+    "\n     and st.t_symbol = 'J' ",
+    "\n   ) t ",
+    "\n  WHERE " + strSource,
+    "\n  GROUP BY t.t_paymentid, t.t_dockind, t.origin ",
+    "\n  ORDER BY t.t_dockind desc ) t order by rownum desc "));
+
+    //обработка документов
+    while (rs.moveNext)
+        //инициализация прогрессбара
+        if (not progressIsRunning)
+            RemProgress();
+            j = rs.value("rownum");
+            InitProgress(j, "Идёт обработка документов...", "Общие показатели обработки документов в RS-Bank");
+            progressIsRunning = true;
+        end;
+
+        i = 0;
+        resultSize = aResult.size/RES_SIZE;
+
+        useProgress(progressCounter);
+        progressCounter = progressCounter + 1;
+
+        //ищем существующую запись с соответствующими параметрами
+        while (not (
+            ((aResult[RES_SIZE*i] == rs.value("t_dockind")) and (aResult[RES_SIZE*i+2] == rs.value("origin")))
+            or (i == resultSize) ))
+                i = i + 1;
+        end;
+
+        //Инициализация структуры, если встретился следующий тип документа или источника
+        if (i == resultSize)
+
+            aResult[RES_SIZE*i] = rs.value("t_dockind"); //код вида документа
+
+            j = 0;
+            while (aDockind[DOCKIND_SIZE*j+1] != rs.value("t_dockind"))
+                j = j + 1;
+            end;
+            aResult[RES_SIZE*i+1] = aDockind[DOCKIND_SIZE*j+2]; //наименование вида документа
+
+            j = 0;
+            while (aSource[SOURCE_SIZE*j+1] != rs.value("origin"))
+                j = j + 1;
+            end;
+
+            aResult[RES_SIZE*i+2] = aSource[SOURCE_SIZE*j+1]; //код происхождения документа
+            aResult[RES_SIZE*i+3] = aSource[SOURCE_SIZE*j+2]; //наименование происхождения документа
+
+            aResult[RES_SIZE*i+4] = 0; //всего документов
+            aResult[RES_SIZE*i+5] = ""; //пользователь
+            aResult[RES_SIZE*i+6] = ""; //paymentid для режима отладки
+        end;
+
+        aResult[RES_SIZE*i+4] = aResult[RES_SIZE*i+4] + 1;
+        if (debugMode)
+            if (aResult[RES_SIZE*i+4] < debugNumDocs)
+                aResult[RES_SIZE*i+6] = aResult[RES_SIZE*i+6] + "," + rs.value("pid");
+            end;
+        end;
+
+    end;
+
+    //поиск дней, за которые отсутствуют платежи
+    //из списка дней периода, который задал пользователь, вычитаются все дни, в которых есть платежи
+    rs = RsdRecordSet(string(
+    "select to_char(dates) dates from ( ",
+    "select to_date('" + startDate + "') + rownum - 1 dates from dual ",
+    "\n connect by level <= (to_date('" + endDate + "') - to_date('" + startDate + "') + 1) ",
+    "\n MINUS ",
+    "\n (select distinct t_plan_date from ",
+    "\n   (select ",
+    "\n         pm.t_paymentid, ",
+    "\n         pm.t_dockind, ",
+    "\n         case when (pm.t_dockind in " + strDockind + ") ",
+    "\n              then decode( user_ea.getOrigin(pm.t_docKind, pm.t_paymentID), ",
+    "\n                           9999, decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ), ",
+    "\n                           user_ea.getOrigin(pm.t_docKind, pm.t_paymentID) ) ",
+    "\n              else decode( pm.t_primdocorigin, 9999, pm.t_origin, pm.t_primdocorigin ) end origin, ",
+    "\n         st.t_plan_date ",
+    "\n    from dpmpaym_dbt pm, ",
+    "\n         doproper_dbt op, ",
+    "\n         doprstep_dbt st ",
+    "\n   where op.t_id_operation = st.t_id_operation ",
+    "\n     and op.t_documentid = lpad(pm.t_paymentid, 34, '0') ",
+    "\n     and op.t_dockind = pm.t_dockind ",
+    "\n     and st.t_plan_date between '" + startDate + "' and '" + endDate + "' ",
+    "\n     and st.t_symbol = 'J' ",
+    "\n   ) t ",
+    "\n  where " + strSource,
+    "\n  ) order by dates )" ));
+
+    //составление списка дней, за которые отсутствуют платежи
+    while (rs.moveNext)
+        strDayExists = strDayExists + ", " + substr(rs.value("dates"),1,8); //отрезаем выводимое время, оставляя только дату
+    end;
+
+end;
+/*----------------------------------------------------------------------------*/
+macro queryDeleted()
+var rs,
+    cmd,
+    query,
+    roboList,
+    errCode,
+    origin,
+    i : integer = 0,
+    j : integer = 0,
+    curDate : Date = startdate,
+    dayExists : bool = false,
+    strDockind : string = "",
+    strSource : string = "",
+    resultSize : integer = 0,
+    progressCounter : integer = 0;
+
+const
+    OPCODE_DEL = 1006; //код транзакции удаления в фискальном журнале
+
+    //в случае неверного ввода меняем даты местами
+    if (startDate > endDate)
+        curDate = startDate;
+        startDate = endDate;
+        endDate = curDate;
+        curDate = startDate;
+    end;
+
+    //считываем список операционистов-роботов
+    if (not getRegistryValue("PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS", V_STRING, roboList, errCode, false))
+        msgbox("Значение настройки реестра 'PRBB\\МОНИТОР ОБРАБОТЧИКОВ\\ROBOTS' не задано. Будет использовано значение по умолчанию.");
+        roboList = string("10000,10001,20000,20001,20002,20003,20004,20005,20006,20007,",
+                          "20008,20009,20010,20011,20012,20013,20014,20050,20201,22222");
+    end;
+
+    //подготовка строки с параметрами "вид документа" и происхождение документа" для вставки в запрос
+    strSource = strFillSource(aSource, "t.t_dockind", "t.origin");
+
+    //виды документов, обрабатываемые функцией user_ea.getOrigin
+    strDockind = "(" + CB_MULTYDOC + //15
+                 "," + DLDOC_BANKPAYMENT + //16
+                 "," + DLDOC_BANKCLAIM + //17
+                 "," + "18" +
+                 "," + BBANK_CPORDER + //27
+                 "," + DLDOC_MEMORIALORDER + //70
+                 "," + PS_PAYORDER + //201
+                 "," + PS_CPORDER + //202
+                 "," + PS_INRQ + //203
+                 "," + CASH_BOF_ADDORDER + //400
+                 "," + CASH_PS_INCORDER + //410
+                 "," + CASH_PS_OUTORDER + //420
+                 "," + CASH_BOF_INCORDER + ")"; //430
+
+    //виды документов, которые могут удалять роботы
+/*    strDockindDelByRobots = 
+                 "(" + CB_MULTYDOC + //15
+                 "," + DLDOC_BANKPAYMENT + //16
+                 "," + DLDOC_BANKCLAIM + //17
+                 "," + DLDOC_MEMORIALORDER + //70
+                 "," + PS_PAYORDER + //201
+                 "," + DLDOC_BANKORDER + //286
+                 "," + CASH_BOF_ADDORDER + //400
+                 "," + CASH_BOF_INCORDER + //430
+                 "," + CASH_BOF_OUTORDER + ")"; //440
+*/
+
+    //проверка, есть ли вообще в фискальном журнале записи за заданный период
+    rs = RsdRecordSet(string(
+    " select count(dates) dates from ( ",
+    " select to_date('" + startDate + "') + rownum - 1 dates from dual ",
+    "\n connect by level <= (to_date('" + endDate + "') - to_date('" + startDate + "') + 1) ",
+    "\n MINUS ",
+    "\n select distinct t_date from dxml_dfisclog_dbt where t_date between '" + startDate + "' and '" + endDate + "' ) " ));
+    rs.moveNext;
+
+    //если количество дней совпадает, то фискальный журнал за период пуст
+    if (rs.value("dates") == endDate - startDate + 1)
+        fisclogIsEmpty = true;
+    end;
+
+    if (fisclogIsEmpty)
+        strFisclogExists = "За весь выбранный период в фискальном журнале нет ни одной записи.";
+    else
+    //подсчёт количества документов
+        rs = RsdRecordSet(string(
+          " select count(distinct t.t_paymentID) pid from ( ",
+          "\n select t_paymentID, ",
+          "\n        t_dockind, ",
+          "\n        case when (t_dockind in " + strDockind + ") ",
+          "\n             then decode( user_ea.getOrigin(t_dockind, t_paymentID), ",
+          "\n                          9999, decode( t_primdocorigin, 9999, t_origin, t_primdocorigin ), ",
+          "\n                          user_ea.getOrigin(t_dockind, t_paymentID) ) ",
+          "\n             else decode( t_primdocorigin, 9999, t_origin, t_primdocorigin ) end origin ",
+          "\n   from ( ",
+          "\n         select  ",
+          "\n             xmltype (t_fmtblobdata_xxxx).extract ('//field[@name=\"t_paymentid\"]/oldVal/text()').getstringval() t_paymentID, ",
+          "\n             xmltype (t_fmtblobdata_xxxx).extract ('//field[@name=\"t_dockind\"]/oldVal/text()').getstringval() t_dockind, ",
+          "\n             xmltype (t_fmtblobdata_xxxx).extract ('//field[@name=\"t_primdocorigin\"]/oldVal/text()').getstringval() t_primdocorigin, ",
+          "\n             xmltype (t_fmtblobdata_xxxx).extract ('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() t_origin ",
+          "\n          from dxml_dfisclog_dbt ",
+          "\n         where t_date between '" + startDate + "' and '" + endDate + "' ",
+          "\n           and t_tablename = 'pmpaym.dbt' ",
+          "\n           and t_opcode = " + OPCODE_DEL,
+          "\n        ) t ",
+          "\n ) t where " + strSource ));
+
+        rs.moveNext;
+
+        j = rs.value("pid");
+
+        RemProgress();
+        InitProgress(j, "Идёт обработка документов...", "Общие показатели обработки документов в RS-Bank");
+
+        query = string(
+            "   SELECT distinct ",
+            "\n        t.t_paymentid pid",
+            "\n       ,t.t_dockind ",
+            "\n       ,t.origin ",
+            "\n       ,t.oper ",
+            "\n FROM ",
+            "\n (select ",
+            "\n     t_paymentid, ",
+            "\n     t_dockind, ",
+            "\n     case when (psn.t_oper in (" + roboList + ")) then psn.t_oper || ' ' || psn.t_name end oper, ",
+            "\n     case when t_DocKind = "+CB_MULTYDOC+" then ", //15
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'multydoc.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_autokey\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind in ("+DLDOC_BANKPAYMENT+", "+DLDOC_BANKCLAIM+", 18) then ", //16,17,18
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'memorder.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_orderid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+BBANK_CPORDER+" then ", //27
+            "\n              ( select distinct xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'bbcpord.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_orderid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+DLDOC_MEMORIALORDER+" then ", //70
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'cb_doc.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_documentid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+PS_PAYORDER+" then ", //201
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'pspayord.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_orderid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+PS_CPORDER+" then ", //202
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'pscpord.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_orderid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+PS_INRQ+" then ", //203
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'psinrq.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_paymentid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind = "+DLDOC_BANKORDER+" then ", //286
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'pmpaym.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_paymentid\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          when t_DocKind in ("+CASH_BOF_ADDORDER+","+CASH_PS_INCORDER+","+CASH_PS_OUTORDER+","+CASH_BOF_INCORDER+") then ", //400,410,420,430
+            "\n              ( select xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() ",
+            "\n                  from dxml_dfisclog_dbt ",
+            "\n                 where t_tablename = 'pscshdoc.dbt' ",
+            "\n                   and t_date = ? ",
+            "\n                   and t_opcode = " + OPCODE_DEL,
+            "\n                   and xmltype(t_fmtblobdata_xxxx).extract('//field[@name=\"t_autokey\"]/oldVal/text()').getstringval() = t_PaymentId ) ",
+            "\n          else decode( t.t_primdocorigin, 9999, t.t_origin, t.t_primdocorigin ) ",
+            "\n          end origin ",
+            "\n   from ( ",
+            "\n         select  ",
+            "\n             xmltype (t_fmtblobdata_xxxx).extract('//field[@name=\"t_paymentid\"]/oldVal/text()').getstringval() t_paymentID, ",
+            "\n             xmltype (t_fmtblobdata_xxxx).extract('//field[@name=\"t_dockind\"]/oldVal/text()').getstringval() t_dockind, ",
+            "\n             xmltype (t_fmtblobdata_xxxx).extract('//field[@name=\"t_primdocorigin\"]/oldVal/text()').getstringval() t_primdocorigin, ",
+            "\n             xmltype (t_fmtblobdata_xxxx).extract('//field[@name=\"t_origin\"]/oldVal/text()').getstringval() t_origin, ",
+            "\n             t_userid oper ",
+            "\n         from dxml_dfisclog_dbt ",
+            "\n         where t_date = ? ",
+            "\n           and t_tablename = 'pmpaym.dbt' ",
+            "\n           and t_opcode = " + OPCODE_DEL,
+            "\n        ) t, ",
+            "\n        dperson_dbt psn ",
+            "\n   where psn.t_oper = t.oper ",
+            "\n  ) t ",
+            "\n WHERE " + strSource,
+            "\n GROUP BY t.t_paymentid, t.t_dockind, t.origin, t.oper ",
+            "\n ORDER BY t.t_dockind" 
+            );
+
+        //запрос выполняется для каждого дня в отдельности, т.к. нужна статистика по дням с отсутствующими платежами
+        while (curDate != endDate + 1)
+
+            cmd = RSDCommand(query);
+            cmd.addParam("curDate0", RSDBP_IN, curDate);
+            cmd.addParam("curDate1", RSDBP_IN, curDate);
+            cmd.addParam("curDate2", RSDBP_IN, curDate);
+            cmd.addParam("curDate3", RSDBP_IN, curDate);
+            cmd.addParam("curDate4", RSDBP_IN, curDate);
+            cmd.addParam("curDate5", RSDBP_IN, curDate);
+            cmd.addParam("curDate6", RSDBP_IN, curDate);
+            cmd.addParam("curDate7", RSDBP_IN, curDate);
+            cmd.addParam("curDate8", RSDBP_IN, curDate);
+            cmd.addParam("curDate9", RSDBP_IN, curDate);
+            rs = RSDRecordset(cmd);
+
+            dayExists = false;
+
+            while (rs.moveNext)
+                dayExists = true;
+                i = 0;
+                resultSize = aResult.size/RES_SIZE;
+
+                useProgress(progressCounter);
+                progressCounter = progressCounter + 1;
+
+                //подготовка на случай отсутствия записи о происхождении документа
+                origin = rs.value("origin");
+                if (valtype(origin) == V_SPECIAL_VALUE)
+                    origin = -1;
+                end;
+
+                //ищем существующую запись с соответствующими параметрами
+                while (not (
+                    ( (aResult[RES_SIZE*i] == rs.value("t_dockind")) 
+                  and (aResult[RES_SIZE*i+2] == origin)
+                  and (aResult[RES_SIZE*i+5] == rs.value("oper")) )
+                    or (i == resultSize) ))
+                        i = i + 1;
+                end;
+
+                //Инициализация структуры, если встретился следующий тип документа или источника
+                if (i == resultSize)
+
+                    j = 0;
+                    while (aDockind[DOCKIND_SIZE*j+1] != rs.value("t_dockind"))
+                        j = j + 1;
+                    end;
+                    aResult[RES_SIZE*i] = rs.value("t_dockind"); //код вида документа
+                    aResult[RES_SIZE*i+1] = aDockind[DOCKIND_SIZE*j+2]; //наименование вида документа
+ 
+                    if (origin == -1)
+                        aResult[RES_SIZE*i+2] = origin;   //код происхождения документа
+                        aResult[RES_SIZE*i+3] = "***НЕИЗВЕСТНО***";   //наименование происхождения документа
+                    else
+                        j = 0;
+                        while (aSource[SOURCE_SIZE*j+1] != rs.value("origin"))
+                            j = j + 1;
+                        end;
+                        aResult[RES_SIZE*i+2] = aSource[SOURCE_SIZE*j+1];   //код происхождения документа
+                        aResult[RES_SIZE*i+3] = aSource[SOURCE_SIZE*j+2];   //наименование происхождения документа
+                    end;
+
+                    aResult[RES_SIZE*i+4] = 0;                          //всего документов
+                    aResult[RES_SIZE*i+5] = rs.value("oper");           //пользователь
+                    aResult[RES_SIZE*i+6] = "";                         //paymentid для режима отладки
+                end;
+
+                aResult[RES_SIZE*i+4] = aResult[RES_SIZE*i+4] + 1;
+                if (debugMode)
+                    if (aResult[RES_SIZE*i+4] < debugNumDocs)
+                        aResult[RES_SIZE*i+6] = aResult[RES_SIZE*i+6] + "," + rs.value("pid");
+                    end;
+                end;
+
+            end;
+
+            if (not dayExists)
+                strDayExists = strDayExists + ", " + curDate;
+            end;
+
+            curDate = curDate + 1;
+
+        end;
+
+        //формирование строки со списком дней, за которые в фискальном журнале отсутствуют записи
+        rs = RsdRecordSet(string(
+        " select to_char(dates) dates from ( ",
+        " select to_date('" + startDate + "') + rownum - 1 dates from dual ",
+        "\n connect by level <= (to_date('" + endDate + "') - to_date('" + startDate + "') + 1) ",
+        "\n MINUS ",
+        "\n select distinct t_date from dxml_dfisclog_dbt where t_date between '" + startDate + "' and '" + endDate + "' ) " ));
+
+        while (rs.moveNext)
+            strFisclogExists = strFisclogExists + ", " + substr(rs.value("dates"),1,8);
+        end;
+
+        if (strFisclogExists != "")
+            strFisclogExists = "За следующие дни в фискальном журнале нет ни одной записи: " + substr(strFisclogExists,3);
+        end;
+
+    end;
+
+end;
+
+/*----------------------------------------------------------------------------*/
+//основные расчёты статистики: подготовка и выполнение запроса, заполнение массива результатов
+private macro core()
+    var rs,
+        strType : string = "";
+
+    //массив инициализируется с ненулевым размером, хотя по факту он пуст. Исправляем.
+    aResult.size = 0;
+
+    //удалённые
+    if (chosenType == DELETED)
+        queryDeleted();
+
+    //отвергнутые
+    elif (chosenType == OUTCASTED)
+        queryOutcast();
+
+    //введенные в архив
+    elif (chosenType == ARCHIEVED)
+        strType = "pm.t_creationdate > pm.t_valuedate";
+        quickQuery(strType);
+    end;
+
+    //перегруппируем массив результатов: может возникнуть ситуация, когда запись с новым значением источника 
+    //для существующего значения вида документа оторвана от группы предыдущих записей с этим видом документа
+    if (aResult.size >= RES_SIZE+1) aResult = sortme(aResult, RES_SIZE); end;
+
+    //доформирование строки с днями, за которые отсутствуют платежи
+    if (strDayExists != "")
+        strDayExists = "За следующие дни платежи отсутствуют: " + substr(strDayExists,3);
+    end;
+
+    RemProgress();
+    Message("Формирование Excel-файла...");
+
+end;
+/*----------------------------------------------------------------------------*/
+//x - строка, y - столбец
+
+private macro Put_Cell_Border(Lst, x, y, string)
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = 3;
+    Lst.Cells(x, y).Borders.LineStyle = 1;
+end; /*End Of Put_Cell_Border*/
+
+private macro Put_Cell(Lst, x, y, string, al)
+    if (valtype(al) == V_UNDEF) al = 3 end;
+    Lst.Cells(x, y).Value = string;
+    Lst.Cells(x, y).HorizontalAlignment = al;
+end; /*End Of Put_Cell*/
+
+private macro ExcelRepDOA(ComObj)
+    var i : integer = 0,
+        rs,
+        List = ComObj.Sheets(1),
+        tempstr : string = "",
+        sumAll : integer = 0,
+        alLeft = 2,
+        alRight = 4,
+        alCenter = 3;
+    
+    List.Columns("A:A").ColumnWidth  = 11;
+    List.Columns("B:B").ColumnWidth  = 28.5;
+    List.Columns("C:C").ColumnWidth  = 30;
+    List.Columns("D:D").ColumnWidth  = 19;
+    List.Columns("E:E").ColumnWidth  = 36;
+
+    List.Range("A2:G2").Merge;
+    List.Range("A2:G2").Font.Bold = True;
+    Put_Cell(List,2,1,"Удаленные, отвергнутые, введенные в архив документы", alCenter);
+
+    List.Range("A4:C4").Merge;
+    List.Range("A4:C4").Value = string("Подразделение (банк): " + {Name_Bank});
+
+    List.Range("D4:G4").Merge;
+    List.Range("D4:G4").Value = string("За период с " + startDate + " по " + endDate);
+
+    List.Range("A6:C6").Merge;
+    List.Range("A6:C6").Value = string("Дата, время формирования отчёта: " + date + " " + time);
+
+    List.Range("D6:G6").Merge;
+    List.Range("D6:G6").Value = "Параметры фильтра:";
+
+    rs = RsdRecordSet(string("select t_name from dperson_dbt where t_oper = " + {oper}));
+    rs.movenext;
+
+    List.Range("A8:C8").Merge;
+    List.Range("A8:C8").Value = string("Исполнитель: {" + {oper} + "} " + rs.value("t_name"));
+
+    tempstr = "";
+    for (i, 0, aDockind.size/DOCKIND_SIZE)
+        if (aDockind[DOCKIND_SIZE*i] == true) tempstr = tempstr + ", " + aDockind[DOCKIND_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+    
+    List.Range("D8:G8").Merge;
+    List.Range("D8:G8").Value = string("Вид документа:" + tempstr);
+
+    tempstr = "";
+    for (i, 0, aSource.size/SOURCE_SIZE)
+        if (aSource[SOURCE_SIZE*i] == true) tempstr = tempstr + ", " + aSource[SOURCE_SIZE*i+2] end;
+    end;
+    if (substr(tempstr,1,1) == ",") tempstr = substr(tempstr,2) end;
+    if (tempstr == "") tempstr = "ВСЕ" end;
+
+    List.Range("D9:G9").Merge;
+    List.Range("D9:G9").Value = string("Источник поступления: " + tempstr);
+
+    tempstr = aType[TYPE_SIZE*chosenType+1];
+
+    List.Range("D10:G10").Merge;
+    List.Range("D10:G10").Value = string("Тип документа: " + tempstr);
+
+    if (chosenType == DELETED)
+        List.Range("A12:E13").Interior.Color = #B5B5B5;
+        List.Range("A12:E13").WrapText = True;
+    else 
+        List.Range("A12:D13").Interior.Color = #B5B5B5;
+        List.Range("A12:D13").WrapText = True;
+    end;
+
+    List.Range("A12:A13").Merge;
+    List.Range("A12:A13").Borders.LineStyle = 1;
+    Put_Cell(List, 12, 1, string("Код вида документа:"), alCenter); 
+
+    List.Range("B12:B13").Merge;
+    List.Range("B12:B13").Borders.LineStyle = 1;
+    Put_Cell(List, 12, 2, string("Наименование вида документа:"), alCenter);
+
+    List.Range("C12:C13").Merge;
+    List.Range("C12:C13").Borders.LineStyle = 1;
+    Put_Cell(List, 12, 3 ,string("Источник поступления:"), alCenter);
+
+    List.Range("D12:D13").Merge;
+    List.Range("D12:D13").Borders.LineStyle = 1;
+    Put_Cell(List, 12, 4, string("Количество документов (всего):"), alCenter);
+
+    if (chosenType == DELETED)
+        List.Range("E12:E13").Merge;
+        List.Range("E12:E13").Borders.LineStyle = 1;
+        Put_Cell(List, 12, 5, string("Пользователь, изменивший/удаливший:"), alCenter);
+        if (debugMode)
+            List.Range("F12:F13").Merge;
+            List.Range("F12:F13").Borders.LineStyle = 1;
+            Put_Cell(List, 12, 6, string("ID документов:"), alCenter);
+        end;
+    else
+        if (debugMode)
+            List.Range("E12:E13").Merge;
+            List.Range("E12:E13").Borders.LineStyle = 1;
+            Put_Cell(List, 12, 5, string("ID документов:"), alCenter);
+        end;
+    end;
+
+    //если считали удалённые документы и фискальный журнал пуст, то результаты выводить не нужно
+    if ((chosenType == DELETED) and fisclogIsEmpty)
+        List.Cells(15, 1).Value = strFisclogExists;
+        List.Cells(15, 1).Font.Color = #0000FF;
+    else
+        //заполнение блока результатов, проверка нужна, потому что пустой массив результатов иногда имеет ненулевой размер
+        if (aResult.size/RES_SIZE != 0)
+            for (i, 0, aResult.size/RES_SIZE-1)
+                Put_Cell(List, 14+i, 1, aResult[RES_SIZE*i], alRight);    //код вида
+                Put_Cell(List, 14+i, 2, aResult[RES_SIZE*i+1], alLeft);   //наим. вида
+                Put_Cell(List, 14+i, 3, aResult[RES_SIZE*i+3], alLeft);   //источник
+                Put_Cell(List, 14+i, 4, aResult[RES_SIZE*i+4], alRight);  //кол-во документов
+
+                if (debugMode)
+                    if (substr(aResult[RES_SIZE*i+6], 1, 1) == "0")
+                        aResult[RES_SIZE*i+6] = substr(aResult[RES_SIZE*i+6], 3);
+                    else
+                        aResult[RES_SIZE*i+6] = substr(aResult[RES_SIZE*i+6], 2);
+                    end;
+                end;
+
+                if (chosenType == DELETED)
+                    Put_Cell(List, 14+i, 5, aResult[RES_SIZE*i+5], alLeft);   //пользователь
+                    if (debugMode)
+                        Put_Cell(List, 14+i, 6, aResult[RES_SIZE*i+6], alLeft);
+                    end;
+                else
+                    if (debugMode)
+                        Put_Cell(List, 14+i, 5, aResult[RES_SIZE*i+6], alLeft);
+                    end;
+                end;
+            end;
+    
+            Put_Cell(List, 14+aResult.size/RES_SIZE, 2, "ИТОГО", alLeft);
+    
+            for (i, 0, aResult.size/RES_SIZE - 1)
+                sumAll = sumAll + aResult[RES_SIZE*i+4];
+            end;
+            Put_Cell(List,14+aResult.size/RES_SIZE, 4, sumAll, alRight);
+
+        end;
+
+        List.Cells(14+aResult.size/RES_SIZE+2, 1).Value = strDayExists;
+
+        if (chosenType == DELETED)
+            List.Cells(14+aResult.size/RES_SIZE+4, 1).Value = strFisclogExists;
+        end;
+
+    end;
+
+end; /*End Of ExcelRepDOA*/
+
+
+Macro OpenExcel()
+    var ExObj;
+    var ComObj;
+      
+    ExObj  = CreateObject ("rsax","TRsAxServer","RsAxServer",IsStandAlone());
+    ComObj = ExObj.CreateComObject ("Excel.Application", False);
+    ComObj.Application.DisplayAlerts = True;
+    ComObj.Workbooks.Add();
+
+    ExcelRepDOA(ComObj);
+    
+    ComObj.Visible = True;
+
+End; /* End Of OpenExcel */
+
+
+
+macro main();
+    var form: TRsbPanel = RslPanel("Удаленные, отвергнутые, введенные в архив документы");
+    //GetCmdLineParm("debug", debugMode, v_bool);
+    form.run();
+    if (formRun)
+        Message("Обработка результатов запроса...");
+        core();
+        Message("Формирование Excel-файла...");
+        OpenExcel();
+    end;
+end;
+                               
+main();
+exit(1);

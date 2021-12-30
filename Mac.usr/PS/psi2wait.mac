@@ -1,0 +1,241 @@
+//-----------------------------------------------------------------------------
+// Блок     : 29020 - "Картотека 2"
+// Шаг      : 20    - "Ожидание в картотеке №2"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+// LAO         13.08.2013 C-22144-6 отправка уведомлений для инкассовых поручений и платежных требований 
+// KS          22.11.2013 Перенесены доработки из 30й сборки
+// Jushmanov   2014-02-24 C-19151 логгирование массово выполненных шагов
+// LVV         01.08.2014 C-31748 Показ информационного сообщения для платежей по исполнительному документу
+// TAM         02.06.2015 C-38458 - отправка в OW сумм заблокированных средств
+//-----------------------------------------------------------------------------
+
+import pm_setst, PaymInter, payinter, catfdoc, cbsttls, pm_common, Календарь;
+import "AvtoTypePayment.mac","op_lib.mac","send_claim.mac";
+import OprInter, oralib; //Jushmanov 2014-02-24 C-19151
+
+var PaymentObj:RsbPayment;
+
+private macro ValueDateForWaitInK2(Paym : RsbPayment) : date
+    var ValueDate : date = {curdate};
+    var DocKind = Paym.PrimDocKind;
+
+    if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+        ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+    elif( GetParentOrEqualDocKindFromList(DocKind, DLDOC_BANKORDER) )
+        ValueDate = PM_GetOperDay_Balance(Paym.Department);
+    end;
+
+    return ValueDate;
+end;
+
+// Выполнение шага
+MACRO ExecuteStep( doc, payorder, DocKind:integer, ID_Operation:integer, ID_Step:integer  )
+    private var Theme;
+
+    //Gurin S. 17.04.2015 R-572281-2
+    if(GetOprStatus(291) == 1)
+       УстановитьСтатусыПлатежа(291, 2);
+    end; 
+
+    if(IsArestDebetAcc(PaymentObj.PayerAccount, PaymentObj.PayerFIID))
+        msgbox("На счет наложено ограничение операций");
+        return 1;
+    end;
+
+    if(CheckDateStartOpr(ID_Operation))
+        return 1;
+    end;
+    //LVV 01.08.2014 C-31748 Показ информационного сообщения для платежей по исполнительному документу	
+    if( PaymentObj.TaxPmGround == "АР" )
+        msgbox("ВНИМАНИЕ! ПЛАТЁЖ ПО ИСПОЛНИТЕЛЬНОМУ ДОКУМЕНТУ");
+    end;
+
+    PaymentObj.ValueDate = ValueDateForWaitInK2(PaymentObj);
+
+    var choise = GetCachedVar( "PmIndex2Wait" + PaymentObj.PayerAccount + PaymentObj.PayerFIID );
+    Array Text;
+    Array Buttons;
+
+    if( ValType( choise ) == V_UNDEF )
+
+        if( CheckPmIWPPlaced_ByObj( PaymentObj, 0 ) )
+
+            Text[0] = "К счету " + PaymentObj.PayerAccount + 
+                      " есть неоплаченные документы|в картотеке ожидания разрешений с более высоким приоритетом.|Продолжить?";
+            Buttons[0] = "   Да  ";
+            Buttons[1] = "  Нет  ";
+
+            choise = ConfWin( Text, Buttons );
+            if( IsOprMultiExec() )
+                SetCachedVar( "PmIndex2Wait" + PaymentObj.PayerAccount + PaymentObj.PayerFIID, choise );
+            end;
+        end;
+    end;
+
+    if( choise == 1 ) /*Нет*/
+        return 1;
+    end;
+
+    if( PaymentObj.I2PlaceDate > {curdate} )
+        msgbox("Дата помещения документа в картотеку больше даты текущего операционного дня");
+        return 1;
+    end;
+
+    // Определим счета в проводках
+    var ВнебалСчетКартотеки2;
+
+    // Объекты для КУ
+    var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+
+    // Счета КУ
+    var СистемныйСчетДляКартотек:string = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+
+    // Выполним проводку по внебалансу
+    var paymtr:RsbAccTransaction = PaymentObj.MakeTransaction();
+
+    // То, что надо для формирования проводки
+    var PayAmount   = PaymentObj.FuturePayerAmount;
+    
+    /*SDA 24/01/2012 */
+    var CarryDate   = {curdate};
+    PaymentObj.ValueDate = {curdate};
+
+    var NumberPack  = PaymentObj.NumberPack;
+    var ResultCarry = OBI2CARRY;
+  
+    // Установить статус платежа
+    PaymentObj.PaymStatus = PM_READIED;
+
+    // Установить статус первички
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_WORKING );
+
+    AvtoTypePaym(PaymentObj);
+
+    if( PaymentObj.StartDepartment != PaymentObj.EndDepartment )
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_CABS, OPR_PM_ST_MFR_NO ) )
+            msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+            return 1;
+        end;
+    end;
+
+    PaymentObj.PlaceToIndex = "";
+
+    if( paymtr == NULL )
+        MsgBox("Ошибка при создании проводки по платежу");
+        return 1;
+    end;
+
+    // Устанавливаем даты
+    PaymentObj.OutTransferDate = PmGetDefaultOutTransferDate( PaymentObj ); 
+
+    // Установить дату начала операции равной дате операционного дня пользователя
+    SetOprDate(29000000, {curdate});
+
+    if ((PaymentObj.PaymentKind == "П") and (PaymentObj.IsExternal))
+
+        /* EVG 24/01/2012 Чтение настройки из реестра - след. день ставится только если настройка false. */
+        var POSTA_ExecToday = true, /*SDA - значение по-умолчанию*/
+            err;
+
+        CarryDate =
+        PaymentObj.ValueDate =
+        PaymentObj.OutTransferDate =  {curdate};
+
+        GetRegistryValue( "PRBB\\МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\ДПП_ТЕКУЩИМ_ДНЕМ\\ПОЧТОВЫЕ", V_BOOL, POSTA_ExecToday, err );
+        if ( err != 0 )
+            POSTA_ExecToday = false;
+        end;
+        if ( not POSTA_ExecToday )
+            PaymentObj.OutTransferDate = GetDateAfterWorkDays ( {curdate}, 1);
+        end;
+        /* EVG 24/01/2012 end */
+    end;
+
+    paymtr.Chapter         = 3;
+    paymtr.Date_Carry      = PaymentObj.ValueDate;
+    paymtr.Number_Pack     = PaymentObj.NumberPack;
+    paymtr.Numb_Document   = PaymentObj.Number;
+    paymtr.ResultCarry     = OBI2CARRY;
+    paymtr.Kind_Oper       = " 6";
+    paymtr.Shifr_Oper      = "09";
+    paymtr.Department      = PaymentObj.Department;
+    paymtr.AccountPayer    = СистемныйСчетДляКартотек;
+    paymtr.AccountReceiver = PaymIndex2_FirstDoc( PaymentObj.PaymentID ).FindAndOpenAccount( "Картотека 2", 0, {curdate} );
+    paymtr.FIIDPayer       = NATCUR; 
+    paymtr.FIIDReceiver    = PaymentObj.BaseFIID;
+
+    paymtr.SumReceiver     = PaymentObj.FutureBaseAmount;
+    if( ConvSum( paymtr.SumPayer, PaymentObj.FutureBaseAmount, PaymentObj.ValueDate, PaymentObj.BaseFIID, NATCUR ) )
+        msgbox("Ошибка конвертации суммы");
+        return 1;
+    end;
+
+    paymtr.Ground          = "Снятие с Картотеки 2 суммы " + PaymentObj.FuturePayerAmount +
+                             " по документу № "            + string(PaymentObj.Number) +
+                             " от "                        + string(PaymentObj.Date)   +
+                             " к счету "                   + string(PaymentObj.PayerAccount);
+
+    if( not paymtr.Carry )
+        MsgBox("Ошибка при актуализации платежа");
+        return 1;
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+    end;
+
+    if(PaymentObj.CheckTerror != CHT_NOTNEED)
+        PaymentObj.CheckTerror = CHT_NOTCHECK;
+    end;
+
+    if ((PaymentObj.PayerBankID == {OurBank}) and ((PaymentObj.ShifrOper == "06") or (PaymentObj.ShifrOper == "02")))
+
+        if (PaymentObj.ShifrOper == "06")
+            Theme = "Уведомление о списании  с Картотеки 2: инкассовое поручение";
+        else
+            Theme = "Уведомление о списании  с Картотеки 2: платежное требование";
+        end; 
+
+        send_use_MailFront(Paymentobj.PayerAccount,Theme,GetINKLetter(Paymentobj, paymtr,"PAY_K2"));
+
+    end;
+
+    return 0;
+END;
+
+
+//Jushmanov 2014-02-24 C-19151
+macro PostStepAction( message,      /* 1 - выполнение шага; 2 - откат шага;   */
+                      errTrn,       /* статус выполнения шага. 0 - ошибки нет */
+                      FirstDoc,     /* указатель на первичный документ        */
+                      ID_Oper,      /* внутренний идентификатор операции      */
+                      Number_Step,  /* Номер шага операции (из настроек)      */
+                      KindOper,     /* номер вида операции                    */
+                      KindDoc,      /* номер вида первичного документа        */
+                      KindStep,     /* вид шага операции                      */
+                      ID_Step )     /* внутренний идентификатор шага операции */
+    private var logquery, idStep = ID_Step, idOper = ID_Oper;
+
+    if(( message == OP_EXECUTE_STEP ) and (errTrn == 0) and (IsOprMultiExec))
+        if ((valtype(idOper) != V_INTEGER) and (valtype(idOper) != V_STRING)) idOper = 0; end;
+        if ((valtype(idStep) != V_INTEGER) and (valtype(idStep) != V_STRING)) idStep = 0; end;
+        
+        logquery = "UPDATE usr_doprstep_robot_dbt SET t_is_robot_step = chr(88)" +
+                   " WHERE t_id_operation = " + idOper + " AND t_id_step = " + idStep;
+        ExecSQL(logquery, null, false);
+    end;
+    
+    // TAM 28.04.2015 C-38458 - отправка в OW сумм заблокированных средств
+    var rsdcom:RSDCommand;
+    if(message == OP_EXECUTE_STEP) 
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (5," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    elif (message == OP_BACKOUT_STEP)
+        rsdcom = RSDCommand(" begin usr_ow.SEND_INDEX2_IIS_OW (6," + PaymentObj.PaymentID + "); end;");
+        rsdcom.Execute();
+    end;
+
+    return 0;
+end;
